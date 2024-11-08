@@ -84,15 +84,21 @@ Replace /path/to/your/sdxl/model with the path to your SDXL model checkpoint, an
 4. Training Options
   
    --model_path: Path to the pre-trained SDXL model.
+
    --data_dir: Directory containing training images and captions.
+   
    --cache_dir: Directory to cache latents and embeddings.
+
    --learning_rate: Learning rate for the optimizer.
+
    --num_epochs: Number of training epochs.
+
    --num_inference_steps: Number of inference steps for sigma schedule.
+
    --gradient_accumulation_steps: Number of steps to accumulate gradients.
+
    --ema_decay: Decay rate for Exponential Moving Average.
-
-
+   
 ### Acknowledgements
 This project is inspired by the following paper:
 
