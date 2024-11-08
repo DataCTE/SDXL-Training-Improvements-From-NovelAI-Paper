@@ -301,11 +301,16 @@ def main(args):
     # Setup EMA
     ema_model = AveragedModel(unet, avg_fn=lambda avg, new, _: args.ema_decay * avg + (1 - args.ema_decay) * new)
 
-    # Setup scheduler
+    # Calculate total training steps
+    num_update_steps_per_epoch = len(train_dataloader) // args.gradient_accumulation_steps
+    num_training_steps = args.num_epochs * num_update_steps_per_epoch
+
+    # Setup scheduler with total steps
     lr_scheduler = get_scheduler(
         "cosine",
         optimizer=optimizer,
         num_warmup_steps=0,
+        num_training_steps=num_training_steps
     )
    
     # Create dataloader
