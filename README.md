@@ -67,7 +67,7 @@ The script will automatically cache the latents and text embeddings during the f
 Use the following command to start training with DeepSpeed:
 
 ```bash
-deepspeed training_script.py \
+python HighSigma.py \
   --model_path /path/to/your/sdxl/model \
   --data_dir /path/to/your/data \
   --cache_dir ./latents_cache \
