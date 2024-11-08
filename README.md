@@ -95,9 +95,10 @@ To enable training at 1024x1024 resolution without running into memory issues, s
 ### Acknowledgements
 This project is inspired by the following paper:
 
-"Improvements to SDXL in NovelAI Diffusion V3" by Juan Ossa, Eren Doğan, Alex Birch, and F. Johnson.
+**"Improvements to SDXL in NovelAI Diffusion V3"** by Juan Ossa, Eren Doğan, Alex Birch, and F. Johnson.
 
-Special thanks to the authors for their valuable contributions to the field of diffusion-based image generation.
+link: https://arxiv.org/pdf/2409.15997
 
-License
+## License
+
 This project is licensed under the apachie 2.0 License. See the LICENSE file for details.
