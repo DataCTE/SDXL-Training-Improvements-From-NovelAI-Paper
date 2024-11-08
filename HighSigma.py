@@ -290,9 +290,27 @@ def main(args):
     unet.enable_gradient_checkpointing()
 
     # Setup optimizer with per-device batch size
+    dataset = Dataset(
+        args.data_dir,
+        vae,
+        tokenizer,
+        tokenizer_2,
+        text_encoder,
+        text_encoder_2,
+        cache_dir=args.cache_dir
+    )
+    train_dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=True,
+    )
+
+    # Setup optimizer
     optimizer = AdamW8bit(
         unet.parameters(),
-        lr=args.learning_rate * args.batch_size,  # Scale learning rate with batch size
+        lr=args.learning_rate * args.batch_size,
         betas=(0.9, 0.999),
         weight_decay=1e-2,
         eps=1e-8
@@ -305,7 +323,7 @@ def main(args):
     num_update_steps_per_epoch = len(train_dataloader) // args.gradient_accumulation_steps
     num_training_steps = args.num_epochs * num_update_steps_per_epoch
 
-    # Setup scheduler with total steps
+    # Setup scheduler
     lr_scheduler = get_scheduler(
         "cosine",
         optimizer=optimizer,
@@ -313,23 +331,6 @@ def main(args):
         num_training_steps=num_training_steps
     )
    
-    # Create dataloader
-    dataset = Dataset(
-        args.data_dir,
-        vae,
-        tokenizer,
-        tokenizer_2,
-        text_encoder,
-        text_encoder_2,
-        cache_dir=args.cache_dir
-    )
-    train_dataloader = DataLoader(
-        dataset,
-        batch_size=1,
-        shuffle=True,
-        num_workers=0,
-        pin_memory=True,
-    )
 
     # Training loop
     logger.info("Starting training...")
