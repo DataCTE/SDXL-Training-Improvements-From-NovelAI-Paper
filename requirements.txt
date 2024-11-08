@@ -1,0 +1,7 @@
+torch 
+torchvision 
+diffusers 
+transformers 
+bitsandbytes 
+tqdm 
+Pillow
