@@ -277,48 +277,33 @@ class Dataset(Dataset):
         latents_path = self.cache_dir / f"{self.image_paths[idx].stem}_latents.pt"
         embeddings_path = self.cache_dir / f"{self.image_paths[idx].stem}_embeddings.pt"
         
-        # Load with weights_only=True for memory efficiency
+        # Load cached data
         latents = torch.load(latents_path, weights_only=True)
         embeddings = torch.load(embeddings_path, weights_only=True)
         
-        # Load original image for VAE training
+        # Load and transform original image
         original_image = Image.open(self.image_paths[idx]).convert("RGB")
-        original_image_tensor = self.transform(original_image)  # Should be [3, H, W]
+        original_image_tensor = self.transform(original_image)  # [3, H, W]
         
-        # Calculate latent dimensions
+        # Calculate latent dimensions and reshape
         latent_h = original_image_tensor.shape[1] // 8
         latent_w = original_image_tensor.shape[2] // 8
+        latents = latents.reshape(4, latent_h, latent_w)  # [4, H/8, W/8]
         
-        # Create or load latents with correct shape
-        latents = latents.view(4, latent_h, latent_w)  # [4, H/8, W/8]
-        
-        # Ensure correct shapes for embeddings
-        # We want [B, 77, 768] and [B, 77, 1280] and [B, 1280]
-        text_embeddings = embeddings["text_embeddings"]
-        text_embeddings_2 = embeddings["text_embeddings_2"]
-        pooled_text_embeddings_2 = embeddings["pooled_text_embeddings_2"]
-        
-        # Ensure correct shapes for original images
-        if len(original_image_tensor.shape) != 3:  # Should be [C, H, W]
-            raise ValueError(f"Unexpected image tensor shape: {original_image_tensor.shape}")
-        
-        # Add batch dimension if needed
-        if len(text_embeddings.shape) == 2:
-            text_embeddings = text_embeddings.unsqueeze(0)
-        if len(text_embeddings_2.shape) == 2:
-            text_embeddings_2 = text_embeddings_2.unsqueeze(0)
-        if len(pooled_text_embeddings_2.shape) == 1:
-            pooled_text_embeddings_2 = pooled_text_embeddings_2.unsqueeze(0)
+        # Extract embeddings with guaranteed shapes through reshape operations
+        text_embeddings = embeddings["text_embeddings"].reshape(1, 77, 768)  # [1, 77, 768]
+        text_embeddings_2 = embeddings["text_embeddings_2"].reshape(1, 77, 1280)  # [1, 77, 1280]
+        pooled_text_embeddings_2 = embeddings["pooled_text_embeddings_2"].reshape(1, 1280)  # [1, 1280]
         
         return {
-        "latents": latents,  # Should be [4, H/8, W/8]
-        "text_embeddings": text_embeddings,  # [B, 77, 768]
-        "text_embeddings_2": text_embeddings_2,  # [B, 77, 1280]
-        "pooled_text_embeddings_2": pooled_text_embeddings_2,  # [B, 1280]
-        "clip_image_embed": embeddings["clip_image_embed"],
-        "clip_tag_embeds": embeddings["clip_tag_embeds"],
-        "tags": embeddings["tags"],
-        "original_images": original_image_tensor  # Should be [3, H, W]
+            "latents": latents,  # [4, H/8, W/8]
+            "text_embeddings": text_embeddings,  # [1, 77, 768]
+            "text_embeddings_2": text_embeddings_2,  # [1, 77, 1280]
+            "pooled_text_embeddings_2": pooled_text_embeddings_2,  # [1, 1280]
+            "clip_image_embed": embeddings["clip_image_embed"],
+            "clip_tag_embeds": embeddings["clip_tag_embeds"],
+            "tags": embeddings["tags"],
+            "original_images": original_image_tensor  # [3, H, W]
         }
 
 class PerceptualLoss:
