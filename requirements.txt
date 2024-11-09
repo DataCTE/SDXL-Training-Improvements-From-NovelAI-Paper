@@ -7,3 +7,4 @@ tqdm
 Pillow
 sentencepiece
 accelerate
+xformers

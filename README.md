@@ -1,111 +1,106 @@
-# SDXL Training Enhancements by NovelAI Diffusion V3
+# SDXL Training with High Sigma and VAE Finetuning
 
-This repository contains code for training Stable Diffusion XL (SDXL) at a resolution of 1024x1024, incorporating several enhancements inspired by the paper:
+This repository contains an experimental implementation for training Stable Diffusion XL (SDXL) with high sigma values and optional VAE finetuning. Please note that this is a work in progress and requires further testing and optimization.
 
-**"Improvements to SDXL in NovelAI Diffusion V3"**
+## ⚠️ Current Status
 
-## Table of Contents
+This code is currently in an experimental state and needs several improvements:
 
-- [Introduction](#introduction)
-- [Features](#features)
-- [Installation](#installation)
-- [Usage](#usage)
-- [Memory Optimization Techniques](#memory-optimization-techniques)
-- [Dataset Preparation](#dataset-preparation)
-- [Training Details](#training-details)
-- [Acknowledgements](#acknowledgements)
-- [License](#license)
-- [Contact](#contact)
-
-## Introduction
-
-This project implements several improvements to SDXL as described in the NovelAI Diffusion V3 paper. These enhancements aim to improve generation results, particularly for high-resolution image synthesis.
+- Memory management needs optimization
+- Batch processing requires refinement
+- VAE finetuning implementation needs validation
+- Training stability needs improvement
+- Documentation requires expansion
 
 ## Features
 
-- **v-Prediction Parameterization**: Transitions from noise prediction to data prediction as signal-to-noise ratio (SNR) changes, ensuring better training across different noise levels.
+Current implementation includes:
+- High sigma training based on improved noise schedules
+- Optional VAE finetuning with perceptual loss
+- Text embedding caching
+- Mixed precision training (bfloat16)
+- Memory optimizations (xformers, gradient checkpointing)
+- EMA model averaging
+- Aspect ratio bucketing (preliminary implementation)
 
-- **Zero Terminal Signal-to-Noise Ratio (ZTSNR)**: Introduces training up to infinite noise levels, allowing the model to handle pure noise during inference and improving mean color prediction.
+## Prerequisites
 
-- **High-Noise Timesteps for High-Resolution Generation**: Adjusts the noise schedule to include higher sigma values, aiding in generating coherent high-resolution images without artifacts.
-
-- **MinSNR Loss Weighting**: Balances the learning of different timesteps by weighting the loss according to the difficulty of each timestep.
-
-- **Aspect-Ratio Bucketing**: Organizes training images into buckets based on aspect ratio, allowing for better framing and token efficiency compared to center-crop regimes.
-
-- **Precomputed Text Embeddings**: Caches text embeddings to reduce computation and memory usage during training.
-
-- **Memory Optimizations**:
-  - Gradient Accumulation
-  - Gradient Checkpointing
-  - Attention Slicing
-  - PyTorch Memory-Efficient Attention
-
-- **Mixed-Precision Training**: BF16 precision.
-
-## Installation
-
-1. **Clone the repository**:
-
+Required packages:
 ```bash
-   git clone https://github.com/yourusername/SDXL-Enhancements-NovelAI-Diffusion-V3.git
-   cd SDXL-Enhancements-NovelAI-Diffusion-V3
-   pip install -r requirements.txt
+torch 
+torchvision 
+diffusers 
+transformers 
+bitsandbytes 
+tqdm 
+Pillow
+sentencepiece
+accelerate
+xformers
 ```
 
-## Usage
+## Basic Usage
 
-1.**Prepare Your Data**
-Place your training images in a directory.
-For each image, create a .txt file with the same name containing the caption.
-Ensure your dataset is well-labeled and enriched with detailed captions.
-
-2. Cache Latents and Embeddings
-The script will automatically cache the latents and text embeddings during the first run. This reduces computation during training.
-
-3. Run the Training Script
-Use the following command to start training with DeepSpeed:
-
+Basic training command:
 ```bash
 python HighSigma.py \
-  --model_path /path/to/your/sdxl/model \
-  --data_dir /path/to/your/data \
-  --cache_dir ./latents_cache \
-  --learning_rate 1e-5 \
-  --num_epochs 20 \
-  --num_inference_steps 28 \
-  --gradient_accumulation_steps 4 \
-  --ema_decay 0.9999
-
+  --model_path /path/to/sdxl/model \
+  --data_dir /path/to/training/data \
+  --output_dir ./output \
+  --learning_rate 1e-6 \
+  --num_epochs 1
 ```
 
-Replace /path/to/your/sdxl/model with the path to your SDXL model checkpoint, and /path/to/your/data with the path to your dataset.
+### Key Arguments
 
-4. Training Options
-  
-   --model_path: Path to the pre-trained SDXL model.
+```
+--model_path          : Path to base SDXL model
+--data_dir           : Training data directory
+--learning_rate      : Learning rate (default: 1e-6)
+--num_epochs         : Number of training epochs
+--finetune_vae      : Enable VAE finetuning
+--vae_learning_rate : VAE learning rate when finetuning
+--use_adafactor     : Use Adafactor optimizer instead of AdamW8bit
+```
 
-   --data_dir: Directory containing training images and captions.
-   
-   --cache_dir: Directory to cache latents and embeddings.
+## Data Preparation
 
-   --learning_rate: Learning rate for the optimizer.
+1. Place training images in your data directory
+2. Create matching .txt files with captions (same filename, .txt extension)
+3. First run will cache latents and embeddings
 
-   --num_epochs: Number of training epochs.
+## Known Issues
 
-   --num_inference_steps: Number of inference steps for sigma schedule.
+1. Memory Usage:
+   - Current implementation may be memory intensive
+   - Batch sizes may need adjustment based on GPU memory
 
-   --gradient_accumulation_steps: Number of steps to accumulate gradients.
+2. Performance:
+   - Training speed needs optimization
+   - Gradient accumulation might need tuning
 
-   --ema_decay: Decay rate for Exponential Moving Average.
-   
-### Acknowledgements
-This project is inspired by the following paper:
+3. VAE Finetuning:
+   - Experimental feature that needs validation
+   - May require additional memory management
 
-**"Improvements to SDXL in NovelAI Diffusion V3"** by Juan Ossa, Eren Doğan, Alex Birch, and F. Johnson.
+## TODO
 
-link: https://arxiv.org/pdf/2409.15997
+- [ ] Optimize memory usage
+- [ ] Improve batch processing
+- [ ] Validate and improve VAE finetuning
+- [ ] Add proper validation steps
+- [ ] Expand documentation
+- [ ] Add training monitoring
+- [ ] Implement proper error handling
+
+## Contributing
+
+Given the experimental nature of this code, contributions and improvements are welcome. Please open issues or pull requests for any enhancements.
 
 ## License
 
-This project is licensed under the apachie 2.0 License. See the LICENSE file for details.
+Apache 2.0
+
+## Disclaimer
+
+This is experimental code that needs further development and testing. Use at your own risk and expect potential issues that will need addressing.
