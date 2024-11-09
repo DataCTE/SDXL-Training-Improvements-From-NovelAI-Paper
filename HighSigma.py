@@ -16,8 +16,10 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from transformers.optimization import Adafactor
 import torchvision.models as models
-import time
-
+from torchvision.utils import make_grid
+import torchvision.transforms.functional as TF
+import os
+import wandb
 
 
 def setup_logging():
@@ -174,7 +176,120 @@ def training_loss(model, x_0, sigma, text_embeddings, text_embeddings_2, pooled_
     return loss
 
 
+class TagBasedLossWeighter:
+    def __init__(self, tag_classes=None, min_weight=0.1, max_weight=3.0):
+        """
+        Initialize the tag-based loss weighting system.
+        
+        Args:
+            tag_classes (dict): Dictionary mapping tag class names to lists of tags
+                              e.g., {'character': ['girl', 'boy'], 'style': ['anime', 'sketch']}
+            min_weight (float): Minimum weight multiplier for any image
+            max_weight (float): Maximum weight multiplier for any image
+        """
+        self.tag_classes = tag_classes or {
+            'character': set(),
+            'style': set(),
+            'setting': set(),
+            'action': set(),
+            'object': set(),
+            'quality': set()
+        }
+        
+        # Track tag frequencies per class
+        self.tag_frequencies = {class_name: {} for class_name in self.tag_classes}
+        self.class_total_counts = {class_name: 0 for class_name in self.tag_classes}
+        
+        # Parameters for weight calculation
+        self.min_weight = min_weight
+        self.max_weight = max_weight
+        
+        # Cache for tag classifications
+        self.tag_to_class = {}
+        
+    def add_tags_to_frequency(self, tags, count=1):
+        """
+        Update tag frequencies with new tags.
+        
+        Args:
+            tags (list): List of tags from an image
+            count (int): How many times to count these tags (default: 1)
+        """
+        for tag in tags:
+            # Find which class this tag belongs to (if not already cached)
+            if tag not in self.tag_to_class:
+                for class_name, tag_set in self.tag_classes.items():
+                    if tag in tag_set:
+                        self.tag_to_class[tag] = class_name
+                        break
+                else:
+                    continue  # Skip tags that don't belong to any class
+            
+            # Update frequencies
+            class_name = self.tag_to_class.get(tag)
+            if class_name:
+                self.tag_frequencies[class_name][tag] = (
+                    self.tag_frequencies[class_name].get(tag, 0) + count
+                )
+                self.class_total_counts[class_name] += count
 
+    def calculate_tag_weights(self, tags):
+        """
+        Calculate weight multiplier for an image based on its tags.
+        
+        Args:
+            tags (list): List of tags from an image
+            
+        Returns:
+            float: Weight multiplier for the image's loss
+        """
+        if not tags:
+            return 1.0
+            
+        class_weights = []
+        
+        for class_name in self.tag_classes:
+            class_tags = [tag for tag in tags if tag in self.tag_classes[class_name]]
+            if not class_tags:
+                continue
+                
+            # Calculate average frequency for tags in this class
+            total_freq = sum(self.tag_frequencies[class_name].get(tag, 0) 
+                           for tag in class_tags)
+            avg_freq = total_freq / len(class_tags)
+            
+            # Calculate relative frequency compared to class average
+            class_avg = self.class_total_counts[class_name] / len(self.tag_frequencies[class_name])
+            relative_freq = avg_freq / class_avg if class_avg > 0 else 1.0
+            
+            # Convert to weight (inverse relationship with frequency)
+            weight = 1.0 / relative_freq if relative_freq > 0 else 1.0
+            class_weights.append(weight)
+        
+        # Combine weights from all classes (geometric mean)
+        if class_weights:
+            final_weight = torch.exp(torch.mean(torch.tensor([torch.log(torch.tensor(w)) 
+                                                            for w in class_weights])))
+            # Clamp to allowed range
+            final_weight = torch.clamp(final_weight, self.min_weight, self.max_weight)
+            return final_weight.item()
+        
+        return 1.0
+
+    def update_training_loss(self, loss, tags):
+        """
+        Apply tag-based weighting to the training loss.
+        
+        Args:
+            loss (torch.Tensor): Original loss value
+            tags (list): List of tags for the current image/batch
+            
+        Returns:
+            torch.Tensor: Weighted loss value
+        """
+        weight = self.calculate_tag_weights(tags)
+        return loss * weight
+    
 class CustomDataset(Dataset):
     def __init__(self, data_dir, vae, tokenizer, tokenizer_2, text_encoder, text_encoder_2,
                  cache_dir="latents_cache", batch_size=1):
@@ -494,7 +609,8 @@ def custom_collate(batch):
         return collated
 
 class VAEFineTuner:
-    def __init__(self, vae, learning_rate=1e-6, perceptual_weight=1.0, l1_weight=1.0, kl_weight=0.1):
+    def __init__(self, vae, learning_rate=1e-6, perceptual_weight=1.0, l1_weight=1.0, 
+                 kl_weight=0.1, use_vae_scaling=True, per_channel_scaling=True):
         self.vae = vae
         self.perceptual_loss = PerceptualLoss()
 
@@ -502,6 +618,12 @@ class VAEFineTuner:
         self.perceptual_weight = perceptual_weight
         self.l1_weight = l1_weight
         self.kl_weight = kl_weight
+
+        # VAE scaling configuration
+        self.use_vae_scaling = use_vae_scaling
+        if use_vae_scaling:
+            # Pre-computed statistics from the paper for anime illustrations
+            self.register_latent_stats(per_channel=per_channel_scaling)
 
         # Optimizer
         self.optimizer = AdamW8bit(
@@ -511,6 +633,31 @@ class VAEFineTuner:
             weight_decay=1e-2,
             eps=1e-8
         )
+
+    def register_latent_stats(self, per_channel=True):
+        """Register VAE latent statistics as buffers"""
+        means = torch.tensor([4.8119, 0.1607, 1.3538, -1.7753])
+        stds = torch.tensor([9.9181, 6.2753, 7.5978, 5.9956])
+        
+        if not per_channel:
+            means = means.mean().repeat(4)
+            stds = stds.mean().repeat(4)
+        
+        # Register as buffers so they move to the correct device with the model
+        self.register_buffer('latent_means', means.view(4, 1, 1))
+        self.register_buffer('latent_stds', stds.view(4, 1, 1))
+
+    def scale_latents(self, latents, reverse=False):
+        """Apply scale and shift to latents"""
+        if not self.use_vae_scaling:
+            return latents
+            
+        if reverse:
+            # Convert from standard Gaussian back to VAE distribution
+            return latents * self.latent_stds + self.latent_means
+        else:
+            # Convert to standard Gaussian
+            return (latents - self.latent_means) / self.latent_stds
 
     def training_step(self, latents, original_images):
         """VAE training step"""
@@ -524,6 +671,10 @@ class VAEFineTuner:
         while latents.dim() > 4:
             latents = latents.squeeze(1)
 
+        # Apply scale-and-shift normalization if enabled
+        if self.use_vae_scaling:
+            latents = self.scale_latents(latents, reverse=True)  # Convert back to VAE distribution for decoding
+
         # Decode latents
         decoded_images = self.vae.decode(latents).sample
 
@@ -531,9 +682,15 @@ class VAEFineTuner:
         p_loss = self.perceptual_loss(decoded_images, original_images)
         l1_loss = F.l1_loss(decoded_images, original_images)
 
-        # KL loss
+        # KL loss with scale-and-shift consideration
         posterior = self.vae.encode(original_images).latent_dist
-        kl_loss = torch.mean(-0.5 * torch.sum(1 + posterior.logvar - posterior.mean.pow(2) - posterior.logvar.exp(), dim=1))
+        if self.use_vae_scaling:
+            # Scale the posterior distribution
+            posterior_mean = (posterior.mean - self.latent_means) / self.latent_stds
+            posterior_logvar = posterior.logvar - 2 * torch.log(self.latent_stds)
+            kl_loss = torch.mean(-0.5 * torch.sum(1 + posterior_logvar - posterior_mean.pow(2) - posterior_logvar.exp(), dim=1))
+        else:
+            kl_loss = torch.mean(-0.5 * torch.sum(1 + posterior.logvar - posterior.mean.pow(2) - posterior.logvar.exp(), dim=1))
 
         # Total loss
         total_loss = self.perceptual_weight * p_loss + self.l1_weight * l1_loss + self.kl_weight * kl_loss
@@ -550,6 +707,44 @@ class VAEFineTuner:
             'l1_loss': l1_loss.item(),
             'kl_loss': kl_loss.item()
         }
+
+    @torch.no_grad()
+    def compute_online_statistics(self, dataloader, num_batches=1000):
+        """Compute dataset statistics using Welford's online algorithm"""
+        self.vae.eval()
+        count = 0
+        means = torch.zeros(4, device=self.vae.device)
+        M2s = torch.zeros(4, device=self.vae.device)
+        
+        print("Computing VAE latent statistics...")
+        for i, batch in enumerate(tqdm(dataloader)):
+            if i >= num_batches:
+                break
+                
+            images = batch["original_images"].to(self.vae.device)
+            latents = self.vae.encode(images).latent_dist.sample()
+            
+            # Flatten spatial dimensions for each channel
+            latents = latents.view(latents.shape[0], 4, -1)
+            
+            # Update statistics for each channel using Welford's algorithm
+            for c in range(4):
+                channel_values = latents[:, c].flatten()
+                for value in channel_values:
+                    count += 1
+                    delta = value - means[c]
+                    means[c] += delta / count
+                    delta2 = value - means[c]
+                    M2s[c] += delta * delta2
+        
+        # Calculate final statistics
+        stds = torch.sqrt(M2s / (count - 1))
+        
+        # Update the registered buffers
+        self.latent_means.data = means.view(4, 1, 1)
+        self.latent_stds.data = stds.view(4, 1, 1)
+        
+        return means, stds
 
 def setup_distributed():
     """Setup distributed training"""
@@ -659,12 +854,30 @@ def parse_args():
     parser.add_argument("--compile_mode", type=str, choices=['default', 'reduce-overhead', 'max-autotune'], default='default', help="Torch compile mode")
     
     parser.add_argument("--save_checkpoints", action="store_true", help="Save checkpoints after each epoch")
+    parser.add_argument("--min_tag_weight", type=float, default=0.1, help="Minimum tag-based loss weight")
+    parser.add_argument("--max_tag_weight", type=float, default=3.0, help="Maximum tag-based loss weight")
+    parser.add_argument("--use_wandb", action="store_true", help="Enable Weights & Biases logging")
+    parser.add_argument("--wandb_project", type=str, default="sdxl-training", help="W&B project name")
+    parser.add_argument("--wandb_run_name", type=str, default=None, help="W&B run name")
+    parser.add_argument("--push_to_hub", action="store_true", help="Push model to HuggingFace Hub")
+    parser.add_argument("--hub_model_id", type=str, default=None, help="HuggingFace Hub model ID")
+    parser.add_argument("--hub_private", action="store_true", help="Make the HuggingFace repo private")
     return parser.parse_args()
 
 
 
     
 def main(args):
+    # Initialize wandb if enabled
+    if args.use_wandb:
+        import wandb
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            config=vars(args),
+            settings=wandb.Settings(code_dir="."),
+        )
+        
     # Set up device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
@@ -782,18 +995,34 @@ def main(args):
     if args.finetune_vae:
         vae = vae.to("cuda").to(dtype=torch.bfloat16)
         vae_finetuner = VAEFineTuner(
-            vae,
+            vae=vae,
             learning_rate=args.vae_learning_rate,
-            perceptual_weight=1.0,
-            l1_weight=1.0,
-            kl_weight=0.1
+            use_vae_scaling=True,
+            per_channel_scaling=True
         )
+
+    # Initialize validator after model setup
+    validator = ModelValidator(unet, vae, device=device)
 
     # Move models to device and set dtype
     unet = unet.to(device=device, dtype=dtype)
     vae = vae.to(device=device, dtype=dtype)
 
-   
+    # Initialize tag weighter with dataset's tag list
+    tag_weighter = TagBasedLossWeighter(
+        min_weight=args.min_tag_weight,
+        max_weight=args.max_tag_weight
+    )
+
+    # Populate tag frequencies from dataset
+    print("Initializing tag frequencies...")
+    for img_path in tqdm(dataset.image_paths):
+        caption_path = img_path.with_suffix('.txt')
+        if caption_path.exists():
+            with open(caption_path, 'r', encoding='utf-8') as f:
+                caption = f.read().strip()
+                tags = [t.strip() for t in caption.split(',')]
+                tag_weighter.add_tags_to_frequency(tags)
 
     # Training loop
     logger.info("Starting training...")
@@ -802,6 +1031,27 @@ def main(args):
 
     for epoch in range(args.num_epochs):
         logger.info(f"Starting epoch {epoch+1}/{args.num_epochs}")
+
+        # Run validation at start of epoch if specified
+        if epoch % args.validation_frequency == 0:
+            logger.info(f"\nRunning validation for epoch {epoch+1}")
+            test_prompts = [
+                "a detailed portrait of a girl",
+                "completely black",
+                "a red ball on top of a blue cube, both infront of a green triangle"
+            ]
+            
+            validation_results = validator.run_paper_validation(test_prompts)
+            
+            # Save validation images
+            validation_dir = Path(args.output_dir) / "validation_results" / f"epoch_{epoch+1}"
+            validator.save_validation_images(validation_results, validation_dir)
+            
+            if args.use_wandb:
+                wandb.log({
+                    'ztsnr/black_generation_brightness': validation_results['ztsnr'][1]['ztsnr_mean_brightness'],
+                    'epoch': epoch + 1
+                })
 
         for step, batch in enumerate(train_dataloader):
             # Convert inputs to correct dtype (bfloat16)
@@ -829,6 +1079,9 @@ def main(args):
                     timestep,
                     target_size
                 ) / args.gradient_accumulation_steps
+
+            # Apply tag-based weighting
+            loss = tag_weighter.update_training_loss(loss, batch["tags"])
 
             loss.backward()
 
@@ -860,19 +1113,215 @@ def main(args):
             checkpoint_path.mkdir(exist_ok=True, parents=True)
             unet.save_pretrained(checkpoint_path / "unet")
 
-    # Save models
-    logger.info("Saving models...")
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(exist_ok=True, parents=True)
+        # Log metrics to wandb
+        if args.use_wandb:
+            wandb.log({
+                'epoch': epoch + 1,
+                'loss': loss.item(),
+                'learning_rate': lr_scheduler.get_last_lr()[0],
+                **({"vae_loss": vae_losses['total_loss']} if args.finetune_vae else {})
+            })
 
-    # Save in Diffusers format
-    unet.save_pretrained(output_dir / "unet")
-    if args.finetune_vae:
-        vae.save_pretrained(output_dir / "vae")
-    text_encoder.save_pretrained(output_dir / "text_encoder")
-    text_encoder_2.save_pretrained(output_dir / "text_encoder_2")
-    tokenizer.save_pretrained(output_dir / "tokenizer")
-    tokenizer_2.save_pretrained(output_dir / "tokenizer_2")
+        # Validation
+        if epoch % args.validation_frequency == 0:
+            validation_results = validator.run_paper_validation(test_prompts)
+            validation_dir = Path(args.output_dir) / "validation_results" / f"epoch_{epoch+1}"
+            validator.save_validation_images(validation_results, validation_dir)
+            
+            if args.use_wandb:
+                # Log validation images
+                wandb.log({
+                    'ztsnr/black_generation_brightness': validation_results['ztsnr'][1]['ztsnr_mean_brightness'],
+                    'validation/ztsnr_comparison': wandb.Image(validation_dir / 'ztsnr_comparison.png'),
+                    'validation/coherence_comparison': wandb.Image(validation_dir / 'coherence_comparison.png'),
+                    'epoch': epoch + 1
+                })
+
+    # Push to HuggingFace Hub if enabled
+    if args.push_to_hub and args.hub_model_id:
+        logger.info(f"Pushing model to HuggingFace Hub: {args.hub_model_id}")
+        
+        # Create model card with research details
+        model_card = f"""
+        ---
+        language: en
+        tags:
+        - stable-diffusion-xl
+        - text-to-image
+        - diffusers
+        license: mit
+        ---
+
+        # {args.hub_model_id}
+
+        This model is a fine-tuned version of SDXL implementing improvements from the paper:
+        "Improvements to SDXL in NovelAI Diffusion V3"
+
+        ## Improvements
+        - Zero Terminal SNR (ZTSNR)
+        - High-resolution coherence through increased sigma_max
+        - Tag-based loss weighting
+        - VAE scale-and-shift normalization
+
+        ## Training
+        - Base model: SDXL 1.0
+        - Training steps: {args.num_epochs * len(train_dataloader)}
+        - Batch size: {args.batch_size}
+        - Learning rate: {args.learning_rate}
+        """
+
+        # Save to hub
+        unet.push_to_hub(
+            args.hub_model_id,
+            private=args.hub_private,
+            commit_message=f"Epoch {args.num_epochs}",
+            model_card=model_card
+        )
+        
+        if args.finetune_vae:
+            vae.push_to_hub(
+                f"{args.hub_model_id}-vae",
+                private=args.hub_private,
+                commit_message=f"Epoch {args.num_epochs}"
+            )
+
+    if args.use_wandb:
+        wandb.finish()
+
+def save_image_grid(images, path, nrow=1, normalize=True):
+    """Save a list of images as a grid"""
+    grid = make_grid(images, nrow=nrow, normalize=normalize)
+    TF.to_pil_image(grid).save(path)
+
+class ModelValidator:
+    def __init__(self, model, vae, device="cuda"):
+        """
+        Initialize validation system based on paper's methodology.
+        """
+        self.model = model
+        self.vae = vae
+        self.device = device
+
+    def validate_ztsnr(self, prompt="completely black"):
+        """
+        Validate Zero Terminal SNR as shown in Figure 2 of the paper.
+        Tests if model can generate pure black images when prompted.
+        """
+        print("Validating ZTSNR effectiveness...")
+        
+        # Generate with and without ZTSNR
+        results = {
+            'ztsnr': self.generate_with_ztsnr(prompt),
+            'no_ztsnr': self.generate_without_ztsnr(prompt)
+        }
+        
+        # Calculate mean brightness of generated images
+        metrics = {
+            'ztsnr_mean_brightness': results['ztsnr'].mean(),
+            'no_ztsnr_mean_brightness': results['no_ztsnr'].mean()
+        }
+        
+        return results, metrics
+
+    def validate_high_res_coherence(self, prompt):
+        """
+        Validate high-resolution coherence as shown in Figure 6 of the paper.
+        Tests if model maintains coherence with different sigma_max values.
+        """
+        print("Validating high-resolution coherence...")
+        
+        results = {
+            'default_sigma': self.generate_with_sigma_max(prompt, sigma_max=14.6),
+            'high_sigma': self.generate_with_sigma_max(prompt, sigma_max=29.0)
+        }
+        
+        return results
+
+    def validate_noise_schedule(self, image):
+        """
+        Validate noise schedule as shown in Figure 1 of the paper.
+        Shows progressive noise addition up to final training timestep.
+        """
+        print("Validating noise schedule...")
+        
+        sigmas = [0, 0.447, 3.17, 14.6]
+        noised_images = []
+        
+        for sigma in sigmas:
+            noise = torch.randn_like(image)
+            noised = image + sigma * noise
+            noised_images.append(noised)
+            
+        return noised_images
+
+    def validate_denoising_steps(self, prompt, sigma_max_values=[14.6, 29.0]):
+        """
+        Validate intermediate denoising steps as shown in Figure 7 of the paper.
+        Shows denoising progression with different sigma_max values.
+        """
+        print("Validating denoising steps...")
+        
+        results = {}
+        step_sigmas = {
+            14.6: [14.6, 10.8, 8.3, 6.6, 5.4],
+            29.0: [29.0, 17.8, 12.4, 9.2, 7.2]
+        }
+        
+        for sigma_max in sigma_max_values:
+            steps = []
+            for sigma in step_sigmas[sigma_max]:
+                step = self.generate_at_sigma(prompt, sigma, sigma_max)
+                steps.append(step)
+            results[f'sigma_max_{sigma_max}'] = steps
+            
+        return results
+
+    def run_paper_validation(self, test_prompts):
+        """Run all validation tests described in the paper"""
+        results = {}
+        
+        # Test ZTSNR with pure black generation (Figure 2)
+        results['ztsnr'] = self.validate_ztsnr("completely black")
+        
+        # Test high-res coherence (Figure 6)
+        results['coherence'] = self.validate_high_res_coherence(
+            "a close-up portrait with detailed limbs"
+        )
+        
+        # Test denoising steps (Figure 7)
+        results['denoising'] = self.validate_denoising_steps(test_prompts[0])
+        
+        return results
+
+    def save_validation_images(self, results, output_dir):
+        """Save validation images in a format similar to paper figures"""
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Save ZTSNR comparison (Figure 2 style)
+        save_image_grid(
+            [results['ztsnr']['ztsnr'], results['ztsnr']['no_ztsnr']],
+            os.path.join(output_dir, 'ztsnr_comparison.png'),
+            nrow=2,
+            normalize=True
+        )
+        
+        # Save high-res coherence comparison (Figure 6 style)
+        save_image_grid(
+            [results['coherence']['default_sigma'], 
+             results['coherence']['high_sigma']],
+            os.path.join(output_dir, 'coherence_comparison.png'),
+            nrow=2,
+            normalize=True
+        )
+        
+        # Save denoising steps (Figure 7 style)
+        for sigma_max, steps in results['denoising'].items():
+            save_image_grid(
+                steps,
+                os.path.join(output_dir, f'denoising_{sigma_max}.png'),
+                nrow=len(steps),
+                normalize=True
+            )
 
 if __name__ == "__main__":
     setup_logging()
