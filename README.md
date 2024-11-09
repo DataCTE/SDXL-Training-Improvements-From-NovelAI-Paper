@@ -2,10 +2,10 @@
 
 This repository implements the improvements described in "Improvements to SDXL in NovelAI Diffusion V3" (arXiv:2409.15997v2), including Zero Terminal SNR (ZTSNR), high-resolution coherence, and VAE improvements.
 
-## weights
+### Weights
 
-[ ] 10k dataset proof of concept
-[ ] 200k+ dataset finetune
+- [ ] 10k dataset proof of concept
+- [ ] 200k+ dataset finetune
 
 ## Key Improvements
 
