@@ -292,29 +292,19 @@ class Dataset(Dataset):
         latents_path = self.cache_dir / f"{self.image_paths[idx].stem}_latents.pt"
         embeddings_path = self.cache_dir / f"{self.image_paths[idx].stem}_embeddings.pt"
         
+        # Load with weights_only=True
+        latents = torch.load(latents_path, weights_only=True)
+        embeddings = torch.load(embeddings_path, weights_only=True)
+        
         # Load original image for VAE training
         original_image = Image.open(self.image_paths[idx]).convert("RGB")
         original_image_tensor = self.transform(original_image)
         
-        # Load latents and ensure correct shape [B, C, H, W]
-        latents = torch.load(latents_path)
-        latents = latents.squeeze()  # Remove any extra dimensions
-        if len(latents.shape) == 3:  # If [C, H, W]
-            latents = latents.unsqueeze(0)  # Make it [B, C, H, W]
-        
-       
-        
-        # Load embeddings
-        embeddings = torch.load(embeddings_path)
+        # Ensure correct shapes for embeddings
+        # We want [B, 77, 768] and [B, 77, 1280] and [B, 1280]
         text_embeddings = embeddings["text_embeddings"]
         text_embeddings_2 = embeddings["text_embeddings_2"]
         pooled_text_embeddings_2 = embeddings["pooled_text_embeddings_2"]
-        
-        # Ensure correct shapes for embeddings
-        # We want [B, 77, 768] and [B, 77, 1280] and [B, 1280]
-        text_embeddings = text_embeddings.squeeze()  # Remove extra dims
-        text_embeddings_2 = text_embeddings_2.squeeze()
-        pooled_text_embeddings_2 = pooled_text_embeddings_2.squeeze()
         
         # Add batch dimension if needed
         if len(text_embeddings.shape) == 2:
@@ -337,7 +327,9 @@ class Dataset(Dataset):
 
 class PerceptualLoss:
     def __init__(self):
-        self.vgg = models.vgg16(pretrained=True).features.eval().to("cuda")
+        # Update VGG initialization to use weights parameter
+        weights = models.VGG16_Weights.IMAGENET1K_V1
+        self.vgg = models.vgg16(weights=weights).features.eval().to("cuda")
         self.vgg.requires_grad_(False)
         self.layers = {'3': 'relu1_2', '8': 'relu2_2', '15': 'relu3_3', '22': 'relu4_3'}
         self.normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
@@ -362,9 +354,14 @@ class PerceptualLoss:
 
 
 class VAEFineTuner:
-    def __init__(self, vae, learning_rate=1e-6):
+    def __init__(self, vae, learning_rate=1e-6, perceptual_weight=1.0, l1_weight=1.0, kl_weight=0.1):
         self.vae = vae
         self.perceptual_loss = PerceptualLoss()
+        
+        # Add loss weights as instance variables
+        self.perceptual_weight = perceptual_weight
+        self.l1_weight = l1_weight
+        self.kl_weight = kl_weight
         
         # Use a single optimizer for both encoder and decoder
         self.optimizer = AdamW8bit(
@@ -376,46 +373,53 @@ class VAEFineTuner:
             weight_decay=1e-2,
             eps=1e-8
         )
-        
-        self.scaler = GradScaler()
-        
-        # Loss weights
-        self.perceptual_weight = 1.0
-        self.l1_weight = 0.1
-        self.kl_weight = 0.0001
 
-    @torch.cuda.amp.autocast()
     def training_step(self, latents, original_images):
+        # Convert inputs to bfloat16 to match model parameters
+        latents = latents.to(dtype=torch.bfloat16)
+        original_images = original_images.to(dtype=torch.bfloat16)
+        
         # Ensure inputs are on correct device and shape
         original_images = original_images.to(latents.device, memory_format=torch.channels_last)
         latents = latents.squeeze().unsqueeze(0) if len(latents.squeeze().shape) == 3 else latents
         
-        # Forward pass with memory optimization
-        with torch.cuda.amp.autocast():
-            # Decode latents
-            decoded_images = self.vae.decode(latents).sample
-            
-            # Calculate losses
-            p_loss = self.perceptual_loss(decoded_images, original_images)
-            l1_loss = F.l1_loss(decoded_images, original_images)
-            
-            # Optional KL loss
-            kl_loss = torch.tensor(0.0, device=latents.device)
-            if self.vae.training:
-                posterior = self.vae.encode(original_images).latent_dist
-                kl_loss = torch.mean(-0.5 * torch.sum(1 + posterior.variance.log() - 
-                                   posterior.mean.pow(2) - posterior.variance, dim=1))
-            
-            # Combine losses
-            total_loss = (self.perceptual_weight * p_loss + 
-                         self.l1_weight * l1_loss + 
-                         self.kl_weight * kl_loss)
+        # Forward pass
+        self.optimizer.zero_grad(set_to_none=True)
+        
+        # Decode latents
+        decoded_images = self.vae.decode(latents).sample
+        
+        # Convert to float32 for loss computation
+        decoded_images = decoded_images.float()
+        original_images = original_images.float()
+        
+        # Calculate losses
+        p_loss = self.perceptual_loss(decoded_images, original_images)
+        l1_loss = F.l1_loss(decoded_images, original_images)
+        
+        # Optional KL loss
+        kl_loss = torch.tensor(0.0, device=latents.device)
+        if self.vae.training:
+            posterior = self.vae.encode(original_images.bfloat16()).latent_dist
+            kl_loss = torch.mean(-0.5 * torch.sum(1 + posterior.variance.log() - 
+                               posterior.mean.pow(2) - posterior.variance, dim=1))
+        
+        # Combine losses
+        total_loss = (self.perceptual_weight * p_loss + 
+                     self.l1_weight * l1_loss + 
+                     self.kl_weight * kl_loss)
 
         # Backward pass
-        self.scaler.scale(total_loss).backward()
+        total_loss.backward()
+        
+        # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(self.vae.parameters(), max_norm=1.0)
+        
+        # Optimizer step
+        self.optimizer.step()
         
         # Clear memory
-        del decoded_images
+        del decoded_images, original_images
         torch.cuda.empty_cache()
         
         return {
@@ -425,11 +429,8 @@ class VAEFineTuner:
             'kl_loss': kl_loss.item()
         }
 
-    def optimizer_step(self):
-        torch.nn.utils.clip_grad_norm_(self.vae.parameters(), max_norm=1.0)
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
-        self.optimizer.zero_grad(set_to_none=True)
+
+
 
 def setup_distributed():
     """Setup distributed training"""
@@ -540,10 +541,13 @@ def main(args):
 
     # Initialize training components
     if args.finetune_vae:
-        vae = vae.to("cuda")
+        vae = vae.to("cuda").to(dtype=torch.bfloat16)
         vae_finetuner = VAEFineTuner(
             vae, 
-            learning_rate=args.vae_learning_rate
+            learning_rate=args.vae_learning_rate,
+            perceptual_weight=1.0,
+            l1_weight=1.0,
+            kl_weight=0.1
         )
 
     # Training loop
@@ -556,7 +560,7 @@ def main(args):
         
         for step, batch in enumerate(train_dataloader):
             # Move batch to GPU efficiently
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+            with torch.amp.autocast(device_type='cuda', dtype=torch.float32):  # Change to float32
                 latents = batch["latents"].to("cuda", non_blocking=True)
                 text_embeddings = batch["text_embeddings"].to("cuda", non_blocking=True)
                 text_embeddings_2 = batch["text_embeddings_2"].to("cuda", non_blocking=True)
@@ -584,13 +588,10 @@ def main(args):
 
                 # VAE finetuning
                 if args.finetune_vae and step % args.vae_train_freq == 0:
-                    with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                        vae_losses = vae_finetuner.training_step(
-                            batch["latents"].to("cuda"), 
-                            batch["original_images"].to("cuda")
-                        )
-                        if (step + 1) % args.gradient_accumulation_steps == 0:
-                            vae_finetuner.optimizer_step()
+                    vae_losses = vae_finetuner.training_step(
+                        batch["latents"].to("cuda"), 
+                        batch["original_images"].to("cuda")
+                    )
 
                 # Clear GPU memory
                 del latents, text_embeddings, text_embeddings_2, pooled_text_embeddings_2
