@@ -40,39 +40,68 @@ torch.backends.cuda.enable_flash_sdp(True)
 torch.backends.cuda.enable_math_sdp(True)
 torch.backends.cuda.enable_mem_efficient_sdp(True)
 
-def get_sigmas(num_inference_steps=28, sigma_max=29.0, sigma_min=0.0292):
+def get_sigmas(num_inference_steps=28, sigma_min=0.0292):
     """
     Generate sigmas using improved schedule from paper
+    Args:
+        num_inference_steps: Number of inference steps
+        sigma_min: Minimum sigma value
+    Returns:
+        Tensor of sigma values
     """
     rho = 7  # ρ parameter from paper
     t = torch.linspace(0, 1, num_inference_steps)
-    sigmas = torch.sqrt((sigma_max ** (2 * (1 - t) / rho)) * (sigma_min ** (2 * t / rho)) + 1)
+    
+    # Use infinite sigma_max formulation from paper
+    sigmas = sigma_min ** (t / rho) * (1 - t)  # Approaches infinity as t->0
+    
     return sigmas
 
-def training_loss(model, x_0, sigma, text_embeddings, text_embeddings_2, pooled_text_embeds_2, timestep):
+def training_loss(model, x_0, sigma, text_embeddings, text_embeddings_2, pooled_text_embeds_2, timestep, target_size=None):
     """UNet training loss with v-prediction and Zero Terminal SNR
     Args:
         model: UNet model
         x_0: Input latents [B, 4, H/8, W/8]
-        sigma: Noise level [B] (now supports σ ≈ ∞ for ZTSNR)
+        sigma: Noise level [B]
         text_embeddings: First text encoder output [B, 77, 768]
-        text_embeddings_2: Second text encoder output [B, 77, 1280]
+        text_embeddings_2: Second text encoder output [B, 77, 1280] 
         pooled_text_embeds_2: Pooled text embeddings [B, 1280]
         timestep: Timestep values [B]
+        target_size: Optional (H, W) tuple for multi-aspect training
     """
-    # Create time_ids for SDXL conditioning
     batch_size = x_0.shape[0]
-    time_ids = torch.zeros((batch_size, 6), device=x_0.device)  # [B, 6]
+    
+    # Get current sample resolution
+    h, w = x_0.shape[2] * 8, x_0.shape[3] * 8  # Convert from latent to pixel space
+    
+    # Use target size if provided (for multi-aspect training), otherwise use current size
+    if target_size is None:
+        target_size = (h, w)
+    
+    # Create micro-conditioning tensors
+    original_size = target_size  # Original size before any crops
+    crops_coords_top_left = (0, 0)  # No cropping during inference
+    
+    # Combine into time_ids tensor [B, 6]
+    time_ids = torch.tensor([
+        original_size[0],  # Original height
+        original_size[1],  # Original width
+        target_size[0],    # Target height 
+        target_size[1],    # Target width
+        crops_coords_top_left[0],  # Top crop coord
+        crops_coords_top_left[1],  # Left crop coord
+    ], device=x_0.device)
+    time_ids = time_ids.repeat(batch_size, 1)  # [B, 6]
     
     # Create combined text embeddings for SDXL
     combined_text_embeddings = torch.cat([text_embeddings, text_embeddings_2], dim=-1)  # [B, 77, 2048]
     
-    # Generate noise and add to input (v-prediction parameterization)
+    # Generate noise and add to input
     noise = torch.randn_like(x_0)  # [B, 4, H/8, W/8]
     sigma = sigma.view(-1, 1, 1, 1)  # [B, 1, 1, 1]
     x_t = x_0 + sigma * noise  # [B, 4, H/8, W/8]
     
-    # V-prediction target (from paper section 2.1)
+    # V-prediction target
     v = noise / (sigma ** 2 + 1).sqrt()  # [B, 4, H/8, W/8]
     target = v  # [B, 4, H/8, W/8]
 
@@ -84,13 +113,13 @@ def training_loss(model, x_0, sigma, text_embeddings, text_embeddings_2, pooled_
 
     # UNet forward pass
     model_output = model(
-        sample=x_t,  # [B, 4, H/8, W/8]
-        timestep=timestep,  # [B]
-        encoder_hidden_states=combined_text_embeddings,  # [B, 77, 2048]
+        sample=x_t,
+        timestep=timestep,
+        encoder_hidden_states=combined_text_embeddings,
         added_cond_kwargs=added_cond_kwargs
-    ).sample  # [B, 4, H/8, W/8]
+    ).sample
 
-    # MinSNR loss weighting (from paper section 2.4)
+    # MinSNR loss weighting
     snr = 1 / (sigma ** 2)  # [B, 1, 1, 1]
     mse = F.mse_loss(model_output, target, reduction="none")  # [B, 4, H/8, W/8]
     min_snr_gamma = 0.5  # From paper
