@@ -82,12 +82,17 @@ def training_loss(model, x_0, sigma, text_embeddings, text_embeddings_2, pooled_
         logger.debug("\nProcessing target_size:")
         if isinstance(target_size, list):
             logger.debug(f"target_size is list with length: {len(target_size)}")
-            logger.debug(f"First element type: {type(target_size[0])} shape: {target_size[0].shape}")
-            # Assuming each element is a tensor of [height, width]
-            heights = torch.stack([t[0] for t in target_size])
-            widths = torch.stack([t[1] for t in target_size])
-            logger.debug(f"Stacked heights shape: {heights.shape} - dtype: {heights.dtype}")
-            logger.debug(f"Stacked widths shape: {widths.shape} - dtype: {widths.dtype}")
+            # Handle both tensor and integer elements
+            if isinstance(target_size[0], (int, float)):
+                logger.debug("target_size contains numbers")
+                heights = torch.full((batch_size,), target_size[0], device=x_0.device)
+                widths = torch.full((batch_size,), target_size[1], device=x_0.device)
+            else:
+                logger.debug("target_size contains tensors")
+                heights = torch.stack([t[0] for t in target_size])
+                widths = torch.stack([t[1] for t in target_size])
+            logger.debug(f"Heights shape: {heights.shape} - dtype: {heights.dtype}")
+            logger.debug(f"Widths shape: {widths.shape} - dtype: {widths.dtype}")
         else:
             logger.debug("Using default 1024x1024 dimensions")
             heights = torch.full((batch_size,), 1024, device=x_0.device)
