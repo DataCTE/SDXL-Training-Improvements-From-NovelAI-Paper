@@ -60,38 +60,69 @@ def compute_snr(sigma):
 
 
 def training_loss(model, x_0, sigma, text_embeddings, text_embeddings_2, pooled_text_embeds_2, timestep, target_size):
-    #print(f"x_0 initial shape: {x_0.shape}")
-    
+    #print("\n=== Starting training_loss ===")
+    #print(f"Initial shapes:")
+    #print(f"x_0: {x_0.shape}")
+    #print(f"text_embeddings: {text_embeddings.shape}")
+    #print(f"text_embeddings_2: {text_embeddings_2.shape}")
+    #print(f"pooled_text_embeds_2: {pooled_text_embeds_2.shape}")
+    #print(f"target_size: {target_size}")
+    #print(f"sigma: {sigma.shape}")
+    #print(f"timestep: {timestep.shape}")
+
     # Remove extra dimensions to get to [B, 4, H, W]
     while x_0.dim() > 4:
         x_0 = x_0.squeeze(1)
-    
-    #print(f"x_0 after squeeze: {x_0.shape}")
+    print(f"x_0 after squeeze: {x_0.shape}")
 
     batch_size = x_0.shape[0]
+    print(f"batch_size: {batch_size}")
 
     # Fix tensor shapes
     # Remove extra dimension from pooled_text_embeds_2
     pooled_text_embeds_2 = pooled_text_embeds_2.squeeze(1)  # [B, 1280]
+    #print(f"pooled_text_embeds_2 after squeeze: {pooled_text_embeds_2.shape}")
     
-    # Fix text_embeddings shape
-    text_embeddings = text_embeddings.squeeze(0)  # [B, 77, 768]
-    text_embeddings_2 = text_embeddings_2.squeeze(0)  # [B, 77, 1280]
+    # Fix text_embeddings shape - need one more squeeze for batch processing
+    text_embeddings = text_embeddings.squeeze(1)  # [B, 77, 768]
+    text_embeddings_2 = text_embeddings_2.squeeze(1)  # [B, 77, 1280]
+    #print(f"text_embeddings after squeeze: {text_embeddings.shape}")
+    #print(f"text_embeddings_2 after squeeze: {text_embeddings_2.shape}")
     
     # Create micro-conditioning tensors
-    original_size = target_size
-    crops_coords_top_left = (0, 0)
+    if isinstance(target_size, list):
+        #print("Processing batch target_size")
+        # Get the first tensor from target_size to extract values
+        first_target = target_size[0]
+        # Create time_ids for the entire batch using the same values
+        time_ids = torch.tensor([
+            first_target[0],  # height
+            first_target[1],  # width
+            first_target[0],  # target height
+            first_target[1],  # target width
+            0,  # crop top
+            0,  # crop left
+        ], device=x_0.device, dtype=torch.float32)
+        # Repeat for batch size
+        time_ids = time_ids.unsqueeze(0).repeat(batch_size, 1)  # [B, 6]
+    else:
+        #print("Processing single target_size")
+        # Original single sample processing
+        original_size = target_size
+        crops_coords_top_left = (0, 0)
 
-    time_ids = torch.tensor([
-        original_size[0],
-        original_size[1],
-        target_size[0],
-        target_size[1],
-        crops_coords_top_left[0],
-        crops_coords_top_left[1],
-    ], device=x_0.device, dtype=torch.float32)
+        time_ids = torch.tensor([
+            original_size[0],
+            original_size[1],
+            target_size[0],
+            target_size[1],
+            crops_coords_top_left[0],
+            crops_coords_top_left[1],
+        ], device=x_0.device, dtype=torch.float32)
 
-    time_ids = time_ids.unsqueeze(0).repeat(batch_size, 1)  # [B, 6]
+        time_ids = time_ids.unsqueeze(0).repeat(batch_size, 1)  # [B, 6]
+    
+    #print(f"time_ids final shape: {time_ids.shape}")
 
     # Prepare SDXL conditioning kwargs
     added_cond_kwargs = {
@@ -101,21 +132,22 @@ def training_loss(model, x_0, sigma, text_embeddings, text_embeddings_2, pooled_
 
     # Combine text embeddings
     combined_text_embeddings = torch.cat([text_embeddings, text_embeddings_2], dim=-1)  # [B, 77, 2048]
-
-    #print(f"pooled_text_embeds_2 shape: {pooled_text_embeds_2.shape}")
-    #print(f"time_ids shape: {time_ids.shape}")
     #print(f"combined_text_embeddings shape: {combined_text_embeddings.shape}")
 
     # Generate noise and add to input
     noise = torch.randn_like(x_0)  # [B, 4, H/8, W/8]
     sigma = sigma.view(-1, 1, 1, 1)  # [B, 1, 1, 1]
     x_t = x_0 + sigma * noise  # [B, 4, H/8, W/8]
+    #print(f"noise shape: {noise.shape}")
+    #print(f"sigma shape after view: {sigma.shape}")
     #print(f"x_t shape: {x_t.shape}")
 
     # V-prediction target
     v = (x_t - x_0) / (sigma**2 + 1).sqrt()
     target = v  # [B, 4, H/8, W/8]
+    #print(f"target shape: {target.shape}")
 
+    #print("\nStarting UNet forward pass...")
     # UNet forward pass
     model_output = model(
         sample=x_t,
@@ -123,13 +155,16 @@ def training_loss(model, x_0, sigma, text_embeddings, text_embeddings_2, pooled_
         encoder_hidden_states=combined_text_embeddings,
         added_cond_kwargs=added_cond_kwargs
     ).sample
+    #print(f"model_output shape: {model_output.shape}")
 
     # MinSNR loss weighting
     snr = compute_snr(sigma.squeeze())  # [B]
-    gamma = 5.0  # Hyperparameter, can be tuned
+    gamma = 1.0  # Hyperparameter, can be tuned
     min_snr_gamma = torch.minimum(snr, torch.full_like(snr, gamma))
     mse_loss = F.mse_loss(model_output, target, reduction='none')
     loss = (min_snr_gamma.view(-1, 1, 1, 1) * mse_loss).mean()
+    #print(f"final loss: {loss.item()}")
+    #print("=== Finished training_loss ===\n")
 
     return loss
 
@@ -467,8 +502,12 @@ def setup_distributed():
     torch.cuda.set_device(dist.get_rank())
     return dist.get_rank(), dist.get_world_size()
 
-def compile_model(model, name, mode='default', logger=None):
+def compile_model(model, name, mode='default', enable_compile=True, logger=None):
     """Safely compile a model with error handling"""
+    if not enable_compile:
+        logger.info(f"Skipping compilation for {name} (disabled)")
+        return model
+        
     if logger is None:
         logger = logging.getLogger(__name__)
 
@@ -483,19 +522,22 @@ def compile_model(model, name, mode='default', logger=None):
 
         # Create appropriate test input based on model type
         dtype = torch.bfloat16
+        batch_size = 1  # Match training batch size
+        
         if isinstance(model, AutoencoderKL):
             test_batch = {
-                "sample": torch.randn(1, 3, 64, 64, dtype=dtype).to(model.device),
+                "sample": torch.randn(1, 4, 64, 64, dtype=dtype).to(model.device),
                 "return_dict": True
             }
         elif isinstance(model, UNet2DConditionModel):
+            # Match shapes from training_loss function
             test_batch = {
-                "sample": torch.randn(1, 4, 64, 64, dtype=dtype).to(model.device),
-                "timestep": torch.ones(1).to(model.device).long(),
-                "encoder_hidden_states": torch.randn(1, 77, 2048, dtype=dtype).to(model.device),
+                "sample": torch.randn(batch_size, 4, 128, 128, dtype=dtype).to(model.device),  # [B, 4, H/8, W/8]
+                "timestep": torch.ones(batch_size).to(model.device).long(),  # [B]
+                "encoder_hidden_states": torch.randn(batch_size, 77, 2048, dtype=dtype).to(model.device),  # [B, 77, 2048]
                 "added_cond_kwargs": {
-                    "text_embeds": torch.randn(1, 1280, dtype=dtype).to(model.device),
-                    "time_ids": torch.zeros(1, 6).to(model.device)
+                    "text_embeds": torch.randn(batch_size, 1280, dtype=dtype).to(model.device),  # [B, 1280]
+                    "time_ids": torch.zeros(batch_size, 6, dtype=dtype).to(model.device)  # [B, 6]
                 }
             }
 
@@ -558,7 +600,9 @@ def parse_args():
         help="Number of steps to accumulate gradients"
     )
     # Removed compile_mode argument
-    # parser.add_argument("--compile_mode", type=str, choices=['default', 'reduce-overhead', 'max-autotune'], default='default', help="Torch compile mode")
+    parser.add_argument("--enable_compile", action="store_true", help="Enable model compilation")
+    parser.add_argument("--compile_mode", type=str, choices=['default', 'reduce-overhead', 'max-autotune'], default='default', help="Torch compile mode")
+    
     parser.add_argument("--save_checkpoints", action="store_true", help="Save checkpoints after each epoch")
     return parser.parse_args()
 
@@ -604,11 +648,14 @@ def main(args):
         subfolder="text_encoder_2",
         torch_dtype=torch.bfloat16
     )
+    
 
     # Keep other models on CPU
     vae.to("cpu")
     text_encoder.to("cpu")
     text_encoder_2.to("cpu")
+
+    
 
     # Enable gradient checkpointing
     unet.enable_gradient_checkpointing()
