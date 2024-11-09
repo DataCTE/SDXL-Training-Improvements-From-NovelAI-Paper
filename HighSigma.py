@@ -18,7 +18,6 @@ from transformers.optimization import Adafactor
 import torchvision.models as models
 import time
 
-
 def setup_logging():
     logging.basicConfig(
         level=logging.INFO,
@@ -38,24 +37,24 @@ torch.backends.cuda.enable_flash_sdp(True)
 torch.backends.cuda.enable_math_sdp(True)
 torch.backends.cuda.enable_mem_efficient_sdp(True)
 
-
-def get_sigmas(num_inference_steps=28, sigma_min=0.0292):
+def get_sigmas(num_inference_steps=28, sigma_min=0.0292, sigma_max=80.0):
     """
-    Generate sigmas using improved schedule from paper
+    Generate sigmas using a schedule that supports Zero Terminal SNR (ZTSNR)
     Args:
         num_inference_steps: Number of inference steps
         sigma_min: Minimum sigma value
+        sigma_max: Maximum sigma value (set to a large number for ZTSNR)
     Returns:
         Tensor of sigma values
     """
-    rho = 7  # ρ parameter from paper
-    t = torch.linspace(0, 1, num_inference_steps)
-
-    # Use infinite sigma_max formulation from paper
-    sigmas = sigma_min ** (t / rho) * (1 - t)  # Approaches infinity as t->0
-
+    t = torch.linspace(1, 0, num_inference_steps)
+    rho = 7.0  # Hyperparameter, can be adjusted
+    sigmas = (sigma_max**(1 / rho) + t * (sigma_min**(1 / rho) - sigma_max**(1 / rho))) ** rho
     return sigmas
 
+def compute_snr(sigma):
+    """Compute Signal-to-Noise Ratio (SNR) from sigma."""
+    return 1 / (sigma**2)
 
 def training_loss(model, x_0, sigma, text_embeddings, text_embeddings_2, pooled_text_embeds_2, timestep, target_size):
     """UNet training loss with v-prediction and Zero Terminal SNR
@@ -77,16 +76,15 @@ def training_loss(model, x_0, sigma, text_embeddings, text_embeddings_2, pooled_
 
     # Ensure all values are integers for time_ids
     time_ids = torch.tensor([
-        int(original_size[0]),  # Original height
-        int(original_size[1]),  # Original width
-        int(target_size[0]),    # Target height
-        int(target_size[1]),    # Target width
-        int(crops_coords_top_left[0]),  # Top crop coord
-        int(crops_coords_top_left[1]),  # Left crop coord
+        original_size[0],  # Original height
+        original_size[1],  # Original width
+        target_size[0],    # Target height
+        target_size[1],    # Target width
+        crops_coords_top_left[0],  # Top crop coord
+        crops_coords_top_left[1],  # Left crop coord
     ], device=x_0.device, dtype=torch.long)  # Use long dtype for indices
 
-    time_ids = time_ids.repeat(batch_size, 1)  # [B, 6]
-    # Removed the unsqueeze(1) to keep time_ids as [B, 6]
+    time_ids = time_ids.unsqueeze(0).repeat(batch_size, 1)  # [B, 6]
 
     # Create combined text embeddings for SDXL
     combined_text_embeddings = torch.cat([text_embeddings, text_embeddings_2], dim=-1)  # [B, 77, 2048]
@@ -97,7 +95,7 @@ def training_loss(model, x_0, sigma, text_embeddings, text_embeddings_2, pooled_
     x_t = x_0 + sigma * noise  # [B, 4, H/8, W/8]
 
     # V-prediction target
-    v = noise / (sigma ** 2 + 1).sqrt()  # [B, 4, H/8, W/8]
+    v = (x_t - x_0) / (sigma**2 + 1).sqrt()
     target = v  # [B, 4, H/8, W/8]
 
     # Prepare SDXL conditioning kwargs
@@ -115,14 +113,13 @@ def training_loss(model, x_0, sigma, text_embeddings, text_embeddings_2, pooled_
     ).sample
 
     # MinSNR loss weighting
-    snr = 1 / (sigma ** 2)  # [B, 1, 1, 1]
-    mse = F.mse_loss(model_output, target, reduction="none")  # [B, 4, H/8, W/8]
-    min_snr_gamma = 0.5  # From paper
-    snr_weight = (snr.squeeze() / (1 + snr.squeeze())).clamp(max=min_snr_gamma)  # [B]
-    loss = (mse * snr_weight.view(-1, 1, 1, 1)).mean()  # scalar
+    snr = compute_snr(sigma.squeeze())  # [B]
+    gamma = 5.0  # Hyperparameter, can be tuned
+    min_snr_gamma = torch.minimum(snr, torch.full_like(snr, gamma))
+    mse_loss = F.mse_loss(model_output, target, reduction='none')
+    loss = (min_snr_gamma.view(-1, 1, 1, 1) * mse_loss).mean()
 
     return loss
-
 
 class CustomDataset(Dataset):
     def __init__(self, data_dir, vae, tokenizer, tokenizer_2, text_encoder, text_encoder_2,
@@ -149,43 +146,34 @@ class CustomDataset(Dataset):
                     self.image_paths.append(img_path)
                     self.caption_paths.append(caption_path)
 
-        self.transform = transforms.Compose([
-            transforms.Resize(1024),
-            transforms.CenterCrop(1024),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
-        ])
-
-        # Add aspect bucketing
-        self.aspect_buckets = {
-            (1, 1): [],    # Square
-            (4, 3): [],    # Landscape
-            (3, 4): [],    # Portrait
-            (16, 9): [],   # Widescreen
-            (9, 16): [],   # Tall
-        }
-
-        # Sort images into aspect buckets
-        for img_path in self.image_paths:
-            with Image.open(img_path) as img:
-                w, h = img.size
-                ratio = w / h
-                bucket = min(self.aspect_buckets.keys(),
-                             key=lambda x: abs(x[0]/x[1] - ratio))
-                self.aspect_buckets[bucket].append(img_path)
-
-        # Initialize current bucket tracking
-        self.bucket_list = list(self.aspect_buckets.keys())
-        self.current_bucket_idx = 0
-        self.update_current_bucket()
+        # Initialize aspect buckets
+        self.aspect_buckets = self.create_aspect_buckets()
 
         # Add tag processing
         self.tag_list = self._build_tag_list()
         self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14")
         self.clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
 
-        # Add this line after initializing all the models and paths
-        self._cache_latents_and_embeddings_optimized()  # Cache latents before using them
+        # Cache latents and embeddings
+        self._cache_latents_and_embeddings_optimized()
+
+    def create_aspect_buckets(self):
+        aspect_buckets = {
+            (1, 1): [],    # Square
+            (4, 3): [],    # Landscape
+            (3, 4): [],    # Portrait
+            (16, 9): [],   # Widescreen
+            (9, 16): [],   # Tall
+        }
+        # Sort images into aspect buckets
+        for img_path in self.image_paths:
+            with Image.open(img_path) as img:
+                w, h = img.size
+                ratio = w / h
+                bucket = min(aspect_buckets.keys(),
+                             key=lambda x: abs(x[0]/x[1] - ratio))
+                aspect_buckets[bucket].append(img_path)
+        return aspect_buckets
 
     def get_target_size_for_bucket(self, ratio):
         """Calculate target size maintaining aspect ratio and ~1024x1024 total pixels
@@ -206,12 +194,6 @@ class CustomDataset(Dataset):
         h = min(2048, h)
 
         return (h, w)
-
-    def update_current_bucket(self):
-        """Update current bucket and associated paths"""
-        self.current_bucket = self.bucket_list[self.current_bucket_idx]
-        self.current_paths = self.aspect_buckets[self.current_bucket]
-        self.current_bucket_idx = (self.current_bucket_idx + 1) % len(self.bucket_list)
 
     def _build_tag_list(self):
         """Build a list of all unique tags from captions"""
@@ -264,9 +246,8 @@ class CustomDataset(Dataset):
             cache_embeddings_path = self.cache_dir / f"{img_path.stem}_embeddings.pt"
 
             if not cache_latents_path.exists() or not cache_embeddings_path.exists():
-                print(f"Caching latents and embeddings for {img_path.name}")
                 image = Image.open(img_path).convert("RGB")
-                image_tensor = self.transform(image).unsqueeze(0)
+                image_tensor = self.transform_image(image)  # [1, 3, H, W]
 
                 with torch.no_grad():
                     # Get tags from caption
@@ -279,8 +260,8 @@ class CustomDataset(Dataset):
 
                     # Regular processing
                     image_tensor = image_tensor.to("cuda", dtype=torch.bfloat16)
-                    latents = self.vae.encode(image_tensor).latent_dist.sample()
-                    latents = latents * 0.18215
+                    latents = self.vae.encode(image_tensor).latent_dist.sample()  # [1, 4, H/8, W/8]
+                    latents = latents * 0.18215  # Scaling factor
 
                     # Process text embeddings
                     text_input = self.tokenizer(
@@ -291,7 +272,7 @@ class CustomDataset(Dataset):
                         return_tensors="pt"
                     ).to("cuda")
 
-                    text_embeddings = self.text_encoder(text_input.input_ids)[0]
+                    text_embeddings = self.text_encoder(text_input.input_ids)[0]  # [1, 77, 768]
 
                     # SDXL text encoder 2
                     text_input_2 = self.tokenizer_2(
@@ -303,8 +284,8 @@ class CustomDataset(Dataset):
                     ).to("cuda")
 
                     text_encoder_output_2 = self.text_encoder_2(text_input_2.input_ids)
-                    text_embeddings_2 = text_encoder_output_2.last_hidden_state
-                    pooled_text_embeddings_2 = text_encoder_output_2.pooler_output.squeeze(1)  # Adjusted shape
+                    text_embeddings_2 = text_encoder_output_2.last_hidden_state  # [1, 77, 1280]
+                    pooled_text_embeddings_2 = text_encoder_output_2.pooler_output  # [1, 1280]
 
                     # Save all embeddings
                     torch.save({
@@ -328,58 +309,57 @@ class CustomDataset(Dataset):
         self.text_encoder_2.to("cpu")
         self.clip_model.to("cpu")
 
+    def transform_image(self, image):
+        """Transform image to tensor"""
+        transform = transforms.Compose([
+            transforms.Resize(1024),
+            transforms.CenterCrop(1024),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5])
+        ])
+        return transform(image).unsqueeze(0)
+
     def __len__(self):
         return len(self.image_paths)
 
     def __getitem__(self, idx):
-        # Get current bucket's target size
-        target_size = self.get_target_size_for_bucket(self.current_bucket)
-
-        # Get actual image path for this index
-        actual_idx = idx % len(self.current_paths)
-        img_path = self.current_paths[actual_idx]
-
-        # Update bucket if we've gone through all images in current bucket
-        if actual_idx == len(self.current_paths) - 1:
-            self.update_current_bucket()
+        # Get image path
+        img_path = self.image_paths[idx]
 
         # Load cached data
         latents_path = self.cache_dir / f"{img_path.stem}_latents.pt"
         embeddings_path = self.cache_dir / f"{img_path.stem}_embeddings.pt"
 
-        latents = torch.load(latents_path)
+        latents = torch.load(latents_path)  # [1, 4, H/8, W/8]
         embeddings = torch.load(embeddings_path)
-
-        # Adjust pooled_text_embeddings_2 shape if necessary
-        pooled_text_embeddings_2 = embeddings["pooled_text_embeddings_2"]
-        if pooled_text_embeddings_2.dim() == 2 and pooled_text_embeddings_2.shape[0] == 1:
-            pooled_text_embeddings_2 = pooled_text_embeddings_2.squeeze(0)
 
         # Load original image
         image = Image.open(img_path).convert("RGB")
-        image_tensor = self.transform(image)
+        original_images = self.transform_image(image).squeeze(0)  # [3, H, W]
+
+        # Get target size for multi-aspect training
+        target_size = (original_images.shape[1], original_images.shape[2])
 
         return {
             "latents": latents,
             "text_embeddings": embeddings["text_embeddings"],
             "text_embeddings_2": embeddings["text_embeddings_2"],
-            "pooled_text_embeddings_2": pooled_text_embeddings_2,
+            "pooled_text_embeddings_2": embeddings["pooled_text_embeddings_2"],
             "target_size": target_size,
             "clip_image_embed": embeddings["clip_image_embed"],
             "clip_tag_embeds": embeddings["clip_tag_embeds"],
             "tags": embeddings["tags"],
-            "original_images": image_tensor  # Add this line
+            "original_images": original_images  # [3, H, W]
         }
-
 
 class PerceptualLoss:
     def __init__(self):
-        # Update VGG initialization to use weights parameter
-        weights = models.VGG16_Weights.IMAGENET1K_V1
-        self.vgg = models.vgg16(weights=weights).features.eval().to("cuda")
+        # Use pre-trained VGG16 model
+        self.vgg = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1).features.eval().to("cuda")
         self.vgg.requires_grad_(False)
         self.layers = {'3': 'relu1_2', '8': 'relu2_2', '15': 'relu3_3', '22': 'relu4_3'}
-        self.normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        self.normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                              std=[0.229, 0.224, 0.225])
 
     def get_features(self, x):
         x = self.normalize(x)
@@ -399,72 +379,62 @@ class PerceptualLoss:
             loss += F.mse_loss(pred_features[key], target_features[key])
         return loss
 
-
 class VAEFineTuner:
     def __init__(self, vae, learning_rate=1e-6, perceptual_weight=1.0, l1_weight=1.0, kl_weight=0.1):
         self.vae = vae
         self.perceptual_loss = PerceptualLoss()
 
-        # Add loss weights as instance variables
+        # Loss weights
         self.perceptual_weight = perceptual_weight
         self.l1_weight = l1_weight
         self.kl_weight = kl_weight
 
-        # Use a single optimizer for both encoder and decoder
+        # Optimizer
         self.optimizer = AdamW8bit(
-            [
-                {'params': self.vae.decoder.parameters(), 'lr': learning_rate},
-                {'params': self.vae.encoder.parameters(), 'lr': learning_rate * 0.5}
-            ],
+            self.vae.parameters(),
+            lr=learning_rate,
             betas=(0.9, 0.999),
             weight_decay=1e-2,
             eps=1e-8
         )
 
     def training_step(self, latents, original_images):
-        """VAE training step with memory-efficient batch processing
+        """VAE training step
         Args:
-            latents: Input latents [B, 4, H/8, W/8]
+            latents: Input latents [B, 1, 4, H/8, W/8]
             original_images: Original images [B, 3, H, W]
         """
         self.vae.train()
-        total_loss = 0
 
-        # Ensure inputs are on the correct device and dtype
-        latents = latents.to("cuda", dtype=torch.bfloat16)
-        original_images = original_images.to("cuda", dtype=torch.bfloat16)
+        latents = latents.to("cuda", dtype=torch.float32)
+        original_images = original_images.to("cuda", dtype=torch.float32)
 
-        # Decode latents to image space
-        decoded_images = self.vae.decode(latents).sample  # [B, 3, H, W]
+        # Decode latents
+        decoded_images = self.vae.decode(latents).sample
 
-        # Calculate losses (all inputs should be float32 for perceptual loss)
-        p_loss = self.perceptual_loss(decoded_images.float(), original_images.float())  # scalar
-        l1_loss = F.l1_loss(decoded_images.float(), original_images.float())  # scalar
+        # Calculate losses
+        p_loss = self.perceptual_loss(decoded_images, original_images)
+        l1_loss = F.l1_loss(decoded_images, original_images)
 
-        # Optional KL loss
-        with torch.no_grad():
-            posterior = self.vae.encode(original_images).latent_dist  # DiagonalGaussianDistribution
-            kl_loss = torch.mean(-0.5 * torch.sum(1 + posterior.variance.log() -
-                                                  posterior.mean.pow(2) - posterior.variance, dim=1))  # scalar
+        # KL loss
+        posterior = self.vae.encode(original_images).latent_dist
+        kl_loss = torch.mean(-0.5 * torch.sum(1 + posterior.logvar - posterior.mean.pow(2) - posterior.logvar.exp(), dim=1))
 
-        # Combine losses (all scalars)
-        total_loss = (self.perceptual_weight * p_loss +
-                      self.l1_weight * l1_loss +
-                      self.kl_weight * kl_loss)  # scalar
+        # Total loss
+        total_loss = self.perceptual_weight * p_loss + self.l1_weight * l1_loss + self.kl_weight * kl_loss
 
-        # Backward pass
+        # Backward
         self.optimizer.zero_grad()
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.vae.parameters(), max_norm=1.0)
         self.optimizer.step()
 
         return {
-            'total_loss': total_loss.item(),  # scalar
-            'perceptual_loss': p_loss.item(),  # scalar
-            'l1_loss': l1_loss.item(),  # scalar
-            'kl_loss': kl_loss.item()  # scalar
+            'total_loss': total_loss.item(),
+            'perceptual_loss': p_loss.item(),
+            'l1_loss': l1_loss.item(),
+            'kl_loss': kl_loss.item()
         }
-
 
 def setup_distributed():
     """Setup distributed training"""
@@ -472,13 +442,12 @@ def setup_distributed():
     torch.cuda.set_device(dist.get_rank())
     return dist.get_rank(), dist.get_world_size()
 
-
 def compile_model(model, name, mode='default', logger=None):
     """Safely compile a model with error handling"""
     if logger is None:
         logger = logging.getLogger(__name__)
 
-    had_xformers = False  # Initialize here
+    had_xformers = False
     try:
         logger.info(f"Compiling {name}...")
 
@@ -488,7 +457,7 @@ def compile_model(model, name, mode='default', logger=None):
             model.disable_xformers_memory_efficient_attention()
 
         # Create appropriate test input based on model type
-        dtype = torch.bfloat16  # Match model dtype
+        dtype = torch.bfloat16
         if isinstance(model, AutoencoderKL):
             test_batch = {
                 "sample": torch.randn(1, 3, 64, 64, dtype=dtype).to(model.device),
@@ -501,7 +470,7 @@ def compile_model(model, name, mode='default', logger=None):
                 "encoder_hidden_states": torch.randn(1, 77, 2048, dtype=dtype).to(model.device),
                 "added_cond_kwargs": {
                     "text_embeds": torch.randn(1, 1280, dtype=dtype).to(model.device),
-                    "time_ids": torch.zeros(1, 6).to(model.device)  # Corrected shape
+                    "time_ids": torch.zeros(1, 6).to(model.device)
                 }
             }
 
@@ -536,18 +505,6 @@ def compile_model(model, name, mode='default', logger=None):
 
         return model
 
-
-def training_loop_with_compile_logging(model, batch, logger):
-    """Log first forward pass timing with compiled model"""
-    start_time = time.time()
-    output = model(**batch)
-    torch.cuda.synchronize()  # Ensure completion
-    end_time = time.time()
-
-    logger.info(f"First forward pass took {end_time - start_time:.2f} seconds")
-    return output
-
-
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str, required=True)
@@ -566,7 +523,7 @@ def parse_args():
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=1,  # Reduce default batch size
+        default=1,
         help="Training batch size per GPU"
     )
     parser.add_argument(
@@ -584,7 +541,6 @@ def parse_args():
     )
     parser.add_argument("--save_checkpoints", action="store_true", help="Save checkpoints after each epoch")
     return parser.parse_args()
-
 
 def main(args):
     # Set up device
@@ -649,7 +605,7 @@ def main(args):
     )
     train_dataloader = DataLoader(
         dataset,
-        batch_size=args.batch_size,  # Use batch size from args
+        batch_size=args.batch_size,
         shuffle=True,
         num_workers=4,
         pin_memory=True
@@ -726,15 +682,18 @@ def main(args):
 
         for step, batch in enumerate(train_dataloader):
             # Convert inputs to correct dtype
-            latents = batch["latents"].to(device)
-            text_embeddings = batch["text_embeddings"].to(device)
-            text_embeddings_2 = batch["text_embeddings_2"].to(device)
-            pooled_text_embeddings_2 = batch["pooled_text_embeddings_2"].to(device)
+            latents = batch["latents"].to(device).to(dtype)
+            text_embeddings = batch["text_embeddings"].to(device).to(dtype)
+            text_embeddings_2 = batch["text_embeddings_2"].to(device).to(dtype)
+            pooled_text_embeddings_2 = batch["pooled_text_embeddings_2"].to(device).to(dtype)
             target_size = batch["target_size"]
 
             # Use autocast for mixed precision
             with torch.amp.autocast('cuda', dtype=dtype):
-                sigma = get_sigmas(args.num_inference_steps)[step % args.num_inference_steps].to(latents.device)
+                sigmas = get_sigmas(args.num_inference_steps).to(device)
+                sigma = sigmas[step % args.num_inference_steps]
+                sigma = sigma.expand(latents.size(0))
+
                 timestep = torch.ones(latents.shape[0], device=device).long() * (step % args.num_inference_steps)
 
                 loss = training_loss(
@@ -786,7 +745,6 @@ def main(args):
     text_encoder_2.save_pretrained(output_dir / "text_encoder_2")
     tokenizer.save_pretrained(output_dir / "tokenizer")
     tokenizer_2.save_pretrained(output_dir / "tokenizer_2")
-
 
 if __name__ == "__main__":
     setup_logging()
