@@ -85,7 +85,7 @@ python HighSigma.py \
 
 ## TODO
 
-- [ ] Optimize memory usage
+- [X] Optimize memory usage
 - [ ] Improve batch processing
 - [ ] Validate and improve VAE finetuning
 - [ ] Add proper validation steps
