@@ -13,11 +13,11 @@ from bitsandbytes.optim import AdamW8bit
 from torch.optim.swa_utils import AveragedModel
 from tqdm.auto import tqdm
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler
 import torch.distributed as dist
 from transformers.optimization import Adafactor
 import torchvision.models as models
 from diffusers.models import AutoencoderKL
+import time
 
 
 def setup_logging():
@@ -49,20 +49,23 @@ def get_sigmas(num_inference_steps=28, sigma_max=29.0, sigma_min=0.0292):
     sigmas = torch.sqrt((sigma_max ** (2 * (1 - t) / rho)) * (sigma_min ** (2 * t / rho)) + 1)
     return sigmas
 
-def training_loss(model, x_0, sigma, text_embeddings, text_embeddings_2, pooled_text_embeds_2, timesteps):
-    #print(f"text_embeddings shape: {text_embeddings.shape}")
-    #print(f"text_embeddings_2 shape: {text_embeddings_2.shape}")
-    #print(f"pooled_text_embeds_2 shape: {pooled_text_embeds_2.shape}")
-    #print(f"timesteps shape: {timesteps.shape}")
-    #print(f"x_0 shape before: {x_0.shape}")
-    
-    # Ensure x_0 has correct shape [B, C, H, W]
+def training_loss(model, x_0, sigma, text_embeddings, text_embeddings_2, pooled_text_embeds_2, timestep):
+    """
+    Args:
+        model: UNet model
+        x_0: Input latents [B, 4, H, W] or [1, B, 4, H, W]
+        sigma: Noise level [B] or scalar
+        text_embeddings: First text encoder output [B, 77, 768] or [1, B, 77, 768]
+        text_embeddings_2: Second text encoder output [B, 77, 1280] or [1, B, 77, 1280]
+        pooled_text_embeds_2: Pooled text embeddings [B, 1280] or [1, B, 1280]
+        timestep: Timestep values [B]
+    """
+    # Ensure x_0 has correct shape [B, 4, H, W]
     x_0 = x_0.squeeze()  # Remove any extra dimensions
     if len(x_0.shape) == 3:
         x_0 = x_0.unsqueeze(0)
-    #print(f"x_0 shape after: {x_0.shape}")
     
-    # Create time_ids with correct shape
+    # Create time_ids with correct shape [B, 6]
     batch_size = x_0.shape[0]
     time_ids = torch.zeros((batch_size, 6), device=x_0.device)
     
@@ -74,53 +77,56 @@ def training_loss(model, x_0, sigma, text_embeddings, text_embeddings_2, pooled_
     
     # Add batch dimension if needed
     if len(text_embeddings.shape) == 2:
-        text_embeddings = text_embeddings.unsqueeze(0)
+        text_embeddings = text_embeddings.unsqueeze(0)  # [1, 77, 768] -> [B, 77, 768]
     if len(text_embeddings_2.shape) == 2:
-        text_embeddings_2 = text_embeddings_2.unsqueeze(0)
+        text_embeddings_2 = text_embeddings_2.unsqueeze(0)  # [1, 77, 1280] -> [B, 77, 1280]
     if len(pooled_text_embeds_2.shape) == 1:
-        pooled_text_embeds_2 = pooled_text_embeds_2.unsqueeze(0)
+        pooled_text_embeds_2 = pooled_text_embeds_2.unsqueeze(0)  # [1280] -> [B, 1280]
     
-    # Create combined text embeddings
+    # Create combined text embeddings [B, 77, 2048]
     combined_text_embeddings = torch.cat([text_embeddings, text_embeddings_2], dim=-1)
     
-   
-    noise = torch.randn_like(x_0)
-    sigma = sigma.view(-1, 1, 1, 1)
-    x_t = x_0 + sigma * noise
+    # Generate noise and add to input
+    noise = torch.randn_like(x_0)  # [B, 4, H, W]
+    sigma = sigma.view(-1, 1, 1, 1)  # [B, 1, 1, 1]
+    x_t = x_0 + sigma * noise  # [B, 4, H, W]
     
     # V-prediction
-    v = noise / (sigma ** 2 + 1).sqrt()
-    target = v
+    v = noise / (sigma ** 2 + 1).sqrt()  # [B, 4, H, W]
+    target = v  # [B, 4, H, W]
 
+    # Prepare conditioning kwargs
     added_cond_kwargs = {
-        "text_embeds": pooled_text_embeds_2,
-        "time_ids": time_ids
+        "text_embeds": pooled_text_embeds_2,  # [B, 1280]
+        "time_ids": time_ids  # [B, 6]
     }
 
+    # Model forward pass
     model_output = model(
-        x_t,
-        timesteps,
-        encoder_hidden_states=combined_text_embeddings,
+        sample=x_t,  # [B, 4, H, W]
+        timestep=timestep,  # [B]
+        encoder_hidden_states=combined_text_embeddings,  # [B, 77, 2048]
         added_cond_kwargs=added_cond_kwargs
-    ).sample
+    ).sample  # [B, 4, H, W]
 
     # ZTSNR loss calculation
-    snr = 1 / (sigma ** 2)
-    mse = F.mse_loss(model_output, target, reduction="none")
+    snr = 1 / (sigma ** 2)  # [B, 1, 1, 1]
+    mse = F.mse_loss(model_output, target, reduction="none")  # [B, 4, H, W]
     
     # Zero terminal SNR
     min_snr_gamma = 0.5  # From paper
-    snr_weight = (snr.squeeze() / (1 + snr.squeeze())).clamp(max=min_snr_gamma)
-    loss = (mse * snr_weight.view(-1, 1, 1, 1)).mean()
+    snr_weight = (snr.squeeze() / (1 + snr.squeeze())).clamp(max=min_snr_gamma)  # [B]
+    loss = (mse * snr_weight.view(-1, 1, 1, 1)).mean()  # scalar
     
     return loss
 
 class Dataset(Dataset):
     def __init__(self, data_dir, vae, tokenizer, tokenizer_2, text_encoder, text_encoder_2, 
-                 cache_dir="latents_cache"):
+             cache_dir="latents_cache"):
         self.data_dir = Path(data_dir)
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(exist_ok=True)
+        self.batch_size = 1
 
         # Store model references as instance variables
         self.vae = vae
@@ -438,10 +444,73 @@ def setup_distributed():
     torch.cuda.set_device(dist.get_rank())
     return dist.get_rank(), dist.get_world_size()
 
+def compile_model(model, name, mode='default', logger=None):
+    """Safely compile a model with error handling"""
+    if logger is None:
+        logger = logging.getLogger(__name__)
+        
+    try:
+        logger.info(f"Compiling {name}...")
+        compiled_model = torch.compile(
+            model,
+            mode=mode,
+            fullgraph=True
+        )
+        logger.info(f"Successfully compiled {name}")
+        return compiled_model
+    except Exception as e:
+        logger.warning(f"Failed to compile {name}: {str(e)}")
+        logger.warning(f"Continuing with uncompiled {name}")
+        return model
+
+def training_loop_with_compile_logging(model, batch, logger):
+    """Log first forward pass timing with compiled model"""
+    start_time = time.time()
+    output = model(**batch)
+    torch.cuda.synchronize()  # Ensure completion
+    end_time = time.time()
+    
+    logger.info(f"First forward pass took {end_time - start_time:.2f} seconds")
+    return output
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_path", type=str, required=True)
+    parser.add_argument("--learning_rate", type=float, default=1e-6)
+    parser.add_argument("--num_epochs", type=int, default=1)
+    parser.add_argument("--num_inference_steps", type=int, default=28)
+    parser.add_argument("--data_dir", type=str, required=True)
+    parser.add_argument("--cache_dir", type=str, default="latents_cache")
+    parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Max gradient norm for clipping")
+    parser.add_argument("--ema_decay", type=float, default=0.9999, help="EMA decay rate")
+    parser.add_argument("--finetune_vae", action="store_true", help="Enable VAE finetuning")
+    parser.add_argument("--vae_learning_rate", type=float, default=1e-6, help="VAE learning rate")
+    parser.add_argument("--vae_train_freq", type=int, default=10, help="VAE training frequency")
+    parser.add_argument("--output_dir", type=str, default="./output", help="Output directory")
+    parser.add_argument("--use_adafactor", action="store_true", help="Use Adafactor instead of AdamW8bit")
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=4,
+        help="Training batch size per GPU"
+    )
+    parser.add_argument(
+        "--gradient_accumulation_steps",
+        type=int,
+        default=1,
+        help="Number of steps to accumulate gradients"
+    )
+    parser.add_argument(
+        "--compile_mode",
+        type=str,
+        choices=['default', 'reduce-overhead', 'max-autotune'],
+        default='default',
+        help="Torch compile mode"
+    )
+    return parser.parse_args()
+
 def main(args):
     logger = setup_logging()
-    
-    
     
     # Load models with bfloat16
     unet = UNet2DConditionModel.from_pretrained(
@@ -494,10 +563,10 @@ def main(args):
     )
     train_dataloader = DataLoader(
         dataset,
-        batch_size=1,
+        batch_size=args.batch_size,  # Use batch size from args
         shuffle=True,
-        num_workers=0,
-        pin_memory=True,
+        num_workers=4,
+        pin_memory=True
     )
 
     # Setup optimizer
@@ -521,6 +590,7 @@ def main(args):
             eps=1e-8
         )
     
+    # Enable memory efficient attention only for models that support it
     unet.enable_xformers_memory_efficient_attention()
     vae.enable_xformers_memory_efficient_attention()
    
@@ -550,6 +620,13 @@ def main(args):
             kl_weight=0.1
         )
 
+    # Compile models if enabled
+    if args.compile_mode:
+        logger.info(f"Using compile mode: {args.compile_mode}")
+        unet = compile_model(unet, "UNet", args.compile_mode, logger)
+        if args.finetune_vae:
+            vae = compile_model(vae, "VAE", args.compile_mode, logger)
+    
     # Training loop
     logger.info("Starting training...")
     total_steps = args.num_epochs * len(train_dataloader)
@@ -559,26 +636,62 @@ def main(args):
         logger.info(f"Starting epoch {epoch+1}/{args.num_epochs}")
         
         for step, batch in enumerate(train_dataloader):
-            # Move batch to GPU efficiently
-            with torch.amp.autocast(device_type='cuda', dtype=torch.float32):  # Change to float32
+            # Log first forward pass if using compiled models
+            if step == 0 and epoch == 0 and args.compile_mode:
+                logger.info("Running first forward pass with compiled models...")
+                try:
+                    # Prepare tensors with same shape handling as training_loss
+                    latents = batch["latents"].to("cuda").squeeze()
+                    if len(latents.shape) == 3:
+                        latents = latents.unsqueeze(0)
+                        
+                    text_embeddings = batch["text_embeddings"].to("cuda").squeeze()
+                    text_embeddings_2 = batch["text_embeddings_2"].to("cuda").squeeze()
+                    pooled_embeds = batch["pooled_text_embeddings_2"].to("cuda").squeeze()
+                    
+                    if len(text_embeddings.shape) == 2:
+                        text_embeddings = text_embeddings.unsqueeze(0)
+                    if len(text_embeddings_2.shape) == 2:
+                        text_embeddings_2 = text_embeddings_2.unsqueeze(0)
+                    if len(pooled_embeds.shape) == 1:
+                        pooled_embeds = pooled_embeds.unsqueeze(0)
+                        
+                    sample_batch = {
+                        "sample": latents,
+                        "timestep": torch.ones(latents.shape[0], device="cuda").long(),
+                        "encoder_hidden_states": torch.cat([text_embeddings, text_embeddings_2], dim=-1),
+                        "added_cond_kwargs": {
+                            "text_embeds": pooled_embeds,
+                            "time_ids": torch.zeros((latents.shape[0], 6), device="cuda")
+                        }
+                    }
+                    training_loop_with_compile_logging(unet, sample_batch, logger)
+                    
+                    if args.finetune_vae:
+                        vae_batch = {"latents": batch["latents"].to("cuda")}
+                        training_loop_with_compile_logging(vae, vae_batch, logger)
+                except Exception as e:
+                    logger.warning(f"Error during first compiled forward pass: {str(e)}")
+            
+            # Regular training step
+            with torch.amp.autocast(device_type='cuda', dtype=torch.float32):
                 latents = batch["latents"].to("cuda", non_blocking=True)
                 text_embeddings = batch["text_embeddings"].to("cuda", non_blocking=True)
                 text_embeddings_2 = batch["text_embeddings_2"].to("cuda", non_blocking=True)
                 pooled_text_embeddings_2 = batch["pooled_text_embeddings_2"].to("cuda", non_blocking=True)
                 
+                # Update training loss function call
                 sigma = get_sigmas(args.num_inference_steps)[step % args.num_inference_steps].to(latents.device)
-                timesteps = torch.ones(latents.shape[0], device=latents.device).long() * (step % args.num_inference_steps)
+                timestep = torch.ones(latents.shape[0], device=latents.device).long() * (step % args.num_inference_steps)
 
-                # Forward pass
                 loss = training_loss(
                     unet, latents, sigma, text_embeddings, 
-                    text_embeddings_2, pooled_text_embeddings_2, timesteps
+                    text_embeddings_2, pooled_text_embeddings_2, timestep
                 ) / args.gradient_accumulation_steps
 
-                # Backward pass
-                loss.backward()
-
-            # Optimization step
+            # Rest of training loop remains the same
+            loss.backward()
+            
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 torch.nn.utils.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
                 optimizer.step()
@@ -586,16 +699,11 @@ def main(args):
                 lr_scheduler.step()
                 ema_model.update_parameters(unet)
 
-                # VAE finetuning
                 if args.finetune_vae and step % args.vae_train_freq == 0:
                     vae_losses = vae_finetuner.training_step(
                         batch["latents"].to("cuda"), 
                         batch["original_images"].to("cuda")
                     )
-
-                # Clear GPU memory
-                del latents, text_embeddings, text_embeddings_2, pooled_text_embeddings_2
-                torch.cuda.empty_cache()
 
             # Update progress
             progress_bar.update(1)
@@ -627,22 +735,5 @@ def main(args):
     tokenizer_2.save_pretrained(output_dir / "tokenizer_2")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", type=str, required=True)
-    parser.add_argument("--learning_rate", type=float, default=1e-6)
-    parser.add_argument("--num_epochs", type=int, default=1)
-    parser.add_argument("--num_inference_steps", type=int, default=28)
-    parser.add_argument("--data_dir", type=str, required=True)
-    parser.add_argument("--cache_dir", type=str, default="latents_cache")
-    parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Max gradient norm for clipping")
-    parser.add_argument("--ema_decay", type=float, default=0.9999, help="EMA decay rate")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Number of steps to accumulate gradients")
-    parser.add_argument("--batch_size", type=int, default=4, help="Training batch size per GPU")
-    parser.add_argument("--finetune_vae", action="store_true", help="Enable VAE finetuning")
-    parser.add_argument("--vae_learning_rate", type=float, default=1e-6, help="VAE learning rate")
-    parser.add_argument("--vae_train_freq", type=int, default=10, help="VAE training frequency")
-    parser.add_argument("--output_dir", type=str, default="./output", help="Output directory")
-    parser.add_argument("--use_adafactor", action="store_true", help="Use Adafactor instead of AdamW8bit")
-
-    args = parser.parse_args()
+    args = parse_args()
     main(args)
