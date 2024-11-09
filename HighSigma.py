@@ -406,19 +406,79 @@ class DInitial(nn.Module):
             x = block(x)
         return self.to_rgb(x)
 
+class SelfAttention(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.channels = channels
+        self.mha = nn.MultiheadAttention(channels, 8, batch_first=True)
+        self.ln = nn.LayerNorm([channels])
+        self.ff_self = nn.Sequential(
+            nn.LayerNorm([channels]),
+            nn.Linear(channels, channels),
+            nn.GELU(),
+            nn.Linear(channels, channels),
+        )
+
+    def forward(self, x):
+        size = x.shape[-2:]
+        x = x.view(x.shape[0], self.channels, -1).swapaxes(1, 2)
+        x_ln = self.ln(x)
+        attention_value, _ = self.mha(x_ln, x_ln, x_ln)
+        attention_value = attention_value + x
+        attention_value = self.ff_self(attention_value) + attention_value
+        return attention_value.swapaxes(2, 1).view(x.shape[0], self.channels, *size)
+
 class DRefine(nn.Module):
     """U-Net based diffusion refinement decoder"""
     def __init__(self):
         super().__init__()
-        # U-Net architecture from paper:
-        # - 4 downsampling stages
-        # - Attention at 16x16 resolution
-        # - Channel multipliers: [1, 2, 4, 8]
-        # - num_res_blocks = [2, 4, 8, 8]
+        # Architecture specs from paper section 3.5:
+        channel_multiplier = [1, 2, 4, 8]
+        num_res_blocks = [2, 4, 8, 8] 
+        downsampling_factor = [1, 2, 2, 2]
+        attn_resolution = 16
+        curr_resolution = 256  # Starting resolution
+        
+        # Downsampling path
+        self.down_blocks = nn.ModuleList()
+        in_channels = 3  # Input image channels
+        
+        for i in range(4):  # 4 downsampling stages
+            out_channels = in_channels * channel_multiplier[i]
+            
+            # Add ResNet blocks
+            blocks = []
+            for _ in range(num_res_blocks[i]):
+                blocks.append(ResNetBlock(in_channels, out_channels))
+            
+            # Add downsampling if needed
+            if downsampling_factor[i] > 1:
+                blocks.append(nn.Conv2d(out_channels, out_channels, 
+                                      kernel_size=3, stride=2, padding=1))
+                curr_resolution = curr_resolution // 2
+                
+            # Add attention when we reach specified resolution
+            if curr_resolution == attn_resolution:
+                blocks.append(SelfAttention(out_channels))
+                
+            self.down_blocks.append(nn.Sequential(*blocks))
+            in_channels = out_channels
         
     def forward(self, x, timestep, context=None):
-        # Refinement pass
-        return x
+        # Store skip connections
+        skips = []
+        
+        # Downsampling path
+        for block in self.down_blocks:
+            x = block(x)
+            skips.append(x)
+            
+        # Upsampling path with skip connections
+        for block, skip in zip(self.up_blocks, reversed(skips[:-1])):
+            x = torch.cat([x, skip], dim=1)  # Add skip connection
+            x = block(x)
+            
+        return self.final_conv(x)
 
 class TwoStageVAE(nn.Module):
     def __init__(self, initial_vae, refine_unet, initial_decoder):
