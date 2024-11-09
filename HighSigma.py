@@ -63,122 +63,186 @@ def compute_snr(sigma):
 
 
 def training_loss(model, x_0, sigma, text_embeddings, text_embeddings_2, pooled_text_embeds_2, timestep, target_size):
-    #print("\n=== Starting training_loss ===")
-    #print(f"Initial shapes:")
-    #print(f"x_0: {x_0.shape}")
-    #print(f"text_embeddings: {text_embeddings.shape}")
-    #print(f"text_embeddings_2: {text_embeddings_2.shape}")
-    #print(f"pooled_text_embeds_2: {pooled_text_embeds_2.shape}")
-    #print(f"target_size: {target_size}")
-    #print(f"sigma: {sigma.shape}")
-    #print(f"timestep: {timestep.shape}")
+    """Compute training loss with detailed error tracking"""
+    try:
+        #print("\n=== Starting training_loss ===")
+        #print(f"Initial shapes:")
+        #print(f"x_0: {x_0.shape}")
+        #print(f"text_embeddings: {text_embeddings.shape}")
+        #print(f"text_embeddings_2: {text_embeddings_2.shape}")
+        #print(f"pooled_text_embeds_2: {pooled_text_embeds_2.shape}")
+        #print(f"target_size: {target_size}")
+        #print(f"sigma: {sigma.shape}")
+        #print(f"timestep: {timestep.shape}")
 
-    # Remove extra dimensions to get to [B, 4, H, W]
-    while x_0.dim() > 4:
-        x_0 = x_0.squeeze(1)
-    #print(f"x_0 after squeeze: {x_0.shape}")
+        # Remove extra dimensions to get to [B, 4, H, W]
+        while x_0.dim() > 4:
+            x_0 = x_0.squeeze(1)
+        #print(f"x_0 after squeeze: {x_0.shape}")
 
-    batch_size = x_0.shape[0]
-    #print(f"batch_size: {batch_size}")
+        batch_size = x_0.shape[0]
+        #print(f"batch_size: {batch_size}")
 
-    # Fix tensor shapes
-    # Remove extra dimension from pooled_text_embeds_2
-    # Handle only the specific error case where dim=1 doesn't exist
-    if pooled_text_embeds_2.dim() == 1:  # Handle 1D case
-        pooled_text_embeds_2 = pooled_text_embeds_2.unsqueeze(0)  # Add batch dimension
-    
-    # Safe squeeze operation
-    if pooled_text_embeds_2.dim() > 2:
-        pooled_text_embeds_2 = pooled_text_embeds_2.squeeze()
-        # Ensure we have at least 2 dimensions
-        if pooled_text_embeds_2.dim() == 1:
-            pooled_text_embeds_2 = pooled_text_embeds_2.unsqueeze(0)
-    
-    # Validate final shape
-    assert pooled_text_embeds_2.dim() == 2, f"Expected 2D tensor [B, 1280], got shape {pooled_text_embeds_2.shape}"
-    
-    # Fix text_embeddings shape - need one more squeeze for batch processing
-    text_embeddings = text_embeddings.squeeze(1)  # [B, 77, 768]
-    text_embeddings_2 = text_embeddings_2.squeeze(1)  # [B, 77, 1280]
-    #print(f"text_embeddings after squeeze: {text_embeddings.shape}")
-    #print(f"text_embeddings_2 after squeeze: {text_embeddings_2.shape}")
-    
-    # Create micro-conditioning tensors
-    if isinstance(target_size, list):
-        # Convert list to tuple for hashing
-        target_size = tuple(target_size[0])  # Convert first target size to tuple
+        # Fix tensor shapes
+        # Remove extra dimension from pooled_text_embeds_2
+        # Handle only the specific error case where dim=1 doesn't exist
+        if pooled_text_embeds_2.dim() == 1:  # Handle 1D case
+            pooled_text_embeds_2 = pooled_text_embeds_2.unsqueeze(0)  # Add batch dimension
         
-        time_ids = torch.tensor([
-            target_size[0],  # height
-            target_size[1],  # width
-            target_size[0],  # target height
-            target_size[1],  # target width
-            0,  # crop top
-            0,  # crop left
-        ], device=x_0.device, dtype=torch.float32)
+        # Safe squeeze operation
+        if pooled_text_embeds_2.dim() > 2:
+            pooled_text_embeds_2 = pooled_text_embeds_2.squeeze()
+            # Ensure we have at least 2 dimensions
+            if pooled_text_embeds_2.dim() == 1:
+                pooled_text_embeds_2 = pooled_text_embeds_2.unsqueeze(0)
         
-        # Repeat for batch size
-        time_ids = time_ids.unsqueeze(0).repeat(batch_size, 1)  # [B, 6]
-    else:
-        # Handle single target_size case
-        target_size = tuple(target_size)  # Convert to tuple for consistency
+        # Validate final shape
+        assert pooled_text_embeds_2.dim() == 2, f"Expected 2D tensor [B, 1280], got shape {pooled_text_embeds_2.shape}"
         
-        time_ids = torch.tensor([
-            target_size[0],
-            target_size[1],
-            target_size[0],
-            target_size[1],
-            0,
-            0,
-        ], device=x_0.device, dtype=torch.float32)
+        # Fix text_embeddings shape - need one more squeeze for batch processing
+        text_embeddings = text_embeddings.squeeze(1)  # [B, 77, 768]
+        text_embeddings_2 = text_embeddings_2.squeeze(1)  # [B, 77, 1280]
+        #print(f"text_embeddings after squeeze: {text_embeddings.shape}")
+        #print(f"text_embeddings_2 after squeeze: {text_embeddings_2.shape}")
         
-        time_ids = time_ids.unsqueeze(0).repeat(batch_size, 1)  # [B, 6]
-    
-    #print(f"time_ids final shape: {time_ids.shape}")
+        # Create micro-conditioning tensors
+        try:
+            if isinstance(target_size, (list, tuple)):
+                # If target_size is already a sequence, use first two elements
+                height, width = target_size[:2]
+            elif isinstance(target_size, torch.Tensor):
+                # If target_size is a tensor, extract height and width
+                if target_size.dim() == 1:
+                    height, width = target_size[0].item(), target_size[1].item()
+                else:
+                    height = width = target_size.item()
+            else:
+                # If target_size is a single number, use it for both dimensions
+                height = width = target_size
+                
+            logger.debug(f"Extracted dimensions - height: {height}, width: {width}")
+            
+            time_ids = torch.tensor([
+                height,  # height
+                width,   # width
+                height,  # target height
+                width,   # target width
+                0,      # crop top
+                0,      # crop left
+            ], device=x_0.device, dtype=torch.float32)
+            
+            # Repeat for batch size
+            time_ids = time_ids.unsqueeze(0).repeat(batch_size, 1)  # [B, 6]
+            
+        except Exception as e:
+            logger.error(f"Error in target_size processing: {str(e)}")
+            logger.error(f"target_size type: {type(target_size)}")
+            logger.error(f"target_size value: {target_size}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            raise
+        
+        #print(f"time_ids final shape: {time_ids.shape}")
 
-    # Prepare SDXL conditioning kwargs
-    added_cond_kwargs = {
-        "text_embeds": pooled_text_embeds_2,  # [B, 1280]
-        "time_ids": time_ids  # [B, 6]
-    }
+        # Prepare SDXL conditioning kwargs
+        added_cond_kwargs = {
+            "text_embeds": pooled_text_embeds_2,  # [B, 1280]
+            "time_ids": time_ids  # [B, 6]
+        }
 
-    # Combine text embeddings
-    combined_text_embeddings = torch.cat([text_embeddings, text_embeddings_2], dim=-1)  # [B, 77, 2048]
-    #print(f"combined_text_embeddings shape: {combined_text_embeddings.shape}")
+        # Combine text embeddings
+        try:
+            combined_text_embeddings = torch.cat([text_embeddings, text_embeddings_2], dim=-1)  # [B, 77, 2048]
+            #print(f"combined_text_embeddings shape: {combined_text_embeddings.shape}")
+        except Exception as e:
+            logger.error("Error combining text embeddings")
+            logger.error(f"text_embeddings shape: {text_embeddings.shape}")
+            logger.error(f"text_embeddings_2 shape: {text_embeddings_2.shape}")
+            logger.error(f"Error: {str(e)}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            raise
 
-    # Generate noise and add to input
-    noise = torch.randn_like(x_0)  # [B, 4, H/8, W/8]
-    sigma = sigma.view(-1, 1, 1, 1)  # [B, 1, 1, 1]
-    x_t = x_0 + sigma * noise  # [B, 4, H/8, W/8]
-    #print(f"noise shape: {noise.shape}")
-    #print(f"sigma shape after view: {sigma.shape}")
-    #print(f"x_t shape: {x_t.shape}")
+        # Generate noise and add to input
+        try:
+            noise = torch.randn_like(x_0)  # [B, 4, H/8, W/8]
+            sigma = sigma.view(-1, 1, 1, 1)  # [B, 1, 1, 1]
+            x_t = x_0 + sigma * noise  # [B, 4, H/8, W/8]
+            #print(f"noise shape: {noise.shape}")
+            #print(f"sigma shape after view: {sigma.shape}")
+            #print(f"x_t shape: {x_t.shape}")
+        except Exception as e:
+            logger.error("Error in noise generation and addition")
+            logger.error(f"x_0 shape: {x_0.shape}")
+            logger.error(f"sigma shape: {sigma.shape}")
+            logger.error(f"Error: {str(e)}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            raise
 
-    # V-prediction target
-    v = (x_t - x_0) / (sigma**2 + 1).sqrt()
-    target = v  # [B, 4, H/8, W/8]
-    #print(f"target shape: {target.shape}")
+        # V-prediction target
+        try:
+            v = (x_t - x_0) / (sigma**2 + 1).sqrt()
+            target = v  # [B, 4, H/8, W/8]
+            #print(f"target shape: {target.shape}")
+        except Exception as e:
+            logger.error("Error calculating v-prediction target")
+            logger.error(f"x_t shape: {x_t.shape}")
+            logger.error(f"x_0 shape: {x_0.shape}")
+            logger.error(f"sigma shape: {sigma.shape}")
+            logger.error(f"Error: {str(e)}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            raise
 
-    #print("\nStarting UNet forward pass...")
-    # UNet forward pass
-    model_output = model(
-        sample=x_t,
-        timestep=timestep,
-        encoder_hidden_states=combined_text_embeddings,
-        added_cond_kwargs=added_cond_kwargs
-    ).sample
-    #print(f"model_output shape: {model_output.shape}")
+        #print("\nStarting UNet forward pass...")
+        # UNet forward pass
+        try:
+            model_output = model(
+                sample=x_t,
+                timestep=timestep,
+                encoder_hidden_states=combined_text_embeddings,
+                added_cond_kwargs=added_cond_kwargs
+            ).sample
+            #print(f"model_output shape: {model_output.shape}")
+        except Exception as e:
+            logger.error("Error in UNet forward pass")
+            logger.error(f"x_t shape: {x_t.shape}")
+            logger.error(f"timestep shape: {timestep.shape}")
+            logger.error(f"combined_text_embeddings shape: {combined_text_embeddings.shape}")
+            logger.error(f"added_cond_kwargs: {added_cond_kwargs}")
+            logger.error(f"Error: {str(e)}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            raise
 
-    # MinSNR loss weighting
-    snr = compute_snr(sigma.squeeze())  # [B]
-    gamma = 1.0  # Hyperparameter, can be tuned
-    min_snr_gamma = torch.minimum(snr, torch.full_like(snr, gamma))
-    mse_loss = F.mse_loss(model_output, target, reduction='none')
-    loss = (min_snr_gamma.view(-1, 1, 1, 1) * mse_loss).mean()
-    #print(f"final loss: {loss.item()}")
-    #print("=== Finished training_loss ===\n")
+        # MinSNR loss weighting
+        try:
+            snr = compute_snr(sigma.squeeze())  # [B]
+            gamma = 1.0  # Hyperparameter, can be tuned
+            min_snr_gamma = torch.minimum(snr, torch.full_like(snr, gamma))
+            mse_loss = F.mse_loss(model_output, target, reduction='none')
+            loss = (min_snr_gamma.view(-1, 1, 1, 1) * mse_loss).mean()
+            #print(f"final loss: {loss.item()}")
+        except Exception as e:
+            logger.error("Error in loss calculation")
+            logger.error(f"model_output shape: {model_output.shape}")
+            logger.error(f"target shape: {target.shape}")
+            logger.error(f"sigma shape: {sigma.shape}")
+            logger.error(f"Error: {str(e)}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            raise
 
-    return loss
+        return loss
+
+    except Exception as e:
+        logger.error(f"Training loss calculation failed: {str(e)}")
+        logger.error(f"Full traceback: {traceback.format_exc()}")
+        # Log all input shapes
+        logger.error("Input shapes:")
+        logger.error(f"x_0: {x_0.shape if isinstance(x_0, torch.Tensor) else type(x_0)}")
+        logger.error(f"sigma: {sigma.shape if isinstance(sigma, torch.Tensor) else type(sigma)}")
+        logger.error(f"text_embeddings: {text_embeddings.shape if isinstance(text_embeddings, torch.Tensor) else type(text_embeddings)}")
+        logger.error(f"text_embeddings_2: {text_embeddings_2.shape if isinstance(text_embeddings_2, torch.Tensor) else type(text_embeddings_2)}")
+        logger.error(f"pooled_text_embeds_2: {pooled_text_embeds_2.shape if isinstance(pooled_text_embeds_2, torch.Tensor) else type(pooled_text_embeds_2)}")
+        logger.error(f"timestep: {timestep.shape if isinstance(timestep, torch.Tensor) else type(timestep)}")
+        logger.error(f"target_size: {type(target_size)} - value: {target_size}")
+        raise
 
 
 class TagBasedLossWeighter:
@@ -628,8 +692,12 @@ class VAEFineTuner:
             self.vae = vae
             self.optimizer = AdamW8bit(vae.parameters(), lr=learning_rate)
             
-            # Convert VAE to bfloat16
+            # Convert VAE to bfloat16 and enable memory efficient attention
             self.vae = self.vae.to(dtype=torch.bfloat16)
+            self.vae.enable_xformers_memory_efficient_attention()
+            
+            # Enable gradient checkpointing
+            self.vae.enable_gradient_checkpointing()
             
             # Initialize Welford's online statistics
             self.latent_count = 0
@@ -684,7 +752,7 @@ class VAEFineTuner:
         try:
             self.optimizer.zero_grad()
             
-            # Ensure input data is in bfloat16
+            # Process in smaller chunks if batch size is large
             if original_images is None:
                 if isinstance(latents, dict):
                     original_images = latents["pixel_values"].to(self.vae.device, dtype=torch.bfloat16)
@@ -693,36 +761,56 @@ class VAEFineTuner:
             else:
                 original_images = original_images.to(self.vae.device, dtype=torch.bfloat16)
             
-            logger.debug(f"Input images shape: {original_images.shape}")
+            # Ensure proper shape [B, C, H, W]
+            if original_images.dim() == 3:
+                original_images = original_images.unsqueeze(0)  # Add batch dimension
+            elif original_images.dim() > 4:
+                original_images = original_images.squeeze(1)  # Remove extra dimensions
+                
+            # Validate shape
+            if original_images.dim() != 4:
+                raise ValueError(f"Expected 4D tensor [B,C,H,W], got shape {original_images.shape}")
             
-            # Encode
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                latents = self.vae.encode(original_images).latent_dist.sample()
-                logger.debug(f"Encoded latents shape: {latents.shape}")
+            # Split batch into chunks if needed
+            batch_size = original_images.shape[0]
+            chunk_size = min(batch_size, 2)  # Process max 2 images at once
+            
+            total_loss = 0
+            for i in range(0, batch_size, chunk_size):
+                chunk = original_images[i:i+chunk_size]
                 
-                # Update statistics
-                self.update_statistics(latents.detach())
+                # Clear cache before processing chunk
+                torch.cuda.empty_cache()
                 
-                # Get current statistics
-                means, stds = self.get_statistics()
-                if means is not None and stds is not None:
-                    latents = (latents - means[None,:,None,None]) / stds[None,:,None,None]
-                    decode_latents = latents * stds[None,:,None,None] + means[None,:,None,None]
-                else:
-                    decode_latents = latents
+                with torch.amp.autocast('cuda', dtype=torch.bfloat16):  # Updated autocast syntax
+                    # Encode
+                    latents_chunk = self.vae.encode(chunk).latent_dist.sample()
                     
-                # Decode
-                decoded = self.vae.decode(decode_latents).sample
-                logger.debug(f"Decoded images shape: {decoded.shape}")
+                    # Update statistics for this chunk
+                    self.update_statistics(latents_chunk.detach())
+                    
+                    # Get current statistics
+                    means, stds = self.get_statistics()
+                    if means is not None and stds is not None:
+                        latents_chunk = (latents_chunk - means[None,:,None,None]) / stds[None,:,None,None]
+                        decode_latents = latents_chunk * stds[None,:,None,None] + means[None,:,None,None]
+                    else:
+                        decode_latents = latents_chunk
+                    
+                    # Decode
+                    decoded = self.vae.decode(decode_latents).sample
+                
+                # Calculate loss for this chunk
+                chunk_loss = F.mse_loss(decoded, chunk, reduction="mean")
+                chunk_loss = chunk_loss / (batch_size / chunk_size)  # Scale loss by number of chunks
+                chunk_loss.backward()
+                
+                total_loss += chunk_loss.item() * (batch_size / chunk_size)
             
-            # Calculate loss
-            loss = F.mse_loss(decoded, original_images, reduction="mean")
-            
-            loss.backward()
             self.optimizer.step()
             
             return {
-                "total_loss": loss.item(),
+                "total_loss": total_loss,
                 "latent_means": self.latent_means.detach().cpu() if self.latent_means is not None else None,
                 "latent_stds": stds.detach().cpu() if stds is not None else None
             }
@@ -1140,6 +1228,12 @@ class ModelValidator:
         """
         self.model = model.to(device)
         self.vae = vae.to(device)
+        # Load default SDXL VAE for decoding validation images
+        self.default_vae = AutoencoderKL.from_pretrained(
+            "stabilityai/stable-diffusion-xl-base-1.0", 
+            subfolder="vae",
+            torch_dtype=torch.float32
+        ).to(device)
         self.tokenizer = tokenizer
         self.tokenizer_2 = tokenizer_2
         self.text_encoder = text_encoder.to(device)
@@ -1309,31 +1403,75 @@ class ModelValidator:
         """Save validation images in a format matching paper figures"""
         os.makedirs(output_dir, exist_ok=True)
         
-        # Save ZTSNR comparison (Figure 2)
-        save_image_grid(
-            [results['ztsnr']['ztsnr'], results['ztsnr']['no_ztsnr']],
-            os.path.join(output_dir, 'ztsnr_comparison.png'),
-            nrow=2,
-            normalize=True
-        )
+        def prepare_image(img):
+            """Convert image tensor to proper format for saving"""
+            try:
+                # If the input is latents, decode with default VAE
+                if img.shape[1] == 4:  # Latent space has 4 channels
+                    with torch.no_grad():
+                        img = self.default_vae.decode(img / 0.18215).sample
+                
+                # Convert to float32 if needed
+                if img.dtype == torch.bfloat16:
+                    img = img.to(torch.float32)
+                
+                # Remove batch dimension if present
+                if img.dim() == 4:
+                    img = img.squeeze(0)
+                
+                # Ensure we have a valid image tensor [C, H, W]
+                assert img.dim() == 3, f"Expected 3D tensor after processing, got shape {img.shape}"
+                return img
+                
+            except Exception as e:
+                logger.error(f"Error preparing image: {str(e)}")
+                logger.error(f"Input tensor shape: {img.shape}")
+                logger.error(f"Input tensor dtype: {img.dtype}")
+                logger.error(f"Traceback: {traceback.format_exc()}")
+                raise
         
-        # Save high-res coherence comparison (Figure 6)
-        save_image_grid(
-            [results['coherence']['default_sigma'], 
-             results['coherence']['high_sigma']],
-            os.path.join(output_dir, 'coherence_comparison.png'),
-            nrow=2,
-            normalize=True
-        )
-        
-        # Save denoising steps (Figure 7)
-        for sigma_max, steps in results['denoising'].items():
-            save_image_grid(
-                steps,
-                os.path.join(output_dir, f'denoising_{sigma_max}.png'),
-                nrow=len(steps),
-                normalize=True
-            )
+        try:
+            # Save ZTSNR comparison (Figure 2)
+            if 'ztsnr' in results:
+                ztsnr_results, _ = results['ztsnr']  # Unpack tuple
+                images = [
+                    prepare_image(ztsnr_results['ztsnr']),
+                    prepare_image(ztsnr_results['no_ztsnr'])
+                ]
+                save_image_grid(
+                    images,
+                    os.path.join(output_dir, 'ztsnr_comparison.png'),
+                    nrow=2,
+                    normalize=True
+                )
+            
+            # Save high-res coherence comparison (Figure 6)
+            if 'coherence' in results:
+                coherence_steps = []
+                for steps in results['coherence'].values():
+                    coherence_steps.extend([prepare_image(step) for step in steps])
+                save_image_grid(
+                    coherence_steps,
+                    os.path.join(output_dir, 'coherence_steps.png'),
+                    nrow=len(steps),
+                    normalize=True
+                )
+            
+            # Save individual prompt results
+            for key, image in results.items():
+                if isinstance(image, torch.Tensor):
+                    # Skip non-image results
+                    if not (isinstance(key, str) and key in ['ztsnr', 'coherence']):
+                        save_image_grid(
+                            [prepare_image(image)],
+                            os.path.join(output_dir, f'prompt_{key[:30]}.png'),
+                            normalize=True
+                        )
+                    
+        except Exception as e:
+            logger.error(f"Failed to save validation images: {str(e)}")
+            logger.error(f"Results keys: {results.keys()}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
 
     def generate_with_ztsnr(self, prompt):
         """Generate image with ZTSNR (σ ≈ 20000)"""
@@ -1381,17 +1519,14 @@ class ModelValidator:
                 pooled_prompt_embeds = prompt_embeds_2[0].to(dtype=torch.bfloat16)
                 text_embeds = prompt_embeds_2.pooler_output.to(dtype=torch.bfloat16)
             
-            # Create micro-conditioning tensors
-            height = width = 1024
-            target_size = (height, width)
-            
+            # Create micro-conditioning tensors for 1024x1024 output
             time_ids = torch.tensor([
-                height,  # Original height
-                width,   # Original width
-                height,  # Target height
-                width,   # Target width
-                0,      # Crop top
-                0,      # Crop left
+                1024,  # Original height
+                1024,  # Original width
+                1024,  # Target height
+                1024,  # Target width
+                0,    # Crop top
+                0,    # Crop left
             ], device=self.device, dtype=torch.bfloat16)
             
             time_ids = time_ids.unsqueeze(0)  # Add batch dimension
