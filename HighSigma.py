@@ -79,13 +79,16 @@ def training_loss(model, x_0, sigma, text_embeddings, text_embeddings_2, pooled_
     #print(f"batch_size: {batch_size}")
 
     # Fix tensor shapes
-    # Remove extra dimension from pooled_text_embeds_2
-    pooled_text_embeds_2 = pooled_text_embeds_2.squeeze(1)  # [B, 1280]
+    # Only squeeze if dimension exists
+    if pooled_text_embeds_2.dim() > 2:
+        pooled_text_embeds_2 = pooled_text_embeds_2.squeeze()  # [B, 1280]
     #print(f"pooled_text_embeds_2 after squeeze: {pooled_text_embeds_2.shape}")
     
     # Fix text_embeddings shape - need one more squeeze for batch processing
-    text_embeddings = text_embeddings.squeeze(1)  # [B, 77, 768]
-    text_embeddings_2 = text_embeddings_2.squeeze(1)  # [B, 77, 1280]
+    if text_embeddings.dim() > 3:
+        text_embeddings = text_embeddings.squeeze()  # [B, 77, 768]
+    if text_embeddings_2.dim() > 3:
+        text_embeddings_2 = text_embeddings_2.squeeze()  # [B, 77, 1280]
     #print(f"text_embeddings after squeeze: {text_embeddings.shape}")
     #print(f"text_embeddings_2 after squeeze: {text_embeddings_2.shape}")
     
