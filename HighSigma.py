@@ -522,8 +522,7 @@ def main(args):
     
     unet.enable_xformers_memory_efficient_attention()
     vae.enable_xformers_memory_efficient_attention()
-    text_encoder.enable_xformers_memory_efficient_attention()
-    text_encoder_2.enable_xformers_memory_efficient_attention()
+   
     # Setup EMA
     ema_model = AveragedModel(unet, avg_fn=lambda avg, new, _: args.ema_decay * avg + (1 - args.ema_decay) * new)
 
