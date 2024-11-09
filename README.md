@@ -1,27 +1,21 @@
 # SDXL Training with High Sigma and VAE Finetuning
 
-This repository contains an experimental implementation for training Stable Diffusion XL (SDXL) with high sigma values and optional VAE finetuning. Please note that this is a work in progress and requires further testing and optimization.
-
-## ⚠️ Current Status
-
-This code is currently in an experimental state and needs several improvements:
-
-- Memory management needs optimization
-- Batch processing requires refinement
-- VAE finetuning implementation needs validation
-- Training stability needs improvement
-- Documentation requires expansion
+This repository contains an implementation for training Stable Diffusion XL (SDXL) with high sigma values and optional VAE finetuning, incorporating advanced features like CLIP embeddings and aspect ratio bucketing.
 
 ## Features
 
-Current implementation includes:
-- High sigma training based on improved noise schedules
-- Optional VAE finetuning with perceptual loss
-- Text embedding caching
+- High sigma training with Zero Terminal SNR (ZTSNR) schedule
+- VAE finetuning with perceptual loss
+- CLIP embeddings for enhanced training
+- Efficient caching system for latents and embeddings
 - Mixed precision training (bfloat16)
 - Memory optimizations (xformers, gradient checkpointing)
 - EMA model averaging
-- Aspect ratio bucketing (preliminary implementation)
+- Aspect ratio bucketing
+- Gradient accumulation support
+- Optional model compilation with torch.compile
+- Support for distributed training
+- Adafactor optimizer option
 
 ## Prerequisites
 
@@ -48,63 +42,83 @@ python HighSigma.py \
   --data_dir /path/to/training/data \
   --output_dir ./output \
   --learning_rate 1e-6 \
-  --num_epochs 1
+  --num_epochs 1 \
+  --batch_size 1 \
+  --gradient_accumulation_steps 1
 ```
 
 ### Key Arguments
 
 ```
---model_path          : Path to base SDXL model
---data_dir           : Training data directory
---learning_rate      : Learning rate (default: 1e-6)
---num_epochs         : Number of training epochs
---finetune_vae      : Enable VAE finetuning
---vae_learning_rate : VAE learning rate when finetuning
---use_adafactor     : Use Adafactor optimizer instead of AdamW8bit
+--model_path                    : Path to base SDXL model
+--data_dir                     : Training data directory
+--learning_rate                : Learning rate (default: 1e-6)
+--num_epochs                   : Number of training epochs
+--batch_size                   : Training batch size per GPU
+--gradient_accumulation_steps  : Number of steps for gradient accumulation
+--finetune_vae                : Enable VAE finetuning
+--vae_learning_rate           : VAE learning rate when finetuning
+--use_adafactor               : Use Adafactor optimizer instead of AdamW8bit
+--enable_compile              : Enable torch.compile optimization
+--compile_mode                : Torch compile mode (default/reduce-overhead/max-autotune)
+--save_checkpoints           : Save checkpoints after each epoch
+--cache_dir                  : Directory for caching latents and embeddings
 ```
 
 ## Data Preparation
 
 1. Place training images in your data directory
 2. Create matching .txt files with captions (same filename, .txt extension)
-3. First run will cache latents and embeddings
+3. First run will cache:
+   - VAE latents
+   - Text embeddings (SDXL dual encoders)
+   - CLIP embeddings
+   - Tag embeddings
 
-## Known Issues
+## Advanced Features
 
-1. Memory Usage:
-   - Current implementation may be memory intensive
-   - Batch sizes may need adjustment based on GPU memory
+### Aspect Ratio Bucketing
+The implementation includes automatic aspect ratio bucketing with the following ratios:
+- 1:1 (Square)
+- 4:3 (Landscape)
+- 3:4 (Portrait)
+- 16:9 (Widescreen)
+- 9:16 (Tall)
 
-2. Performance:
-   - Training speed needs optimization
-   - Gradient accumulation might need tuning
+### CLIP Integration
+- Incorporates CLIP embeddings for both images and tags
+- Uses CLIP-ViT-Large-Patch14 model
+- Enhances training with visual-semantic alignment
 
-3. VAE Finetuning:
-   - Experimental feature that needs validation
-   - May require additional memory management
+### Perceptual Loss
+- VGG16-based perceptual loss for VAE finetuning
+- Multiple layer feature matching
+- Configurable loss weights
 
-## TODO
+### Memory Optimization
+- Efficient caching system
+- bfloat16 precision
+- Gradient checkpointing
+- xformers memory efficient attention
+- Optional model compilation
 
-- [X] Optimize memory usage
-- [ ] Improve batch processing
-- [ ] Validate and improve VAE finetuning
-- [ ] Add proper validation steps
-- [ ] Expand documentation
-- [ ] Add training monitoring
-- [ ] Implement proper error handling
+## Training Monitoring
+
+The training progress includes:
+- Loss values
+- Learning rate
+- VAE loss (when enabled)
+- Progress bar with epoch tracking
+- Checkpoint saving (optional)
 
 ## Contributing
 
-Given the experimental nature of this code, contributions and improvements are welcome. Please open issues or pull requests for any enhancements.
-
-## Acknowledgments
-
-This implementation is based on the research presented in **"Improvements to SDXL in NovelAI Diffusion V3"** by Juan Ossa, Eren Doğan, Alex Birch, and F. Johnson ([arXiv:2409.15997](https://arxiv.org/pdf/2409.15997)). The high sigma training approach and various optimizations are derived from their findings.
+Contributions are welcome! Please feel free to submit issues or pull requests for improvements.
 
 ## License
 
 Apache 2.0
 
-## Disclaimer
+## Acknowledgments
 
-This is experimental code that needs further development and testing. Use at your own risk and expect potential issues that will need addressing.
+This implementation is based on the research presented in **"Improvements to SDXL in NovelAI Diffusion V3"** by Juan Ossa, Eren Doğan, Alex Birch, and F. Johnson ([arXiv:2409.15997](https://arxiv.org/pdf/2409.15997)). The high sigma training approach and various optimizations are derived from their findings.
