@@ -73,10 +73,10 @@ def training_loss(model, x_0, sigma, text_embeddings, text_embeddings_2, pooled_
     # Remove extra dimensions to get to [B, 4, H, W]
     while x_0.dim() > 4:
         x_0 = x_0.squeeze(1)
-    print(f"x_0 after squeeze: {x_0.shape}")
+    #print(f"x_0 after squeeze: {x_0.shape}")
 
     batch_size = x_0.shape[0]
-    print(f"batch_size: {batch_size}")
+    #print(f"batch_size: {batch_size}")
 
     # Fix tensor shapes
     # Remove extra dimension from pooled_text_embeds_2
@@ -172,11 +172,11 @@ def training_loss(model, x_0, sigma, text_embeddings, text_embeddings_2, pooled_
 
 class CustomDataset(Dataset):
     def __init__(self, data_dir, vae, tokenizer, tokenizer_2, text_encoder, text_encoder_2,
-                 cache_dir="latents_cache"):
+                 cache_dir="latents_cache", batch_size=1):
         self.data_dir = Path(data_dir)
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(exist_ok=True)
-        self.batch_size = 1
+        self.batch_size = batch_size 
 
         # Store model references as instance variables
         self.vae = vae
@@ -372,36 +372,45 @@ class CustomDataset(Dataset):
         return len(self.image_paths)
 
     def __getitem__(self, idx):
-        """Get item without adding extra dimensions"""
+        """Get item with separate handling for batch_size=1 and batch_size>1"""
         img_path = self.image_paths[idx]
         latents_path = self.cache_dir / f"{img_path.stem}_latents.pt"
         embeddings_path = self.cache_dir / f"{img_path.stem}_embeddings.pt"
 
         # Load cached data
         latents = torch.load(latents_path, map_location='cpu')  # [1, 4, 128, 128]
-        # Remove the batch dimension from saved latents
-        latents = latents.squeeze(0)  # Now [4, 128, 128]
-        
         embeddings = torch.load(embeddings_path, map_location='cpu')
 
         # Load original image
         image = Image.open(img_path).convert("RGB")
         original_images = self.transform_image(image)  # [3, H, W]
 
-        # Get target size for multi-aspect training
-        target_size = (original_images.shape[1], original_images.shape[2])
-
-        return {
-            "latents": latents,  # [4, 128, 128]
-            "text_embeddings": embeddings["text_embeddings"],
-            "text_embeddings_2": embeddings["text_embeddings_2"],
-            "pooled_text_embeddings_2": embeddings["pooled_text_embeddings_2"],
-            "target_size": target_size,
-            "clip_image_embed": embeddings["clip_image_embed"],
-            "clip_tag_embeds": embeddings["clip_tag_embeds"],
-            "tags": embeddings["tags"],
-            "original_images": original_images  # [3, H, W]
-        }
+        if self.batch_size == 1:
+            # Original single sample processing
+            return {
+                "latents": latents,  # [1, 4, 128, 128]
+                "text_embeddings": embeddings["text_embeddings"],  # [1, 77, 768]
+                "text_embeddings_2": embeddings["text_embeddings_2"],  # [1, 77, 1280]
+                "pooled_text_embeddings_2": embeddings["pooled_text_embeddings_2"],  # [1, 1280]
+                "target_size": (original_images.shape[1], original_images.shape[2]),  # tuple of (H, W)
+                "clip_image_embed": embeddings["clip_image_embed"],
+                "clip_tag_embeds": embeddings["clip_tag_embeds"],
+                "tags": embeddings["tags"],
+                "original_images": original_images  # [3, H, W]
+            }
+        else:
+            # Batch processing
+            return {
+                "latents": latents.squeeze(0),  # [4, 128, 128]
+                "text_embeddings": embeddings["text_embeddings"].squeeze(0),  # [77, 768]
+                "text_embeddings_2": embeddings["text_embeddings_2"].squeeze(0),  # [77, 1280]
+                "pooled_text_embeddings_2": embeddings["pooled_text_embeddings_2"].squeeze(0),  # [1280]
+                "target_size": torch.tensor([original_images.shape[1], original_images.shape[2]], dtype=torch.long),  # [2]
+                "clip_image_embed": embeddings["clip_image_embed"].squeeze(0),
+                "clip_tag_embeds": embeddings["clip_tag_embeds"].squeeze(0),
+                "tags": embeddings["tags"],
+                "original_images": original_images  # [3, H, W]
+            }
 
 class PerceptualLoss:
     def __init__(self):
@@ -437,6 +446,47 @@ class PerceptualLoss:
         for key in pred_features:
             loss += F.mse_loss(pred_features[key], target_features[key])
         return loss
+
+def custom_collate(batch):
+    """
+    Custom collate function for DataLoader that handles both single and batched samples.
+    
+    Args:
+        batch: List of dictionaries containing dataset items
+            For batch_size=1: List with single dictionary
+            For batch_size>1: List of multiple dictionaries
+    
+    Returns:
+        For batch_size=1: Original dictionary without any stacking
+        For batch_size>1: Dictionary with properly stacked tensors and lists
+    """
+    # Get batch size from first item
+    batch_size = len(batch)
+    
+    if batch_size == 1:
+        # For single samples, return the dictionary directly without any stacking
+        return batch[0]
+    else:
+        # For batched samples, we need to stack the tensors properly
+        elem = batch[0]  # Get first item to determine dictionary structure
+        collated = {}
+        
+        for key in elem:
+            if key == "tags":
+                # Tags are lists of strings, so we keep them as a list of lists
+                collated[key] = [d[key] for d in batch]
+            elif key == "target_size":
+                # target_size needs to remain as separate tensors for each batch item
+                collated[key] = [d[key] for d in batch]
+            else:
+                try:
+                    # Try to stack tensors along a new batch dimension
+                    collated[key] = torch.stack([d[key] for d in batch])
+                except:
+                    # If stacking fails, keep as list (for non-tensor data)
+                    collated[key] = [d[key] for d in batch]
+        
+        return collated
 
 class VAEFineTuner:
     def __init__(self, vae, learning_rate=1e-6, perceptual_weight=1.0, l1_weight=1.0, kl_weight=0.1):
@@ -606,6 +656,9 @@ def parse_args():
     parser.add_argument("--save_checkpoints", action="store_true", help="Save checkpoints after each epoch")
     return parser.parse_args()
 
+
+
+    
 def main(args):
     # Set up device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -668,14 +721,16 @@ def main(args):
         tokenizer_2,
         text_encoder,
         text_encoder_2,
-        cache_dir=args.cache_dir
+        cache_dir=args.cache_dir,
+        batch_size=args.batch_size
     )
     train_dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=4,
-        pin_memory=True
+        pin_memory=True,
+        collate_fn=custom_collate
     )
 
     # Setup optimizer
