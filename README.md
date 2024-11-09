@@ -97,6 +97,10 @@ python HighSigma.py \
 
 Given the experimental nature of this code, contributions and improvements are welcome. Please open issues or pull requests for any enhancements.
 
+## Acknowledgments
+
+This implementation is based on the research presented in **"Improvements to SDXL in NovelAI Diffusion V3"** by Juan Ossa, Eren Doğan, Alex Birch, and F. Johnson ([arXiv:2409.15997](https://arxiv.org/pdf/2409.15997)). The high sigma training approach and various optimizations are derived from their findings.
+
 ## License
 
 Apache 2.0
