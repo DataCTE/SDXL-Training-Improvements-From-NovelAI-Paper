@@ -1162,7 +1162,8 @@ class ModelValidator:
             "stabilityai/stable-diffusion-xl-base-1.0", 
             subfolder="vae",
             torch_dtype=torch.bfloat16  # Match model dtype
-        )
+        ).to(device)
+        self.default_vae.eval()  # Ensure VAE is in eval mode
         self.tokenizer = tokenizer
         self.tokenizer_2 = tokenizer_2
         self.text_encoder = text_encoder.to(device)
