@@ -1,21 +1,29 @@
-# SDXL Training with High Sigma and VAE Finetuning
+# SDXL Training with ZTSNR and NovelAI V3 Improvements
 
-This repository contains an implementation for training Stable Diffusion XL (SDXL) with high sigma values and optional VAE finetuning, incorporating advanced features like CLIP embeddings and aspect ratio bucketing.
+This repository implements the improvements described in "Improvements to SDXL in NovelAI Diffusion V3" (arXiv:2409.15997v2), including Zero Terminal SNR (ZTSNR), high-resolution coherence, and VAE improvements.
 
-## Features
+## Key Improvements
 
-- High sigma training with Zero Terminal SNR (ZTSNR) schedule
-- VAE finetuning with perceptual loss
-- CLIP embeddings for enhanced training
-- Efficient caching system for latents and embeddings
-- Mixed precision training (bfloat16)
-- Memory optimizations (xformers, gradient checkpointing)
-- EMA model averaging
-- Aspect ratio bucketing
-- Gradient accumulation support
-- Optional model compilation with torch.compile
-- Support for distributed training
-- Adafactor optimizer option
+1. **Zero Terminal SNR (ZTSNR)**
+   - Implements σ ≈ 20000 as practical approximation of infinity
+   - Enables true black image generation
+   - Prevents mean-color leakage from noise
+
+2. **High-Resolution Coherence**
+   - Enhanced noise schedule for better global coherence
+   - Supports higher resolution generation without artifacts
+   - Progressive noise level visualization
+
+3. **VAE Improvements**
+   - Scale-and-shift normalization
+   - Per-channel statistics
+   - Improved decoder finetuning
+
+4. **Training Optimizations**
+   - Tag-based loss weighting
+   - Aspect ratio bucketing
+   - Mixed precision (bfloat16)
+   - Memory optimizations (xformers)
 
 ## Prerequisites
 
@@ -31,6 +39,7 @@ Pillow
 sentencepiece
 accelerate
 xformers
+wandb
 ```
 
 ## Basic Usage
@@ -44,7 +53,10 @@ python HighSigma.py \
   --learning_rate 1e-6 \
   --num_epochs 1 \
   --batch_size 1 \
-  --gradient_accumulation_steps 1
+  --gradient_accumulation_steps 1 \
+  --use_wandb \
+  --wandb_project "sdxl-training" \
+  --wandb_run_name "high-sigma-training"
 ```
 
 ### Key Arguments
@@ -63,53 +75,39 @@ python HighSigma.py \
 --compile_mode                : Torch compile mode (default/reduce-overhead/max-autotune)
 --save_checkpoints           : Save checkpoints after each epoch
 --cache_dir                  : Directory for caching latents and embeddings
+--use_wandb                   : Enable Weights & Biases logging
+--wandb_project               : W&B project name
+--wandb_run_name              : W&B run name
+--push_to_hub                 : Push model to HuggingFace Hub
+--hub_model_id                : HuggingFace Hub model ID
+--hub_private                 : Make the HuggingFace repo private
 ```
 
-## Data Preparation
+## Validation
 
-1. Place training images in your data directory
-2. Create matching .txt files with captions (same filename, .txt extension)
-3. First run will cache:
-   - VAE latents
-   - Text embeddings (SDXL dual encoders)
-   - CLIP embeddings
-   - Tag embeddings
+The training includes automatic validation of:
+1. ZTSNR effectiveness (black image generation)
+2. High-resolution coherence
+3. Noise schedule visualization
+4. Progressive denoising steps
 
-## Advanced Features
+Results are saved as images and logged to W&B if enabled.
 
-### Aspect Ratio Bucketing
-The implementation includes automatic aspect ratio bucketing with the following ratios:
-- 1:1 (Square)
-- 4:3 (Landscape)
-- 3:4 (Portrait)
-- 16:9 (Widescreen)
-- 9:16 (Tall)
+## Dataset Preparation
 
-### CLIP Integration
-- Incorporates CLIP embeddings for both images and tags
-- Uses CLIP-ViT-Large-Patch14 model
-- Enhances training with visual-semantic alignment
+1. Place training images in data directory
+2. Create matching .txt files with comma-separated tags
+3. Optional: Enable tag-based loss weighting for balanced training
 
-### Perceptual Loss
-- VGG16-based perceptual loss for VAE finetuning
-- Multiple layer feature matching
-- Configurable loss weights
+## Paper Implementation Details
 
-### Memory Optimization
-- Efficient caching system
-- bfloat16 precision
-- Gradient checkpointing
-- xformers memory efficient attention
-- Optional model compilation
+This codebase follows the paper's specifications:
+- σ ≈ 20000 for ZTSNR
+- CFG scale range: 3.5-5.0 (optimal)
+- bfloat16 precision with tf32 optimizations
+- Aspect ratio bucketing for proper framing
+- Tag-based loss weighting for balanced concept learning
 
-## Training Monitoring
-
-The training progress includes:
-- Loss values
-- Learning rate
-- VAE loss (when enabled)
-- Progress bar with epoch tracking
-- Checkpoint saving (optional)
 
 ## Contributing
 
@@ -119,6 +117,16 @@ Contributions are welcome! Please feel free to submit issues or pull requests fo
 
 Apache 2.0
 
-## Acknowledgments
+## Citation
 
-This implementation is based on the research presented in **"Improvements to SDXL in NovelAI Diffusion V3"** by Juan Ossa, Eren Doğan, Alex Birch, and F. Johnson ([arXiv:2409.15997](https://arxiv.org/pdf/2409.15997)). The high sigma training approach and various optimizations are derived from their findings.
+all credit to Juan Ossa, Eren Doğan, Alex Birch, and F. Johnson for the research.
+
+```
+bibtex
+@article{ossa2024improvements,
+title={Improvements to SDXL in NovelAI Diffusion V3},
+author={Ossa, Juan and Doğan, Eren and Birch, Alex and Johnson, F.},
+journal={arXiv preprint arXiv:2409.15997v2},
+year={2024}
+}
+```
