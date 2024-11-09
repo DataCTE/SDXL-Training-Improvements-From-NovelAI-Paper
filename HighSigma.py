@@ -21,6 +21,7 @@ import os
 import wandb
 import json
 import traceback
+from collections import defaultdict
 
 def setup_logging():
     logging.basicConfig(
@@ -162,7 +163,15 @@ def training_loss(model, x_0, sigma, text_embeddings, text_embeddings_2, pooled_
         loss = (min_snr_gamma.view(-1, 1, 1, 1) * mse_loss).mean()
         logger.debug(f"Final loss value: {loss.item()} - dtype: {loss.dtype}")
 
-        return loss
+        # Add detailed loss metrics
+        loss_metrics = {
+            'loss/total': loss.item(),
+            'loss/mse_mean': mse_loss.mean().item(),
+            'loss/snr_mean': snr.mean().item(),
+            'loss/min_snr_gamma_mean': min_snr_gamma.mean().item()
+        }
+        
+        return loss, loss_metrics
 
     except Exception as e:
         logger.error(f"\n=== Error in training_loss ===")
@@ -852,14 +861,13 @@ def main(args):
     try:
         # Initialize wandb if enabled
         if args.use_wandb:
-            import wandb
             wandb.init(
                 project=args.wandb_project,
                 name=args.wandb_run_name,
                 config=vars(args),
                 settings=wandb.Settings(code_dir="."),
             )
-            
+
         # Set up device
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         logger.info(f"Using device: {device}")
@@ -878,6 +886,9 @@ def main(args):
             torch_dtype=torch.bfloat16
         ).to(device)
 
+        # Now we can watch the model after it's initialized
+        if args.use_wandb:
+            wandb.watch(unet, log='all', log_freq=100)
         vae = AutoencoderKL.from_pretrained(
             args.model_path,
             subfolder="vae",
@@ -1018,34 +1029,9 @@ def main(args):
         progress_bar = tqdm(total=total_steps, desc="Training", dynamic_ncols=True)
 
         for epoch in range(args.num_epochs):
-            logger.info(f"Starting epoch {epoch+1}/{args.num_epochs}")
-
-            # Run validation if enabled
-            if not args.skip_validation and hasattr(args, 'validation_frequency') and \
-               epoch % args.validation_frequency == 0:
-                try:
-                    logger.info(f"\nRunning validation for epoch {epoch+1}")
-                    test_prompts = [
-                        "a detailed portrait of a girl",
-                        "completely black",
-                        "a red ball on top of a blue cube, both infront of a green triangle"
-                    ]
-                    
-                    validation_results = validator.run_paper_validation(test_prompts)
-                    
-                    # Save validation images
-                    validation_dir = Path(args.output_dir) / "validation_results" / f"epoch_{epoch+1}"
-                    validator.save_validation_images(validation_results, validation_dir)
-                    
-                    if args.use_wandb:
-                        wandb.log({
-                            'ztsnr/black_generation_brightness': validation_results['ztsnr'][1]['ztsnr_mean_brightness'],
-                            'epoch': epoch + 1
-                        })
-                except Exception as val_error:
-                    logger.error(f"Validation failed: {val_error}")
-                    logger.info("Continuing training despite validation error")
-
+            epoch_loss = 0
+            epoch_metrics = defaultdict(float)
+            
             for step, batch in enumerate(train_dataloader):
                 # Convert inputs to correct dtype (bfloat16)
                 latents = batch["latents"].to(device).to(dtype=torch.bfloat16)
@@ -1062,7 +1048,7 @@ def main(args):
 
                     timestep = torch.ones(latents.shape[0], device=device).long() * (step % args.num_inference_steps)
 
-                    loss = training_loss(
+                    loss, loss_metrics = training_loss(
                         unet,
                         latents,
                         sigma,
@@ -1071,12 +1057,19 @@ def main(args):
                         pooled_text_embeddings_2,
                         timestep,
                         target_size
-                    ) / args.gradient_accumulation_steps
+                    )
+                    
+                    # Scale loss for gradient accumulation
+                    loss = loss / args.gradient_accumulation_steps
 
                 # Apply tag-based weighting
-                loss = tag_weighter.update_training_loss(loss, batch["tags"])
+                weighted_loss = tag_weighter.update_training_loss(loss, batch["tags"])
+                weighted_loss.backward()
 
-                loss.backward()
+                # Update metrics
+                epoch_loss += weighted_loss.item()
+                for metric_name, metric_value in loss_metrics.items():
+                    epoch_metrics[metric_name] += metric_value
 
                 if (step + 1) % args.gradient_accumulation_steps == 0:
                     torch.nn.utils.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
@@ -1100,46 +1093,22 @@ def main(args):
                     **({"vae_loss": f"{vae_losses['total_loss']:.4f}"} if args.finetune_vae and step % args.vae_train_freq == 0 else {})
                 })
 
+            # Log epoch-level metrics
+            if args.use_wandb:
+                wandb.log({
+                    'epoch/average_loss': epoch_loss / len(train_dataloader),
+                    'epoch/current_epoch': epoch + 1,
+                    **{f'epoch/{k}': v / len(train_dataloader) for k, v in epoch_metrics.items()}
+                })
+
     except Exception as e:
         logger.error(f"Error during training: {str(e)}")
         logger.error(f"Traceback: {traceback.format_exc()}")
-        
+        if args.use_wandb:
+            wandb.finish(exit_code=1)
     finally:
-        try:
-            # Save model
-            if args.push_to_hub:
-                logger.info("Pushing model to hub...")
-                unet.push_to_hub(
-                    args.hub_model_id,
-                    private=args.hub_private,
-                    commit_message=f"Epoch {args.num_epochs}"
-                )
-            
-            # Local save
-            logger.info("Saving model locally...")
-            save_path = os.path.join(args.output_dir, "final_model")
-            unet.save_pretrained(save_path)
-            
-            # Save config with proper serialization
-            save_training_config(
-                args=args,
-                output_dir=args.output_dir,
-                total_steps=total_steps,
-                final_loss=loss.item() if 'loss' in locals() else None
-            )
-            
-        except Exception as save_error:
-            logger.error(f"Error during model saving: {save_error}")
-            # Emergency save
-            try:
-                emergency_path = os.path.join(args.output_dir, "emergency_save")
-                torch.save(unet.state_dict(), os.path.join(emergency_path, "unet.pt"))
-                logger.info(f"Emergency save successful at: {emergency_path}")
-            except:
-                logger.error("Emergency save failed")
-
-    if args.use_wandb:
-        wandb.finish()
+        if args.use_wandb:
+            wandb.finish()
 
 def save_image_grid(images, path, nrow=1, normalize=True):
     """Save a list of images as a grid"""
