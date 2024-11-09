@@ -13,7 +13,7 @@ from bitsandbytes.optim import AdamW8bit
 from torch.optim.swa_utils import AveragedModel
 from tqdm.auto import tqdm
 import torch.nn.functional as F
-from torch.cuda.amp import autocast, GradScaler
+from torch.cuda.amp import GradScaler
 import torch.distributed as dist
 from transformers.optimization import Adafactor
 import torchvision.models as models
@@ -32,6 +32,10 @@ def setup_logging():
     return logger
 
 
+# Global bfloat16 settings
+torch.set_float32_matmul_precision('high')
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 torch.backends.cuda.enable_flash_sdp(True)
 torch.backends.cuda.enable_math_sdp(True)
 torch.backends.cuda.enable_mem_efficient_sdp(True)
@@ -166,7 +170,7 @@ class Dataset(Dataset):
         self.clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
 
         # Add this line after initializing all the models and paths
-        self._cache_latents_and_embeddings()  # Cache latents before using them
+        self._cache_latents_and_embeddings_optimized()  # Cache latents before using them
 
     def _build_tag_list(self):
         """Build a list of all unique tags from captions"""
@@ -198,14 +202,17 @@ class Dataset(Dataset):
             
             return image_features, text_features
 
-    def _cache_latents_and_embeddings(self):
+    def _cache_latents_and_embeddings_optimized(self):
+        """Optimized version of caching that uses bfloat16"""
         self.vae.eval()
         self.vae.to("cuda")
         self.text_encoder.eval()
         self.text_encoder.to("cuda")
         self.text_encoder_2.eval()
         self.text_encoder_2.to("cuda")
-
+        self.clip_model.eval()  
+        self.clip_model.to("cuda")
+          
         # Add progress bar
         print("Caching latents and embeddings...")
         for img_path, caption_path in tqdm(zip(self.image_paths, self.caption_paths), 
@@ -268,11 +275,15 @@ class Dataset(Dataset):
                     }, cache_embeddings_path)
                     
                     torch.save(latents.cpu(), cache_latents_path)
-
-        # Move models back to CPU
-        self.vae.to("cpu")
-        self.text_encoder.to("cpu")
-        self.text_encoder_2.to("cpu")
+                    
+                    # Clear memory
+                    del image_tensor, latents, text_embeddings, text_embeddings_2, pooled_text_embeddings_2
+                    torch.cuda.empty_cache()
+                    
+                    # Move models back to CPU
+                    self.vae.to("cpu")
+                    self.text_encoder.to("cpu")
+                    self.text_encoder_2.to("cpu")
 
     def __len__(self):
         return len(self.image_paths)
@@ -351,25 +362,16 @@ class PerceptualLoss:
 
 
 class VAEFineTuner:
-    """Enhanced VAE decoder finetuning with perceptual loss and 16-channel support"""
     def __init__(self, vae, learning_rate=1e-6):
         self.vae = vae
-        
-        
         self.perceptual_loss = PerceptualLoss()
         
-        # Using AdamW8bit for both encoder and decoder
-        self.decoder_optimizer = AdamW8bit(
-            self.vae.decoder.parameters(),
-            lr=learning_rate,
-            betas=(0.9, 0.999),
-            weight_decay=1e-2,
-            eps=1e-8
-        )
-        
-        self.encoder_optimizer = AdamW8bit(
-            self.vae.encoder.parameters(),
-            lr=learning_rate * 0.5,
+        # Use a single optimizer for both encoder and decoder
+        self.optimizer = AdamW8bit(
+            [
+                {'params': self.vae.decoder.parameters(), 'lr': learning_rate},
+                {'params': self.vae.encoder.parameters(), 'lr': learning_rate * 0.5}
+            ],
             betas=(0.9, 0.999),
             weight_decay=1e-2,
             eps=1e-8
@@ -383,74 +385,51 @@ class VAEFineTuner:
         self.kl_weight = 0.0001
 
     @torch.cuda.amp.autocast()
-    def compute_losses(self, original_images, latents):
-        # Reconstruction through decoder
-        decoded_images = self.vae.decode(latents).sample
-        
-        # Perceptual loss
-        p_loss = self.perceptual_loss(decoded_images, original_images)
-        
-        # L1 loss for pixel-level reconstruction
-        l1_loss = F.l1_loss(decoded_images, original_images)
-        
-        # Optional: KL divergence loss if training encoder
-        if self.vae.training:
-            posterior = self.vae.encode(original_images).latent_dist
-            kl_loss = torch.mean(-0.5 * torch.sum(1 + posterior.variance.log() - posterior.mean.pow(2) - posterior.variance, dim=1))
-        else:
-            kl_loss = torch.tensor(0.0, device=original_images.device)
-        
-        return {
-            'perceptual': p_loss,
-            'l1': l1_loss,
-            'kl': kl_loss
-        }
-
     def training_step(self, latents, original_images):
-        # Move inputs to device if needed
-        original_images = original_images.to(latents.device)
+        # Ensure inputs are on correct device and shape
+        original_images = original_images.to(latents.device, memory_format=torch.channels_last)
+        latents = latents.squeeze().unsqueeze(0) if len(latents.squeeze().shape) == 3 else latents
         
-        # Fix latents shape - remove extra dimensions
-        latents = latents.squeeze()  # Remove any extra dimensions
-        if len(latents.shape) == 3:  # If [C, H, W]
-            latents = latents.unsqueeze(0)  # Make it [B, C, H, W]
-        
-        # Forward pass with mixed precision
+        # Forward pass with memory optimization
         with torch.cuda.amp.autocast():
-            losses = self.compute_losses(original_images, latents)
+            # Decode latents
+            decoded_images = self.vae.decode(latents).sample
             
-            # Combine losses with weights
-            total_loss = (
-                self.perceptual_weight * losses['perceptual'] +
-                self.l1_weight * losses['l1'] +
-                self.kl_weight * losses['kl']
-            )
+            # Calculate losses
+            p_loss = self.perceptual_loss(decoded_images, original_images)
+            l1_loss = F.l1_loss(decoded_images, original_images)
+            
+            # Optional KL loss
+            kl_loss = torch.tensor(0.0, device=latents.device)
+            if self.vae.training:
+                posterior = self.vae.encode(original_images).latent_dist
+                kl_loss = torch.mean(-0.5 * torch.sum(1 + posterior.variance.log() - 
+                                   posterior.mean.pow(2) - posterior.variance, dim=1))
+            
+            # Combine losses
+            total_loss = (self.perceptual_weight * p_loss + 
+                         self.l1_weight * l1_loss + 
+                         self.kl_weight * kl_loss)
 
-        # Backward pass with gradient scaling
+        # Backward pass
         self.scaler.scale(total_loss).backward()
+        
+        # Clear memory
+        del decoded_images
+        torch.cuda.empty_cache()
         
         return {
             'total_loss': total_loss.item(),
-            'perceptual_loss': losses['perceptual'].item(),
-            'l1_loss': losses['l1'].item(),
-            'kl_loss': losses['kl'].item()
+            'perceptual_loss': p_loss.item(),
+            'l1_loss': l1_loss.item(),
+            'kl_loss': kl_loss.item()
         }
 
     def optimizer_step(self):
-        # Clip gradients
         torch.nn.utils.clip_grad_norm_(self.vae.parameters(), max_norm=1.0)
-        
-        # Step optimizers with gradient scaling
-        self.scaler.step(self.decoder_optimizer)
-        if self.vae.training:
-            self.scaler.step(self.encoder_optimizer)
-        
+        self.scaler.step(self.optimizer)
         self.scaler.update()
-        
-        # Zero gradients
-        self.decoder_optimizer.zero_grad()
-        if self.vae.training:
-            self.encoder_optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
 
 def setup_distributed():
     """Setup distributed training"""
@@ -461,19 +440,19 @@ def setup_distributed():
 def main(args):
     logger = setup_logging()
     
-    dtype = torch.bfloat16
     
-    # Load models with appropriate dtype
+    
+    # Load models with bfloat16
     unet = UNet2DConditionModel.from_pretrained(
         args.model_path,
         subfolder="unet",
-        torch_dtype=dtype
+        torch_dtype=torch.bfloat16
     ).to("cuda")
     
     vae = AutoencoderKL.from_pretrained(
         args.model_path,
         subfolder="vae",
-        torch_dtype=dtype
+        torch_dtype=torch.bfloat16
     )
     tokenizer = CLIPTokenizer.from_pretrained(
         args.model_path,
@@ -486,12 +465,12 @@ def main(args):
     text_encoder = CLIPTextModel.from_pretrained(
         args.model_path,
         subfolder="text_encoder",
-        torch_dtype=dtype
+        torch_dtype=torch.bfloat16
     )
     text_encoder_2 = CLIPTextModel.from_pretrained(
         args.model_path,
         subfolder="text_encoder_2",
-        torch_dtype=dtype
+        torch_dtype=torch.bfloat16
     )
 
     # Keep other models on CPU
@@ -571,84 +550,67 @@ def main(args):
     # Training loop
     logger.info("Starting training...")
     total_steps = args.num_epochs * len(train_dataloader)
-    progress_bar = tqdm(
-        total=total_steps,
-        desc="Training",
-        dynamic_ncols=True
-    )
+    progress_bar = tqdm(total=total_steps, desc="Training", dynamic_ncols=True)
 
     for epoch in range(args.num_epochs):
         logger.info(f"Starting epoch {epoch+1}/{args.num_epochs}")
         
         for step, batch in enumerate(train_dataloader):
-            # Regular UNet training
-            with autocast(dtype=torch.bfloat16):
-                latents = batch["latents"].to("cuda")
-                text_embeddings = batch["text_embeddings"].to("cuda")
-                text_embeddings_2 = batch["text_embeddings_2"].to("cuda")
-                pooled_text_embeddings_2 = batch["pooled_text_embeddings_2"].to("cuda")
-
-                # Get batch size from latents
-                batch_size = latents.shape[0]
+            # Move batch to GPU efficiently
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                latents = batch["latents"].to("cuda", non_blocking=True)
+                text_embeddings = batch["text_embeddings"].to("cuda", non_blocking=True)
+                text_embeddings_2 = batch["text_embeddings_2"].to("cuda", non_blocking=True)
+                pooled_text_embeddings_2 = batch["pooled_text_embeddings_2"].to("cuda", non_blocking=True)
                 
-                # Get sigmas for this batch
-                sigmas = get_sigmas(num_inference_steps=args.num_inference_steps).to(latents.device)
-                sigma_indices = torch.randint(0, len(sigmas), (batch_size,), device=latents.device)
-                sigma = sigmas[sigma_indices]
+                sigma = get_sigmas(args.num_inference_steps)[step % args.num_inference_steps].to(latents.device)
+                timesteps = torch.ones(latents.shape[0], device=latents.device).long() * (step % args.num_inference_steps)
 
-                # Calculate timesteps from sigma indices
-                timesteps = sigma_indices.float()
-
-                # Calculate loss with improved ZTSNR
+                # Forward pass
                 loss = training_loss(
-                    unet,
-                    latents,
-                    sigma,
-                    text_embeddings,
-                    text_embeddings_2,
-                    pooled_text_embeddings_2,
-                    timesteps
-                )
+                    unet, latents, sigma, text_embeddings, 
+                    text_embeddings_2, pooled_text_embeddings_2, timesteps
+                ) / args.gradient_accumulation_steps
 
-            loss.backward()
+                # Backward pass
+                loss.backward()
 
-            # Gradient clipping and optimization
+            # Optimization step
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 torch.nn.utils.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
                 optimizer.step()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 lr_scheduler.step()
                 ema_model.update_parameters(unet)
 
-                # VAE finetuning step
+                # VAE finetuning
                 if args.finetune_vae and step % args.vae_train_freq == 0:
-                    vae_losses = vae_finetuner.training_step(
-                        batch["latents"].to("cuda"), 
-                        batch["original_images"].to("cuda")
-                    )
-                    
-                    if (step + 1) % args.gradient_accumulation_steps == 0:
-                        vae_finetuner.optimizer_step()
-                    
-                    # Log VAE losses
-                    progress_bar.set_postfix({
-                        **progress_bar.postfix,
-                        "vae_loss": f"{vae_losses['total_loss']:.4f}",
-                        "vae_perceptual": f"{vae_losses['perceptual_loss']:.4f}"
-                    })
+                    with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                        vae_losses = vae_finetuner.training_step(
+                            batch["latents"].to("cuda"), 
+                            batch["original_images"].to("cuda")
+                        )
+                        if (step + 1) % args.gradient_accumulation_steps == 0:
+                            vae_finetuner.optimizer_step()
 
-            # Enhanced logging
+                # Clear GPU memory
+                del latents, text_embeddings, text_embeddings_2, pooled_text_embeddings_2
+                torch.cuda.empty_cache()
+
+            # Update progress
             progress_bar.update(1)
             progress_bar.set_postfix({
                 "epoch": f"{epoch+1}/{args.num_epochs}",
                 "loss": f"{loss.item():.4f}",
                 "lr": f"{lr_scheduler.get_last_lr()[0]:.2e}",
+                **({"vae_loss": f"{vae_losses['total_loss']:.4f}"} if args.finetune_vae and step % args.vae_train_freq == 0 else {})
             })
 
-        # Optional: Save checkpoint at end of each epoch
-        checkpoint_path = output_dir / f"checkpoint-epoch-{epoch+1}"
-        checkpoint_path.mkdir(exist_ok=True, parents=True)
-        unet.save_pretrained(checkpoint_path / "unet")
+        # Save checkpoint
+        if args.save_checkpoints:
+            checkpoint_path = Path(args.output_dir) / f"checkpoint-epoch-{epoch+1}"
+            checkpoint_path.mkdir(exist_ok=True, parents=True)
+            unet.save_pretrained(checkpoint_path / "unet")
 
     # Save models
     logger.info("Saving models...")
