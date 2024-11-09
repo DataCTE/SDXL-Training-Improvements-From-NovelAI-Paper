@@ -7,7 +7,7 @@ from torchvision import transforms
 from pathlib import Path
 import logging
 import argparse
-import xformers
+import math
 from PIL import Image
 from bitsandbytes.optim import AdamW8bit
 from torch.optim.swa_utils import AveragedModel
@@ -16,7 +16,6 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from transformers.optimization import Adafactor
 import torchvision.models as models
-from diffusers.models import AutoencoderKL
 import time
 
 
@@ -28,9 +27,8 @@ def setup_logging():
             logging.StreamHandler()
         ]
     )
-logger = logging.getLogger(__name__)   
-    
 
+logger = logging.getLogger(__name__)
 
 # Global bfloat16 settings
 torch.set_float32_matmul_precision('high')
@@ -39,6 +37,7 @@ torch.backends.cudnn.allow_tf32 = True
 torch.backends.cuda.enable_flash_sdp(True)
 torch.backends.cuda.enable_math_sdp(True)
 torch.backends.cuda.enable_mem_efficient_sdp(True)
+
 
 def get_sigmas(num_inference_steps=28, sigma_min=0.0292):
     """
@@ -51,56 +50,52 @@ def get_sigmas(num_inference_steps=28, sigma_min=0.0292):
     """
     rho = 7  # ρ parameter from paper
     t = torch.linspace(0, 1, num_inference_steps)
-    
+
     # Use infinite sigma_max formulation from paper
     sigmas = sigma_min ** (t / rho) * (1 - t)  # Approaches infinity as t->0
-    
+
     return sigmas
 
-def training_loss(model, x_0, sigma, text_embeddings, text_embeddings_2, pooled_text_embeds_2, timestep, target_size=None):
+
+def training_loss(model, x_0, sigma, text_embeddings, text_embeddings_2, pooled_text_embeds_2, timestep, target_size):
     """UNet training loss with v-prediction and Zero Terminal SNR
     Args:
         model: UNet model
         x_0: Input latents [B, 4, H/8, W/8]
         sigma: Noise level [B]
         text_embeddings: First text encoder output [B, 77, 768]
-        text_embeddings_2: Second text encoder output [B, 77, 1280] 
+        text_embeddings_2: Second text encoder output [B, 77, 1280]
         pooled_text_embeds_2: Pooled text embeddings [B, 1280]
         timestep: Timestep values [B]
-        target_size: Optional (H, W) tuple for multi-aspect training
+        target_size: required (H, W) tuple for multi-aspect training
     """
     batch_size = x_0.shape[0]
-    
-    # Get current sample resolution
-    h, w = x_0.shape[2] * 8, x_0.shape[3] * 8  # Convert from latent to pixel space
-    
-    # Use target size if provided (for multi-aspect training), otherwise use current size
-    if target_size is None:
-        target_size = (h, w)
-    
+
     # Create micro-conditioning tensors
     original_size = target_size  # Original size before any crops
     crops_coords_top_left = (0, 0)  # No cropping during inference
-    
-    # Combine into time_ids tensor [B, 6]
+
+    # Ensure all values are integers for time_ids
     time_ids = torch.tensor([
-        original_size[0],  # Original height
-        original_size[1],  # Original width
-        target_size[0],    # Target height 
-        target_size[1],    # Target width
-        crops_coords_top_left[0],  # Top crop coord
-        crops_coords_top_left[1],  # Left crop coord
-    ], device=x_0.device)
+        int(original_size[0]),  # Original height
+        int(original_size[1]),  # Original width
+        int(target_size[0]),    # Target height
+        int(target_size[1]),    # Target width
+        int(crops_coords_top_left[0]),  # Top crop coord
+        int(crops_coords_top_left[1]),  # Left crop coord
+    ], device=x_0.device, dtype=torch.long)  # Use long dtype for indices
+
     time_ids = time_ids.repeat(batch_size, 1)  # [B, 6]
-    
+    time_ids = time_ids.unsqueeze(1)  # [B, 1, 6] to match text embedding dimensions
+
     # Create combined text embeddings for SDXL
     combined_text_embeddings = torch.cat([text_embeddings, text_embeddings_2], dim=-1)  # [B, 77, 2048]
-    
+
     # Generate noise and add to input
     noise = torch.randn_like(x_0)  # [B, 4, H/8, W/8]
     sigma = sigma.view(-1, 1, 1, 1)  # [B, 1, 1, 1]
     x_t = x_0 + sigma * noise  # [B, 4, H/8, W/8]
-    
+
     # V-prediction target
     v = noise / (sigma ** 2 + 1).sqrt()  # [B, 4, H/8, W/8]
     target = v  # [B, 4, H/8, W/8]
@@ -108,7 +103,7 @@ def training_loss(model, x_0, sigma, text_embeddings, text_embeddings_2, pooled_
     # Prepare SDXL conditioning kwargs
     added_cond_kwargs = {
         "text_embeds": pooled_text_embeds_2,  # [B, 1280]
-        "time_ids": time_ids  # [B, 6]
+        "time_ids": time_ids  # [B, 1, 6]
     }
 
     # UNet forward pass
@@ -125,12 +120,13 @@ def training_loss(model, x_0, sigma, text_embeddings, text_embeddings_2, pooled_
     min_snr_gamma = 0.5  # From paper
     snr_weight = (snr.squeeze() / (1 + snr.squeeze())).clamp(max=min_snr_gamma)  # [B]
     loss = (mse * snr_weight.view(-1, 1, 1, 1)).mean()  # scalar
-    
+
     return loss
 
-class Dataset(Dataset):
-    def __init__(self, data_dir, vae, tokenizer, tokenizer_2, text_encoder, text_encoder_2, 
-             cache_dir="latents_cache"):
+
+class CustomDataset(Dataset):
+    def __init__(self, data_dir, vae, tokenizer, tokenizer_2, text_encoder, text_encoder_2,
+                 cache_dir="latents_cache"):
         self.data_dir = Path(data_dir)
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(exist_ok=True)
@@ -168,23 +164,54 @@ class Dataset(Dataset):
             (16, 9): [],   # Widescreen
             (9, 16): [],   # Tall
         }
-        
+
         # Sort images into aspect buckets
         for img_path in self.image_paths:
             with Image.open(img_path) as img:
                 w, h = img.size
                 ratio = w / h
-                bucket = min(self.aspect_buckets.keys(), 
-                           key=lambda x: abs(x[0]/x[1] - ratio))
+                bucket = min(self.aspect_buckets.keys(),
+                             key=lambda x: abs(x[0]/x[1] - ratio))
                 self.aspect_buckets[bucket].append(img_path)
+
+        # Initialize current bucket tracking
+        self.bucket_list = list(self.aspect_buckets.keys())
+        self.current_bucket_idx = 0
+        self.update_current_bucket()
 
         # Add tag processing
         self.tag_list = self._build_tag_list()
-        self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to("cuda")
+        self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14")
         self.clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
 
         # Add this line after initializing all the models and paths
         self._cache_latents_and_embeddings_optimized()  # Cache latents before using them
+
+    def get_target_size_for_bucket(self, ratio):
+        """Calculate target size maintaining aspect ratio and ~1024x1024 total pixels
+        Args:
+            ratio: (width, height) tuple of aspect ratio
+        Returns:
+            (height, width) tuple of target size
+        """
+        # Calculate scale to maintain ~1024x1024 pixels
+        scale = math.sqrt(1024 * 1024 / (ratio[0] * ratio[1]))
+
+        # Calculate dimensions and ensure multiple of 64
+        w = int(round(ratio[0] * scale / 64)) * 64
+        h = int(round(ratio[1] * scale / 64)) * 64
+
+        # Clamp to max dimension of 2048
+        w = min(2048, w)
+        h = min(2048, h)
+
+        return (h, w)
+
+    def update_current_bucket(self):
+        """Update current bucket and associated paths"""
+        self.current_bucket = self.bucket_list[self.current_bucket_idx]
+        self.current_paths = self.aspect_buckets[self.current_bucket]
+        self.current_bucket_idx = (self.current_bucket_idx + 1) % len(self.bucket_list)
 
     def _build_tag_list(self):
         """Build a list of all unique tags from captions"""
@@ -203,43 +230,44 @@ class Dataset(Dataset):
             # Get image embeddings
             inputs = self.clip_processor(images=image, return_tensors="pt").to("cuda")
             image_features = self.clip_model.get_image_features(**inputs)
-            
+
             # Get tag embeddings with explicit max length and truncation
             text_inputs = self.clip_processor(
-                text=tags, 
-                return_tensors="pt", 
+                text=tags,
+                return_tensors="pt",
                 padding=True,
-                max_length=77,  # Add this
-                truncation=True  # Add this
+                max_length=77,
+                truncation=True
             ).to("cuda")
             text_features = self.clip_model.get_text_features(**text_inputs)
-            
+
             return image_features, text_features
 
     def _cache_latents_and_embeddings_optimized(self):
         """Optimized version of caching that uses bfloat16"""
         self.vae.eval()
-        self.vae.to("cuda")
         self.text_encoder.eval()
-        self.text_encoder.to("cuda")
         self.text_encoder_2.eval()
+        self.clip_model.eval()
+
+        self.vae.to("cuda")
+        self.text_encoder.to("cuda")
         self.text_encoder_2.to("cuda")
-        self.clip_model.eval()  
         self.clip_model.to("cuda")
-          
+
         # Add progress bar
         print("Caching latents and embeddings...")
-        for img_path, caption_path in tqdm(zip(self.image_paths, self.caption_paths), 
-                                     total=len(self.image_paths),
-                                     desc="Caching"):
+        for img_path, caption_path in tqdm(zip(self.image_paths, self.caption_paths),
+                                           total=len(self.image_paths),
+                                           desc="Caching"):
             cache_latents_path = self.cache_dir / f"{img_path.stem}_latents.pt"
             cache_embeddings_path = self.cache_dir / f"{img_path.stem}_embeddings.pt"
-            
+
             if not cache_latents_path.exists() or not cache_embeddings_path.exists():
                 print(f"Caching latents and embeddings for {img_path.name}")
                 image = Image.open(img_path).convert("RGB")
                 image_tensor = self.transform(image).unsqueeze(0)
-                
+
                 with torch.no_grad():
                     # Get tags from caption
                     with open(caption_path, 'r', encoding='utf-8') as f:
@@ -248,12 +276,12 @@ class Dataset(Dataset):
 
                     # Get CLIP embeddings
                     clip_image_embed, clip_tag_embeds = self._get_clip_embeddings(image, tags)
-                    
+
                     # Regular processing
                     image_tensor = image_tensor.to("cuda", dtype=torch.bfloat16)
                     latents = self.vae.encode(image_tensor).latent_dist.sample()
                     latents = latents * 0.18215
-                    
+
                     # Process text embeddings
                     text_input = self.tokenizer(
                         caption,
@@ -262,9 +290,9 @@ class Dataset(Dataset):
                         truncation=True,
                         return_tensors="pt"
                     ).to("cuda")
-                    
+
                     text_embeddings = self.text_encoder(text_input.input_ids)[0]
-                    
+
                     # SDXL text encoder 2
                     text_input_2 = self.tokenizer_2(
                         caption,
@@ -273,7 +301,7 @@ class Dataset(Dataset):
                         truncation=True,
                         return_tensors="pt"
                     ).to("cuda")
-                    
+
                     text_encoder_output_2 = self.text_encoder_2(text_input_2.input_ids)
                     text_embeddings_2 = text_encoder_output_2.last_hidden_state
                     pooled_text_embeddings_2 = text_encoder_output_2.pooler_output
@@ -287,53 +315,57 @@ class Dataset(Dataset):
                         "clip_tag_embeds": clip_tag_embeds.cpu(),
                         "tags": tags
                     }, cache_embeddings_path)
-                    
+
                     torch.save(latents.cpu(), cache_latents_path)
-                    
+
                     # Clear memory
                     del image_tensor, latents, text_embeddings, text_embeddings_2, pooled_text_embeddings_2
                     torch.cuda.empty_cache()
-                    
-                    # Move models back to CPU
-                    self.vae.to("cpu")
-                    self.text_encoder.to("cpu")
-                    self.text_encoder_2.to("cpu")
+
+        # Move models back to CPU after the loop
+        self.vae.to("cpu")
+        self.text_encoder.to("cpu")
+        self.text_encoder_2.to("cpu")
+        self.clip_model.to("cpu")
 
     def __len__(self):
         return len(self.image_paths)
 
     def __getitem__(self, idx):
-        latents_path = self.cache_dir / f"{self.image_paths[idx].stem}_latents.pt"
-        embeddings_path = self.cache_dir / f"{self.image_paths[idx].stem}_embeddings.pt"
-        
+        # Get current bucket's target size
+        target_size = self.get_target_size_for_bucket(self.current_bucket)
+
+        # Get actual image path for this index
+        actual_idx = idx % len(self.current_paths)
+        img_path = self.current_paths[actual_idx]
+
+        # Update bucket if we've gone through all images in current bucket
+        if actual_idx == len(self.current_paths) - 1:
+            self.update_current_bucket()
+
         # Load cached data
-        latents = torch.load(latents_path, weights_only=True)
-        embeddings = torch.load(embeddings_path, weights_only=True)
-        
-        # Load and transform original image
-        original_image = Image.open(self.image_paths[idx]).convert("RGB")
-        original_image_tensor = self.transform(original_image)  # [3, H, W]
-        
-        # Calculate latent dimensions and reshape
-        latent_h = original_image_tensor.shape[1] // 8
-        latent_w = original_image_tensor.shape[2] // 8
-        latents = latents.reshape(4, latent_h, latent_w)  # [4, H/8, W/8]
-        
-        # Extract embeddings with guaranteed shapes through reshape operations
-        text_embeddings = embeddings["text_embeddings"].reshape(1, 77, 768)  # [1, 77, 768]
-        text_embeddings_2 = embeddings["text_embeddings_2"].reshape(1, 77, 1280)  # [1, 77, 1280]
-        pooled_text_embeddings_2 = embeddings["pooled_text_embeddings_2"].reshape(1, 1280)  # [1, 1280]
-        
+        latents_path = self.cache_dir / f"{img_path.stem}_latents.pt"
+        embeddings_path = self.cache_dir / f"{img_path.stem}_embeddings.pt"
+
+        latents = torch.load(latents_path)
+        embeddings = torch.load(embeddings_path)
+
+        # Load original image
+        image = Image.open(img_path).convert("RGB")
+        image_tensor = self.transform(image)
+
         return {
-            "latents": latents,  # [4, H/8, W/8]
-            "text_embeddings": text_embeddings,  # [1, 77, 768]
-            "text_embeddings_2": text_embeddings_2,  # [1, 77, 1280]
-            "pooled_text_embeddings_2": pooled_text_embeddings_2,  # [1, 1280]
+            "latents": latents,
+            "text_embeddings": embeddings["text_embeddings"],
+            "text_embeddings_2": embeddings["text_embeddings_2"],
+            "pooled_text_embeddings_2": embeddings["pooled_text_embeddings_2"],
+            "target_size": target_size,
             "clip_image_embed": embeddings["clip_image_embed"],
             "clip_tag_embeds": embeddings["clip_tag_embeds"],
             "tags": embeddings["tags"],
-            "original_images": original_image_tensor  # [3, H, W]
+            "original_images": image_tensor  # Add this line
         }
+
 
 class PerceptualLoss:
     def __init__(self):
@@ -356,7 +388,7 @@ class PerceptualLoss:
     def __call__(self, pred, target):
         pred_features = self.get_features(pred)
         target_features = self.get_features(target)
-        
+
         loss = 0.0
         for key in pred_features:
             loss += F.mse_loss(pred_features[key], target_features[key])
@@ -367,12 +399,12 @@ class VAEFineTuner:
     def __init__(self, vae, learning_rate=1e-6, perceptual_weight=1.0, l1_weight=1.0, kl_weight=0.1):
         self.vae = vae
         self.perceptual_loss = PerceptualLoss()
-        
+
         # Add loss weights as instance variables
         self.perceptual_weight = perceptual_weight
         self.l1_weight = l1_weight
         self.kl_weight = kl_weight
-        
+
         # Use a single optimizer for both encoder and decoder
         self.optimizer = AdamW8bit(
             [
@@ -390,63 +422,44 @@ class VAEFineTuner:
             latents: Input latents [B, 4, H/8, W/8]
             original_images: Original images [B, 3, H, W]
         """
-        # Print shapes for debugging
-        #print(f"Input latents shape: {latents.shape}")  # Should be [B, 4, H/8, W/8]
-        #print(f"Input images shape: {original_images.shape}")  # Should be [B, 3, H, W]
-        
-        # Process in batches for memory efficiency
-        batch_size = 1  # Small batch size for memory efficiency
-        total_batches = len(latents) // batch_size
-        
+        self.vae.train()
         total_loss = 0
-        for i in range(total_batches):
-            # Get current batch
-            start_idx = i * batch_size
-            end_idx = start_idx + batch_size
-            
-            # Get current batch and move to device
-            batch_latents = latents[start_idx:end_idx].to("cuda", dtype=torch.bfloat16)  # [1, 4, H/8, W/8]
-            batch_images = original_images[start_idx:end_idx].to("cuda", dtype=torch.bfloat16)  # [1, 3, H, W]
-            
-            # Decode latents to image space
-            decoded_images = self.vae.decode(batch_latents).sample  # [1, 3, H, W]
-            
-            # Calculate losses (all inputs should be float32 for perceptual loss)
-            p_loss = self.perceptual_loss(decoded_images.float(), batch_images.float())  # scalar
-            l1_loss = F.l1_loss(decoded_images.float(), batch_images.float())  # scalar
-            
-            # Optional KL loss
-            kl_loss = torch.tensor(0.0, device=batch_latents.device)  # scalar
-            if self.vae.training:
-                posterior = self.vae.encode(batch_images).latent_dist  # DiagonalGaussianDistribution
-                kl_loss = torch.mean(-0.5 * torch.sum(1 + posterior.variance.log() - 
-                                posterior.mean.pow(2) - posterior.variance, dim=1))  # scalar
-            
-            # Combine losses (all scalars)
-            batch_loss = (self.perceptual_weight * p_loss + 
-                        self.l1_weight * l1_loss + 
-                        self.kl_weight * kl_loss)  # scalar
-            
-            # Backward pass
-            batch_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.vae.parameters(), max_norm=1.0)
-            self.optimizer.step()
-            
-            total_loss += batch_loss.item()
-            
-            # Clear memory
-            del batch_latents, batch_images, decoded_images
-            torch.cuda.empty_cache()
-        
-        avg_loss = total_loss / total_batches  # scalar
+
+        # Ensure inputs are on the correct device and dtype
+        latents = latents.to("cuda", dtype=torch.bfloat16)
+        original_images = original_images.to("cuda", dtype=torch.bfloat16)
+
+        # Decode latents to image space
+        decoded_images = self.vae.decode(latents).sample  # [B, 3, H, W]
+
+        # Calculate losses (all inputs should be float32 for perceptual loss)
+        p_loss = self.perceptual_loss(decoded_images.float(), original_images.float())  # scalar
+        l1_loss = F.l1_loss(decoded_images.float(), original_images.float())  # scalar
+
+        # Optional KL loss
+        kl_loss = torch.tensor(0.0, device=latents.device)  # scalar
+        with torch.no_grad():
+            posterior = self.vae.encode(original_images).latent_dist  # DiagonalGaussianDistribution
+            kl_loss = torch.mean(-0.5 * torch.sum(1 + posterior.variance.log() -
+                                                  posterior.mean.pow(2) - posterior.variance, dim=1))  # scalar
+
+        # Combine losses (all scalars)
+        total_loss = (self.perceptual_weight * p_loss +
+                      self.l1_weight * l1_loss +
+                      self.kl_weight * kl_loss)  # scalar
+
+        # Backward pass
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.vae.parameters(), max_norm=1.0)
+        self.optimizer.step()
+
         return {
-            'total_loss': avg_loss,  # scalar
+            'total_loss': total_loss.item(),  # scalar
             'perceptual_loss': p_loss.item(),  # scalar
             'l1_loss': l1_loss.item(),  # scalar
             'kl_loss': kl_loss.item()  # scalar
         }
-
-
 
 
 def setup_distributed():
@@ -455,20 +468,21 @@ def setup_distributed():
     torch.cuda.set_device(dist.get_rank())
     return dist.get_rank(), dist.get_world_size()
 
+
 def compile_model(model, name, mode='default', logger=None):
     """Safely compile a model with error handling"""
     if logger is None:
         logger = logging.getLogger(__name__)
-        
+
+    had_xformers = False  # Initialize here
     try:
         logger.info(f"Compiling {name}...")
-        
+
         # Temporarily disable xformers
-        had_xformers = False
         if hasattr(model, 'disable_xformers_memory_efficient_attention'):
             had_xformers = True
             model.disable_xformers_memory_efficient_attention()
-        
+
         # Create appropriate test input based on model type
         dtype = torch.bfloat16  # Match model dtype
         if isinstance(model, AutoencoderKL):
@@ -483,40 +497,41 @@ def compile_model(model, name, mode='default', logger=None):
                 "encoder_hidden_states": torch.randn(1, 77, 2048, dtype=dtype).to(model.device),
                 "added_cond_kwargs": {
                     "text_embeds": torch.randn(1, 1280, dtype=dtype).to(model.device),
-                    "time_ids": torch.zeros(1, 6).to(model.device)
+                    "time_ids": torch.zeros(1, 1, 6).to(model.device)
                 }
             }
-        
+
         # Clear CUDA cache before compilation
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-            
+
         # Compile with reduced batch size for memory efficiency
         compiled_model = torch.compile(
             model,
             mode=mode,
             fullgraph=True
         )
-        
+
         # Test the compiled model
         with torch.amp.autocast('cuda', dtype=dtype):
             _ = compiled_model(**test_batch)
-        
+
         # Re-enable xformers if it was enabled before
         if had_xformers:
             compiled_model.enable_xformers_memory_efficient_attention()
-            
+
         logger.info(f"Successfully compiled {name}")
         return compiled_model
     except Exception as e:
         logger.warning(f"Failed to compile {name}: {str(e)}")
         logger.warning(f"Continuing with uncompiled {name}")
-        
+
         # Re-enable xformers if it was enabled before
         if had_xformers:
             model.enable_xformers_memory_efficient_attention()
-            
+
         return model
+
 
 def training_loop_with_compile_logging(model, batch, logger):
     """Log first forward pass timing with compiled model"""
@@ -524,9 +539,10 @@ def training_loop_with_compile_logging(model, batch, logger):
     output = model(**batch)
     torch.cuda.synchronize()  # Ensure completion
     end_time = time.time()
-    
+
     logger.info(f"First forward pass took {end_time - start_time:.2f} seconds")
     return output
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -546,7 +562,7 @@ def parse_args():
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=4,
+        default=1,  # Reduce default batch size
         help="Training batch size per GPU"
     )
     parser.add_argument(
@@ -562,27 +578,29 @@ def parse_args():
         default='default',
         help="Torch compile mode"
     )
+    parser.add_argument("--save_checkpoints", action="store_true", help="Save checkpoints after each epoch")
     return parser.parse_args()
+
 
 def main(args):
     # Set up device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
-    
+
     # Set up dtype
     dtype = torch.bfloat16
-    
+
     # Clear CUDA cache before training
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    
+
     # Load models with bfloat16
     unet = UNet2DConditionModel.from_pretrained(
         args.model_path,
         subfolder="unet",
         torch_dtype=torch.bfloat16
     ).to(device)
-    
+
     vae = AutoencoderKL.from_pretrained(
         args.model_path,
         subfolder="vae",
@@ -616,7 +634,7 @@ def main(args):
     unet.enable_gradient_checkpointing()
 
     # Setup optimizer with per-device batch size
-    dataset = Dataset(
+    dataset = CustomDataset(
         args.data_dir,
         vae,
         tokenizer,
@@ -653,11 +671,11 @@ def main(args):
             weight_decay=1e-2,
             eps=1e-8
         )
-    
+
     # Enable memory efficient attention only for models that support it
     unet.enable_xformers_memory_efficient_attention()
     vae.enable_xformers_memory_efficient_attention()
-   
+
     # Setup EMA
     ema_model = AveragedModel(unet, avg_fn=lambda avg, new, _: args.ema_decay * avg + (1 - args.ema_decay) * new)
 
@@ -677,7 +695,7 @@ def main(args):
     if args.finetune_vae:
         vae = vae.to("cuda").to(dtype=torch.bfloat16)
         vae_finetuner = VAEFineTuner(
-            vae, 
+            vae,
             learning_rate=args.vae_learning_rate,
             perceptual_weight=1.0,
             l1_weight=1.0,
@@ -687,13 +705,13 @@ def main(args):
     # Move models to device and set dtype
     unet = unet.to(device=device, dtype=dtype)
     vae = vae.to(device=device, dtype=dtype)
-    
+
     # Compile models if requested
     if args.compile_mode:
         unet = compile_model(unet, "UNet", args.compile_mode, logger)
         if args.finetune_vae:
             vae = compile_model(vae, "VAE", args.compile_mode, logger)
-    
+
     # Training loop
     logger.info("Starting training...")
     total_steps = args.num_epochs * len(train_dataloader)
@@ -701,27 +719,28 @@ def main(args):
 
     for epoch in range(args.num_epochs):
         logger.info(f"Starting epoch {epoch+1}/{args.num_epochs}")
-        
+
         for step, batch in enumerate(train_dataloader):
             # Convert inputs to correct dtype
-            latents = batch["latents"].to(device=device, dtype=dtype, non_blocking=True)
-            text_embeddings = batch["text_embeddings"].to(device=device, dtype=dtype, non_blocking=True)
-            text_embeddings_2 = batch["text_embeddings_2"].to(device=device, dtype=dtype, non_blocking=True)
-            pooled_text_embeddings_2 = batch["pooled_text_embeddings_2"].to(device=device, dtype=dtype, non_blocking=True)
-            
+            latents = batch["latents"].to(device)
+            text_embeddings = batch["text_embeddings"].to(device)
+            text_embeddings_2 = batch["text_embeddings_2"].to(device)
+            pooled_text_embeddings_2 = batch["pooled_text_embeddings_2"].to(device)
+            target_size = batch["target_size"]
+
             # Use autocast for mixed precision
             with torch.cuda.amp.autocast(dtype=dtype):
                 sigma = get_sigmas(args.num_inference_steps)[step % args.num_inference_steps].to(latents.device)
                 timestep = torch.ones(latents.shape[0], device=device).long() * (step % args.num_inference_steps)
-                
+
                 loss = training_loss(
-                    unet, latents, sigma, text_embeddings, 
-                    text_embeddings_2, pooled_text_embeddings_2, timestep
+                    unet, latents, sigma, text_embeddings,
+                    text_embeddings_2, pooled_text_embeddings_2, timestep,
+                    target_size
                 ) / args.gradient_accumulation_steps
 
-            # Rest of training loop remains the same
             loss.backward()
-            
+
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 torch.nn.utils.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
                 optimizer.step()
@@ -731,7 +750,7 @@ def main(args):
 
                 if args.finetune_vae and step % args.vae_train_freq == 0:
                     vae_losses = vae_finetuner.training_step(
-                        batch["latents"].to("cuda"), 
+                        batch["latents"].to("cuda"),
                         batch["original_images"].to("cuda")
                     )
 
@@ -754,7 +773,7 @@ def main(args):
     logger.info("Saving models...")
     output_dir = Path(args.output_dir)
     output_dir.mkdir(exist_ok=True, parents=True)
-    
+
     # Save in Diffusers format
     unet.save_pretrained(output_dir / "unet")
     if args.finetune_vae:
@@ -764,6 +783,8 @@ def main(args):
     tokenizer.save_pretrained(output_dir / "tokenizer")
     tokenizer_2.save_pretrained(output_dir / "tokenizer_2")
 
+
 if __name__ == "__main__":
+    setup_logging()
     args = parse_args()
     main(args)
