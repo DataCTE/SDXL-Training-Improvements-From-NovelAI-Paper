@@ -4,8 +4,8 @@ This repository implements the improvements described in "Improvements to SDXL i
 
 ### Weights
 
-- [ ] 10k dataset proof of concept
-- [ ] 200k+ dataset finetune
+- [ ] 10k dataset proof of concept (currently training/ in testing)
+- [ ] 200k+ dataset finetune (coming soon)
 
 ## Key Improvements
 
