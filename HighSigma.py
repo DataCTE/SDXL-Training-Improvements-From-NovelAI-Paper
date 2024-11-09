@@ -39,7 +39,7 @@ torch.backends.cuda.enable_flash_sdp(True)
 torch.backends.cuda.enable_math_sdp(True)
 torch.backends.cuda.enable_mem_efficient_sdp(True)
 
-def get_sigmas(num_inference_steps=28, sigma_min=0.0292, sigma_max=80.0):
+def get_sigmas(num_inference_steps=28, sigma_min=0.0292, sigma_max=20000.0):
     """
     Generate sigmas using a schedule that supports Zero Terminal SNR (ZTSNR)
     Args:
