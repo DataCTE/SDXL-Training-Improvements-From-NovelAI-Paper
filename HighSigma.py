@@ -13,7 +13,6 @@ from bitsandbytes.optim import AdamW8bit
 from torch.optim.swa_utils import AveragedModel
 from tqdm.auto import tqdm
 import torch.nn.functional as F
-import torch.distributed as dist
 from transformers.optimization import Adafactor
 import torchvision.models as models
 from torchvision.utils import make_grid
@@ -63,185 +62,115 @@ def compute_snr(sigma):
 
 
 def training_loss(model, x_0, sigma, text_embeddings, text_embeddings_2, pooled_text_embeds_2, timestep, target_size):
-    """Compute training loss with detailed error tracking"""
+    """Compute training loss with detailed debugging"""
     try:
-        #print("\n=== Starting training_loss ===")
-        #print(f"Initial shapes:")
-        #print(f"x_0: {x_0.shape}")
-        #print(f"text_embeddings: {text_embeddings.shape}")
-        #print(f"text_embeddings_2: {text_embeddings_2.shape}")
-        #print(f"pooled_text_embeds_2: {pooled_text_embeds_2.shape}")
-        #print(f"target_size: {target_size}")
-        #print(f"sigma: {sigma.shape}")
-        #print(f"timestep: {timestep.shape}")
+        logger.debug("\n=== Starting training_loss ===")
+        logger.debug("Initial input shapes:")
+        logger.debug(f"x_0: {x_0.shape} - dtype: {x_0.dtype}")
+        logger.debug(f"sigma: {sigma.shape} - dtype: {sigma.dtype}")
+        logger.debug(f"text_embeddings: {text_embeddings.shape} - dtype: {text_embeddings.dtype}")
+        logger.debug(f"text_embeddings_2: {text_embeddings_2.shape} - dtype: {text_embeddings_2.dtype}")
+        logger.debug(f"pooled_text_embeds_2: {pooled_text_embeds_2.shape} - dtype: {pooled_text_embeds_2.dtype}")
+        logger.debug(f"timestep: {timestep.shape} - dtype: {timestep.dtype}")
+        logger.debug(f"target_size: {type(target_size)} - value: {target_size}")
 
-        # Remove extra dimensions to get to [B, 4, H, W]
-        while x_0.dim() > 4:
-            x_0 = x_0.squeeze(1)
-        #print(f"x_0 after squeeze: {x_0.shape}")
-
+        # Get batch size
         batch_size = x_0.shape[0]
-        #print(f"batch_size: {batch_size}")
+        logger.debug(f"\nBatch size: {batch_size}")
 
-        # Fix tensor shapes
-        # Remove extra dimension from pooled_text_embeds_2
-        # Handle only the specific error case where dim=1 doesn't exist
-        if pooled_text_embeds_2.dim() == 1:  # Handle 1D case
-            pooled_text_embeds_2 = pooled_text_embeds_2.unsqueeze(0)  # Add batch dimension
-        
-        # Safe squeeze operation
-        if pooled_text_embeds_2.dim() > 2:
-            pooled_text_embeds_2 = pooled_text_embeds_2.squeeze()
-            # Ensure we have at least 2 dimensions
-            if pooled_text_embeds_2.dim() == 1:
-                pooled_text_embeds_2 = pooled_text_embeds_2.unsqueeze(0)
-        
-        # Validate final shape
-        assert pooled_text_embeds_2.dim() == 2, f"Expected 2D tensor [B, 1280], got shape {pooled_text_embeds_2.shape}"
-        
-        # Fix text_embeddings shape - need one more squeeze for batch processing
-        text_embeddings = text_embeddings.squeeze(1)  # [B, 77, 768]
-        text_embeddings_2 = text_embeddings_2.squeeze(1)  # [B, 77, 1280]
-        #print(f"text_embeddings after squeeze: {text_embeddings.shape}")
-        #print(f"text_embeddings_2 after squeeze: {text_embeddings_2.shape}")
-        
         # Create micro-conditioning tensors
-        try:
-            if isinstance(target_size, (list, tuple)):
-                # If target_size is already a sequence, use first two elements
-                height, width = target_size[:2]
-            elif isinstance(target_size, torch.Tensor):
-                # If target_size is a tensor, extract height and width
-                if target_size.dim() == 1:
-                    height, width = target_size[0].item(), target_size[1].item()
-                else:
-                    height = width = target_size.item()
-            else:
-                # If target_size is a single number, use it for both dimensions
-                height = width = target_size
-                
-            logger.debug(f"Extracted dimensions - height: {height}, width: {width}")
-            
-            time_ids = torch.tensor([
-                height,  # height
-                width,   # width
-                height,  # target height
-                width,   # target width
-                0,      # crop top
-                0,      # crop left
-            ], device=x_0.device, dtype=torch.float32)
-            
-            # Repeat for batch size
-            time_ids = time_ids.unsqueeze(0).repeat(batch_size, 1)  # [B, 6]
-            
-        except Exception as e:
-            logger.error(f"Error in target_size processing: {str(e)}")
-            logger.error(f"target_size type: {type(target_size)}")
-            logger.error(f"target_size value: {target_size}")
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            raise
-        
-        #print(f"time_ids final shape: {time_ids.shape}")
+        logger.debug("\nProcessing target_size:")
+        if isinstance(target_size, list):
+            logger.debug(f"target_size is list with length: {len(target_size)}")
+            logger.debug(f"First element type: {type(target_size[0])} shape: {target_size[0].shape}")
+            # Assuming each element is a tensor of [height, width]
+            heights = torch.stack([t[0] for t in target_size])
+            widths = torch.stack([t[1] for t in target_size])
+            logger.debug(f"Stacked heights shape: {heights.shape} - dtype: {heights.dtype}")
+            logger.debug(f"Stacked widths shape: {widths.shape} - dtype: {widths.dtype}")
+        else:
+            logger.debug("Using default 1024x1024 dimensions")
+            heights = torch.full((batch_size,), 1024, device=x_0.device)
+            widths = torch.full((batch_size,), 1024, device=x_0.device)
+            logger.debug(f"Created heights shape: {heights.shape} - dtype: {heights.dtype}")
+            logger.debug(f"Created widths shape: {widths.shape} - dtype: {widths.dtype}")
 
-        # Prepare SDXL conditioning kwargs
+        logger.debug("\nCreating time_ids:")
+        # Create time_ids for each item in batch
+        time_ids = torch.stack([
+            heights,  # Original height
+            widths,   # Original width
+            heights,  # Target height
+            widths,   # Target width
+            torch.zeros_like(heights),  # Crop top
+            torch.zeros_like(widths),   # Crop left
+        ], dim=1).to(x_0.device, dtype=x_0.dtype)
+        logger.debug(f"time_ids shape: {time_ids.shape} - dtype: {time_ids.dtype}")
+
+        logger.debug("\nPreparing conditioning kwargs:")
+        # Prepare added conditioning kwargs
         added_cond_kwargs = {
-            "text_embeds": pooled_text_embeds_2,  # [B, 1280]
-            "time_ids": time_ids  # [B, 6]
+            "text_embeds": pooled_text_embeds_2,
+            "time_ids": time_ids
         }
+        logger.debug(f"added_cond_kwargs text_embeds shape: {added_cond_kwargs['text_embeds'].shape}")
+        logger.debug(f"added_cond_kwargs time_ids shape: {added_cond_kwargs['time_ids'].shape}")
 
+        logger.debug("\nCombining text embeddings:")
         # Combine text embeddings
-        try:
-            combined_text_embeddings = torch.cat([text_embeddings, text_embeddings_2], dim=-1)  # [B, 77, 2048]
-            #print(f"combined_text_embeddings shape: {combined_text_embeddings.shape}")
-        except Exception as e:
-            logger.error("Error combining text embeddings")
-            logger.error(f"text_embeddings shape: {text_embeddings.shape}")
-            logger.error(f"text_embeddings_2 shape: {text_embeddings_2.shape}")
-            logger.error(f"Error: {str(e)}")
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            raise
+        prompt_embeds = torch.cat([text_embeddings, text_embeddings_2], dim=-1)
+        logger.debug(f"Combined prompt_embeds shape: {prompt_embeds.shape} - dtype: {prompt_embeds.dtype}")
 
-        # Generate noise and add to input
-        try:
-            noise = torch.randn_like(x_0)  # [B, 4, H/8, W/8]
-            sigma = sigma.view(-1, 1, 1, 1)  # [B, 1, 1, 1]
-            x_t = x_0 + sigma * noise  # [B, 4, H/8, W/8]
-            #print(f"noise shape: {noise.shape}")
-            #print(f"sigma shape after view: {sigma.shape}")
-            #print(f"x_t shape: {x_t.shape}")
-        except Exception as e:
-            logger.error("Error in noise generation and addition")
-            logger.error(f"x_0 shape: {x_0.shape}")
-            logger.error(f"sigma shape: {sigma.shape}")
-            logger.error(f"Error: {str(e)}")
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            raise
+        logger.debug("\nAdding noise:")
+        # Add noise
+        noise = torch.randn_like(x_0)
+        logger.debug(f"Generated noise shape: {noise.shape} - dtype: {noise.dtype}")
+        x_t = x_0 + noise * sigma.view(-1, 1, 1, 1)
+        logger.debug(f"Noised x_t shape: {x_t.shape} - dtype: {x_t.dtype}")
 
-        # V-prediction target
-        try:
-            v = (x_t - x_0) / (sigma**2 + 1).sqrt()
-            target = v  # [B, 4, H/8, W/8]
-            #print(f"target shape: {target.shape}")
-        except Exception as e:
-            logger.error("Error calculating v-prediction target")
-            logger.error(f"x_t shape: {x_t.shape}")
-            logger.error(f"x_0 shape: {x_0.shape}")
-            logger.error(f"sigma shape: {sigma.shape}")
-            logger.error(f"Error: {str(e)}")
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            raise
+        logger.debug("\nRunning model prediction:")
+        # Get model prediction
+        model_output = model(
+            x_t,
+            sigma,
+            encoder_hidden_states=prompt_embeds,
+            added_cond_kwargs=added_cond_kwargs
+        ).sample
+        logger.debug(f"Model output shape: {model_output.shape} - dtype: {model_output.dtype}")
 
-        #print("\nStarting UNet forward pass...")
-        # UNet forward pass
-        try:
-            model_output = model(
-                sample=x_t,
-                timestep=timestep,
-                encoder_hidden_states=combined_text_embeddings,
-                added_cond_kwargs=added_cond_kwargs
-            ).sample
-            #print(f"model_output shape: {model_output.shape}")
-        except Exception as e:
-            logger.error("Error in UNet forward pass")
-            logger.error(f"x_t shape: {x_t.shape}")
-            logger.error(f"timestep shape: {timestep.shape}")
-            logger.error(f"combined_text_embeddings shape: {combined_text_embeddings.shape}")
-            logger.error(f"added_cond_kwargs: {added_cond_kwargs}")
-            logger.error(f"Error: {str(e)}")
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            raise
+        logger.debug("\nCalculating loss:")
+        # Calculate target
+        target = noise
+        logger.debug(f"Target shape: {target.shape} - dtype: {target.dtype}")
 
         # MinSNR loss weighting
-        try:
-            snr = compute_snr(sigma.squeeze())  # [B]
-            gamma = 1.0  # Hyperparameter, can be tuned
-            min_snr_gamma = torch.minimum(snr, torch.full_like(snr, gamma))
-            mse_loss = F.mse_loss(model_output, target, reduction='none')
-            loss = (min_snr_gamma.view(-1, 1, 1, 1) * mse_loss).mean()
-            #print(f"final loss: {loss.item()}")
-        except Exception as e:
-            logger.error("Error in loss calculation")
-            logger.error(f"model_output shape: {model_output.shape}")
-            logger.error(f"target shape: {target.shape}")
-            logger.error(f"sigma shape: {sigma.shape}")
-            logger.error(f"Error: {str(e)}")
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            raise
+        snr = compute_snr(sigma)
+        logger.debug(f"SNR shape: {snr.shape} - dtype: {snr.dtype}")
+        
+        gamma = 1.0  # Hyperparameter, can be tuned
+        min_snr_gamma = torch.minimum(snr, torch.full_like(snr, gamma))
+        logger.debug(f"min_snr_gamma shape: {min_snr_gamma.shape} - dtype: {min_snr_gamma.dtype}")
+        
+        mse_loss = F.mse_loss(model_output, target, reduction='none')
+        logger.debug(f"MSE loss shape: {mse_loss.shape} - dtype: {mse_loss.dtype}")
+        
+        loss = (min_snr_gamma.view(-1, 1, 1, 1) * mse_loss).mean()
+        logger.debug(f"Final loss value: {loss.item()} - dtype: {loss.dtype}")
 
         return loss
 
     except Exception as e:
-        logger.error(f"Training loss calculation failed: {str(e)}")
+        logger.error(f"\n=== Error in training_loss ===")
+        logger.error(f"Error message: {str(e)}")
         logger.error(f"Full traceback: {traceback.format_exc()}")
-        # Log all input shapes
-        logger.error("Input shapes:")
-        logger.error(f"x_0: {x_0.shape if isinstance(x_0, torch.Tensor) else type(x_0)}")
-        logger.error(f"sigma: {sigma.shape if isinstance(sigma, torch.Tensor) else type(sigma)}")
-        logger.error(f"text_embeddings: {text_embeddings.shape if isinstance(text_embeddings, torch.Tensor) else type(text_embeddings)}")
-        logger.error(f"text_embeddings_2: {text_embeddings_2.shape if isinstance(text_embeddings_2, torch.Tensor) else type(text_embeddings_2)}")
-        logger.error(f"pooled_text_embeds_2: {pooled_text_embeds_2.shape if isinstance(pooled_text_embeds_2, torch.Tensor) else type(pooled_text_embeds_2)}")
-        logger.error(f"timestep: {timestep.shape if isinstance(timestep, torch.Tensor) else type(timestep)}")
-        logger.error(f"target_size: {type(target_size)} - value: {target_size}")
+        logger.error("\nFinal state of variables:")
+        # Log all local variables
+        local_vars = locals()
+        for name, value in local_vars.items():
+            if isinstance(value, torch.Tensor):
+                logger.error(f"{name}: shape={value.shape}, dtype={value.dtype}")
+            else:
+                logger.error(f"{name}: type={type(value)}")
         raise
 
 
@@ -1232,8 +1161,8 @@ class ModelValidator:
         self.default_vae = AutoencoderKL.from_pretrained(
             "stabilityai/stable-diffusion-xl-base-1.0", 
             subfolder="vae",
-            torch_dtype=torch.float32
-        ).to(device)
+            torch_dtype=torch.bfloat16  # Match model dtype
+        )
         self.tokenizer = tokenizer
         self.tokenizer_2 = tokenizer_2
         self.text_encoder = text_encoder.to(device)
@@ -1558,9 +1487,9 @@ class ModelValidator:
                     noise = torch.randn_like(latents)
                     latents = latents + noise * (sigmas[i + 1] ** 2 - sigmas[i] ** 2) ** 0.5
             
-            # Decode latents
+            # Decode latents using default VAE
             with torch.no_grad():
-                image = self.vae.decode(latents / 0.18215).sample
+                image = self.default_vae.decode(latents / 0.18215).sample
                 
             return image
             
