@@ -1149,6 +1149,8 @@ def main(args):
         - stable-diffusion-xl
         - text-to-image
         - diffusers
+        - ztsnr
+        - high-resolution
         license: mit
         ---
 
@@ -1163,14 +1165,52 @@ def main(args):
         - Tag-based loss weighting
         - VAE scale-and-shift normalization
 
-        ## Training
+        ## Training Details
         - Base model: SDXL 1.0
         - Training steps: {args.num_epochs * len(train_dataloader)}
         - Batch size: {args.batch_size}
         - Learning rate: {args.learning_rate}
+        - CFG scale range: 3.5-5.0 (optimal)
+
+        ## Validation Results
+
+        ### Zero Terminal SNR (ZTSNR)
+        ![ZTSNR Comparison](validation_results/latest/ztsnr_comparison.png)
+        Testing ZTSNR effectiveness with "completely black" prompt. Left: With ZTSNR, Right: Without ZTSNR.
+
+        ### High-Resolution Coherence
+        ![Coherence Comparison](validation_results/latest/coherence_comparison.png)
+        Testing high-resolution coherence with different sigma_max values (14.6 vs 20000.0).
+        Note: σ ≈ 20000 is used as a practical approximation of infinity for ZTSNR.
+
+        ### Denoising Steps
+        ![Denoising Steps](validation_results/latest/denoising_14.6.png)
+        Progressive denoising steps with sigma_max = 14.6
+        
+        ![Denoising Steps High Sigma](validation_results/latest/denoising_20000.0.png)
+        Progressive denoising steps with ZTSNR (sigma_max ≈ 20000)
+
+        ## Validation Methodology
+        1. **ZTSNR Validation**: Testing model's ability to generate pure black images when prompted
+        2. **High-Resolution Coherence**: Testing with different sigma_max values (14.6 and 20000.0)
+        3. **Noise Schedule**: Progressive noise addition visualization
+        4. **Denoising Steps**: Intermediate generation steps visualization
+
+        ## Example Prompts
+        - "a detailed portrait of a girl"
+        - "completely black"
+        - "a red ball on top of a blue cube, both infront of a green triangle"
+
+        ## Paper Reference
+        For more details, please refer to the original paper:
+        "Improvements to SDXL in NovelAI Diffusion V3" (arXiv:2409.15997v2)
         """
 
-        # Save to hub
+        # Before pushing to hub, save latest validation images to a permanent location
+        latest_validation_dir = Path(args.output_dir) / "validation_results" / "latest"
+        validator.save_validation_images(validation_results, latest_validation_dir)
+
+        # Save to hub with updated model card
         unet.push_to_hub(
             args.hub_model_id,
             private=args.hub_private,
@@ -1216,15 +1256,16 @@ class ModelValidator:
         
         return results, metrics
 
-    def validate_high_res_coherence(self, prompt, sigma_max_values=[14.6, 29.0]):
+    def validate_high_res_coherence(self, prompt, sigma_max_values=[14.6, 20000.0]):
         """
         Validate high-resolution coherence as shown in Figure 6 of the paper.
         Tests if model maintains coherence with different sigma_max values.
+        Note: σ ≈ 20000 is used as a practical approximation of infinity for ZTSNR.
         """
         results = {}
         step_sigmas = {
             14.6: [14.6, 10.8, 8.3, 6.6, 5.4],  # From Figure 7
-            29.0: [29.0, 17.8, 12.4, 9.2, 7.2]  # From Figure 7
+            20000.0: [20000.0, 17.8, 12.4, 9.2, 7.2]  # ZTSNR regime
         }
         
         for sigma_max in sigma_max_values:
