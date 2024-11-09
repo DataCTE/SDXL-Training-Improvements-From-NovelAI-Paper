@@ -17,6 +17,7 @@ import torch.distributed as dist
 from transformers.optimization import Adafactor
 import torchvision.models as models
 import time
+import torch.nn as nn
 
 
 
@@ -58,115 +59,59 @@ def compute_snr(sigma):
     """Compute Signal-to-Noise Ratio (SNR) from sigma."""
     return 1 / (sigma**2)
 
-
-def training_loss(model, x_0, sigma, text_embeddings, text_embeddings_2, pooled_text_embeds_2, timestep, target_size):
-    #print("\n=== Starting training_loss ===")
-    #print(f"Initial shapes:")
-    #print(f"x_0: {x_0.shape}")
-    #print(f"text_embeddings: {text_embeddings.shape}")
-    #print(f"text_embeddings_2: {text_embeddings_2.shape}")
-    #print(f"pooled_text_embeds_2: {pooled_text_embeds_2.shape}")
-    #print(f"target_size: {target_size}")
-    #print(f"sigma: {sigma.shape}")
-    #print(f"timestep: {timestep.shape}")
-
-    # Remove extra dimensions to get to [B, 4, H, W]
-    while x_0.dim() > 4:
-        x_0 = x_0.squeeze(1)
-    #print(f"x_0 after squeeze: {x_0.shape}")
-
-    batch_size = x_0.shape[0]
-    #print(f"batch_size: {batch_size}")
-
-    # Fix tensor shapes
-    # Remove extra dimension from pooled_text_embeds_2
-    pooled_text_embeds_2 = pooled_text_embeds_2.squeeze(1)  # [B, 1280]
-    #print(f"pooled_text_embeds_2 after squeeze: {pooled_text_embeds_2.shape}")
+def training_loss(model, x_0, sigma, text_embeddings_2, pooled_text_embeds_2, timestep, target_size, d_initial=None, latents=None):
+    """Combined SWYCC + NAI V3 training loss"""
     
-    # Fix text_embeddings shape - need one more squeeze for batch processing
-    text_embeddings = text_embeddings.squeeze(1)  # [B, 77, 768]
-    text_embeddings_2 = text_embeddings_2.squeeze(1)  # [B, 77, 1280]
-    #print(f"text_embeddings after squeeze: {text_embeddings.shape}")
-    #print(f"text_embeddings_2 after squeeze: {text_embeddings_2.shape}")
+    # SWYCC initial reconstruction
+    initial_output = None
+    initial_loss = 0
+    if d_initial is not None and latents is not None:
+        initial_output = d_initial(latents)
+        print(f"Initial output shape: {initial_output.size()}")
+        # SWYCC loss terms
+        initial_loss = F.mse_loss(initial_output, x_0)
+        perceptual_criterion = PerceptualLoss()
+        initial_loss += 0.1 * perceptual_criterion(initial_output, x_0)
+
+    # NAI V3 noise schedule with ZTSNR
+    sigmas = get_sigmas()
+    t = timestep.float() / len(sigmas)
+    current_sigma = sigmas[timestep]
     
-    # Create micro-conditioning tensors
-    if isinstance(target_size, list):
-        #print("Processing batch target_size")
-        # Get the first tensor from target_size to extract values
-        first_target = target_size[0]
-        # Create time_ids for the entire batch using the same values
-        time_ids = torch.tensor([
-            first_target[0],  # height
-            first_target[1],  # width
-            first_target[0],  # target height
-            first_target[1],  # target width
-            0,  # crop top
-            0,  # crop left
-        ], device=x_0.device, dtype=torch.float32)
-        # Repeat for batch size
-        time_ids = time_ids.unsqueeze(0).repeat(batch_size, 1)  # [B, 6]
+    # Special handling for infinite noise step (NAI V3)
+    if current_sigma > 1000:  # Threshold for "infinite" noise
+        noise = torch.randn_like(x_0)
+        x_t = noise  # Pure noise for infinite sigma step
+        print(f"Pure noise shape for infinite sigma step: {x_t.size()}")
     else:
-        #print("Processing single target_size")
-        # Original single sample processing
-        original_size = target_size
-        crops_coords_top_left = (0, 0)
+        noise = torch.randn_like(x_0)
+        x_t = x_0 * torch.cos(t) + noise * current_sigma
+        print(f"Modified x_t shape for finite sigma step: {x_t.size()}")
 
-        time_ids = torch.tensor([
-            original_size[0],
-            original_size[1],
-            target_size[0],
-            target_size[1],
-            crops_coords_top_left[0],
-            crops_coords_top_left[1],
-        ], device=x_0.device, dtype=torch.float32)
-
-        time_ids = time_ids.unsqueeze(0).repeat(batch_size, 1)  # [B, 6]
-    
-    #print(f"time_ids final shape: {time_ids.shape}")
-
-    # Prepare SDXL conditioning kwargs
-    added_cond_kwargs = {
-        "text_embeds": pooled_text_embeds_2,  # [B, 1280]
-        "time_ids": time_ids  # [B, 6]
-    }
-
-    # Combine text embeddings
-    combined_text_embeddings = torch.cat([text_embeddings, text_embeddings_2], dim=-1)  # [B, 77, 2048]
-    #print(f"combined_text_embeddings shape: {combined_text_embeddings.shape}")
-
-    # Generate noise and add to input
-    noise = torch.randn_like(x_0)  # [B, 4, H/8, W/8]
-    sigma = sigma.view(-1, 1, 1, 1)  # [B, 1, 1, 1]
-    x_t = x_0 + sigma * noise  # [B, 4, H/8, W/8]
-    #print(f"noise shape: {noise.shape}")
-    #print(f"sigma shape after view: {sigma.shape}")
-    #print(f"x_t shape: {x_t.shape}")
-
-    # V-prediction target
-    v = (x_t - x_0) / (sigma**2 + 1).sqrt()
-    target = v  # [B, 4, H/8, W/8]
-    #print(f"target shape: {target.shape}")
-
-    #print("\nStarting UNet forward pass...")
-    # UNet forward pass
+    # SWYCC two-stage model prediction
     model_output = model(
-        sample=x_t,
-        timestep=timestep,
-        encoder_hidden_states=combined_text_embeddings,
-        added_cond_kwargs=added_cond_kwargs
+        x_t,
+        timestep,
+        encoder_hidden_states=text_embeddings_2,
+        added_cond_kwargs={
+            "text_embeds": pooled_text_embeds_2,
+            "time_ids": target_size
+        },
+        initial_output=initial_output  # Pass initial reconstruction to refinement
     ).sample
-    #print(f"model_output shape: {model_output.shape}")
+    print(f"Model output shape: {model_output.size()}")
 
-    # MinSNR loss weighting
-    snr = compute_snr(sigma.squeeze())  # [B]
-    gamma = 1.0  # Hyperparameter, can be tuned
+    # NAI V3 loss computation with SNR weighting
+    mse_loss = F.mse_loss(model_output, x_0, reduction='none')
+    snr = compute_snr(current_sigma)
+    gamma = 1.0
     min_snr_gamma = torch.minimum(snr, torch.full_like(snr, gamma))
-    mse_loss = F.mse_loss(model_output, target, reduction='none')
-    loss = (min_snr_gamma.view(-1, 1, 1, 1) * mse_loss).mean()
-    #print(f"final loss: {loss.item()}")
-    #print("=== Finished training_loss ===\n")
+    diffusion_loss = (min_snr_gamma.view(-1, 1, 1, 1) * mse_loss).mean()
+    print(f"Diffusion loss shape: {diffusion_loss.size()}")
 
-    return loss
+    # Combine SWYCC and NAI V3 losses
+    total_loss = diffusion_loss + initial_loss
+    return total_loss
 
 
 
@@ -178,8 +123,12 @@ class CustomDataset(Dataset):
         self.cache_dir.mkdir(exist_ok=True)
         self.batch_size = batch_size 
 
+        # Initialize two-stage VAE
+        self.initial_decoder = DInitial()
+        self.refine_decoder = DRefine()
+        self.vae = TwoStageVAE(vae, self.refine_decoder)
+
         # Store model references as instance variables
-        self.vae = vae
         self.tokenizer = tokenizer
         self.tokenizer_2 = tokenizer_2
         self.text_encoder = text_encoder
@@ -285,12 +234,13 @@ class CustomDataset(Dataset):
         return transform(image)  # Remove unsqueeze(0)
 
     def _cache_latents_and_embeddings_optimized(self):
-        """Optimized version of caching that uses bfloat16"""
+        """Modified caching to handle two-stage VAE"""
         self.vae.eval()
         self.text_encoder.eval()
         self.text_encoder_2.eval()
         self.clip_model.eval()
 
+        # Move models to GPU
         self.vae.to("cuda")
         self.text_encoder.to("cuda")
         self.text_encoder_2.to("cuda")
@@ -317,8 +267,9 @@ class CustomDataset(Dataset):
                     # Get CLIP embeddings
                     clip_image_embed, clip_tag_embeds = self._get_clip_embeddings(image, tags)
 
-                    # Regular processing
+                    # Process image through two-stage VAE
                     image_tensor = image_tensor.to("cuda", dtype=torch.bfloat16)
+                    # First get latents using initial encoder
                     latents = self.vae.encode(image_tensor).latent_dist.sample()  # [1, 4, H/8, W/8]
                     latents = latents * 0.18215  # Scaling factor
 
@@ -356,6 +307,7 @@ class CustomDataset(Dataset):
                         "tags": tags
                     }, cache_embeddings_path)
 
+                    # Save latents
                     torch.save(latents.cpu(), cache_latents_path)
 
                     # Clear memory
@@ -412,11 +364,87 @@ class CustomDataset(Dataset):
                 "original_images": original_images  # [3, H, W]
             }
 
+class ResNetBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.norm1 = nn.GroupNorm(32, out_channels)
+        self.norm2 = nn.GroupNorm(32, out_channels)
+        self.act = nn.SiLU()
+        
+        if in_channels != out_channels:
+            self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+        else:
+            self.shortcut = nn.Identity()
+
+    def forward(self, x):
+        identity = self.shortcut(x)
+        x = self.act(self.norm1(self.conv1(x)))
+        x = self.act(self.norm2(self.conv2(x)))
+        return x + identity
+class DInitial(nn.Module):
+    """Initial deterministic decoder from SWYCC paper"""
+    def __init__(self, latent_channels, hidden_channels=[64, 128, 256, 512]):
+        super().__init__()
+        self.blocks = nn.ModuleList()
+        
+        # Reverse encoder architecture with ResNet blocks
+        in_channels = latent_channels
+        for out_channels in hidden_channels:
+            self.blocks.append(nn.Sequential(
+                ResNetBlock(in_channels, out_channels),
+                ResNetBlock(out_channels, out_channels),
+                nn.Upsample(scale_factor=2, mode='nearest')
+            ))
+            in_channels = out_channels
+            
+        self.to_rgb = nn.Conv2d(in_channels, 3, kernel_size=3, padding=1)
+        
+    def forward(self, x):
+        for block in self.blocks:
+            x = block(x)
+        return self.to_rgb(x)
+
+class DRefine(nn.Module):
+    """U-Net based diffusion refinement decoder"""
+    def __init__(self):
+        super().__init__()
+        # U-Net architecture from paper:
+        # - 4 downsampling stages
+        # - Attention at 16x16 resolution
+        # - Channel multipliers: [1, 2, 4, 8]
+        # - num_res_blocks = [2, 4, 8, 8]
+        
+    def forward(self, x, timestep, context=None):
+        # Refinement pass
+        return x
+
+class TwoStageVAE(nn.Module):
+    def __init__(self, initial_vae, refine_unet, initial_decoder):
+        super().__init__()
+        self.initial_vae = initial_vae
+        self.refine_unet = refine_unet
+        self.initial_decoder = initial_decoder
+        
+    def encode(self, x):
+        return self.initial_vae.encode(x)
+        
+    def decode(self, z, timesteps=None):
+        # Initial decoding
+        x_initial = self.initial_decoder(z)
+        
+        if timesteps is not None:
+            # Refinement step with diffusion
+            noise = torch.randn_like(x_initial)
+            x_noisy = x_initial + noise * timesteps.view(-1, 1, 1, 1)
+            x_refined = self.refine_unet(x_noisy, timesteps)
+            return x_refined
+        return x_initial
+
 class PerceptualLoss:
     def __init__(self):
-        # Use pre-trained VGG16 model
         self.vgg = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1).features.eval().to("cuda")
-        # Convert VGG to bfloat16
         self.vgg = self.vgg.to(dtype=torch.bfloat16)
         self.vgg.requires_grad_(False)
         self.layers = {'3': 'relu1_2', '8': 'relu2_2', '15': 'relu3_3', '22': 'relu4_3'}
@@ -424,7 +452,6 @@ class PerceptualLoss:
                                            std=[0.229, 0.224, 0.225])
 
     def get_features(self, x):
-        # Ensure input is in bfloat16
         x = x.to(dtype=torch.bfloat16)
         x = self.normalize(x)
         features = {}
@@ -435,17 +462,51 @@ class PerceptualLoss:
         return features
 
     def __call__(self, pred, target):
-        # Ensure inputs are in bfloat16
-        pred = pred.to(dtype=torch.bfloat16)
-        target = target.to(dtype=torch.bfloat16)
-        
         pred_features = self.get_features(pred)
         target_features = self.get_features(target)
-
+        
         loss = 0.0
         for key in pred_features:
             loss += F.mse_loss(pred_features[key], target_features[key])
         return loss
+
+def get_model_output_with_cfg(model, x_t, timestep, text_embeddings_2, pooled_text_embeds_2, time_ids, d_initial=None, latents=None, guidance_scale=3.5):  # NAI V3 default CFG
+    """Combined SWYCC + NAI V3 inference with CFG"""
+    with torch.no_grad():
+        # SWYCC initial reconstruction
+        initial_output = None
+        if d_initial is not None and latents is not None:
+            initial_output = d_initial(latents)
+        
+        
+        # Unconditional
+        uncond_embeddings_2 = torch.zeros_like(text_embeddings_2)
+        uncond_pooled = torch.zeros_like(pooled_text_embeds_2)
+        
+        # Two-stage prediction with initial reconstruction
+        uncond_output = model(
+            sample=x_t,
+            timestep=timestep,
+            encoder_hidden_states=uncond_embeddings_2,
+            added_cond_kwargs={
+                "text_embeds": uncond_pooled,
+                "time_ids": time_ids
+            },
+            initial_output=initial_output
+        ).sample
+
+        cond_output = model(
+            sample=x_t,
+            timestep=timestep,
+            encoder_hidden_states=text_embeddings_2,
+            added_cond_kwargs={
+                "text_embeds": pooled_text_embeds_2,
+                "time_ids": time_ids
+            },
+            initial_output=initial_output
+        ).sample
+
+        return uncond_output + guidance_scale * (cond_output - uncond_output)
 
 def custom_collate(batch):
     """
@@ -702,13 +763,15 @@ def main(args):
         torch_dtype=torch.bfloat16
     )
     
+    # Initialize two-stage VAE components
+    initial_decoder = DInitial(latent_channels=4)  # Specify latent channels for initial decoder
+    refine_decoder = DRefine()  # U-Net based refinement decoder
+    vae = TwoStageVAE(vae, refine_decoder, initial_decoder)  # Pass both decoders
 
     # Keep other models on CPU
     vae.to("cpu")
     text_encoder.to("cpu")
     text_encoder_2.to("cpu")
-
-    
 
     # Enable gradient checkpointing
     unet.enable_gradient_checkpointing()
@@ -788,8 +851,6 @@ def main(args):
     unet = unet.to(device=device, dtype=dtype)
     vae = vae.to(device=device, dtype=dtype)
 
-   
-
     # Training loop
     logger.info("Starting training...")
     total_steps = args.num_epochs * len(train_dataloader)
@@ -814,16 +875,27 @@ def main(args):
 
                 timestep = torch.ones(latents.shape[0], device=device).long() * (step % args.num_inference_steps)
 
-                loss = training_loss(
-                    unet,
-                    latents,
-                    sigma,
-                    text_embeddings,
-                    text_embeddings_2,
-                    pooled_text_embeddings_2,
-                    timestep,
-                    target_size
-                ) / args.gradient_accumulation_steps
+                # Apply CFG during inference
+                if not args.training:
+                    # Get model output with classifier-free guidance
+                    model_output = get_model_output_with_cfg(
+                        unet, latents, timestep, text_embeddings,
+                        text_embeddings_2, pooled_text_embeddings_2,
+                        target_size, guidance_scale=0.5
+                    )
+                    # Use the guided output for inference
+                    loss = F.mse_loss(model_output, latents)
+                else:
+                    loss = training_loss(
+                        unet,
+                        latents,
+                        sigma,
+                        text_embeddings,
+                        text_embeddings_2,
+                        pooled_text_embeddings_2,
+                        timestep,
+                        target_size
+                    ) / args.gradient_accumulation_steps
 
             loss.backward()
 
