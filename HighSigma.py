@@ -28,8 +28,8 @@ def setup_logging():
             logging.StreamHandler()
         ]
     )
-    logger = logging.getLogger(__name__)
-    return logger
+logger = logging.getLogger(__name__)   
+    
 
 
 # Global bfloat16 settings
@@ -50,70 +50,49 @@ def get_sigmas(num_inference_steps=28, sigma_max=29.0, sigma_min=0.0292):
     return sigmas
 
 def training_loss(model, x_0, sigma, text_embeddings, text_embeddings_2, pooled_text_embeds_2, timestep):
-    """
+    """UNet training loss with v-prediction and Zero Terminal SNR
     Args:
         model: UNet model
-        x_0: Input latents [B, 4, H, W] or [1, B, 4, H, W]
-        sigma: Noise level [B] or scalar
-        text_embeddings: First text encoder output [B, 77, 768] or [1, B, 77, 768]
-        text_embeddings_2: Second text encoder output [B, 77, 1280] or [1, B, 77, 1280]
-        pooled_text_embeds_2: Pooled text embeddings [B, 1280] or [1, B, 1280]
+        x_0: Input latents [B, 4, H/8, W/8]
+        sigma: Noise level [B] (now supports σ ≈ ∞ for ZTSNR)
+        text_embeddings: First text encoder output [B, 77, 768]
+        text_embeddings_2: Second text encoder output [B, 77, 1280]
+        pooled_text_embeds_2: Pooled text embeddings [B, 1280]
         timestep: Timestep values [B]
     """
-    # Ensure x_0 has correct shape [B, 4, H, W]
-    x_0 = x_0.squeeze()  # Remove any extra dimensions
-    if len(x_0.shape) == 3:
-        x_0 = x_0.unsqueeze(0)
-    
-    # Create time_ids with correct shape [B, 6]
+    # Create time_ids for SDXL conditioning
     batch_size = x_0.shape[0]
-    time_ids = torch.zeros((batch_size, 6), device=x_0.device)
+    time_ids = torch.zeros((batch_size, 6), device=x_0.device)  # [B, 6]
     
-    # Ensure embeddings have correct shapes
-    # Remove extra dimensions from embeddings
-    text_embeddings = text_embeddings.squeeze()  # [B, 77, 768]
-    text_embeddings_2 = text_embeddings_2.squeeze()  # [B, 77, 1280]
-    pooled_text_embeds_2 = pooled_text_embeds_2.squeeze()  # [B, 1280]
+    # Create combined text embeddings for SDXL
+    combined_text_embeddings = torch.cat([text_embeddings, text_embeddings_2], dim=-1)  # [B, 77, 2048]
     
-    # Add batch dimension if needed
-    if len(text_embeddings.shape) == 2:
-        text_embeddings = text_embeddings.unsqueeze(0)  # [1, 77, 768] -> [B, 77, 768]
-    if len(text_embeddings_2.shape) == 2:
-        text_embeddings_2 = text_embeddings_2.unsqueeze(0)  # [1, 77, 1280] -> [B, 77, 1280]
-    if len(pooled_text_embeds_2.shape) == 1:
-        pooled_text_embeds_2 = pooled_text_embeds_2.unsqueeze(0)  # [1280] -> [B, 1280]
-    
-    # Create combined text embeddings [B, 77, 2048]
-    combined_text_embeddings = torch.cat([text_embeddings, text_embeddings_2], dim=-1)
-    
-    # Generate noise and add to input
-    noise = torch.randn_like(x_0)  # [B, 4, H, W]
+    # Generate noise and add to input (v-prediction parameterization)
+    noise = torch.randn_like(x_0)  # [B, 4, H/8, W/8]
     sigma = sigma.view(-1, 1, 1, 1)  # [B, 1, 1, 1]
-    x_t = x_0 + sigma * noise  # [B, 4, H, W]
+    x_t = x_0 + sigma * noise  # [B, 4, H/8, W/8]
     
-    # V-prediction
-    v = noise / (sigma ** 2 + 1).sqrt()  # [B, 4, H, W]
-    target = v  # [B, 4, H, W]
+    # V-prediction target (from paper section 2.1)
+    v = noise / (sigma ** 2 + 1).sqrt()  # [B, 4, H/8, W/8]
+    target = v  # [B, 4, H/8, W/8]
 
-    # Prepare conditioning kwargs
+    # Prepare SDXL conditioning kwargs
     added_cond_kwargs = {
         "text_embeds": pooled_text_embeds_2,  # [B, 1280]
         "time_ids": time_ids  # [B, 6]
     }
 
-    # Model forward pass
+    # UNet forward pass
     model_output = model(
-        sample=x_t,  # [B, 4, H, W]
+        sample=x_t,  # [B, 4, H/8, W/8]
         timestep=timestep,  # [B]
         encoder_hidden_states=combined_text_embeddings,  # [B, 77, 2048]
         added_cond_kwargs=added_cond_kwargs
-    ).sample  # [B, 4, H, W]
+    ).sample  # [B, 4, H/8, W/8]
 
-    # ZTSNR loss calculation
+    # MinSNR loss weighting (from paper section 2.4)
     snr = 1 / (sigma ** 2)  # [B, 1, 1, 1]
-    mse = F.mse_loss(model_output, target, reduction="none")  # [B, 4, H, W]
-    
-    # Zero terminal SNR
+    mse = F.mse_loss(model_output, target, reduction="none")  # [B, 4, H/8, W/8]
     min_snr_gamma = 0.5  # From paper
     snr_weight = (snr.squeeze() / (1 + snr.squeeze())).clamp(max=min_snr_gamma)  # [B]
     loss = (mse * snr_weight.view(-1, 1, 1, 1)).mean()  # scalar
@@ -298,19 +277,30 @@ class Dataset(Dataset):
         latents_path = self.cache_dir / f"{self.image_paths[idx].stem}_latents.pt"
         embeddings_path = self.cache_dir / f"{self.image_paths[idx].stem}_embeddings.pt"
         
-        # Load with weights_only=True
+        # Load with weights_only=True for memory efficiency
         latents = torch.load(latents_path, weights_only=True)
         embeddings = torch.load(embeddings_path, weights_only=True)
         
         # Load original image for VAE training
         original_image = Image.open(self.image_paths[idx]).convert("RGB")
-        original_image_tensor = self.transform(original_image)
+        original_image_tensor = self.transform(original_image)  # Should be [3, H, W]
+        
+        # Calculate latent dimensions
+        latent_h = original_image_tensor.shape[1] // 8
+        latent_w = original_image_tensor.shape[2] // 8
+        
+        # Create or load latents with correct shape
+        latents = latents.view(4, latent_h, latent_w)  # [4, H/8, W/8]
         
         # Ensure correct shapes for embeddings
         # We want [B, 77, 768] and [B, 77, 1280] and [B, 1280]
         text_embeddings = embeddings["text_embeddings"]
         text_embeddings_2 = embeddings["text_embeddings_2"]
         pooled_text_embeddings_2 = embeddings["pooled_text_embeddings_2"]
+        
+        # Ensure correct shapes for original images
+        if len(original_image_tensor.shape) != 3:  # Should be [C, H, W]
+            raise ValueError(f"Unexpected image tensor shape: {original_image_tensor.shape}")
         
         # Add batch dimension if needed
         if len(text_embeddings.shape) == 2:
@@ -321,14 +311,14 @@ class Dataset(Dataset):
             pooled_text_embeddings_2 = pooled_text_embeddings_2.unsqueeze(0)
         
         return {
-        "latents": latents,  # [B, C, H, W]
+        "latents": latents,  # Should be [4, H/8, W/8]
         "text_embeddings": text_embeddings,  # [B, 77, 768]
         "text_embeddings_2": text_embeddings_2,  # [B, 77, 1280]
         "pooled_text_embeddings_2": pooled_text_embeddings_2,  # [B, 1280]
         "clip_image_embed": embeddings["clip_image_embed"],
         "clip_tag_embeds": embeddings["clip_tag_embeds"],
         "tags": embeddings["tags"],
-        "original_images": original_image_tensor 
+        "original_images": original_image_tensor  # Should be [3, H, W]
         }
 
 class PerceptualLoss:
@@ -381,58 +371,65 @@ class VAEFineTuner:
         )
 
     def training_step(self, latents, original_images):
-        # Convert inputs to bfloat16 to match model parameters
-        latents = latents.to(dtype=torch.bfloat16)
-        original_images = original_images.to(dtype=torch.bfloat16)
+        """VAE training step with memory-efficient batch processing
+        Args:
+            latents: Input latents [B, 4, H/8, W/8]
+            original_images: Original images [B, 3, H, W]
+        """
+        # Print shapes for debugging
+        #print(f"Input latents shape: {latents.shape}")  # Should be [B, 4, H/8, W/8]
+        #print(f"Input images shape: {original_images.shape}")  # Should be [B, 3, H, W]
         
-        # Ensure inputs are on correct device and shape
-        original_images = original_images.to(latents.device, memory_format=torch.channels_last)
-        latents = latents.squeeze().unsqueeze(0) if len(latents.squeeze().shape) == 3 else latents
+        # Process in batches for memory efficiency
+        batch_size = 1  # Small batch size for memory efficiency
+        total_batches = len(latents) // batch_size
         
-        # Forward pass
-        self.optimizer.zero_grad(set_to_none=True)
+        total_loss = 0
+        for i in range(total_batches):
+            # Get current batch
+            start_idx = i * batch_size
+            end_idx = start_idx + batch_size
+            
+            # Get current batch and move to device
+            batch_latents = latents[start_idx:end_idx].to("cuda", dtype=torch.bfloat16)  # [1, 4, H/8, W/8]
+            batch_images = original_images[start_idx:end_idx].to("cuda", dtype=torch.bfloat16)  # [1, 3, H, W]
+            
+            # Decode latents to image space
+            decoded_images = self.vae.decode(batch_latents).sample  # [1, 3, H, W]
+            
+            # Calculate losses (all inputs should be float32 for perceptual loss)
+            p_loss = self.perceptual_loss(decoded_images.float(), batch_images.float())  # scalar
+            l1_loss = F.l1_loss(decoded_images.float(), batch_images.float())  # scalar
+            
+            # Optional KL loss
+            kl_loss = torch.tensor(0.0, device=batch_latents.device)  # scalar
+            if self.vae.training:
+                posterior = self.vae.encode(batch_images).latent_dist  # DiagonalGaussianDistribution
+                kl_loss = torch.mean(-0.5 * torch.sum(1 + posterior.variance.log() - 
+                                posterior.mean.pow(2) - posterior.variance, dim=1))  # scalar
+            
+            # Combine losses (all scalars)
+            batch_loss = (self.perceptual_weight * p_loss + 
+                        self.l1_weight * l1_loss + 
+                        self.kl_weight * kl_loss)  # scalar
+            
+            # Backward pass
+            batch_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.vae.parameters(), max_norm=1.0)
+            self.optimizer.step()
+            
+            total_loss += batch_loss.item()
+            
+            # Clear memory
+            del batch_latents, batch_images, decoded_images
+            torch.cuda.empty_cache()
         
-        # Decode latents
-        decoded_images = self.vae.decode(latents).sample
-        
-        # Convert to float32 for loss computation
-        decoded_images = decoded_images.float()
-        original_images = original_images.float()
-        
-        # Calculate losses
-        p_loss = self.perceptual_loss(decoded_images, original_images)
-        l1_loss = F.l1_loss(decoded_images, original_images)
-        
-        # Optional KL loss
-        kl_loss = torch.tensor(0.0, device=latents.device)
-        if self.vae.training:
-            posterior = self.vae.encode(original_images.bfloat16()).latent_dist
-            kl_loss = torch.mean(-0.5 * torch.sum(1 + posterior.variance.log() - 
-                               posterior.mean.pow(2) - posterior.variance, dim=1))
-        
-        # Combine losses
-        total_loss = (self.perceptual_weight * p_loss + 
-                     self.l1_weight * l1_loss + 
-                     self.kl_weight * kl_loss)
-
-        # Backward pass
-        total_loss.backward()
-        
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(self.vae.parameters(), max_norm=1.0)
-        
-        # Optimizer step
-        self.optimizer.step()
-        
-        # Clear memory
-        del decoded_images, original_images
-        torch.cuda.empty_cache()
-        
+        avg_loss = total_loss / total_batches  # scalar
         return {
-            'total_loss': total_loss.item(),
-            'perceptual_loss': p_loss.item(),
-            'l1_loss': l1_loss.item(),
-            'kl_loss': kl_loss.item()
+            'total_loss': avg_loss,  # scalar
+            'perceptual_loss': p_loss.item(),  # scalar
+            'l1_loss': l1_loss.item(),  # scalar
+            'kl_loss': kl_loss.item()  # scalar
         }
 
 
@@ -451,16 +448,60 @@ def compile_model(model, name, mode='default', logger=None):
         
     try:
         logger.info(f"Compiling {name}...")
+        
+        # Temporarily disable xformers
+        had_xformers = False
+        if hasattr(model, 'disable_xformers_memory_efficient_attention'):
+            had_xformers = True
+            model.disable_xformers_memory_efficient_attention()
+        
+        # Create appropriate test input based on model type
+        dtype = torch.bfloat16  # Match model dtype
+        if isinstance(model, AutoencoderKL):
+            test_batch = {
+                "sample": torch.randn(1, 3, 64, 64, dtype=dtype).to(model.device),
+                "return_dict": True
+            }
+        elif isinstance(model, UNet2DConditionModel):
+            test_batch = {
+                "sample": torch.randn(1, 4, 64, 64, dtype=dtype).to(model.device),
+                "timestep": torch.ones(1).to(model.device).long(),
+                "encoder_hidden_states": torch.randn(1, 77, 2048, dtype=dtype).to(model.device),
+                "added_cond_kwargs": {
+                    "text_embeds": torch.randn(1, 1280, dtype=dtype).to(model.device),
+                    "time_ids": torch.zeros(1, 6).to(model.device)
+                }
+            }
+        
+        # Clear CUDA cache before compilation
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
+        # Compile with reduced batch size for memory efficiency
         compiled_model = torch.compile(
             model,
             mode=mode,
             fullgraph=True
         )
+        
+        # Test the compiled model
+        with torch.amp.autocast('cuda', dtype=dtype):
+            _ = compiled_model(**test_batch)
+        
+        # Re-enable xformers if it was enabled before
+        if had_xformers:
+            compiled_model.enable_xformers_memory_efficient_attention()
+            
         logger.info(f"Successfully compiled {name}")
         return compiled_model
     except Exception as e:
         logger.warning(f"Failed to compile {name}: {str(e)}")
         logger.warning(f"Continuing with uncompiled {name}")
+        
+        # Re-enable xformers if it was enabled before
+        if had_xformers:
+            model.enable_xformers_memory_efficient_attention()
+            
         return model
 
 def training_loop_with_compile_logging(model, batch, logger):
@@ -510,14 +551,23 @@ def parse_args():
     return parser.parse_args()
 
 def main(args):
-    logger = setup_logging()
+    # Set up device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Using device: {device}")
+    
+    # Set up dtype
+    dtype = torch.bfloat16
+    
+    # Clear CUDA cache before training
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     
     # Load models with bfloat16
     unet = UNet2DConditionModel.from_pretrained(
         args.model_path,
         subfolder="unet",
         torch_dtype=torch.bfloat16
-    ).to("cuda")
+    ).to(device)
     
     vae = AutoencoderKL.from_pretrained(
         args.model_path,
@@ -620,9 +670,12 @@ def main(args):
             kl_weight=0.1
         )
 
-    # Compile models if enabled
+    # Move models to device and set dtype
+    unet = unet.to(device=device, dtype=dtype)
+    vae = vae.to(device=device, dtype=dtype)
+    
+    # Compile models if requested
     if args.compile_mode:
-        logger.info(f"Using compile mode: {args.compile_mode}")
         unet = compile_model(unet, "UNet", args.compile_mode, logger)
         if args.finetune_vae:
             vae = compile_model(vae, "VAE", args.compile_mode, logger)
@@ -636,54 +689,17 @@ def main(args):
         logger.info(f"Starting epoch {epoch+1}/{args.num_epochs}")
         
         for step, batch in enumerate(train_dataloader):
-            # Log first forward pass if using compiled models
-            if step == 0 and epoch == 0 and args.compile_mode:
-                logger.info("Running first forward pass with compiled models...")
-                try:
-                    # Prepare tensors with same shape handling as training_loss
-                    latents = batch["latents"].to("cuda").squeeze()
-                    if len(latents.shape) == 3:
-                        latents = latents.unsqueeze(0)
-                        
-                    text_embeddings = batch["text_embeddings"].to("cuda").squeeze()
-                    text_embeddings_2 = batch["text_embeddings_2"].to("cuda").squeeze()
-                    pooled_embeds = batch["pooled_text_embeddings_2"].to("cuda").squeeze()
-                    
-                    if len(text_embeddings.shape) == 2:
-                        text_embeddings = text_embeddings.unsqueeze(0)
-                    if len(text_embeddings_2.shape) == 2:
-                        text_embeddings_2 = text_embeddings_2.unsqueeze(0)
-                    if len(pooled_embeds.shape) == 1:
-                        pooled_embeds = pooled_embeds.unsqueeze(0)
-                        
-                    sample_batch = {
-                        "sample": latents,
-                        "timestep": torch.ones(latents.shape[0], device="cuda").long(),
-                        "encoder_hidden_states": torch.cat([text_embeddings, text_embeddings_2], dim=-1),
-                        "added_cond_kwargs": {
-                            "text_embeds": pooled_embeds,
-                            "time_ids": torch.zeros((latents.shape[0], 6), device="cuda")
-                        }
-                    }
-                    training_loop_with_compile_logging(unet, sample_batch, logger)
-                    
-                    if args.finetune_vae:
-                        vae_batch = {"latents": batch["latents"].to("cuda")}
-                        training_loop_with_compile_logging(vae, vae_batch, logger)
-                except Exception as e:
-                    logger.warning(f"Error during first compiled forward pass: {str(e)}")
+            # Convert inputs to correct dtype
+            latents = batch["latents"].to(device=device, dtype=dtype, non_blocking=True)
+            text_embeddings = batch["text_embeddings"].to(device=device, dtype=dtype, non_blocking=True)
+            text_embeddings_2 = batch["text_embeddings_2"].to(device=device, dtype=dtype, non_blocking=True)
+            pooled_text_embeddings_2 = batch["pooled_text_embeddings_2"].to(device=device, dtype=dtype, non_blocking=True)
             
-            # Regular training step
-            with torch.amp.autocast(device_type='cuda', dtype=torch.float32):
-                latents = batch["latents"].to("cuda", non_blocking=True)
-                text_embeddings = batch["text_embeddings"].to("cuda", non_blocking=True)
-                text_embeddings_2 = batch["text_embeddings_2"].to("cuda", non_blocking=True)
-                pooled_text_embeddings_2 = batch["pooled_text_embeddings_2"].to("cuda", non_blocking=True)
-                
-                # Update training loss function call
+            # Use autocast for mixed precision
+            with torch.cuda.amp.autocast(dtype=dtype):
                 sigma = get_sigmas(args.num_inference_steps)[step % args.num_inference_steps].to(latents.device)
-                timestep = torch.ones(latents.shape[0], device=latents.device).long() * (step % args.num_inference_steps)
-
+                timestep = torch.ones(latents.shape[0], device=device).long() * (step % args.num_inference_steps)
+                
                 loss = training_loss(
                     unet, latents, sigma, text_embeddings, 
                     text_embeddings_2, pooled_text_embeddings_2, timestep
