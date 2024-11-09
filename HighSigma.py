@@ -201,6 +201,9 @@ class TagBasedLossWeighter:
             'quality': set()
         }
         
+        # Initialize class weights with default value of 1.0
+        self.class_weights = {class_name: 1.0 for class_name in self.tag_classes}
+        
         # Track tag frequencies per class
         self.tag_frequencies = {class_name: {} for class_name in self.tag_classes}
         self.class_total_counts = {class_name: 0 for class_name in self.tag_classes}
@@ -238,29 +241,44 @@ class TagBasedLossWeighter:
                 )
                 self.class_total_counts[class_name] += count
 
+    def set_class_weight(self, class_name, weight):
+        """
+        Set weight for a specific class.
+        
+        Args:
+            class_name (str): Name of the class
+            weight (float): Weight value
+        """
+        if class_name in self.class_weights:
+            self.class_weights[class_name] = weight
+
     def calculate_tag_weights(self, tags):
         try:
-            # Convert lists to sets for membership testing
+            # Convert nested lists to tuples for hashing
             if isinstance(tags, list):
-                tags = set(tags)
+                # Handle nested lists by converting inner lists to tuples
+                tags = tuple(tuple(t) if isinstance(t, list) else t for t in tags)
             
             weights = []
             for class_name in self.tag_classes:
                 try:
-                    # Convert class tags to set if it's a list
-                    if isinstance(self.tag_classes[class_name], list):
-                        self.tag_classes[class_name] = set(self.tag_classes[class_name])
+                    class_tags = set(self.tag_classes[class_name])
+                    tag_set = set(tags) if isinstance(tags, (list, tuple)) else {tags}
                     
-                    class_tags = tags.intersection(self.tag_classes[class_name])
+                    class_intersection = class_tags.intersection(tag_set)
                     weight = self.class_weights.get(class_name, 1.0)
-                    weights.append(weight if class_tags else 1.0)
+                    weights.append(weight if class_intersection else 1.0)
                     
                 except Exception as class_error:
                     logger.error(f"Error processing class {class_name}: {str(class_error)}")
                     logger.error(f"Class traceback: {traceback.format_exc()}")
                     weights.append(1.0)
             
-            return torch.tensor(weights).mean()
+            # Calculate final weight and clamp between min and max
+            final_weight = torch.tensor(weights).mean()
+            final_weight = torch.clamp(final_weight, self.min_weight, self.max_weight)
+            
+            return final_weight
             
         except Exception as e:
             logger.error(f"Tag weight calculation failed: {str(e)}")
@@ -610,6 +628,9 @@ class VAEFineTuner:
             self.vae = vae
             self.optimizer = AdamW8bit(vae.parameters(), lr=learning_rate)
             
+            # Convert VAE to bfloat16
+            self.vae = self.vae.to(dtype=torch.bfloat16)
+            
             # Initialize Welford's online statistics
             self.latent_count = 0
             self.latent_means = None
@@ -625,9 +646,10 @@ class VAEFineTuner:
     def update_statistics(self, latents):
         """Update running mean and variance using Welford's online algorithm"""
         try:
+            latents = latents.to(dtype=torch.bfloat16)  # Ensure bfloat16
             if self.latent_means is None:
-                self.latent_means = torch.zeros(latents.size(1), device=latents.device)
-                self.latent_m2 = torch.zeros(latents.size(1), device=latents.device)
+                self.latent_means = torch.zeros(latents.size(1), device=latents.device, dtype=torch.bfloat16)
+                self.latent_m2 = torch.zeros(latents.size(1), device=latents.device, dtype=torch.bfloat16)
                 
             flat_latents = latents.view(latents.size(0), latents.size(1), -1)
             
@@ -658,44 +680,49 @@ class VAEFineTuner:
             logger.error(f"Calculation traceback: {traceback.format_exc()}")
             return None, None
             
-    def training_step(self, batch):
+    def training_step(self, latents=None, original_images=None):
         try:
             self.optimizer.zero_grad()
             
-            # Log batch info
-            logger.debug(f"Processing batch with keys: {batch.keys()}")
+            # Ensure input data is in bfloat16
+            if original_images is None:
+                if isinstance(latents, dict):
+                    original_images = latents["pixel_values"].to(self.vae.device, dtype=torch.bfloat16)
+                else:
+                    raise ValueError("Either original_images or a batch dict must be provided")
+            else:
+                original_images = original_images.to(self.vae.device, dtype=torch.bfloat16)
             
-            # Get input images
-            images = batch["pixel_values"].to(self.vae.device)
-            logger.debug(f"Input images shape: {images.shape}")
+            logger.debug(f"Input images shape: {original_images.shape}")
             
             # Encode
-            latents = self.vae.encode(images).latent_dist.sample()
-            logger.debug(f"Encoded latents shape: {latents.shape}")
-            
-            # Update statistics
-            self.update_statistics(latents.detach())
-            
-            # Get current statistics
-            means, stds = self.get_statistics()
-            if means is not None and stds is not None:
-                latents = (latents - means[None,:,None,None]) / stds[None,:,None,None]
-                decode_latents = latents * stds[None,:,None,None] + means[None,:,None,None]
-            else:
-                decode_latents = latents
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                latents = self.vae.encode(original_images).latent_dist.sample()
+                logger.debug(f"Encoded latents shape: {latents.shape}")
                 
-            # Decode
-            decoded = self.vae.decode(decode_latents).sample
-            logger.debug(f"Decoded images shape: {decoded.shape}")
+                # Update statistics
+                self.update_statistics(latents.detach())
+                
+                # Get current statistics
+                means, stds = self.get_statistics()
+                if means is not None and stds is not None:
+                    latents = (latents - means[None,:,None,None]) / stds[None,:,None,None]
+                    decode_latents = latents * stds[None,:,None,None] + means[None,:,None,None]
+                else:
+                    decode_latents = latents
+                    
+                # Decode
+                decoded = self.vae.decode(decode_latents).sample
+                logger.debug(f"Decoded images shape: {decoded.shape}")
             
             # Calculate loss
-            loss = F.mse_loss(decoded, images, reduction="mean")
+            loss = F.mse_loss(decoded, original_images, reduction="mean")
             
             loss.backward()
             self.optimizer.step()
             
             return {
-                "loss": loss.item(),
+                "total_loss": loss.item(),
                 "latent_means": self.latent_means.detach().cpu() if self.latent_means is not None else None,
                 "latent_stds": stds.detach().cpu() if stds is not None else None
             }
@@ -703,15 +730,15 @@ class VAEFineTuner:
         except Exception as e:
             logger.error(f"Training step failed: {str(e)}")
             logger.error(f"Training traceback: {traceback.format_exc()}")
-            logger.error(f"Batch keys: {batch.keys()}")
-            logger.error(f"Device info - VAE: {self.vae.device}, Images: {images.device if 'images' in locals() else 'N/A'}")
-            return {"loss": float('inf')}  # Return infinite loss on error
+            logger.error(f"Device info - VAE: {self.vae.device}")
+            return {"total_loss": float('inf')}  # Return infinite loss on error
             
     def save_pretrained(self, path):
-        """Custom save method"""
+        """vae diffusers compatible save"""
         try:
             os.makedirs(path, exist_ok=True)
-            self.vae.save_pretrained(path)
+            self.vae.save_pretrained(path, safe_serialization=True)
+            
             torch.save(self.optimizer.state_dict(), os.path.join(path, "optimizer.pt"))
             
             # Save statistics if available
@@ -937,9 +964,11 @@ def main(args):
             model=unet,
             vae=vae,
             tokenizer=tokenizer,
+            tokenizer_2=tokenizer_2,
             text_encoder=text_encoder,
+            text_encoder_2=text_encoder_2,
             device=device
-        )   
+        )
 
         # Move models to device and set dtype
         unet = unet.to(device=device, dtype=dtype)
@@ -1096,23 +1125,37 @@ def save_image_grid(images, path, nrow=1, normalize=True):
     TF.to_pil_image(grid).save(path)
 
 class ModelValidator:
-    def __init__(self, model, vae, tokenizer, text_encoder, device="cuda"):
+    def __init__(self, model, vae, tokenizer, tokenizer_2, text_encoder, text_encoder_2, device="cuda"):
+        """
+        Initialize the ModelValidator with SDXL models and tokenizers.
+        
+        Args:
+            model: The UNet model
+            vae: The VAE model
+            tokenizer: First SDXL tokenizer
+            tokenizer_2: Second SDXL tokenizer
+            text_encoder: First SDXL text encoder
+            text_encoder_2: Second SDXL text encoder
+            device: Device to run on (default: "cuda")
+        """
         self.model = model.to(device)
         self.vae = vae.to(device)
         self.tokenizer = tokenizer
+        self.tokenizer_2 = tokenizer_2
         self.text_encoder = text_encoder.to(device)
+        self.text_encoder_2 = text_encoder_2.to(device)
         self.device = device
 
     def generate_at_sigma(self, prompt, target_sigma, sigma_max=20000.0):
         """Generate a sample denoising from sigma_max down to target_sigma"""
         try:
             # Create custom sigma schedule from sigma_max down to target_sigma
-            sigmas = torch.linspace(sigma_max, target_sigma, steps=10).to(self.device)
+            sigmas = torch.linspace(sigma_max, target_sigma, steps=10).to(self.device, dtype=torch.bfloat16)
             
             # Initialize random latents
-            latents = torch.randn((1, 4, 64, 64)).to(self.device)
+            latents = torch.randn((1, 4, 64, 64), dtype=torch.bfloat16).to(self.device)
             
-            # Encode text prompt
+            # Encode text prompt for both encoders
             text_input = self.tokenizer(
                 prompt,
                 padding="max_length",
@@ -1121,15 +1164,55 @@ class ModelValidator:
                 return_tensors="pt"
             )
             
+            # SDXL text encoder 2 input
+            text_input_2 = self.tokenizer_2(
+                prompt,
+                padding="max_length",
+                max_length=self.tokenizer_2.model_max_length,
+                truncation=True,
+                return_tensors="pt"
+            )
+            
             with torch.no_grad():
-                prompt_embeds = self.text_encoder(text_input.input_ids.to(self.device))[0]
+                # Process with first text encoder
+                text_input_ids = text_input.input_ids.to(self.device)
+                prompt_embeds = self.text_encoder(text_input_ids)[0].to(dtype=torch.bfloat16)
+                
+                # Process with second text encoder
+                text_input_ids_2 = text_input_2.input_ids.to(self.device)
+                prompt_embeds_2 = self.text_encoder_2(text_input_ids_2)
+                pooled_prompt_embeds = prompt_embeds_2[0].to(dtype=torch.bfloat16)
+                text_embeds = prompt_embeds_2.pooler_output.to(dtype=torch.bfloat16)
+                
+                # Create micro-conditioning tensors
+                height = width = 1024
+                time_ids = torch.tensor([
+                    height,  # Original height
+                    width,   # Original width
+                    height,  # Target height
+                    width,   # Target width
+                    0,      # Crop top
+                    0,      # Crop left
+                ], device=self.device, dtype=torch.bfloat16)
+                
+                time_ids = time_ids.unsqueeze(0)  # Add batch dimension
+                
+                # Prepare added conditioning kwargs
+                added_cond_kwargs = {
+                    "text_embeds": text_embeds,
+                    "time_ids": time_ids
+                }
+                
+                # Combine text embeddings
+                prompt_embeds = torch.cat([prompt_embeds, pooled_prompt_embeds], dim=-1)
                 
                 # Denoise from sigma_max down to target_sigma
                 for sigma in sigmas:
                     noise_pred = self.model(
                         latents,
-                        sigma[None].to(self.device),
-                        encoder_hidden_states=prompt_embeds
+                        sigma[None].to(self.device, dtype=torch.bfloat16),
+                        encoder_hidden_states=prompt_embeds,
+                        added_cond_kwargs=added_cond_kwargs
                     ).sample
                     
                     latents = latents - noise_pred * (sigma ** 2)
@@ -1142,7 +1225,8 @@ class ModelValidator:
         except Exception as e:
             logger.error(f"Sample generation at sigma {target_sigma} failed: {str(e)}")
             logger.error(f"Traceback: {traceback.format_exc()}")
-            return torch.zeros((1, 3, 1024, 1024)).to(self.device)  # Updated size
+            return torch.zeros((1, 3, 1024, 1024), dtype=torch.bfloat16).to(self.device)
+        
 
     def validate_ztsnr(self, prompt="completely black"):
         """
@@ -1265,8 +1349,8 @@ class ModelValidator:
             # Get sigmas for sampling
             sigmas = get_sigmas(num_inference_steps, sigma_max=sigma_max).to(self.device)
             
-            # Initialize random latents
-            latents = torch.randn((1, 4, 64, 64)).to(self.device)
+            # Initialize random latents and convert to bfloat16
+            latents = torch.randn((1, 4, 64, 64), dtype=torch.bfloat16).to(self.device)
             
             # Encode text prompt
             text_input = self.tokenizer(
@@ -1277,16 +1361,60 @@ class ModelValidator:
                 return_tensors="pt"
             )
             
+            # SDXL text encoder 2 input
+            text_input_2 = self.tokenizer_2(
+                prompt,
+                padding="max_length",
+                max_length=self.tokenizer_2.model_max_length,
+                truncation=True,
+                return_tensors="pt"
+            )
+            
             with torch.no_grad():
-                prompt_embeds = self.text_encoder(text_input.input_ids.to(self.device))[0]
+                # Process with first text encoder
+                text_input_ids = text_input.input_ids.to(self.device)
+                prompt_embeds = self.text_encoder(text_input_ids)[0].to(dtype=torch.bfloat16)
+                
+                # Process with second text encoder
+                text_input_ids_2 = text_input_2.input_ids.to(self.device)
+                prompt_embeds_2 = self.text_encoder_2(text_input_ids_2)
+                pooled_prompt_embeds = prompt_embeds_2[0].to(dtype=torch.bfloat16)
+                text_embeds = prompt_embeds_2.pooler_output.to(dtype=torch.bfloat16)
+            
+            # Create micro-conditioning tensors
+            height = width = 1024
+            target_size = (height, width)
+            
+            time_ids = torch.tensor([
+                height,  # Original height
+                width,   # Original width
+                height,  # Target height
+                width,   # Target width
+                0,      # Crop top
+                0,      # Crop left
+            ], device=self.device, dtype=torch.bfloat16)
+            
+            time_ids = time_ids.unsqueeze(0)  # Add batch dimension
+            
+            # Prepare added conditioning kwargs
+            added_cond_kwargs = {
+                "text_embeds": text_embeds,
+                "time_ids": time_ids
+            }
+            
+            # Combine text embeddings
+            prompt_embeds = torch.cat([prompt_embeds, pooled_prompt_embeds], dim=-1)
             
             # Denoise
             for i, sigma in enumerate(sigmas):
                 with torch.no_grad():
+                    # Ensure sigma is bfloat16
+                    sigma = sigma.to(dtype=torch.bfloat16)
                     noise_pred = self.model(
                         latents,
                         sigma[None].to(self.device),
-                        encoder_hidden_states=prompt_embeds
+                        encoder_hidden_states=prompt_embeds,
+                        added_cond_kwargs=added_cond_kwargs
                     ).sample
                 
                 latents = latents - noise_pred * (sigma[None, None, None] ** 2)
@@ -1304,7 +1432,8 @@ class ModelValidator:
         except Exception as e:
             logger.error(f"Sample generation failed: {str(e)}")
             logger.error(f"Traceback: {traceback.format_exc()}")
-            return torch.zeros((1, 3, 1024, 1024)).to(self.device)  # Updated size
+            return torch.zeros((1, 3, 1024, 1024), dtype=torch.bfloat16).to(self.device)
+
 
         
 
