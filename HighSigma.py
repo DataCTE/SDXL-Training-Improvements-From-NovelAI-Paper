@@ -16,8 +16,8 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from transformers.optimization import Adafactor
 import torchvision.models as models
-import time
 import torch.nn as nn
+
 
 
 
@@ -367,6 +367,11 @@ class CustomDataset(Dataset):
 class ResNetBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
+        self.time_emb = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(512, out_channels)  # 512 is timestep embedding dim
+        )
+        
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
         self.norm1 = nn.GroupNorm(32, out_channels)
@@ -378,11 +383,17 @@ class ResNetBlock(nn.Module):
         else:
             self.shortcut = nn.Identity()
 
-    def forward(self, x):
+    def forward(self, x, t_emb=None):
         identity = self.shortcut(x)
+        
         x = self.act(self.norm1(self.conv1(x)))
+        if t_emb is not None:
+            # Add time embedding
+            x = x + self.time_emb(t_emb)[:, :, None, None]
+            
         x = self.act(self.norm2(self.conv2(x)))
         return x + identity
+
 class DInitial(nn.Module):
     """Initial deterministic decoder from SWYCC paper"""
     def __init__(self, latent_channels, hidden_channels=[64, 128, 256, 512]):
@@ -428,6 +439,23 @@ class SelfAttention(nn.Module):
         attention_value = self.ff_self(attention_value) + attention_value
         return attention_value.swapaxes(2, 1).view(x.shape[0], self.channels, *size)
 
+def get_timestep_embedding(timesteps, embedding_dim=512):
+        """
+        Create sinusoidal timestep embeddings.
+        :param timesteps: a 1-D Tensor of N indices, one per batch element.
+        :param embedding_dim: the dimension of the output.
+        :return: an [N x embedding_dim] Tensor of positional embeddings.
+        """
+        assert len(timesteps.shape) == 1
+        half_dim = embedding_dim // 2
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=timesteps.device) * -emb)
+        emb = timesteps[:, None] * emb[None, :]
+        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
+        if embedding_dim % 2 == 1:  # zero pad
+            emb = torch.nn.functional.pad(emb, (0, 1, 0, 0))
+        return emb
+
 class DRefine(nn.Module):
     """U-Net based diffusion refinement decoder"""
     def __init__(self):
@@ -464,13 +492,42 @@ class DRefine(nn.Module):
             self.down_blocks.append(nn.Sequential(*blocks))
             in_channels = out_channels
         
+        # Upsampling path with skip connections
+        self.up_blocks = nn.ModuleList()
+        curr_resolution = 16  # Starting from bottleneck
+        
+        for i in range(4):  # 4 upsampling stages
+            out_channels = in_channels // channel_multiplier[-(i+1)]
+            
+            blocks = []
+            # Add ResNet blocks
+            for _ in range(num_res_blocks[-(i+1)]):
+                blocks.append(ResNetBlock(in_channels * 2, out_channels))  # *2 for skip connection
+                
+            # Add upsampling if needed
+            if downsampling_factor[-(i+1)] > 1:
+                blocks.append(nn.Upsample(scale_factor=2, mode='nearest'))
+                curr_resolution *= 2
+                
+            # Add attention at specified resolution
+            if curr_resolution == attn_resolution:
+                blocks.append(SelfAttention(out_channels))
+                
+            self.up_blocks.append(nn.Sequential(*blocks))
+            in_channels = out_channels
+            
+        self.final_conv = nn.Conv2d(in_channels, 3, kernel_size=3, padding=1)
+
     def forward(self, x, timestep, context=None):
+        # Embed timestep
+        t_emb = get_timestep_embedding(timestep)  # Need to implement this
+        
         # Store skip connections
         skips = []
         
-        # Downsampling path
+        # Downsampling path with timestep conditioning
         for block in self.down_blocks:
-            x = block(x)
+            x = block(x, t_emb)  # Need to modify ResNetBlock to accept t_emb
             skips.append(x)
             
         # Upsampling path with skip connections
@@ -537,7 +594,6 @@ def get_model_output_with_cfg(model, x_t, timestep, text_embeddings_2, pooled_te
         initial_output = None
         if d_initial is not None and latents is not None:
             initial_output = d_initial(latents)
-        
         
         # Unconditional
         uncond_embeddings_2 = torch.zeros_like(text_embeddings_2)
