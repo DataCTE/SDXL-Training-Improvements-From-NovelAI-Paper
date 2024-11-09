@@ -1195,9 +1195,6 @@ def save_image_grid(images, path, nrow=1, normalize=True):
 
 class ModelValidator:
     def __init__(self, model, vae, device="cuda"):
-        """
-        Initialize validation system based on paper's methodology.
-        """
         self.model = model
         self.vae = vae
         self.device = device
@@ -1207,15 +1204,11 @@ class ModelValidator:
         Validate Zero Terminal SNR as shown in Figure 2 of the paper.
         Tests if model can generate pure black images when prompted.
         """
-        print("Validating ZTSNR effectiveness...")
-        
-        # Generate with and without ZTSNR
         results = {
             'ztsnr': self.generate_with_ztsnr(prompt),
             'no_ztsnr': self.generate_without_ztsnr(prompt)
         }
         
-        # Calculate mean brightness of generated images
         metrics = {
             'ztsnr_mean_brightness': results['ztsnr'].mean(),
             'no_ztsnr_mean_brightness': results['no_ztsnr'].mean()
@@ -1223,48 +1216,15 @@ class ModelValidator:
         
         return results, metrics
 
-    def validate_high_res_coherence(self, prompt):
+    def validate_high_res_coherence(self, prompt, sigma_max_values=[14.6, 29.0]):
         """
         Validate high-resolution coherence as shown in Figure 6 of the paper.
         Tests if model maintains coherence with different sigma_max values.
         """
-        print("Validating high-resolution coherence...")
-        
-        results = {
-            'default_sigma': self.generate_with_sigma_max(prompt, sigma_max=14.6),
-            'high_sigma': self.generate_with_sigma_max(prompt, sigma_max=29.0)
-        }
-        
-        return results
-
-    def validate_noise_schedule(self, image):
-        """
-        Validate noise schedule as shown in Figure 1 of the paper.
-        Shows progressive noise addition up to final training timestep.
-        """
-        print("Validating noise schedule...")
-        
-        sigmas = [0, 0.447, 3.17, 14.6]
-        noised_images = []
-        
-        for sigma in sigmas:
-            noise = torch.randn_like(image)
-            noised = image + sigma * noise
-            noised_images.append(noised)
-            
-        return noised_images
-
-    def validate_denoising_steps(self, prompt, sigma_max_values=[14.6, 29.0]):
-        """
-        Validate intermediate denoising steps as shown in Figure 7 of the paper.
-        Shows denoising progression with different sigma_max values.
-        """
-        print("Validating denoising steps...")
-        
         results = {}
         step_sigmas = {
-            14.6: [14.6, 10.8, 8.3, 6.6, 5.4],
-            29.0: [29.0, 17.8, 12.4, 9.2, 7.2]
+            14.6: [14.6, 10.8, 8.3, 6.6, 5.4],  # From Figure 7
+            29.0: [29.0, 17.8, 12.4, 9.2, 7.2]  # From Figure 7
         }
         
         for sigma_max in sigma_max_values:
@@ -1276,6 +1236,22 @@ class ModelValidator:
             
         return results
 
+    def validate_noise_schedule(self, image):
+        """
+        Validate noise schedule as shown in Figure 1 of the paper.
+        Shows progressive noise addition up to final training timestep.
+        """
+        # Sigmas from Figure 1
+        sigmas = [0, 0.447, 3.17, 14.6]
+        noised_images = []
+        
+        for sigma in sigmas:
+            noise = torch.randn_like(image)
+            noised = image + sigma * noise
+            noised_images.append(noised)
+            
+        return noised_images
+
     def run_paper_validation(self, test_prompts):
         """Run all validation tests described in the paper"""
         results = {}
@@ -1283,7 +1259,7 @@ class ModelValidator:
         # Test ZTSNR with pure black generation (Figure 2)
         results['ztsnr'] = self.validate_ztsnr("completely black")
         
-        # Test high-res coherence (Figure 6)
+        # Test high-res coherence with specific prompts (Figure 6)
         results['coherence'] = self.validate_high_res_coherence(
             "a close-up portrait with detailed limbs"
         )
@@ -1294,10 +1270,10 @@ class ModelValidator:
         return results
 
     def save_validation_images(self, results, output_dir):
-        """Save validation images in a format similar to paper figures"""
+        """Save validation images in a format matching paper figures"""
         os.makedirs(output_dir, exist_ok=True)
         
-        # Save ZTSNR comparison (Figure 2 style)
+        # Save ZTSNR comparison (Figure 2)
         save_image_grid(
             [results['ztsnr']['ztsnr'], results['ztsnr']['no_ztsnr']],
             os.path.join(output_dir, 'ztsnr_comparison.png'),
@@ -1305,7 +1281,7 @@ class ModelValidator:
             normalize=True
         )
         
-        # Save high-res coherence comparison (Figure 6 style)
+        # Save high-res coherence comparison (Figure 6)
         save_image_grid(
             [results['coherence']['default_sigma'], 
              results['coherence']['high_sigma']],
@@ -1314,7 +1290,7 @@ class ModelValidator:
             normalize=True
         )
         
-        # Save denoising steps (Figure 7 style)
+        # Save denoising steps (Figure 7)
         for sigma_max, steps in results['denoising'].items():
             save_image_grid(
                 steps,
