@@ -20,7 +20,8 @@ from torchvision.utils import make_grid
 import torchvision.transforms.functional as TF
 import os
 import wandb
-
+import json
+import traceback
 
 def setup_logging():
     logging.basicConfig(
@@ -83,12 +84,18 @@ def training_loss(model, x_0, sigma, text_embeddings, text_embeddings_2, pooled_
     # Fix tensor shapes
     # Remove extra dimension from pooled_text_embeds_2
     # Handle only the specific error case where dim=1 doesn't exist
-    if pooled_text_embeds_2.dim() == 2:  # Already [B, 1280]
-        pass
-    else:
-        pooled_text_embeds_2 = pooled_text_embeds_2.squeeze(1)  # [B, 1280]
+    if pooled_text_embeds_2.dim() == 1:  # Handle 1D case
+        pooled_text_embeds_2 = pooled_text_embeds_2.unsqueeze(0)  # Add batch dimension
     
-    #print(f"pooled_text_embeds_2 after squeeze: {pooled_text_embeds_2.shape}")
+    # Safe squeeze operation
+    if pooled_text_embeds_2.dim() > 2:
+        pooled_text_embeds_2 = pooled_text_embeds_2.squeeze()
+        # Ensure we have at least 2 dimensions
+        if pooled_text_embeds_2.dim() == 1:
+            pooled_text_embeds_2 = pooled_text_embeds_2.unsqueeze(0)
+    
+    # Validate final shape
+    assert pooled_text_embeds_2.dim() == 2, f"Expected 2D tensor [B, 1280], got shape {pooled_text_embeds_2.shape}"
     
     # Fix text_embeddings shape - need one more squeeze for batch processing
     text_embeddings = text_embeddings.squeeze(1)  # [B, 77, 768]
@@ -98,35 +105,33 @@ def training_loss(model, x_0, sigma, text_embeddings, text_embeddings_2, pooled_
     
     # Create micro-conditioning tensors
     if isinstance(target_size, list):
-        #print("Processing batch target_size")
-        # Get the first tensor from target_size to extract values
-        first_target = target_size[0]
-        # Create time_ids for the entire batch using the same values
+        # Convert list to tuple for hashing
+        target_size = tuple(target_size[0])  # Convert first target size to tuple
+        
         time_ids = torch.tensor([
-            first_target[0],  # height
-            first_target[1],  # width
-            first_target[0],  # target height
-            first_target[1],  # target width
+            target_size[0],  # height
+            target_size[1],  # width
+            target_size[0],  # target height
+            target_size[1],  # target width
             0,  # crop top
             0,  # crop left
         ], device=x_0.device, dtype=torch.float32)
+        
         # Repeat for batch size
         time_ids = time_ids.unsqueeze(0).repeat(batch_size, 1)  # [B, 6]
     else:
-        #print("Processing single target_size")
-        # Original single sample processing
-        original_size = target_size
-        crops_coords_top_left = (0, 0)
-
+        # Handle single target_size case
+        target_size = tuple(target_size)  # Convert to tuple for consistency
+        
         time_ids = torch.tensor([
-            original_size[0],
-            original_size[1],
             target_size[0],
             target_size[1],
-            crops_coords_top_left[0],
-            crops_coords_top_left[1],
+            target_size[0],
+            target_size[1],
+            0,
+            0,
         ], device=x_0.device, dtype=torch.float32)
-
+        
         time_ids = time_ids.unsqueeze(0).repeat(batch_size, 1)  # [B, 6]
     
     #print(f"time_ids final shape: {time_ids.shape}")
@@ -234,47 +239,33 @@ class TagBasedLossWeighter:
                 self.class_total_counts[class_name] += count
 
     def calculate_tag_weights(self, tags):
-        """
-        Calculate weight multiplier for an image based on its tags.
-        
-        Args:
-            tags (list): List of tags from an image
+        try:
+            # Convert lists to sets for membership testing
+            if isinstance(tags, list):
+                tags = set(tags)
             
-        Returns:
-            float: Weight multiplier for the image's loss
-        """
-        if not tags:
-            return 1.0
+            weights = []
+            for class_name in self.tag_classes:
+                try:
+                    # Convert class tags to set if it's a list
+                    if isinstance(self.tag_classes[class_name], list):
+                        self.tag_classes[class_name] = set(self.tag_classes[class_name])
+                    
+                    class_tags = tags.intersection(self.tag_classes[class_name])
+                    weight = self.class_weights.get(class_name, 1.0)
+                    weights.append(weight if class_tags else 1.0)
+                    
+                except Exception as class_error:
+                    logger.error(f"Error processing class {class_name}: {str(class_error)}")
+                    logger.error(f"Class traceback: {traceback.format_exc()}")
+                    weights.append(1.0)
             
-        class_weights = []
-        
-        for class_name in self.tag_classes:
-            class_tags = [tag for tag in tags if tag in self.tag_classes[class_name]]
-            if not class_tags:
-                continue
-                
-            # Calculate average frequency for tags in this class
-            total_freq = sum(self.tag_frequencies[class_name].get(tag, 0) 
-                           for tag in class_tags)
-            avg_freq = total_freq / len(class_tags)
+            return torch.tensor(weights).mean()
             
-            # Calculate relative frequency compared to class average
-            class_avg = self.class_total_counts[class_name] / len(self.tag_frequencies[class_name])
-            relative_freq = avg_freq / class_avg if class_avg > 0 else 1.0
-            
-            # Convert to weight (inverse relationship with frequency)
-            weight = 1.0 / relative_freq if relative_freq > 0 else 1.0
-            class_weights.append(weight)
-        
-        # Combine weights from all classes (geometric mean)
-        if class_weights:
-            final_weight = torch.exp(torch.mean(torch.tensor([torch.log(torch.tensor(w)) 
-                                                            for w in class_weights])))
-            # Clamp to allowed range
-            final_weight = torch.clamp(final_weight, self.min_weight, self.max_weight)
-            return final_weight.item()
-        
-        return 1.0
+        except Exception as e:
+            logger.error(f"Tag weight calculation failed: {str(e)}")
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            return torch.tensor(1.0)
 
     def update_training_loss(self, loss, tags):
         """
@@ -287,8 +278,13 @@ class TagBasedLossWeighter:
         Returns:
             torch.Tensor: Weighted loss value
         """
-        weight = self.calculate_tag_weights(tags)
-        return loss * weight
+        try:
+            weight = self.calculate_tag_weights(tags)
+            return loss * weight
+        except Exception as e:
+            logger.error(f"Loss update failed: {str(e)}")
+            logger.error(f"Loss update traceback: {traceback.format_exc()}")
+            return loss  # Return original loss on error
     
 class CustomDataset(Dataset):
     def __init__(self, data_dir, vae, tokenizer, tokenizer_2, text_encoder, text_encoder_2,
@@ -498,8 +494,8 @@ class CustomDataset(Dataset):
         embeddings_path = self.cache_dir / f"{img_path.stem}_embeddings.pt"
 
         # Load cached data
-        latents = torch.load(latents_path, map_location='cpu')  # [1, 4, 128, 128]
-        embeddings = torch.load(embeddings_path, map_location='cpu')
+        latents = torch.load(latents_path, map_location='cpu', weights_only=True)
+        embeddings = torch.load(embeddings_path, map_location='cpu', weights_only=True)
 
         # Load original image
         image = Image.open(img_path).convert("RGB")
@@ -609,218 +605,130 @@ def custom_collate(batch):
         return collated
 
 class VAEFineTuner:
-    def __init__(self, vae, learning_rate=1e-6, perceptual_weight=1.0, l1_weight=1.0, 
-                 kl_weight=0.1, use_vae_scaling=True, per_channel_scaling=True):
-        self.vae = vae
-        self.perceptual_loss = PerceptualLoss()
-
-        # Loss weights
-        self.perceptual_weight = perceptual_weight
-        self.l1_weight = l1_weight
-        self.kl_weight = kl_weight
-
-        # VAE scaling configuration
-        self.use_vae_scaling = use_vae_scaling
-        if use_vae_scaling:
-            # Pre-computed statistics from the paper for anime illustrations
-            self.register_latent_stats(per_channel=per_channel_scaling)
-
-        # Optimizer
-        self.optimizer = AdamW8bit(
-            self.vae.parameters(),
-            lr=learning_rate,
-            betas=(0.9, 0.999),
-            weight_decay=1e-2,
-            eps=1e-8
-        )
-
-    def register_latent_stats(self, per_channel=True):
-        """Register VAE latent statistics as buffers"""
-        means = torch.tensor([4.8119, 0.1607, 1.3538, -1.7753])
-        stds = torch.tensor([9.9181, 6.2753, 7.5978, 5.9956])
-        
-        if not per_channel:
-            means = means.mean().repeat(4)
-            stds = stds.mean().repeat(4)
-        
-        # Register as buffers so they move to the correct device with the model
-        self.register_buffer('latent_means', means.view(4, 1, 1))
-        self.register_buffer('latent_stds', stds.view(4, 1, 1))
-
-    def scale_latents(self, latents, reverse=False):
-        """Apply scale and shift to latents"""
-        if not self.use_vae_scaling:
-            return latents
+    def __init__(self, vae, learning_rate=1e-6):
+        try:
+            self.vae = vae
+            self.optimizer = AdamW8bit(vae.parameters(), lr=learning_rate)
             
-        if reverse:
-            # Convert from standard Gaussian back to VAE distribution
-            return latents * self.latent_stds + self.latent_means
-        else:
-            # Convert to standard Gaussian
-            return (latents - self.latent_means) / self.latent_stds
-
-    def training_step(self, latents, original_images):
-        """VAE training step"""
-        self.vae.train()
-        
-        # Ensure consistent dtype (bfloat16)
-        latents = latents.to("cuda", dtype=torch.bfloat16)
-        original_images = original_images.to("cuda", dtype=torch.bfloat16)
-
-        # Remove extra dimensions if present
-        while latents.dim() > 4:
-            latents = latents.squeeze(1)
-
-        # Apply scale-and-shift normalization if enabled
-        if self.use_vae_scaling:
-            latents = self.scale_latents(latents, reverse=True)  # Convert back to VAE distribution for decoding
-
-        # Decode latents
-        decoded_images = self.vae.decode(latents).sample
-
-        # Calculate losses
-        p_loss = self.perceptual_loss(decoded_images, original_images)
-        l1_loss = F.l1_loss(decoded_images, original_images)
-
-        # KL loss with scale-and-shift consideration
-        posterior = self.vae.encode(original_images).latent_dist
-        if self.use_vae_scaling:
-            # Scale the posterior distribution
-            posterior_mean = (posterior.mean - self.latent_means) / self.latent_stds
-            posterior_logvar = posterior.logvar - 2 * torch.log(self.latent_stds)
-            kl_loss = torch.mean(-0.5 * torch.sum(1 + posterior_logvar - posterior_mean.pow(2) - posterior_logvar.exp(), dim=1))
-        else:
-            kl_loss = torch.mean(-0.5 * torch.sum(1 + posterior.logvar - posterior.mean.pow(2) - posterior.logvar.exp(), dim=1))
-
-        # Total loss
-        total_loss = self.perceptual_weight * p_loss + self.l1_weight * l1_loss + self.kl_weight * kl_loss
-
-        # Backward
-        self.optimizer.zero_grad()
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.vae.parameters(), max_norm=1.0)
-        self.optimizer.step()
-
-        return {
-            'total_loss': total_loss.item(),
-            'perceptual_loss': p_loss.item(),
-            'l1_loss': l1_loss.item(),
-            'kl_loss': kl_loss.item()
-        }
-
-    @torch.no_grad()
-    def compute_online_statistics(self, dataloader, num_batches=1000):
-        """Compute dataset statistics using Welford's online algorithm"""
-        self.vae.eval()
-        count = 0
-        means = torch.zeros(4, device=self.vae.device)
-        M2s = torch.zeros(4, device=self.vae.device)
-        
-        print("Computing VAE latent statistics...")
-        for i, batch in enumerate(tqdm(dataloader)):
-            if i >= num_batches:
-                break
+            # Initialize Welford's online statistics
+            self.latent_count = 0
+            self.latent_means = None
+            self.latent_m2 = None
+            
+            logger.info("VAEFineTuner initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"VAEFineTuner initialization failed: {str(e)}")
+            logger.error(f"Initialization traceback: {traceback.format_exc()}")
+            raise
+            
+    def update_statistics(self, latents):
+        """Update running mean and variance using Welford's online algorithm"""
+        try:
+            if self.latent_means is None:
+                self.latent_means = torch.zeros(latents.size(1), device=latents.device)
+                self.latent_m2 = torch.zeros(latents.size(1), device=latents.device)
                 
-            images = batch["original_images"].to(self.vae.device)
+            flat_latents = latents.view(latents.size(0), latents.size(1), -1)
+            
+            for i in range(latents.size(0)):
+                self.latent_count += 1
+                delta = flat_latents[i].mean(dim=1) - self.latent_means
+                self.latent_means += delta / self.latent_count
+                delta2 = flat_latents[i].mean(dim=1) - self.latent_means
+                self.latent_m2 += delta * delta2
+                
+        except Exception as e:
+            logger.error(f"Statistics update failed: {str(e)}")
+            logger.error(f"Update traceback: {traceback.format_exc()}")
+            logger.error(f"Latents shape: {latents.shape}")
+            logger.error(f"Current means shape: {self.latent_means.shape if self.latent_means is not None else None}")
+            
+    def get_statistics(self):
+        try:
+            if self.latent_count < 2:
+                return None, None
+                
+            variance = self.latent_m2 / (self.latent_count - 1)
+            std = torch.sqrt(variance + 1e-8)
+            return self.latent_means, std
+            
+        except Exception as e:
+            logger.error(f"Statistics calculation failed: {str(e)}")
+            logger.error(f"Calculation traceback: {traceback.format_exc()}")
+            return None, None
+            
+    def training_step(self, batch):
+        try:
+            self.optimizer.zero_grad()
+            
+            # Log batch info
+            logger.debug(f"Processing batch with keys: {batch.keys()}")
+            
+            # Get input images
+            images = batch["pixel_values"].to(self.vae.device)
+            logger.debug(f"Input images shape: {images.shape}")
+            
+            # Encode
             latents = self.vae.encode(images).latent_dist.sample()
+            logger.debug(f"Encoded latents shape: {latents.shape}")
             
-            # Flatten spatial dimensions for each channel
-            latents = latents.view(latents.shape[0], 4, -1)
+            # Update statistics
+            self.update_statistics(latents.detach())
             
-            # Update statistics for each channel using Welford's algorithm
-            for c in range(4):
-                channel_values = latents[:, c].flatten()
-                for value in channel_values:
-                    count += 1
-                    delta = value - means[c]
-                    means[c] += delta / count
-                    delta2 = value - means[c]
-                    M2s[c] += delta * delta2
-        
-        # Calculate final statistics
-        stds = torch.sqrt(M2s / (count - 1))
-        
-        # Update the registered buffers
-        self.latent_means.data = means.view(4, 1, 1)
-        self.latent_stds.data = stds.view(4, 1, 1)
-        
-        return means, stds
-
-def setup_distributed():
-    """Setup distributed training"""
-    dist.init_process_group(backend='nccl')
-    torch.cuda.set_device(dist.get_rank())
-    return dist.get_rank(), dist.get_world_size()
-
-def compile_model(model, name, mode='default', enable_compile=True, logger=None):
-    """Safely compile a model with error handling"""
-    if not enable_compile:
-        logger.info(f"Skipping compilation for {name} (disabled)")
-        return model
-        
-    if logger is None:
-        logger = logging.getLogger(__name__)
-
-    had_xformers = False
-    try:
-        logger.info(f"Compiling {name}...")
-
-        # Temporarily disable xformers
-        if hasattr(model, 'disable_xformers_memory_efficient_attention'):
-            had_xformers = True
-            model.disable_xformers_memory_efficient_attention()
-
-        # Create appropriate test input based on model type
-        dtype = torch.bfloat16
-        batch_size = 1  # Match training batch size
-        
-        if isinstance(model, AutoencoderKL):
-            test_batch = {
-                "sample": torch.randn(1, 4, 64, 64, dtype=dtype).to(model.device),
-                "return_dict": True
+            # Get current statistics
+            means, stds = self.get_statistics()
+            if means is not None and stds is not None:
+                latents = (latents - means[None,:,None,None]) / stds[None,:,None,None]
+                decode_latents = latents * stds[None,:,None,None] + means[None,:,None,None]
+            else:
+                decode_latents = latents
+                
+            # Decode
+            decoded = self.vae.decode(decode_latents).sample
+            logger.debug(f"Decoded images shape: {decoded.shape}")
+            
+            # Calculate loss
+            loss = F.mse_loss(decoded, images, reduction="mean")
+            
+            loss.backward()
+            self.optimizer.step()
+            
+            return {
+                "loss": loss.item(),
+                "latent_means": self.latent_means.detach().cpu() if self.latent_means is not None else None,
+                "latent_stds": stds.detach().cpu() if stds is not None else None
             }
-        elif isinstance(model, UNet2DConditionModel):
-            # Match shapes from training_loss function
-            test_batch = {
-                "sample": torch.randn(batch_size, 4, 128, 128, dtype=dtype).to(model.device),  # [B, 4, H/8, W/8]
-                "timestep": torch.ones(batch_size).to(model.device).long(),  # [B]
-                "encoder_hidden_states": torch.randn(batch_size, 77, 2048, dtype=dtype).to(model.device),  # [B, 77, 2048]
-                "added_cond_kwargs": {
-                    "text_embeds": torch.randn(batch_size, 1280, dtype=dtype).to(model.device),  # [B, 1280]
-                    "time_ids": torch.zeros(batch_size, 6, dtype=dtype).to(model.device)  # [B, 6]
+            
+        except Exception as e:
+            logger.error(f"Training step failed: {str(e)}")
+            logger.error(f"Training traceback: {traceback.format_exc()}")
+            logger.error(f"Batch keys: {batch.keys()}")
+            logger.error(f"Device info - VAE: {self.vae.device}, Images: {images.device if 'images' in locals() else 'N/A'}")
+            return {"loss": float('inf')}  # Return infinite loss on error
+            
+    def save_pretrained(self, path):
+        """Custom save method"""
+        try:
+            os.makedirs(path, exist_ok=True)
+            self.vae.save_pretrained(path)
+            torch.save(self.optimizer.state_dict(), os.path.join(path, "optimizer.pt"))
+            
+            # Save statistics if available
+            if self.latent_means is not None and self.latent_m2 is not None:
+                stats = {
+                    "means": self.latent_means.cpu(),
+                    "m2": self.latent_m2.cpu(),
+                    "count": self.latent_count
                 }
-            }
-
-        # Clear CUDA cache before compilation
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        # Compile with reduced batch size for memory efficiency
-        compiled_model = torch.compile(
-            model,
-            mode=mode,
-            fullgraph=True
-        )
-
-        # Test the compiled model
-        with torch.amp.autocast('cuda', dtype=dtype):
-            _ = compiled_model(**test_batch)
-
-        # Re-enable xformers if it was enabled before
-        if had_xformers:
-            compiled_model.enable_xformers_memory_efficient_attention()
-
-        logger.info(f"Successfully compiled {name}")
-        return compiled_model
-    except Exception as e:
-        logger.warning(f"Failed to compile {name}: {str(e)}")
-        logger.warning(f"Continuing with uncompiled {name}")
-
-        # Re-enable xformers if it was enabled before
-        if had_xformers:
-            model.enable_xformers_memory_efficient_attention()
-
-        return model
+                torch.save(stats, os.path.join(path, "latent_stats.pt"))
+                
+            logger.info(f"Model saved successfully to {path}")
+            
+        except Exception as e:
+            logger.error(f"Model save failed: {str(e)}")
+            logger.error(f"Save traceback: {traceback.format_exc()}")
+            raise
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -862,368 +770,322 @@ def parse_args():
     parser.add_argument("--push_to_hub", action="store_true", help="Push model to HuggingFace Hub")
     parser.add_argument("--hub_model_id", type=str, default=None, help="HuggingFace Hub model ID")
     parser.add_argument("--hub_private", action="store_true", help="Make the HuggingFace repo private")
-    return parser.parse_args()
+    parser.add_argument(
+        "--validation_frequency",
+        type=int,
+        default=1,  # Run validation every epoch by default
+        help="Number of epochs between validation runs"
+    )
+    parser.add_argument(
+        "--validation_prompts",
+        type=str,
+        nargs="+",
+        default=[
+            "a detailed portrait of a girl",
+            "completely black",
+            "a red ball on top of a blue cube, both infront of a green triangle"
+        ],
+        help="Prompts to use for validation"
+    )
+    parser.add_argument(
+        "--skip_validation",
+        action="store_true",
+        help="Skip validation entirely"
+    )
+
+    args = parser.parse_args()
+    return args
 
 
 
     
 def main(args):
-    # Initialize wandb if enabled
-    if args.use_wandb:
-        import wandb
-        wandb.init(
-            project=args.wandb_project,
-            name=args.wandb_run_name,
-            config=vars(args),
-            settings=wandb.Settings(code_dir="."),
-        )
-        
-    # Set up device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Using device: {device}")
-
-    # Set up dtype
-    dtype = torch.bfloat16
-
-    # Clear CUDA cache before training
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    # Load models with bfloat16
-    unet = UNet2DConditionModel.from_pretrained(
-        args.model_path,
-        subfolder="unet",
-        torch_dtype=torch.bfloat16
-    ).to(device)
-
-    vae = AutoencoderKL.from_pretrained(
-        args.model_path,
-        subfolder="vae",
-        torch_dtype=torch.bfloat16
-    )
-    tokenizer = CLIPTokenizer.from_pretrained(
-        args.model_path,
-        subfolder="tokenizer"
-    )
-    tokenizer_2 = CLIPTokenizer.from_pretrained(
-        args.model_path,
-        subfolder="tokenizer_2"
-    )
-    text_encoder = CLIPTextModel.from_pretrained(
-        args.model_path,
-        subfolder="text_encoder",
-        torch_dtype=torch.bfloat16
-    )
-    text_encoder_2 = CLIPTextModel.from_pretrained(
-        args.model_path,
-        subfolder="text_encoder_2",
-        torch_dtype=torch.bfloat16
-    )
-    
-
-    # Keep other models on CPU
-    vae.to("cpu")
-    text_encoder.to("cpu")
-    text_encoder_2.to("cpu")
-
-    
-
-    # Enable gradient checkpointing
-    unet.enable_gradient_checkpointing()
-
-    # Setup optimizer with per-device batch size
-    dataset = CustomDataset(
-        args.data_dir,
-        vae,
-        tokenizer,
-        tokenizer_2,
-        text_encoder,
-        text_encoder_2,
-        cache_dir=args.cache_dir,
-        batch_size=args.batch_size
-    )
-    train_dataloader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True,
-        collate_fn=custom_collate
-    )
-
-    # Setup optimizer
-    if args.use_adafactor:
-        optimizer = Adafactor(
-            unet.parameters(),
-            lr=args.learning_rate * args.batch_size,
-            scale_parameter=True,
-            relative_step=False,
-            warmup_init=False,
-            clip_threshold=1.0,
-            beta1=0.9,
-            weight_decay=1e-2,
-        )
-    else:
-        optimizer = AdamW8bit(
-            unet.parameters(),
-            lr=args.learning_rate * args.batch_size,
-            betas=(0.9, 0.999),
-            weight_decay=1e-2,
-            eps=1e-8
-        )
-
-    # Enable memory efficient attention only for models that support it
-    unet.enable_xformers_memory_efficient_attention()
-    vae.enable_xformers_memory_efficient_attention()
-
-    # Setup EMA
-    ema_model = AveragedModel(unet, avg_fn=lambda avg, new, _: args.ema_decay * avg + (1 - args.ema_decay) * new)
-
-    # Calculate total training steps
-    num_update_steps_per_epoch = len(train_dataloader) // args.gradient_accumulation_steps
-    num_training_steps = args.num_epochs * num_update_steps_per_epoch
-
-    # Setup scheduler
-    lr_scheduler = get_scheduler(
-        "cosine",
-        optimizer=optimizer,
-        num_warmup_steps=0,
-        num_training_steps=num_training_steps
-    )
-
-    # Initialize training components
-    if args.finetune_vae:
-        vae = vae.to("cuda").to(dtype=torch.bfloat16)
-        vae_finetuner = VAEFineTuner(
-            vae=vae,
-            learning_rate=args.vae_learning_rate,
-            use_vae_scaling=True,
-            per_channel_scaling=True
-        )
-
-    # Initialize validator after model setup
-    validator = ModelValidator(unet, vae, device=device)
-
-    # Move models to device and set dtype
-    unet = unet.to(device=device, dtype=dtype)
-    vae = vae.to(device=device, dtype=dtype)
-
-    # Initialize tag weighter with dataset's tag list
-    tag_weighter = TagBasedLossWeighter(
-        min_weight=args.min_tag_weight,
-        max_weight=args.max_tag_weight
-    )
-
-    # Populate tag frequencies from dataset
-    print("Initializing tag frequencies...")
-    for img_path in tqdm(dataset.image_paths):
-        caption_path = img_path.with_suffix('.txt')
-        if caption_path.exists():
-            with open(caption_path, 'r', encoding='utf-8') as f:
-                caption = f.read().strip()
-                tags = [t.strip() for t in caption.split(',')]
-                tag_weighter.add_tags_to_frequency(tags)
-
-    # Training loop
-    logger.info("Starting training...")
-    total_steps = args.num_epochs * len(train_dataloader)
-    progress_bar = tqdm(total=total_steps, desc="Training", dynamic_ncols=True)
-
-    for epoch in range(args.num_epochs):
-        logger.info(f"Starting epoch {epoch+1}/{args.num_epochs}")
-
-        # Run validation at start of epoch if specified
-        if epoch % args.validation_frequency == 0:
-            logger.info(f"\nRunning validation for epoch {epoch+1}")
-            test_prompts = [
-                "a detailed portrait of a girl",
-                "completely black",
-                "a red ball on top of a blue cube, both infront of a green triangle"
-            ]
-            
-            validation_results = validator.run_paper_validation(test_prompts)
-            
-            # Save validation images
-            validation_dir = Path(args.output_dir) / "validation_results" / f"epoch_{epoch+1}"
-            validator.save_validation_images(validation_results, validation_dir)
-            
-            if args.use_wandb:
-                wandb.log({
-                    'ztsnr/black_generation_brightness': validation_results['ztsnr'][1]['ztsnr_mean_brightness'],
-                    'epoch': epoch + 1
-                })
-
-        for step, batch in enumerate(train_dataloader):
-            # Convert inputs to correct dtype (bfloat16)
-            latents = batch["latents"].to(device).to(dtype=torch.bfloat16)
-            text_embeddings = batch["text_embeddings"].to(device).to(dtype=torch.bfloat16)
-            text_embeddings_2 = batch["text_embeddings_2"].to(device).to(dtype=torch.bfloat16)
-            pooled_text_embeddings_2 = batch["pooled_text_embeddings_2"].to(device).to(dtype=torch.bfloat16)
-            target_size = batch["target_size"]
-
-            # Use autocast for mixed precision
-            with torch.amp.autocast('cuda', dtype=dtype):
-                sigmas = get_sigmas(args.num_inference_steps).to(device)
-                sigma = sigmas[step % args.num_inference_steps]
-                sigma = sigma.expand(latents.size(0))
-
-                timestep = torch.ones(latents.shape[0], device=device).long() * (step % args.num_inference_steps)
-
-                loss = training_loss(
-                    unet,
-                    latents,
-                    sigma,
-                    text_embeddings,
-                    text_embeddings_2,
-                    pooled_text_embeddings_2,
-                    timestep,
-                    target_size
-                ) / args.gradient_accumulation_steps
-
-            # Apply tag-based weighting
-            loss = tag_weighter.update_training_loss(loss, batch["tags"])
-
-            loss.backward()
-
-            if (step + 1) % args.gradient_accumulation_steps == 0:
-                torch.nn.utils.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-                lr_scheduler.step()
-                ema_model.update_parameters(unet)
-
-                if args.finetune_vae and step % args.vae_train_freq == 0:
-                    vae_losses = vae_finetuner.training_step(
-                        batch["latents"].to("cuda"),
-                        batch["original_images"].to("cuda")
-                    )
-
-            # Update progress
-            progress_bar.update(1)
-            progress_bar.set_postfix({
-                "epoch": f"{epoch+1}/{args.num_epochs}",
-                "loss": f"{loss.item():.4f}",
-                "lr": f"{lr_scheduler.get_last_lr()[0]:.2e}",
-                **({"vae_loss": f"{vae_losses['total_loss']:.4f}"} if args.finetune_vae and step % args.vae_train_freq == 0 else {})
-            })
-
-        # Save checkpoint
-        if args.save_checkpoints:
-            checkpoint_path = Path(args.output_dir) / f"checkpoint-epoch-{epoch+1}"
-            checkpoint_path.mkdir(exist_ok=True, parents=True)
-            unet.save_pretrained(checkpoint_path / "unet")
-
-        # Log metrics to wandb
+    try:
+        # Initialize wandb if enabled
         if args.use_wandb:
-            wandb.log({
-                'epoch': epoch + 1,
-                'loss': loss.item(),
-                'learning_rate': lr_scheduler.get_last_lr()[0],
-                **({"vae_loss": vae_losses['total_loss']} if args.finetune_vae else {})
-            })
-
-        # Validation
-        if epoch % args.validation_frequency == 0:
-            validation_results = validator.run_paper_validation(test_prompts)
-            validation_dir = Path(args.output_dir) / "validation_results" / f"epoch_{epoch+1}"
-            validator.save_validation_images(validation_results, validation_dir)
+            import wandb
+            wandb.init(
+                project=args.wandb_project,
+                name=args.wandb_run_name,
+                config=vars(args),
+                settings=wandb.Settings(code_dir="."),
+            )
             
-            if args.use_wandb:
-                # Log validation images
-                wandb.log({
-                    'ztsnr/black_generation_brightness': validation_results['ztsnr'][1]['ztsnr_mean_brightness'],
-                    'validation/ztsnr_comparison': wandb.Image(validation_dir / 'ztsnr_comparison.png'),
-                    'validation/coherence_comparison': wandb.Image(validation_dir / 'coherence_comparison.png'),
-                    'epoch': epoch + 1
-                })
+        # Set up device
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        logger.info(f"Using device: {device}")
 
-    # Push to HuggingFace Hub if enabled
-    if args.push_to_hub and args.hub_model_id:
-        logger.info(f"Pushing model to HuggingFace Hub: {args.hub_model_id}")
-        
-        # Create model card with research details
-        model_card = f"""
-        ---
-        language: en
-        tags:
-        - stable-diffusion-xl
-        - text-to-image
-        - diffusers
-        - ztsnr
-        - high-resolution
-        license: mit
-        ---
+        # Set up dtype
+        dtype = torch.bfloat16
 
-        # {args.hub_model_id}
+        # Clear CUDA cache before training
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-        This model is a fine-tuned version of SDXL implementing improvements from the paper:
-        "Improvements to SDXL in NovelAI Diffusion V3"
+        # Load models with bfloat16
+        unet = UNet2DConditionModel.from_pretrained(
+            args.model_path,
+            subfolder="unet",
+            torch_dtype=torch.bfloat16
+        ).to(device)
 
-        ## Improvements
-        - Zero Terminal SNR (ZTSNR)
-        - High-resolution coherence through increased sigma_max
-        - Tag-based loss weighting
-        - VAE scale-and-shift normalization
-
-        ## Training Details
-        - Base model: SDXL 1.0
-        - Training steps: {args.num_epochs * len(train_dataloader)}
-        - Batch size: {args.batch_size}
-        - Learning rate: {args.learning_rate}
-        - CFG scale range: 3.5-5.0 (optimal)
-
-        ## Validation Results
-
-        ### Zero Terminal SNR (ZTSNR)
-        ![ZTSNR Comparison](validation_results/latest/ztsnr_comparison.png)
-        Testing ZTSNR effectiveness with "completely black" prompt. Left: With ZTSNR, Right: Without ZTSNR.
-
-        ### High-Resolution Coherence
-        ![Coherence Comparison](validation_results/latest/coherence_comparison.png)
-        Testing high-resolution coherence with different sigma_max values (14.6 vs 20000.0).
-        Note: σ ≈ 20000 is used as a practical approximation of infinity for ZTSNR.
-
-        ### Denoising Steps
-        ![Denoising Steps](validation_results/latest/denoising_14.6.png)
-        Progressive denoising steps with sigma_max = 14.6
-        
-        ![Denoising Steps High Sigma](validation_results/latest/denoising_20000.0.png)
-        Progressive denoising steps with ZTSNR (sigma_max ≈ 20000)
-
-        ## Validation Methodology
-        1. **ZTSNR Validation**: Testing model's ability to generate pure black images when prompted
-        2. **High-Resolution Coherence**: Testing with different sigma_max values (14.6 and 20000.0)
-        3. **Noise Schedule**: Progressive noise addition visualization
-        4. **Denoising Steps**: Intermediate generation steps visualization
-
-        ## Example Prompts
-        - "a detailed portrait of a girl"
-        - "completely black"
-        - "a red ball on top of a blue cube, both infront of a green triangle"
-
-        ## Paper Reference
-        For more details, please refer to the original paper:
-        "Improvements to SDXL in NovelAI Diffusion V3" (arXiv:2409.15997v2)
-        """
-
-        # Before pushing to hub, save latest validation images to a permanent location
-        latest_validation_dir = Path(args.output_dir) / "validation_results" / "latest"
-        validator.save_validation_images(validation_results, latest_validation_dir)
-
-        # Save to hub with updated model card
-        unet.push_to_hub(
-            args.hub_model_id,
-            private=args.hub_private,
-            commit_message=f"Epoch {args.num_epochs}",
-            model_card=model_card
+        vae = AutoencoderKL.from_pretrained(
+            args.model_path,
+            subfolder="vae",
+            torch_dtype=torch.bfloat16
+        )
+        tokenizer = CLIPTokenizer.from_pretrained(
+            args.model_path,
+            subfolder="tokenizer"
+        )
+        tokenizer_2 = CLIPTokenizer.from_pretrained(
+            args.model_path,
+            subfolder="tokenizer_2"
+        )
+        text_encoder = CLIPTextModel.from_pretrained(
+            args.model_path,
+            subfolder="text_encoder",
+            torch_dtype=torch.bfloat16
+        )
+        text_encoder_2 = CLIPTextModel.from_pretrained(
+            args.model_path,
+            subfolder="text_encoder_2",
+            torch_dtype=torch.bfloat16
         )
         
-        if args.finetune_vae:
-            vae.push_to_hub(
-                f"{args.hub_model_id}-vae",
-                private=args.hub_private,
-                commit_message=f"Epoch {args.num_epochs}"
+
+        # Keep other models on CPU
+        vae.to("cpu")
+        text_encoder.to("cpu")
+        text_encoder_2.to("cpu")
+
+        
+
+        # Enable gradient checkpointing
+        unet.enable_gradient_checkpointing()
+
+        # Setup optimizer with per-device batch size
+        dataset = CustomDataset(
+            args.data_dir,
+            vae,
+            tokenizer,
+            tokenizer_2,
+            text_encoder,
+            text_encoder_2,
+            cache_dir=args.cache_dir,
+            batch_size=args.batch_size
+        )
+        train_dataloader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=4,
+            pin_memory=True,
+            collate_fn=custom_collate
+        )
+
+        # Setup optimizer
+        if args.use_adafactor:
+            optimizer = Adafactor(
+                unet.parameters(),
+                lr=args.learning_rate * args.batch_size,
+                scale_parameter=True,
+                relative_step=False,
+                warmup_init=False,
+                clip_threshold=1.0,
+                beta1=0.9,
+                weight_decay=1e-2,
             )
+        else:
+            optimizer = AdamW8bit(
+                unet.parameters(),
+                lr=args.learning_rate * args.batch_size,
+                betas=(0.9, 0.999),
+                weight_decay=1e-2,
+                eps=1e-8
+            )
+
+        # Enable memory efficient attention only for models that support it
+        unet.enable_xformers_memory_efficient_attention()
+        vae.enable_xformers_memory_efficient_attention()
+
+        # Setup EMA
+        ema_model = AveragedModel(unet, avg_fn=lambda avg, new, _: args.ema_decay * avg + (1 - args.ema_decay) * new)
+
+        # Calculate total training steps
+        num_update_steps_per_epoch = len(train_dataloader) // args.gradient_accumulation_steps
+        num_training_steps = args.num_epochs * num_update_steps_per_epoch
+
+        # Setup scheduler
+        lr_scheduler = get_scheduler(
+            "cosine",
+            optimizer=optimizer,
+            num_warmup_steps=0,
+            num_training_steps=num_training_steps
+        )
+
+        # Initialize training components
+        if args.finetune_vae:
+            vae = vae.to("cuda").to(dtype=torch.bfloat16)
+            vae_finetuner = VAEFineTuner(
+                vae=vae,
+                learning_rate=args.vae_learning_rate
+            )
+
+        # Initialize validator after model setup
+        validator = ModelValidator(
+            model=unet,
+            vae=vae,
+            tokenizer=tokenizer,
+            text_encoder=text_encoder,
+            device=device
+        )   
+
+        # Move models to device and set dtype
+        unet = unet.to(device=device, dtype=dtype)
+        vae = vae.to(device=device, dtype=dtype)
+
+        # Initialize tag weighter with dataset's tag list
+        tag_weighter = TagBasedLossWeighter(
+            min_weight=args.min_tag_weight,
+            max_weight=args.max_tag_weight
+        )
+
+        # Populate tag frequencies from dataset
+        print("Initializing tag frequencies...")
+        for img_path in tqdm(dataset.image_paths):
+            caption_path = img_path.with_suffix('.txt')
+            if caption_path.exists():
+                with open(caption_path, 'r', encoding='utf-8') as f:
+                    caption = f.read().strip()
+                    tags = [t.strip() for t in caption.split(',')]
+                    tag_weighter.add_tags_to_frequency(tags)
+
+        # Training loop
+        logger.info("Starting training...")
+        total_steps = args.num_epochs * len(train_dataloader)
+        progress_bar = tqdm(total=total_steps, desc="Training", dynamic_ncols=True)
+
+        for epoch in range(args.num_epochs):
+            logger.info(f"Starting epoch {epoch+1}/{args.num_epochs}")
+
+            # Run validation if enabled
+            if not args.skip_validation and hasattr(args, 'validation_frequency') and \
+               epoch % args.validation_frequency == 0:
+                try:
+                    logger.info(f"\nRunning validation for epoch {epoch+1}")
+                    test_prompts = [
+                        "a detailed portrait of a girl",
+                        "completely black",
+                        "a red ball on top of a blue cube, both infront of a green triangle"
+                    ]
+                    
+                    validation_results = validator.run_paper_validation(test_prompts)
+                    
+                    # Save validation images
+                    validation_dir = Path(args.output_dir) / "validation_results" / f"epoch_{epoch+1}"
+                    validator.save_validation_images(validation_results, validation_dir)
+                    
+                    if args.use_wandb:
+                        wandb.log({
+                            'ztsnr/black_generation_brightness': validation_results['ztsnr'][1]['ztsnr_mean_brightness'],
+                            'epoch': epoch + 1
+                        })
+                except Exception as val_error:
+                    logger.error(f"Validation failed: {val_error}")
+                    logger.info("Continuing training despite validation error")
+
+            for step, batch in enumerate(train_dataloader):
+                # Convert inputs to correct dtype (bfloat16)
+                latents = batch["latents"].to(device).to(dtype=torch.bfloat16)
+                text_embeddings = batch["text_embeddings"].to(device).to(dtype=torch.bfloat16)
+                text_embeddings_2 = batch["text_embeddings_2"].to(device).to(dtype=torch.bfloat16)
+                pooled_text_embeddings_2 = batch["pooled_text_embeddings_2"].to(device).to(dtype=torch.bfloat16)
+                target_size = batch["target_size"]
+
+                # Use autocast for mixed precision
+                with torch.amp.autocast('cuda', dtype=dtype):
+                    sigmas = get_sigmas(args.num_inference_steps).to(device)
+                    sigma = sigmas[step % args.num_inference_steps]
+                    sigma = sigma.expand(latents.size(0))
+
+                    timestep = torch.ones(latents.shape[0], device=device).long() * (step % args.num_inference_steps)
+
+                    loss = training_loss(
+                        unet,
+                        latents,
+                        sigma,
+                        text_embeddings,
+                        text_embeddings_2,
+                        pooled_text_embeddings_2,
+                        timestep,
+                        target_size
+                    ) / args.gradient_accumulation_steps
+
+                # Apply tag-based weighting
+                loss = tag_weighter.update_training_loss(loss, batch["tags"])
+
+                loss.backward()
+
+                if (step + 1) % args.gradient_accumulation_steps == 0:
+                    torch.nn.utils.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    lr_scheduler.step()
+                    ema_model.update_parameters(unet)
+
+                    if args.finetune_vae and step % args.vae_train_freq == 0:
+                        vae_losses = vae_finetuner.training_step(
+                            batch["latents"].to("cuda"),
+                            batch["original_images"].to("cuda")
+                        )
+
+                # Update progress
+                progress_bar.update(1)
+                progress_bar.set_postfix({
+                    "epoch": f"{epoch+1}/{args.num_epochs}",
+                    "loss": f"{loss.item():.4f}",
+                    "lr": f"{lr_scheduler.get_last_lr()[0]:.2e}",
+                    **({"vae_loss": f"{vae_losses['total_loss']:.4f}"} if args.finetune_vae and step % args.vae_train_freq == 0 else {})
+                })
+
+    except Exception as e:
+        logger.error(f"Error during training: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        
+    finally:
+        try:
+            # Save model
+            if args.push_to_hub:
+                logger.info("Pushing model to hub...")
+                unet.push_to_hub(
+                    args.hub_model_id,
+                    private=args.hub_private,
+                    commit_message=f"Epoch {args.num_epochs}"
+                )
+            
+            # Local save
+            logger.info("Saving model locally...")
+            save_path = os.path.join(args.output_dir, "final_model")
+            unet.save_pretrained(save_path)
+            
+            # Save config with proper serialization
+            save_training_config(
+                args=args,
+                output_dir=args.output_dir,
+                total_steps=total_steps,
+                final_loss=loss.item() if 'loss' in locals() else None
+            )
+            
+        except Exception as save_error:
+            logger.error(f"Error during model saving: {save_error}")
+            # Emergency save
+            try:
+                emergency_path = os.path.join(args.output_dir, "emergency_save")
+                torch.save(unet.state_dict(), os.path.join(emergency_path, "unet.pt"))
+                logger.info(f"Emergency save successful at: {emergency_path}")
+            except:
+                logger.error("Emergency save failed")
 
     if args.use_wandb:
         wandb.finish()
@@ -1234,10 +1096,53 @@ def save_image_grid(images, path, nrow=1, normalize=True):
     TF.to_pil_image(grid).save(path)
 
 class ModelValidator:
-    def __init__(self, model, vae, device="cuda"):
-        self.model = model
-        self.vae = vae
+    def __init__(self, model, vae, tokenizer, text_encoder, device="cuda"):
+        self.model = model.to(device)
+        self.vae = vae.to(device)
+        self.tokenizer = tokenizer
+        self.text_encoder = text_encoder.to(device)
         self.device = device
+
+    def generate_at_sigma(self, prompt, target_sigma, sigma_max=20000.0):
+        """Generate a sample denoising from sigma_max down to target_sigma"""
+        try:
+            # Create custom sigma schedule from sigma_max down to target_sigma
+            sigmas = torch.linspace(sigma_max, target_sigma, steps=10).to(self.device)
+            
+            # Initialize random latents
+            latents = torch.randn((1, 4, 64, 64)).to(self.device)
+            
+            # Encode text prompt
+            text_input = self.tokenizer(
+                prompt,
+                padding="max_length",
+                max_length=self.tokenizer.model_max_length,
+                truncation=True,
+                return_tensors="pt"
+            )
+            
+            with torch.no_grad():
+                prompt_embeds = self.text_encoder(text_input.input_ids.to(self.device))[0]
+                
+                # Denoise from sigma_max down to target_sigma
+                for sigma in sigmas:
+                    noise_pred = self.model(
+                        latents,
+                        sigma[None].to(self.device),
+                        encoder_hidden_states=prompt_embeds
+                    ).sample
+                    
+                    latents = latents - noise_pred * (sigma ** 2)
+                
+                # Decode final latents
+                image = self.vae.decode(latents / 0.18215).sample
+                
+            return image
+            
+        except Exception as e:
+            logger.error(f"Sample generation at sigma {target_sigma} failed: {str(e)}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            return torch.zeros((1, 3, 1024, 1024)).to(self.device)  # Updated size
 
     def validate_ztsnr(self, prompt="completely black"):
         """
@@ -1293,22 +1198,28 @@ class ModelValidator:
             
         return noised_images
 
-    def run_paper_validation(self, test_prompts):
-        """Run all validation tests described in the paper"""
+    def run_paper_validation(self, prompts):
         results = {}
-        
-        # Test ZTSNR with pure black generation (Figure 2)
-        results['ztsnr'] = self.validate_ztsnr("completely black")
-        
-        # Test high-res coherence with specific prompts (Figure 6)
-        results['coherence'] = self.validate_high_res_coherence(
-            "a close-up portrait with detailed limbs"
-        )
-        
-        # Test denoising steps (Figure 7)
-        results['denoising'] = self.validate_denoising_steps(test_prompts[0])
-        
-        return results
+        try:
+            # ZTSNR validation (using black prompt)
+            logger.info("Running ZTSNR validation...")
+            results['ztsnr'] = self.validate_ztsnr("completely black")
+            
+            # High-res coherence validation (using first prompt)
+            logger.info("Running high-res coherence validation...")
+            results['coherence'] = self.validate_high_res_coherence(prompts[0])
+            
+            # Prompt-based validation
+            logger.info("Running prompt-based validation...")
+            for prompt in prompts:
+                results[prompt] = self.generate_sample(prompt)
+                
+            return results
+            
+        except Exception as e:
+            logger.error(f"Validation failed with error: {str(e)}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            return {}  # Return empty dict instead of failing
 
     def save_validation_images(self, results, output_dir):
         """Save validation images in a format matching paper figures"""
@@ -1339,6 +1250,110 @@ class ModelValidator:
                 nrow=len(steps),
                 normalize=True
             )
+
+    def generate_with_ztsnr(self, prompt):
+        """Generate image with ZTSNR (σ ≈ 20000)"""
+        return self.generate_sample(prompt, sigma_max=20000.0)
+
+    def generate_without_ztsnr(self, prompt):
+        """Generate image without ZTSNR (default σ = 14.6)"""
+        return self.generate_sample(prompt, sigma_max=14.6)
+
+    def generate_sample(self, prompt, sigma_max=14.6, num_inference_steps=28):
+        """Generate a sample image given a prompt"""
+        try:
+            # Get sigmas for sampling
+            sigmas = get_sigmas(num_inference_steps, sigma_max=sigma_max).to(self.device)
+            
+            # Initialize random latents
+            latents = torch.randn((1, 4, 64, 64)).to(self.device)
+            
+            # Encode text prompt
+            text_input = self.tokenizer(
+                prompt,
+                padding="max_length",
+                max_length=self.tokenizer.model_max_length,
+                truncation=True,
+                return_tensors="pt"
+            )
+            
+            with torch.no_grad():
+                prompt_embeds = self.text_encoder(text_input.input_ids.to(self.device))[0]
+            
+            # Denoise
+            for i, sigma in enumerate(sigmas):
+                with torch.no_grad():
+                    noise_pred = self.model(
+                        latents,
+                        sigma[None].to(self.device),
+                        encoder_hidden_states=prompt_embeds
+                    ).sample
+                
+                latents = latents - noise_pred * (sigma[None, None, None] ** 2)
+                
+                if i < len(sigmas) - 1:
+                    noise = torch.randn_like(latents)
+                    latents = latents + noise * (sigmas[i + 1] ** 2 - sigmas[i] ** 2) ** 0.5
+            
+            # Decode latents
+            with torch.no_grad():
+                image = self.vae.decode(latents / 0.18215).sample
+                
+            return image
+            
+        except Exception as e:
+            logger.error(f"Sample generation failed: {str(e)}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            return torch.zeros((1, 3, 1024, 1024)).to(self.device)  # Updated size
+
+        
+
+def save_training_config(args, output_dir, total_steps, final_loss=None):
+    """Save training config with proper type handling"""
+    config = {
+        'args': {k: str(v) if not isinstance(v, (int, float, str, bool, type(None))) else v 
+                for k, v in vars(args).items()},
+        'training_steps': total_steps,
+        'final_loss': float(final_loss) if final_loss is not None else None,
+    }
+    
+    config_path = os.path.join(output_dir, 'training_config.json')
+    with open(config_path, 'w') as f:
+        json.dump(config, f, indent=2)
+    
+    logger.info(f"Saved training config to {config_path}")
+
+def create_model_card(args, train_dataloader, validation_results=None):
+    model_card = f"""
+    ---
+    language: en
+    tags:
+    - stable-diffusion-xl
+    - text-to-image
+    - diffusers
+    - ztsnr
+    license: mit
+    ---
+
+    # {args.hub_model_id}
+
+    ## Training Details
+    - Base model: SDXL 1.0
+    - Training steps: {args.num_epochs * len(train_dataloader)}
+    - Batch size: {args.batch_size}
+    - Learning rate: {args.learning_rate}
+    - Validation frequency: {args.validation_frequency} epochs
+    - Validation prompts: {args.validation_prompts}
+
+    ## Validation Results
+    """
+    
+    if validation_results:
+        model_card += "Latest validation results included in the validation_results directory."
+    else:
+        model_card += "No validation results available."
+    
+    return model_card
 
 if __name__ == "__main__":
     setup_logging()
