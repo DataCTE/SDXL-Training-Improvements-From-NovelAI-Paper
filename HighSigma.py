@@ -86,7 +86,7 @@ def training_loss(model, x_0, sigma, text_embeddings, text_embeddings_2, pooled_
     ], device=x_0.device, dtype=torch.long)  # Use long dtype for indices
 
     time_ids = time_ids.repeat(batch_size, 1)  # [B, 6]
-    time_ids = time_ids.unsqueeze(1)  # [B, 1, 6] to match text embedding dimensions
+    # Removed the unsqueeze(1) to keep time_ids as [B, 6]
 
     # Create combined text embeddings for SDXL
     combined_text_embeddings = torch.cat([text_embeddings, text_embeddings_2], dim=-1)  # [B, 77, 2048]
@@ -103,7 +103,7 @@ def training_loss(model, x_0, sigma, text_embeddings, text_embeddings_2, pooled_
     # Prepare SDXL conditioning kwargs
     added_cond_kwargs = {
         "text_embeds": pooled_text_embeds_2,  # [B, 1280]
-        "time_ids": time_ids  # [B, 1, 6]
+        "time_ids": time_ids  # [B, 6]
     }
 
     # UNet forward pass
@@ -304,7 +304,7 @@ class CustomDataset(Dataset):
 
                     text_encoder_output_2 = self.text_encoder_2(text_input_2.input_ids)
                     text_embeddings_2 = text_encoder_output_2.last_hidden_state
-                    pooled_text_embeddings_2 = text_encoder_output_2.pooler_output
+                    pooled_text_embeddings_2 = text_encoder_output_2.pooler_output.squeeze(1)  # Adjusted shape
 
                     # Save all embeddings
                     torch.save({
@@ -350,6 +350,11 @@ class CustomDataset(Dataset):
         latents = torch.load(latents_path)
         embeddings = torch.load(embeddings_path)
 
+        # Adjust pooled_text_embeddings_2 shape if necessary
+        pooled_text_embeddings_2 = embeddings["pooled_text_embeddings_2"]
+        if pooled_text_embeddings_2.dim() == 2 and pooled_text_embeddings_2.shape[0] == 1:
+            pooled_text_embeddings_2 = pooled_text_embeddings_2.squeeze(0)
+
         # Load original image
         image = Image.open(img_path).convert("RGB")
         image_tensor = self.transform(image)
@@ -358,7 +363,7 @@ class CustomDataset(Dataset):
             "latents": latents,
             "text_embeddings": embeddings["text_embeddings"],
             "text_embeddings_2": embeddings["text_embeddings_2"],
-            "pooled_text_embeddings_2": embeddings["pooled_text_embeddings_2"],
+            "pooled_text_embeddings_2": pooled_text_embeddings_2,
             "target_size": target_size,
             "clip_image_embed": embeddings["clip_image_embed"],
             "clip_tag_embeds": embeddings["clip_tag_embeds"],
@@ -437,7 +442,6 @@ class VAEFineTuner:
         l1_loss = F.l1_loss(decoded_images.float(), original_images.float())  # scalar
 
         # Optional KL loss
-        kl_loss = torch.tensor(0.0, device=latents.device)  # scalar
         with torch.no_grad():
             posterior = self.vae.encode(original_images).latent_dist  # DiagonalGaussianDistribution
             kl_loss = torch.mean(-0.5 * torch.sum(1 + posterior.variance.log() -
@@ -497,7 +501,7 @@ def compile_model(model, name, mode='default', logger=None):
                 "encoder_hidden_states": torch.randn(1, 77, 2048, dtype=dtype).to(model.device),
                 "added_cond_kwargs": {
                     "text_embeds": torch.randn(1, 1280, dtype=dtype).to(model.device),
-                    "time_ids": torch.zeros(1, 1, 6).to(model.device)
+                    "time_ids": torch.zeros(1, 6).to(model.device)  # Corrected shape
                 }
             }
 
@@ -729,7 +733,7 @@ def main(args):
             target_size = batch["target_size"]
 
             # Use autocast for mixed precision
-            with torch.cuda.amp.autocast(dtype=dtype):
+            with torch.amp.autocast('cuda', dtype=dtype):
                 sigma = get_sigmas(args.num_inference_steps)[step % args.num_inference_steps].to(latents.device)
                 timestep = torch.ones(latents.shape[0], device=device).long() * (step % args.num_inference_steps)
 
