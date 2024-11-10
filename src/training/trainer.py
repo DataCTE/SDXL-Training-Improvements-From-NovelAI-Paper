@@ -272,13 +272,10 @@ def train(args, models, train_components, device, dtype):
             # Always save final checkpoint
             logger.info("Saving final checkpoint...")
             save_checkpoint(
+                checkpoint_dir=args.output_dir,
                 models=models,
                 train_components=train_components,
-                args=args,
-                epoch=args.num_epochs - 1,
-                training_history=training_history,
-                output_dir=args.output_dir,
-                is_final=True  # Optional flag to indicate final checkpoint
+                training_state=training_history
             )
             
             logger.info("\n=== Training Complete ===")
@@ -292,13 +289,10 @@ def train(args, models, train_components, device, dtype):
         logger.info("Attempting to save checkpoint after failure...")
         try:
             save_checkpoint(
+                checkpoint_dir=args.output_dir,
                 models=models,
                 train_components=train_components,
-                args=args,
-                epoch=epoch,
-                training_history=training_history,
-                output_dir=args.output_dir,
-                is_final=True
+                training_state=training_history
             )
         except Exception as save_error:
             logger.error(f"Failed to save checkpoint after training error: {str(save_error)}")
