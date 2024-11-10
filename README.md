@@ -2,14 +2,8 @@
 
 Most SDXL implementations use a maximum noise deviation (σ_max) of 14.6 [meaning that only 14.6% of the noise is removed at maximum] inherited from SD1.5/1.4, without accounting for SDXL's larger scale. Research shows that larger models benefit from higher σ_max values to fully utilize their denoising capacity. This repository implements an increased σ_max ≈ 20000.0 (as recommended by NovelAI research arXiv:2409.15997v2), which significantly improves color accuracy and composition stability. Combined with Zero Terminal SNR (ZTSNR) and VAE finetuning.
 
-### Weights and Todolist
+### Weights
 
-todolist:
-- [ ] Working decoding of validation images
-  - [ ] proof that the validation generation is working correctly
-- [ ] wandb logging of training process in full detail
-
-weights:
 - [ ] 10k dataset proof of concept (currently training/ in testing)
 - [ ] 200k+ dataset finetune (coming soon)
 
