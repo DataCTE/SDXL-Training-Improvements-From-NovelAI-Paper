@@ -169,3 +169,48 @@ def verify_checkpoint_directory(checkpoint_dir):
         optional_files[filename] = os.path.exists(os.path.join(checkpoint_dir, filename))
         
     return True, optional_files
+
+def save_checkpoint(checkpoint_dir, models, train_components, training_state):
+    """
+    Save checkpoint in diffusers format with safetensors support
+    
+    Args:
+        checkpoint_dir (str): Directory to save the checkpoint
+        models (dict): Dictionary containing models to save
+        train_components (dict): Dictionary containing training components
+        training_state (dict): Training state to save
+    """
+    try:
+        logger.info(f"Saving checkpoint to {checkpoint_dir}")
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        
+        # Save models
+        models["unet"].save_pretrained(os.path.join(checkpoint_dir, "unet"), safe_serialization=True)
+        models["vae"].save_pretrained(os.path.join(checkpoint_dir, "vae"), safe_serialization=True)
+        models["text_encoder"].save_pretrained(os.path.join(checkpoint_dir, "text_encoder"), safe_serialization=True)
+        models["text_encoder_2"].save_pretrained(os.path.join(checkpoint_dir, "text_encoder_2"), safe_serialization=True)
+        
+        # Save training state
+        if training_state is not None:
+            torch.save(training_state, os.path.join(checkpoint_dir, "training_state.pt"))
+            
+            # Save optimizer state
+            if "optimizer" in train_components:
+                torch.save(train_components["optimizer"].state_dict(), 
+                         os.path.join(checkpoint_dir, "optimizer.pt"))
+            
+            # Save scheduler state
+            if "lr_scheduler" in train_components:
+                torch.save(train_components["lr_scheduler"].state_dict(),
+                         os.path.join(checkpoint_dir, "scheduler.pt"))
+            
+            # Save EMA state
+            if "ema_model" in train_components:
+                train_components["ema_model"].save_pretrained(
+                    os.path.join(checkpoint_dir, "ema"), safe_serialization=True)
+                
+    except Exception as e:
+        logger.error(f"Failed to save checkpoint: {str(e)}")
+        logger.error(f"Checkpoint directory: {checkpoint_dir}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise
