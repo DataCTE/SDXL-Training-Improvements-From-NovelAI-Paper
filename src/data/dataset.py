@@ -166,6 +166,19 @@ class CustomDataset(Dataset):
                 for bucket, files in bucket_files.items():
                     logger.info(f"Processing bucket {bucket} with {len(files)} files...")
                     
+                    # Calculate standard size for this bucket
+                    w, h = bucket
+                    target_h, target_w = self.get_target_size_for_bucket((w, h))
+                    logger.info(f"Bucket {bucket} target size: {target_w}x{target_h}")
+                    
+                    # Create transform for this bucket
+                    bucket_transform = transforms.Compose([
+                        transforms.Resize((target_h, target_w), 
+                                       interpolation=transforms.InterpolationMode.LANCZOS),
+                        transforms.ToTensor(),
+                        transforms.Normalize([0.5], [0.5])
+                    ])
+                    
                     # Process files in batches within each bucket
                     for i in tqdm(range(0, len(files), BATCH_SIZE), 
                                 desc=f"Caching bucket {bucket}"):
@@ -178,7 +191,7 @@ class CustomDataset(Dataset):
                         
                         for img_path, caption_path in batch_files:
                             image = Image.open(img_path).convert("RGB")
-                            vae_image = self.transform_image(image)
+                            vae_image = bucket_transform(image)
                             
                             # Validate image size meets minimum requirements
                             if vae_image.shape[1] < 256 or vae_image.shape[2] < 256:
@@ -197,6 +210,13 @@ class CustomDataset(Dataset):
                         # Stack images for VAE (now guaranteed to be same size within bucket)
                         image_batch = torch.stack(vae_images).to("cuda", dtype=torch.bfloat16)
                         
+                        # Validate batch dimensions
+                        if image_batch.shape[-2:] != (target_h, target_w):
+                            raise ValueError(
+                                f"Batch shape mismatch. Expected {(target_h, target_w)}, "
+                                f"got {image_batch.shape[-2:]}"
+                            )
+
                         with torch.no_grad():
                             # VAE encoding
                             latents_batch = self.vae.encode(image_batch).latent_dist.sample() * 0.18215
