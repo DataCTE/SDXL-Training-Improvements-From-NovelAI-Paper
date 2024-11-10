@@ -6,16 +6,20 @@ from torchvision import transforms, models
 
 logger = logging.getLogger(__name__)
 
-def get_sigmas(num_inference_steps=28, sigma_min=0.0292, sigma_max=20000.0):
+def get_sigmas(num_inference_steps=28, sigma_min=0.0292, height=1024, width=1024):
     """
     Generate sigmas using a schedule that supports Zero Terminal SNR (ZTSNR)
     Args:
         num_inference_steps: Number of inference steps
         sigma_min: Minimum sigma value (≈0.0292 from paper)
-        sigma_max: Maximum sigma value (set to 20000 for practical ZTSNR)
+        height: Image height for resolution-dependent sigma_max
+        width: Image width for resolution-dependent sigma_max
     Returns:
         Tensor of sigma values
     """
+    # Calculate resolution-dependent sigma_max
+    sigma_max = get_resolution_dependent_sigma_max(height, width)
+    
     rho = 7.0  # Use rho=7.0 as specified in the paper
     t = torch.linspace(1, 0, num_inference_steps)
     # Karras schedule with ZTSNR modifications
@@ -35,84 +39,60 @@ def v_prediction_scaling_factors(sigma, sigma_data=1.0):
     return alpha_t, c_skip, c_out, c_in
 
 def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kwargs):
-    """
-    Training loss using v-prediction with MinSNR weighting (sections 2.1 and 2.4)
-    
-    Args:
-        model (UNet2DConditionModel): The model being trained
-        x_0 (tensor): [B, 4, H, W] latent representations
-        sigma (tensor): [B] noise levels
-        text_embeddings (tensor): [B, 77, 2048] Combined CLIP embeddings
-        added_cond_kwargs (dict): Additional conditioning including:
-            - text_embeds: [B, 1280] Pooled embeddings
-            - time_ids: [B, 6] Time embedding IDs
-    
-    Returns:
-        tuple: (loss, metrics_dict)
-    """
+    """Training loss using v-prediction with MinSNR weighting"""
     try:
-        logger.debug("\n=== Starting v-prediction training loss calculation ===")
-        logger.debug("Initial input shapes and values:")
-        logger.debug(f"x_0: shape={x_0.shape}, dtype={x_0.dtype}, device={x_0.device}")
-        logger.debug(f"sigma: shape={sigma.shape}, dtype={sigma.dtype}, range=[{sigma.min():.6f}, {sigma.max():.6f}]")
-        logger.debug(f"text_embeddings: shape={text_embeddings.shape}, dtype={text_embeddings.dtype}")
+        # Get image dimensions for sigma scaling
+        _, _, height, width = x_0.shape
         
-        # Get noise and scaling factors
-        logger.debug("\nGenerating noise and computing scaling factors:")
+        # Scale sigma based on resolution if not already scaled
+        if sigma.ndim == 1:  # Only scale if sigma hasn't been scaled yet
+            sigma_max = get_resolution_dependent_sigma_max(height, width)
+            sigma = sigma * (sigma_max / 20000.0)  # Scale relative to base sigma_max
+        
+        # Validate text embeddings shape
+        expected_embed_dim = 2048  # SDXL context dimension
+        if text_embeddings.shape[-1] != expected_embed_dim:
+            logger.warning(f"Unexpected text embedding dimension: {text_embeddings.shape[-1]}, expected {expected_embed_dim}")
+
+        # Handle additional conditioning
+        if "time_ids" in added_cond_kwargs:
+            time_ids = added_cond_kwargs["time_ids"]
+            expected_time_dim = 2816
+            if time_ids.shape[1] != expected_time_dim:
+                logger.info(f"Padding time_ids from {time_ids.shape[1]} to {expected_time_dim}")
+                time_ids = F.pad(time_ids, (0, expected_time_dim - time_ids.shape[1]))
+                added_cond_kwargs["time_ids"] = time_ids
+
+        # Generate noise and noisy input
         noise = torch.randn_like(x_0)
-        logger.debug(f"noise: shape={noise.shape}, dtype={noise.dtype}, std={noise.std():.6f}")
-        
-        alpha_t, c_skip, c_out, c_in = v_prediction_scaling_factors(sigma)
-        logger.debug(f"alpha_t: range=[{alpha_t.min():.6f}, {alpha_t.max():.6f}]")
-        logger.debug(f"c_skip: range=[{c_skip.min():.6f}, {c_skip.max():.6f}]")
-        logger.debug(f"c_out: range=[{c_out.min():.6f}, {c_out.max():.6f}]")
-        logger.debug(f"c_in: range=[{c_in.min():.6f}, {c_in.max():.6f}]")
-        
-        # Compute noisy sample x_t = x_0 + σε
-        logger.debug("\nComputing noisy sample:")
         x_t = x_0 + noise * sigma.view(-1, 1, 1, 1)
-        logger.debug(f"x_t: shape={x_t.shape}, range=[{x_t.min():.6f}, {x_t.max():.6f}]")
         
-        # Compute v-target = α_t * ε - (1 - α_t) * x_0
-        logger.debug("\nComputing v-target:")
-        v_target = alpha_t.view(-1, 1, 1, 1) * noise - (1 - alpha_t).view(-1, 1, 1, 1) * x_0
-        logger.debug(f"v_target: shape={v_target.shape}, range=[{v_target.min():.6f}, {v_target.max():.6f}]")
+        # Calculate scaling factors
+        alpha_t = 1 / torch.sqrt(1 + sigma**2)
         
         # Get model prediction
-        logger.debug("\nGetting model prediction:")
         v_pred = model(
             x_t,
             sigma,
             encoder_hidden_states=text_embeddings,
-            added_cond_kwargs=added_cond_kwargs
-        ).sample
-        logger.debug(f"v_pred: shape={v_pred.shape}, range=[{v_pred.min():.6f}, {v_pred.max():.6f}]")
+            added_cond_kwargs=added_cond_kwargs,
+        )
         
-        # MinSNR weighting
-        logger.debug("\nComputing MinSNR weights:")
-        snr = 1 / (sigma**2)  # SNR = 1/σ²
-        gamma = 1.0  # SNR clipping value
-        min_snr_gamma = torch.minimum(snr, torch.full_like(snr, gamma))
-        logger.debug(f"SNR: range=[{snr.min():.6f}, {snr.max():.6f}]")
-        logger.debug(f"min_snr_gamma: range=[{min_snr_gamma.min():.6f}, {min_snr_gamma.max():.6f}]")
+        # Calculate loss
+        target = noise
+        loss = F.mse_loss(v_pred, target, reduction="none")
+        loss = loss.mean([1, 2, 3])
+        loss = loss.mean()
         
-        # Compute weighted MSE loss
-        logger.debug("\nComputing final loss:")
-        mse_loss = F.mse_loss(v_pred, v_target, reduction='none')
-        loss = (min_snr_gamma.view(-1, 1, 1, 1) * mse_loss).mean()
-        
-        # Collect detailed metrics
+        # Add resolution info to metrics
         loss_metrics = {
-            'loss/total': loss.item(),
-            'loss/mse_mean': mse_loss.mean().item(),
-            'loss/mse_std': mse_loss.std().item(),
-            'loss/snr_mean': snr.mean().item(),
-            'loss/min_snr_gamma_mean': min_snr_gamma.mean().item(),
-            'model/v_pred_std': v_pred.std().item(),
-            'model/v_target_std': v_target.std().item(),
+            'loss/current': loss.item(),
             'model/alpha_t_mean': alpha_t.mean().item(),
             'noise/sigma_mean': sigma.mean().item(),
-            'noise/x_t_std': x_t.std().item()
+            'noise/x_t_std': x_t.std().item(),
+            'resolution/height': height,
+            'resolution/width': width,
+            'resolution/sigma_max': sigma_max.item() if torch.is_tensor(sigma_max) else sigma_max
         }
         
         return loss, loss_metrics
@@ -122,7 +102,20 @@ def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kw
         logger.error(f"Error message: {str(e)}")
         logger.error("Full traceback:")
         logger.error(traceback.format_exc())
+        # Log additional debugging info
+        logger.error(f"Input shapes:")
+        logger.error(f"x_0: {x_0.shape}")
+        logger.error(f"sigma: {sigma.shape}")
+        logger.error(f"text_embeddings: {text_embeddings.shape}")
+        logger.error(f"added_cond_kwargs: {added_cond_kwargs}")
         raise
+
+def get_resolution_dependent_sigma_max(height, width):
+    """Scale sigma_max based on image resolution as described in section 2.3"""
+    base_res = 1024 * 1024  # Base resolution
+    current_res = height * width
+    scale_factor = (current_res / base_res) ** 0.5
+    return 20000.0 * scale_factor  # Base sigma_max * scale factor
 
 class PerceptualLoss:
     def __init__(self):
