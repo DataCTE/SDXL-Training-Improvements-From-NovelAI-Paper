@@ -8,3 +8,4 @@ Pillow
 sentencepiece
 accelerate
 xformers
+wandb
