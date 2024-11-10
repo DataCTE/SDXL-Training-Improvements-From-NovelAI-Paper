@@ -1,4 +1,8 @@
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 def verify_models(models):
     """
     Verify that all required models are present and properly configured
