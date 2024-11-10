@@ -4,11 +4,12 @@ Most SDXL implementations blindly port the 14% maximum allowed deviation value f
 
 ### Weights and Todolist
 
+todolist:
 - [ ] Working decoding of validation images
   - [ ] proof that the validation generation is working correctly
 - [ ] wandb logging of training process in full detail
 
-
+weights:
 - [ ] 10k dataset proof of concept (currently training/ in testing)
 - [ ] 200k+ dataset finetune (coming soon)
 
