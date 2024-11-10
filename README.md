@@ -46,6 +46,70 @@ Most SDXL implementations use a maximum noise deviation (σ_max) of 14.6 [meanin
      * Statistical distribution monitoring
      * Latent space stability measurements
 
+## Tag-Based CLIP Weighting System
+
+The training implements an intelligent tag weighting system that uses CLIP embeddings to dynamically adjust loss weights based on tag categories and frequencies.
+
+### Tag Classification System
+```python
+tag_classes = {
+    'character': set(),  # Character-related tags
+    'style': set(),     # Artistic style tags
+    'setting': set(),   # Location/environment tags
+    'action': set(),    # Action/pose tags
+    'object': set(),    # Object/item tags
+    'quality': set()    # Quality/technical tags
+}
+```
+
+### Features
+1. **CLIP-Based Tag Analysis**
+   - Automatic tag categorization using CLIP embeddings
+   - Dynamic weight adjustment based on tag frequencies
+   - Per-class weight customization
+   - Cached embeddings for performance
+
+2. **Weight Calculation**
+   ```python
+   min_weight = 0.1  # Minimum loss multiplier
+   max_weight = 3.0  # Maximum loss multiplier
+   ```
+   - Weights automatically scaled between min/max bounds
+   - Class-specific weight adjustments
+   - Frequency-based importance scaling
+
+3. **Tag Frequency Tracking**
+   - Automatic tracking of tag occurrences
+   - Class-based frequency normalization
+   - Dynamic weight adjustment based on dataset statistics
+
+### Usage
+1. **Tag File Format**
+   ```plain
+   character_tag, style_tag, setting_tag, quality_tag
+   ```
+   Example: `1girl, anime style, outdoor, high quality`
+
+2. **Custom Weight Configuration**
+   ```bash
+   python HighSigma.py \
+     --min_tag_weight 0.1 \
+     --max_tag_weight 3.0 \
+     --character_weight 1.5 \
+     --style_weight 1.2 \
+     --quality_weight 0.8
+   ```
+
+3. **Monitoring**
+   - Tag frequency statistics logged to W&B
+   - Per-class weight distributions
+   - CLIP embedding visualizations
+
+### Benefits
+- Balanced training across different tag categories
+- Improved handling of rare vs common tags
+- Semantic-aware loss weighting
+- Automatic handling of dataset imbalances
 
 ## Prerequisites
 
