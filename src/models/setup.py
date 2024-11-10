@@ -114,7 +114,6 @@ def setup_models(args, device, dtype):
             "tokenizer_2": tokenizer_2,
             "text_encoder": text_encoder,
             "text_encoder_2": text_encoder_2,
-            "ema_model": ema_model,
             "validator": validator
         }
         

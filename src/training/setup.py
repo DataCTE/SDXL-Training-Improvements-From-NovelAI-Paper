@@ -106,7 +106,8 @@ def setup_training(args, models, device, dtype):
             "tag_weighter": tag_weighter,
             "vae_finetuner": vae_finetuner,
             "num_update_steps_per_epoch": num_update_steps_per_epoch,
-            "num_training_steps": num_training_steps
+            "num_training_steps": num_training_steps,
+            "ema_model": models["ema_model"]
         }
         
         logger.info("Training setup completed successfully")
