@@ -164,9 +164,19 @@ Example: `1girl, anime style, outdoor, high quality`
 --save_checkpoints     : Enable checkpoint saving
 --validation_prompts   : Validation prompt file
 ```
+## Dataset Preparation
+
+1. Place training images in data directory
+2. Create matching .txt files with comma-separated tags
+3. Optional: Enable tag-based loss weighting for balanced training
+
 
 ## Project Structure
 See [Project Structure Documentation](src/filestruc.md) for detailed component descriptions.
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit issues or pull requests for improvements.
 
 ## License
 Apache 2.0
@@ -180,34 +190,3 @@ Apache 2.0
   year={2024}
 }
 ```
-Results are saved as images and logged to W&B if enabled.
-
-## Dataset Preparation
-
-1. Place training images in data directory
-2. Create matching .txt files with comma-separated tags
-3. Optional: Enable tag-based loss weighting for balanced training
-
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit issues or pull requests for improvements.
-
-## License
-
-Apache 2.0
-
-## Citation
-
-all credit to Juan Ossa, Eren Doğan, Alex Birch, and F. Johnson for the research.
-
-```
-bibtex
-@article{ossa2024improvements,
-title={Improvements to SDXL in NovelAI Diffusion V3},
-author={Ossa, Juan and Doğan, Eren and Birch, Alex and Johnson, F.},
-journal={arXiv preprint arXiv:2409.15997v2},
-year={2024}
-}
-```
-
