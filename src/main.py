@@ -180,6 +180,89 @@ def main(args):
     finally:
         cleanup_wandb(wandb_run)
 
+def setup_wandb(args):
+    """Initialize Weights & Biases logging with custom charts"""
+    if args.use_wandb:
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            config=vars(args),
+            group="training",
+        )
+        
+        # Define metric groupings
+        wandb.define_metric("loss/*", summary="min")
+        wandb.define_metric("model/*", summary="last")
+        wandb.define_metric("noise/*", summary="mean")
+        wandb.define_metric("lr/*", summary="last")
+        
+        # Create custom charts
+        wandb.run.log({
+            "Loss Curves": wandb.plot.line_series(
+                xs=[],
+                ys=[],
+                keys=["loss/current", "loss/average", "loss/running"],
+                title="Training Loss",
+                xname="Step"
+            ),
+            "Learning Rates": wandb.plot.line_series(
+                xs=[],
+                ys=[],
+                keys=["lr/textencoder", "lr/unet"],
+                title="Learning Rate Schedule",
+                xname="Step"
+            ),
+            "MSE Components": wandb.plot.line_series(
+                xs=[],
+                ys=[],
+                keys=["loss/mse_mean", "loss/mse_std"],
+                title="MSE Loss Components",
+                xname="Step"
+            ),
+            "SNR Metrics": wandb.plot.line_series(
+                xs=[],
+                ys=[],
+                keys=["loss/snr_mean", "loss/min_snr_gamma_mean"],
+                title="SNR Metrics",
+                xname="Step"
+            ),
+            "Model Statistics": wandb.plot.line_series(
+                xs=[],
+                ys=[],
+                keys=["model/v_pred_std", "model/v_target_std", "model/alpha_t_mean"],
+                title="Model Statistics",
+                xname="Step"
+            ),
+            "Noise Statistics": wandb.plot.line_series(
+                xs=[],
+                ys=[],
+                keys=["noise/sigma_mean", "noise/x_t_std"],
+                title="Noise Statistics",
+                xname="Step"
+            )
+        })
+        
+        # Configure chart layouts
+        wandb.run.log_config({
+            "layouts": {
+                "Training Progress": {
+                    "Loss Curves": {"type": "plot", "size": 8},
+                    "Learning Rates": {"type": "plot", "size": 8},
+                },
+                "Loss Components": {
+                    "MSE Components": {"type": "plot", "size": 6},
+                    "SNR Metrics": {"type": "plot", "size": 6},
+                },
+                "Model Metrics": {
+                    "Model Statistics": {"type": "plot", "size": 6},
+                    "Noise Statistics": {"type": "plot", "size": 6},
+                }
+            }
+        })
+        
+        return wandb.run
+    return None
+
 if __name__ == "__main__":
     setup_torch_backends()
     args = parse_args()

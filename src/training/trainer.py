@@ -29,7 +29,21 @@ def train_one_epoch(
 ):
     """Single epoch training loop"""
     epoch_metrics = defaultdict(float)
-    progress_bar = tqdm(total=len(train_dataloader), desc=f"Epoch {epoch+1}")
+    
+    # Initialize running averages for smoothed metrics
+    running_loss = 0.0
+    loss_history = []
+    
+    # Initialize metric histories for averaging
+    metric_histories = defaultdict(list)
+    window_size = 100  # Window size for averaging
+    
+    progress_bar = tqdm(
+        total=len(train_dataloader),
+        desc=f"Epoch {epoch+1}",
+        bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] Loss: {postfix[0]:.4f}, LR: {postfix[1]:.2e}',
+        postfix=[0.0, lr_scheduler.get_last_lr()[0]]
+    )
     
     for step, batch in enumerate(train_dataloader):
         step_start = time.time()
@@ -91,15 +105,55 @@ def train_one_epoch(
         for k, v in step_metrics.items():
             epoch_metrics[k] += v
             
-        # Log step metrics
+        # Update running loss and histories
+        running_loss = 0.9 * running_loss + 0.1 * loss.item() if step > 0 else loss.item()
+        loss_history.append(loss.item())
+        
+        # Update metric histories
+        for k, v in step_metrics.items():
+            metric_histories[k].append(v)
+            if len(metric_histories[k]) > window_size:
+                metric_histories[k] = metric_histories[k][-window_size:]
+        
+        # Calculate averages
+        if len(loss_history) > window_size:
+            loss_history = loss_history[-window_size:]
+        average_loss = sum(loss_history) / len(loss_history)
+        
+        # Log metrics to wandb
         if args.use_wandb and step % args.logging_steps == 0:
-            wandb.log({
-                'train/loss': loss.item(),
-                'train/weighted_loss': weighted_loss.item(),
-                'train/grad_norm': grad_norm.item(),
-                'train/lr': lr_scheduler.get_last_lr()[0],
-                **{f'train/{k}': v for k, v in step_metrics.items()}
-            }, step=global_step)
+            metrics = {
+                # Main loss metrics
+                "loss/current": loss.item(),
+                "loss/average": average_loss,
+                "loss/running": running_loss,
+                
+                # Detailed loss metrics from loss.py
+                "loss/mse_mean": step_metrics['loss/mse_mean'],
+                "loss/mse_std": step_metrics['loss/mse_std'],
+                "loss/snr_mean": step_metrics['loss/snr_mean'],
+                "loss/min_snr_gamma_mean": step_metrics['loss/min_snr_gamma_mean'],
+                
+                # Model metrics
+                "model/v_pred_std": step_metrics['model/v_pred_std'],
+                "model/v_target_std": step_metrics['model/v_target_std'],
+                "model/alpha_t_mean": step_metrics['model/alpha_t_mean'],
+                
+                # Noise metrics
+                "noise/sigma_mean": step_metrics['noise/sigma_mean'],
+                "noise/x_t_std": step_metrics['noise/x_t_std'],
+                
+                # Learning rates
+                "lr/unet": lr_scheduler.get_last_lr()[0],
+                "lr/textencoder": lr_scheduler.get_last_lr()[0],  # Adjust if using different LRs
+            }
+            
+            # Add averaged metrics
+            for k, v in metric_histories.items():
+                if v:  # Only add if we have values
+                    metrics[f"{k}/average"] = sum(v) / len(v)
+            
+            wandb.log(metrics, step=global_step)
         
         progress_bar.update(1)
         step_metrics['step_time'] = time.time() - step_start
