@@ -25,6 +25,16 @@ from utils.logging import (
 
 logger = logging.getLogger(__name__)
 
+# Set up logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('training_debug.log'),
+        logging.StreamHandler()
+    ]
+)
+
 def parse_args():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(description="Train a Stable Diffusion XL model")

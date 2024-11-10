@@ -28,16 +28,14 @@ def train_one_epoch(
     global_step
 ):
     """Single epoch training loop"""
+    logger.debug("\n=== Starting new epoch ===")
     epoch_metrics = defaultdict(float)
     
-    # Initialize running averages for smoothed metrics
+    # Initialize metrics
+    window_size = 100
     running_loss = 0.0
     loss_history = []
-    grad_norm_value = 0.0  # Add this to store grad norm
-    
-    # Initialize metric histories for averaging
-    metric_histories = defaultdict(list)
-    window_size = 100  # Window size for averaging
+    grad_norm_value = 0.0
     
     progress_bar = tqdm(
         total=len(train_dataloader),
@@ -47,6 +45,7 @@ def train_one_epoch(
     )
     
     for step, batch in enumerate(train_dataloader):
+        logger.debug(f"\n--- Step {step} ---")
         step_start = time.time()
         
         # Process batch
@@ -57,9 +56,13 @@ def train_one_epoch(
         ], dim=-1)
         pooled_embeds = batch["pooled_text_embeddings_2"].to(device, dtype=dtype)
         
+        logger.debug(f"Latents shape: {latents.shape}, range: [{latents.min():.4f}, {latents.max():.4f}]")
+        logger.debug(f"Text embeddings shape: {text_embeddings.shape}")
+        
         # Get noise schedule
         sigmas = get_sigmas(args.num_inference_steps).to(device)
         sigma = sigmas[step % args.num_inference_steps].expand(latents.size(0))
+        logger.debug(f"Sigma value: {sigma[0].item():.4f}")
         
         # Training step
         with torch.amp.autocast('cuda', dtype=dtype):
@@ -74,65 +77,61 @@ def train_one_epoch(
                                           device=device, dtype=dtype).repeat(latents.shape[0], 1)
                 }
             )
+            logger.debug(f"Raw loss: {loss.item():.6f}")
             loss = loss / args.gradient_accumulation_steps
+            logger.debug(f"Loss after accumulation scaling: {loss.item():.6f}")
         
         # Apply tag-based weighting
         weighted_loss = tag_weighter.update_training_loss(loss, batch["tags"])
+        logger.debug(f"Weighted loss: {weighted_loss.item():.6f}")
         weighted_loss.backward()
         
         # Update model if gradient accumulation complete
         if (step + 1) % args.gradient_accumulation_steps == 0:
-            # Store the gradient norm value
+            # Log pre-clipping gradients
+            total_norm = 0.0
+            for p in unet.parameters():
+                if p.grad is not None:
+                    param_norm = p.grad.data.norm(2)
+                    total_norm += param_norm.item() ** 2
+            total_norm = total_norm ** 0.5
+            logger.debug(f"Pre-clipping gradient norm: {total_norm:.6f}")
+            
             grad_norm_value = torch.nn.utils.clip_grad_norm_(
                 unet.parameters(), 
                 args.max_grad_norm
-            ).item()  # Convert to Python float
+            ).item()
+            logger.debug(f"Post-clipping gradient norm: {grad_norm_value:.6f}")
             
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             lr_scheduler.step()
             
-            # Only update EMA if it exists
             if ema_model is not None:
                 ema_model.update_parameters(unet)
-            
-            # VAE finetuning step
-            if vae_finetuner and (global_step % args.vae_train_freq == 0):
-                vae_loss = vae_finetuner.training_step(
-                    batch["images"].to(device),
-                    batch["latents"].to(device)
-                )
-                step_metrics['vae_loss'] = vae_loss
         
         # Update metrics
-        for k, v in step_metrics.items():
-            epoch_metrics[k] += v
-            
-        # Update running loss and histories
-        running_loss = 0.9 * running_loss + 0.1 * loss.item() if step > 0 else loss.item()
-        loss_history.append(loss.item())
-        
-        # Update metric histories
-        for k, v in step_metrics.items():
-            metric_histories[k].append(v)
-            if len(metric_histories[k]) > window_size:
-                metric_histories[k] = metric_histories[k][-window_size:]
+        running_loss = 0.9 * running_loss + 0.1 * weighted_loss.item() if step > 0 else weighted_loss.item()
+        loss_history.append(weighted_loss.item())
+        logger.debug(f"Running loss: {running_loss:.6f}")
         
         # Calculate averages
         if len(loss_history) > window_size:
             loss_history = loss_history[-window_size:]
         average_loss = sum(loss_history) / len(loss_history)
+        logger.debug(f"Average loss: {average_loss:.6f}")
         
         # Log metrics to wandb
         if args.use_wandb and step % args.logging_steps == 0:
+            logger.debug("\nLogging to wandb:")
             metrics = {
                 # Loss metrics
-                "loss/current": loss.item(),
+                "loss/current": weighted_loss.item(),
                 "loss/average": average_loss,
                 "loss/running": running_loss,
                 
                 # Gradient metrics
-                "gradients/norm": grad_norm_value,  # Now we can safely access this
+                "gradients/norm": grad_norm_value,
                 
                 # Learning rates
                 "lr/unet": lr_scheduler.get_last_lr()[0],
@@ -155,8 +154,16 @@ def train_one_epoch(
             }
             
             wandb.log(metrics, step=global_step)
+            
+            # Debug print all metrics
+            logger.debug("Wandb metrics:")
+            for k, v in metrics.items():
+                logger.debug(f"  {k}: {v:.6f}")
         
+        progress_bar.postfix[0] = running_loss
+        progress_bar.postfix[1] = lr_scheduler.get_last_lr()[0]
         progress_bar.update(1)
+        
         step_metrics['step_time'] = time.time() - step_start
         global_step += 1
     
