@@ -15,13 +15,16 @@ from tqdm.auto import tqdm
 import torch.nn.functional as F
 from transformers.optimization import Adafactor
 import torchvision.models as models
-from torchvision.utils import make_grid
+from models.model_validator import ModelValidator
 import torchvision.transforms.functional as TF
 import os
 import wandb
 import json
 import traceback
 from collections import defaultdict
+import time
+import shutil
+import sys
 
 def setup_logging():
     logging.basicConfig(
@@ -87,6 +90,29 @@ def get_ztsnr_schedule(num_steps=28, sigma_min=0.0292, sigma_max=20000.0, rho=7.
 def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kwargs):
     """
     Training loss using v-prediction with MinSNR weighting (sections 2.1 and 2.4)
+    
+    Args:
+        unet (UNet2DConditionModel): The model being trained
+        batch (dict): Training batch containing:
+            - latents: [B, 4, H, W] latent representations
+            - text_embeddings: [B, 77, 768] CLIP-L embeddings
+            - text_embeddings_2: [B, 77, 1280] CLIP-G embeddings
+            - pooled_text_embeddings_2: [B, 1280] Pooled CLIP-G embeddings
+            - tags: List of image tags for weighting
+        args: Training arguments
+        device: Target device
+        step (int): Current step number
+        sigmas (tensor): Noise schedule
+        optimizer: Model optimizer
+        lr_scheduler: Learning rate scheduler
+        ema_model: EMA model instance
+        tag_weighter: Tag-based loss weighting instance
+        vae_finetuner: VAE finetuning instance
+        dtype: Training precision (default: bfloat16)
+    
+    Returns:
+        dict: Step metrics including loss values and model stats
+   
     """
     try:
         logger.debug("\n=== Starting v-prediction training loss calculation ===")
@@ -180,371 +206,6 @@ def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kw
         raise
 
 
-class TagBasedLossWeighter:
-    def __init__(self, tag_classes=None, min_weight=0.1, max_weight=3.0):
-        """
-        Initialize the tag-based loss weighting system.
-        
-        Args:
-            tag_classes (dict): Dictionary mapping tag class names to lists of tags
-                              e.g., {'character': ['girl', 'boy'], 'style': ['anime', 'sketch']}
-            min_weight (float): Minimum weight multiplier for any image
-            max_weight (float): Maximum weight multiplier for any image
-        """
-        self.tag_classes = tag_classes or {
-            'character': set(),
-            'style': set(),
-            'setting': set(),
-            'action': set(),
-            'object': set(),
-            'quality': set()
-        }
-        
-        # Initialize class weights with default value of 1.0
-        self.class_weights = {class_name: 1.0 for class_name in self.tag_classes}
-        
-        # Track tag frequencies per class
-        self.tag_frequencies = {class_name: {} for class_name in self.tag_classes}
-        self.class_total_counts = {class_name: 0 for class_name in self.tag_classes}
-        
-        # Parameters for weight calculation
-        self.min_weight = min_weight
-        self.max_weight = max_weight
-        
-        # Cache for tag classifications
-        self.tag_to_class = {}
-        
-    def add_tags_to_frequency(self, tags, count=1):
-        """
-        Update tag frequencies with new tags.
-        
-        Args:
-            tags (list): List of tags from an image
-            count (int): How many times to count these tags (default: 1)
-        """
-        for tag in tags:
-            # Find which class this tag belongs to (if not already cached)
-            if tag not in self.tag_to_class:
-                for class_name, tag_set in self.tag_classes.items():
-                    if tag in tag_set:
-                        self.tag_to_class[tag] = class_name
-                        break
-                else:
-                    continue  # Skip tags that don't belong to any class
-            
-            # Update frequencies
-            class_name = self.tag_to_class.get(tag)
-            if class_name:
-                self.tag_frequencies[class_name][tag] = (
-                    self.tag_frequencies[class_name].get(tag, 0) + count
-                )
-                self.class_total_counts[class_name] += count
-
-    def set_class_weight(self, class_name, weight):
-        """
-        Set weight for a specific class.
-        
-        Args:
-            class_name (str): Name of the class
-            weight (float): Weight value
-        """
-        if class_name in self.class_weights:
-            self.class_weights[class_name] = weight
-
-    def calculate_tag_weights(self, tags):
-        try:
-            # Convert nested lists to tuples for hashing
-            if isinstance(tags, list):
-                # Handle nested lists by converting inner lists to tuples
-                tags = tuple(tuple(t) if isinstance(t, list) else t for t in tags)
-            
-            weights = []
-            for class_name in self.tag_classes:
-                try:
-                    class_tags = set(self.tag_classes[class_name])
-                    tag_set = set(tags) if isinstance(tags, (list, tuple)) else {tags}
-                    
-                    class_intersection = class_tags.intersection(tag_set)
-                    weight = self.class_weights.get(class_name, 1.0)
-                    weights.append(weight if class_intersection else 1.0)
-                    
-                except Exception as class_error:
-                    logger.error(f"Error processing class {class_name}: {str(class_error)}")
-                    logger.error(f"Class traceback: {traceback.format_exc()}")
-                    weights.append(1.0)
-            
-            # Calculate final weight and clamp between min and max
-            final_weight = torch.tensor(weights).mean()
-            final_weight = torch.clamp(final_weight, self.min_weight, self.max_weight)
-            
-            return final_weight
-            
-        except Exception as e:
-            logger.error(f"Tag weight calculation failed: {str(e)}")
-            logger.error(f"Full traceback: {traceback.format_exc()}")
-            return torch.tensor(1.0)
-
-    def update_training_loss(self, loss, tags):
-        """
-        Apply tag-based weighting to the training loss.
-        
-        Args:
-            loss (torch.Tensor): Original loss value
-            tags (list): List of tags for the current image/batch
-            
-        Returns:
-            torch.Tensor: Weighted loss value
-        """
-        try:
-            weight = self.calculate_tag_weights(tags)
-            return loss * weight
-        except Exception as e:
-            logger.error(f"Loss update failed: {str(e)}")
-            logger.error(f"Loss update traceback: {traceback.format_exc()}")
-            return loss  # Return original loss on error
-    
-class CustomDataset(Dataset):
-    def __init__(self, data_dir, vae, tokenizer, tokenizer_2, text_encoder, text_encoder_2,
-                 cache_dir="latents_cache", batch_size=1):
-        self.data_dir = Path(data_dir)
-        self.cache_dir = Path(cache_dir)
-        self.cache_dir.mkdir(exist_ok=True)
-        self.batch_size = batch_size 
-
-        # Store model references as instance variables
-        self.vae = vae
-        self.tokenizer = tokenizer
-        self.tokenizer_2 = tokenizer_2
-        self.text_encoder = text_encoder
-        self.text_encoder_2 = text_encoder_2
-
-        # Find all image files and their corresponding caption files
-        self.image_paths = []
-        self.caption_paths = []
-        for img_path in self.data_dir.glob("*.*"):
-            if img_path.suffix.lower() in ['.png', '.jpg', '.jpeg', '.webp', '.bmp']:
-                caption_path = img_path.with_suffix('.txt')
-                if caption_path.exists():
-                    self.image_paths.append(img_path)
-                    self.caption_paths.append(caption_path)
-
-        # Initialize aspect buckets
-        self.aspect_buckets = self.create_aspect_buckets()
-
-        # Add tag processing
-        self.tag_list = self._build_tag_list()
-        self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14")
-        self.clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
-
-        # Cache latents and embeddings
-        self._cache_latents_and_embeddings_optimized()
-
-    def create_aspect_buckets(self):
-        aspect_buckets = {
-            (1, 1): [],    # Square
-            (4, 3): [],    # Landscape
-            (3, 4): [],    # Portrait
-            (16, 9): [],   # Widescreen
-            (9, 16): [],   # Tall
-        }
-        # Sort images into aspect buckets
-        for img_path in self.image_paths:
-            with Image.open(img_path) as img:
-                w, h = img.size
-                ratio = w / h
-                bucket = min(aspect_buckets.keys(),
-                             key=lambda x: abs(x[0]/x[1] - ratio))
-                aspect_buckets[bucket].append(img_path)
-        return aspect_buckets
-
-    def get_target_size_for_bucket(self, ratio):
-        """Calculate target size maintaining aspect ratio and ~1024x1024 total pixels
-        Args:
-            ratio: (width, height) tuple of aspect ratio
-        Returns:
-            (height, width) tuple of target size
-        """
-        # Calculate scale to maintain ~1024x1024 pixels
-        scale = math.sqrt(1024 * 1024 / (ratio[0] * ratio[1]))
-
-        # Calculate dimensions and ensure multiple of 64
-        w = int(round(ratio[0] * scale / 64)) * 64
-        h = int(round(ratio[1] * scale / 64)) * 64
-
-        # Clamp to max dimension of 2048
-        w = min(2048, w)
-        h = min(2048, h)
-
-        return (h, w)
-
-    def _build_tag_list(self):
-        """Build a list of all unique tags from captions"""
-        tags = set()
-        for caption_path in self.caption_paths:
-            with open(caption_path, 'r', encoding='utf-8') as f:
-                caption = f.read().strip()
-                # Assuming tags are comma-separated
-                caption_tags = [t.strip() for t in caption.split(',')]
-                tags.update(caption_tags)
-        return list(tags)
-
-    def _get_clip_embeddings(self, image, tags):
-        """Get CLIP embeddings for image and tags"""
-        with torch.no_grad():
-            # Get image embeddings
-            inputs = self.clip_processor(images=image, return_tensors="pt").to("cuda")
-            image_features = self.clip_model.get_image_features(**inputs)
-
-            # Get tag embeddings with explicit max length and truncation
-            text_inputs = self.clip_processor(
-                text=tags,
-                return_tensors="pt",
-                padding=True,
-                max_length=77,
-                truncation=True
-            ).to("cuda")
-            text_features = self.clip_model.get_text_features(**text_inputs)
-
-            return image_features, text_features
-
-    def transform_image(self, image):
-        """Transform image to tensor without extra batch dimension"""
-        transform = transforms.Compose([
-            transforms.Resize(1024),
-            transforms.CenterCrop(1024),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5])
-        ])
-        return transform(image)  # Remove unsqueeze(0)
-
-    def _cache_latents_and_embeddings_optimized(self):
-        """Optimized version of caching that uses bfloat16"""
-        self.vae.eval()
-        self.text_encoder.eval()
-        self.text_encoder_2.eval()
-        self.clip_model.eval()
-
-        self.vae.to("cuda")
-        self.text_encoder.to("cuda")
-        self.text_encoder_2.to("cuda")
-        self.clip_model.to("cuda")
-
-        # Add progress bar
-        print("Caching latents and embeddings...")
-        for img_path, caption_path in tqdm(zip(self.image_paths, self.caption_paths),
-                                           total=len(self.image_paths),
-                                           desc="Caching"):
-            cache_latents_path = self.cache_dir / f"{img_path.stem}_latents.pt"
-            cache_embeddings_path = self.cache_dir / f"{img_path.stem}_embeddings.pt"
-
-            if not cache_latents_path.exists() or not cache_embeddings_path.exists():
-                image = Image.open(img_path).convert("RGB")
-                image_tensor = self.transform_image(image).unsqueeze(0)  # Add batch dim only for VAE
-
-                with torch.no_grad():
-                    # Get tags from caption
-                    with open(caption_path, 'r', encoding='utf-8') as f:
-                        caption = f.read().strip()
-                        tags = [t.strip() for t in caption.split(',')]
-
-                    # Get CLIP embeddings
-                    clip_image_embed, clip_tag_embeds = self._get_clip_embeddings(image, tags)
-
-                    # Regular processing
-                    image_tensor = image_tensor.to("cuda", dtype=torch.bfloat16)
-                    latents = self.vae.encode(image_tensor).latent_dist.sample()  # [1, 4, H/8, W/8]
-                    latents = latents * 0.18215  # Scaling factor
-
-                    # Process text embeddings
-                    text_input = self.tokenizer(
-                        caption,
-                        padding="max_length",
-                        max_length=self.tokenizer.model_max_length,
-                        truncation=True,
-                        return_tensors="pt"
-                    ).to("cuda")
-
-                    text_embeddings = self.text_encoder(text_input.input_ids)[0]  # [1, 77, 768]
-
-                    # SDXL text encoder 2
-                    text_input_2 = self.tokenizer_2(
-                        caption,
-                        padding="max_length",
-                        max_length=self.tokenizer_2.model_max_length,
-                        truncation=True,
-                        return_tensors="pt"
-                    ).to("cuda")
-
-                    text_encoder_output_2 = self.text_encoder_2(text_input_2.input_ids)
-                    text_embeddings_2 = text_encoder_output_2.last_hidden_state  # [1, 77, 1280]
-                    pooled_text_embeddings_2 = text_encoder_output_2.pooler_output  # [1, 1280]
-
-                    # Save all embeddings
-                    torch.save({
-                        "text_embeddings": text_embeddings.cpu(),
-                        "text_embeddings_2": text_embeddings_2.cpu(),
-                        "pooled_text_embeddings_2": pooled_text_embeddings_2.cpu(),
-                        "clip_image_embed": clip_image_embed.cpu(),
-                        "clip_tag_embeds": clip_tag_embeds.cpu(),
-                        "tags": tags
-                    }, cache_embeddings_path)
-
-                    torch.save(latents.cpu(), cache_latents_path)
-
-                    # Clear memory
-                    del image_tensor, latents, text_embeddings, text_embeddings_2, pooled_text_embeddings_2
-                    torch.cuda.empty_cache()
-
-        # Move models back to CPU after the loop
-        self.vae.to("cpu")
-        self.text_encoder.to("cpu")
-        self.text_encoder_2.to("cpu")
-        self.clip_model.to("cpu")
-
-    def __len__(self):
-        return len(self.image_paths)
-
-    def __getitem__(self, idx):
-        """Get item with separate handling for batch_size=1 and batch_size>1"""
-        img_path = self.image_paths[idx]
-        latents_path = self.cache_dir / f"{img_path.stem}_latents.pt"
-        embeddings_path = self.cache_dir / f"{img_path.stem}_embeddings.pt"
-
-        # Load cached data
-        latents = torch.load(latents_path, map_location='cpu', weights_only=True)
-        embeddings = torch.load(embeddings_path, map_location='cpu', weights_only=True)
-
-        # Load original image
-        image = Image.open(img_path).convert("RGB")
-        original_images = self.transform_image(image)  # [3, H, W]
-
-        if self.batch_size == 1:
-            # Original single sample processing
-            return {
-                "latents": latents,  # [1, 4, 128, 128]
-                "text_embeddings": embeddings["text_embeddings"],  # [1, 77, 768]
-                "text_embeddings_2": embeddings["text_embeddings_2"],  # [1, 77, 1280]
-                "pooled_text_embeddings_2": embeddings["pooled_text_embeddings_2"],  # [1, 1280]
-                "target_size": (original_images.shape[1], original_images.shape[2]),  # tuple of (H, W)
-                "clip_image_embed": embeddings["clip_image_embed"],
-                "clip_tag_embeds": embeddings["clip_tag_embeds"],
-                "tags": embeddings["tags"],
-                "original_images": original_images  # [3, H, W]
-            }
-        else:
-            # Batch processing
-            return {
-                "latents": latents.squeeze(0),  # [4, 128, 128]
-                "text_embeddings": embeddings["text_embeddings"].squeeze(0),  # [77, 768]
-                "text_embeddings_2": embeddings["text_embeddings_2"].squeeze(0),  # [77, 1280]
-                "pooled_text_embeddings_2": embeddings["pooled_text_embeddings_2"].squeeze(0),  # [1280]
-                "target_size": torch.tensor([original_images.shape[1], original_images.shape[2]], dtype=torch.long),  # [2]
-                "clip_image_embed": embeddings["clip_image_embed"].squeeze(0),
-                "clip_tag_embeds": embeddings["clip_tag_embeds"].squeeze(0),
-                "tags": embeddings["tags"],
-                "original_images": original_images  # [3, H, W]
-            }
-
 class PerceptualLoss:
     def __init__(self):
         # Use pre-trained VGG16 model
@@ -621,164 +282,860 @@ def custom_collate(batch):
         
         return collated
 
-class VAEFineTuner:
-    def __init__(self, vae, learning_rate=1e-6):
-        try:
-            self.vae = vae
-            self.optimizer = AdamW8bit(vae.parameters(), lr=learning_rate)
+
+
+
+def setup_models(args, device, dtype):
+    """Initialize and configure all models"""
+    logger.info("Setting up models...")
+    
+    models = {
+        "unet": UNet2DConditionModel.from_pretrained(
+            args.model_path,
+            subfolder="unet",
+            torch_dtype=dtype
+        ).to(device),
+        
+        "vae": AutoencoderKL.from_pretrained(
+            args.model_path,
+            subfolder="vae",
+            torch_dtype=dtype
+        ),
+        
+        "tokenizer": CLIPTokenizer.from_pretrained(
+            args.model_path,
+            subfolder="tokenizer"
+        ),
+        
+        "tokenizer_2": CLIPTokenizer.from_pretrained(
+            args.model_path,
+            subfolder="tokenizer_2"
+        ),
+        
+        "text_encoder": CLIPTextModel.from_pretrained(
+            args.model_path,
+            subfolder="text_encoder",
+            torch_dtype=dtype
+        ),
+        
+        "text_encoder_2": CLIPTextModel.from_pretrained(
+            args.model_path,
+            subfolder="text_encoder_2",
+            torch_dtype=dtype
+        )
+    }
+    
+    # Enable optimizations
+    models["unet"].enable_gradient_checkpointing()
+    models["unet"].enable_xformers_memory_efficient_attention()
+    models["vae"].enable_xformers_memory_efficient_attention()
+    
+    return models
+
+def setup_training(args, models, device, dtype):
+    """Initialize all training components"""
+    logger.info("Setting up training components...")
+    
+    # Create dataset and dataloader
+    dataset = CustomDataset(
+        args.data_dir,
+        models["vae"],
+        models["tokenizer"],
+        models["tokenizer_2"],
+        models["text_encoder"],
+        models["text_encoder_2"],
+        cache_dir=args.cache_dir,
+        batch_size=args.batch_size
+    )
+    
+    train_dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        collate_fn=custom_collate
+    )
+
+    # Initialize optimizer
+    optimizer = (
+        Adafactor(
+            models["unet"].parameters(),
+            lr=args.learning_rate * args.batch_size,
+            scale_parameter=True,
+            relative_step=False,
+            warmup_init=False
+        ) if args.use_adafactor else
+        AdamW8bit(
+            models["unet"].parameters(),
+            lr=args.learning_rate * args.batch_size,
+            betas=(0.9, 0.999)
+        )
+    )
+
+    # Calculate training steps
+    num_update_steps_per_epoch = len(train_dataloader) // args.gradient_accumulation_steps
+    num_training_steps = args.num_epochs * num_update_steps_per_epoch
+
+    # Setup other components
+    return {
+        "train_dataloader": train_dataloader,
+        "optimizer": optimizer,
+        "lr_scheduler": get_scheduler(
+            "cosine",
+            optimizer=optimizer,
+            num_warmup_steps=0,
+            num_training_steps=num_training_steps
+        ),
+        "ema_model": AveragedModel(
+            models["unet"],
+            avg_fn=lambda avg, new, _: args.ema_decay * avg + (1 - args.ema_decay) * new
+        ),
+        "validator": ModelValidator(
+            model=models["unet"],
+            vae=models["vae"],
+            tokenizer=models["tokenizer"],
+            tokenizer_2=models["tokenizer_2"],
+            text_encoder=models["text_encoder"],
+            text_encoder_2=models["text_encoder_2"],
+            device=device
+        ),
+        "tag_weighter": TagBasedLossWeighter(
+            min_weight=args.min_tag_weight,
+            max_weight=args.max_tag_weight
+        ),
+        "vae_finetuner": VAEFineTuner(
+            vae=models["vae"],
+            learning_rate=args.vae_learning_rate
+        ) if args.finetune_vae else None
+    }
+
+def save_checkpoint(models, train_components, args, epoch, training_history, output_dir):
+    """
+    Save a training checkpoint including models, optimizer state, and training history
+    
+    Args:
+        models (dict): Dictionary containing all models:
+            - unet: UNet2DConditionModel
+            - vae: AutoencoderKL
+            - text_encoder: CLIPTextModel
+            - text_encoder_2: CLIPTextModel
+        train_components (dict): Dictionary containing training components:
+            - optimizer: Optimizer
+            - lr_scheduler: LRScheduler
+            - ema_model: EMA model
+        args: Training arguments
+        epoch (int): Current epoch number
+        training_history (dict): Dictionary containing training metrics
+        output_dir (str): Base directory for saving checkpoints
+    """
+    try:
+        # Create checkpoint directory
+        checkpoint_dir = os.path.join(output_dir, f"checkpoint_{epoch:04d}")
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        
+        logger.info(f"Saving checkpoint to {checkpoint_dir}")
+        
+        # Save models with diffusers-compatible format
+        for name, model in models.items():
+            if hasattr(model, 'save_pretrained'):
+                model_dir = os.path.join(checkpoint_dir, name)
+                logger.info(f"Saving {name} to {model_dir}")
+                model.save_pretrained(model_dir, safe_serialization=True)
+        
+        # Save optimizer state
+        optimizer = train_components["optimizer"]
+        torch.save(
+            optimizer.state_dict(),
+            os.path.join(checkpoint_dir, "optimizer.pt")
+        )
+        
+        # Save scheduler state
+        lr_scheduler = train_components["lr_scheduler"]
+        torch.save(
+            lr_scheduler.state_dict(),
+            os.path.join(checkpoint_dir, "scheduler.pt")
+        )
+        
+        # Save EMA model if present
+        if "ema_model" in train_components:
+            ema_model = train_components["ema_model"]
+            torch.save(
+                ema_model.state_dict(),
+                os.path.join(checkpoint_dir, "ema.pt")
+            )
+        
+        # Save training state
+        training_state = {
+            "epoch": epoch,
+            "training_history": training_history,
+            "args": vars(args)  # Convert args to dict for saving
+        }
+        torch.save(
+            training_state,
+            os.path.join(checkpoint_dir, "training_state.pt")
+        )
+        
+        logger.info("Checkpoint saved successfully")
+        
+    except Exception as e:
+        logger.error(f"Failed to save checkpoint: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise
+
+def train(args, models, train_components, device, dtype):
+    """
+    Main training loop with comprehensive progress tracking and validation
+    
+    Args:
+        args: Training arguments including:
+            - num_epochs: Number of training epochs
+            - batch_size: Batch size per device
+            - learning_rate: Initial learning rate
+            - validation_frequency: Epochs between validations
+            - logging_steps: Steps between metric logging
+            - save_epochs: Epochs between checkpoints
+        models: Dictionary containing:
+            - unet: UNet2DConditionModel
+            - vae: AutoencoderKL
+            - tokenizer: CLIPTokenizer
+            - tokenizer_2: CLIPTokenizer
+            - text_encoder: CLIPTextModel
+            - text_encoder_2: CLIPTextModel
+        train_components: Dictionary containing:
+            - train_dataloader: DataLoader
+            - optimizer: Optimizer
+            - lr_scheduler: LRScheduler
+            - ema_model: EMA model
+            - validator: ModelValidator
+            - tag_weighter: TagBasedLossWeighter
+            - vae_finetuner: VAEFineTuner (optional)
+        device: Target device (cuda/cpu)
+        dtype: Training precision (typically bfloat16)
             
-            # Convert VAE to bfloat16 and enable memory efficient attention
-            self.vae = self.vae.to(dtype=torch.bfloat16)
-            self.vae.enable_xformers_memory_efficient_attention()
+    Returns:
+        dict: Training history containing:
+            - epoch_losses: List of average losses per epoch
+            - learning_rates: Learning rate schedule
+            - grad_norms: Gradient norms during training
+            - validation_scores: Validation metrics
+    """
+    
+    # Unpack models and components for cleaner access
+    unet = models["unet"]
+    train_dataloader = train_components["train_dataloader"]
+    optimizer = train_components["optimizer"]
+    lr_scheduler = train_components["lr_scheduler"]
+    ema_model = train_components["ema_model"]
+    validator = train_components["validator"]
+    tag_weighter = train_components["tag_weighter"]
+    vae_finetuner = train_components.get("vae_finetuner")
+
+    # Initialize training state tracking
+    training_history = {
+        'epoch_losses': [],
+        'learning_rates': [],
+        'grad_norms': [],
+        'validation_scores': [],
+        'step_times': []
+    }
+    
+    total_steps = args.num_epochs * len(train_dataloader)
+    progress_bar = tqdm(total=total_steps, desc="Training")
+    
+    logger.info("\n=== Starting Training ===")
+    logger.info(f"Total steps: {total_steps}")
+    logger.info(f"Batch size: {args.batch_size}")
+    logger.info(f"Learning rate: {args.learning_rate}")
+    
+    for epoch in range(args.num_epochs):
+        # Initialize epoch tracking
+        epoch_metrics = defaultdict(float)
+        epoch_start_time = time.time()
+        step_times = []
+        
+        logger.info(f"\n=== Starting Epoch {epoch+1}/{args.num_epochs} ===")
+        
+        for step, batch in enumerate(train_dataloader):
+            step_start = time.time()
+            global_step = epoch * len(train_dataloader) + step
             
-            # Enable gradient checkpointing
-            self.vae.enable_gradient_checkpointing()
+            # === Process Batch ===
+            # Shape: [batch_size, 4, 64, 64]
+            latents = batch["latents"].to(device).to(dtype=torch.bfloat16)
             
-            # Initialize Welford's online statistics
-            self.latent_count = 0
-            self.latent_means = None
-            self.latent_m2 = None
+            # Shape: [batch_size, 77, 768] - First encoder (CLIP-L)
+            text_embeddings_1 = batch["text_embeddings"].to(device).to(dtype=torch.bfloat16)
             
-            logger.info("VAEFineTuner initialized successfully")
+            # Shape: [batch_size, 77, 1280] - Second encoder (CLIP-G)
+            text_embeddings_2 = batch["text_embeddings_2"].to(device).to(dtype=torch.bfloat16)
             
-        except Exception as e:
-            logger.error(f"VAEFineTuner initialization failed: {str(e)}")
-            logger.error(f"Initialization traceback: {traceback.format_exc()}")
-            raise
+            # Shape: [batch_size, 77, 2048] - Combined embeddings
+            text_embeddings = torch.cat([text_embeddings_1, text_embeddings_2], dim=-1)
             
-    def update_statistics(self, latents):
-        """Update running mean and variance using Welford's online algorithm"""
-        try:
-            latents = latents.to(dtype=torch.bfloat16)  # Ensure bfloat16
-            if self.latent_means is None:
-                self.latent_means = torch.zeros(latents.size(1), device=latents.device, dtype=torch.bfloat16)
-                self.latent_m2 = torch.zeros(latents.size(1), device=latents.device, dtype=torch.bfloat16)
+            # Shape: [batch_size, 1280] - Pooled embeddings
+            pooled_embeds = batch["pooled_text_embeddings_2"].to(device).to(dtype=torch.bfloat16)
+            
+            # === Training Step ===
+            with torch.amp.autocast('cuda', dtype=dtype):
+                # Shape: [num_inference_steps]
+                sigmas = get_sigmas(args.num_inference_steps).to(device)
+                sigma = sigmas[step % args.num_inference_steps]
+                sigma = sigma.expand(latents.size(0))
                 
-            flat_latents = latents.view(latents.size(0), latents.size(1), -1)
-            
-            for i in range(latents.size(0)):
-                self.latent_count += 1
-                delta = flat_latents[i].mean(dim=1) - self.latent_means
-                self.latent_means += delta / self.latent_count
-                delta2 = flat_latents[i].mean(dim=1) - self.latent_means
-                self.latent_m2 += delta * delta2
+                # Run training step
+                loss, step_metrics = training_loss_v_prediction(
+                    unet,
+                    latents,  # [B, 4, 64, 64]
+                    sigma,    # [B]
+                    text_embeddings,  # [B, 77, 2048]
+                    {
+                        "text_embeds": pooled_embeds,  # [B, 1280]
+                        "time_ids": torch.tensor([
+                            1024, 1024,  # Original dims
+                            1024, 1024,  # Target dims
+                            0, 0,        # Crop coords
+                        ], device=device, dtype=dtype).repeat(latents.shape[0], 1)
+                    }
+                )
                 
-        except Exception as e:
-            logger.error(f"Statistics update failed: {str(e)}")
-            logger.error(f"Update traceback: {traceback.format_exc()}")
-            logger.error(f"Latents shape: {latents.shape}")
-            logger.error(f"Current means shape: {self.latent_means.shape if self.latent_means is not None else None}")
+                # Scale loss for gradient accumulation
+                loss = loss / args.gradient_accumulation_steps
             
-    def get_statistics(self):
-        try:
-            if self.latent_count < 2:
-                return None, None
+            # === Update Model ===
+            weighted_loss = tag_weighter.update_training_loss(loss, batch["tags"])
+            weighted_loss.backward()
+            
+            if (step + 1) % args.gradient_accumulation_steps == 0:
+                # Clip gradients and update model
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    unet.parameters(), 
+                    args.max_grad_norm
+                )
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                lr_scheduler.step()
+                ema_model.update_parameters(unet)
                 
-            variance = self.latent_m2 / (self.latent_count - 1)
-            std = torch.sqrt(variance + 1e-8)
-            return self.latent_means, std
-            
-        except Exception as e:
-            logger.error(f"Statistics calculation failed: {str(e)}")
-            logger.error(f"Calculation traceback: {traceback.format_exc()}")
-            return None, None
-            
-    def training_step(self, latents=None, original_images=None):
-        try:
-            self.optimizer.zero_grad()
-            
-            # Process in smaller chunks if batch size is large
-            if original_images is None:
-                if isinstance(latents, dict):
-                    original_images = latents["pixel_values"].to(self.vae.device, dtype=torch.bfloat16)
-                else:
-                    raise ValueError("Either original_images or a batch dict must be provided")
-            else:
-                original_images = original_images.to(self.vae.device, dtype=torch.bfloat16)
-            
-            # Ensure proper shape [B, C, H, W]
-            if original_images.dim() == 3:
-                original_images = original_images.unsqueeze(0)  # Add batch dimension
-            elif original_images.dim() > 4:
-                original_images = original_images.squeeze(1)  # Remove extra dimensions
+                # Track gradient norm
+                training_history['grad_norms'].append(grad_norm.item())
                 
-            # Validate shape
-            if original_images.dim() != 4:
-                raise ValueError(f"Expected 4D tensor [B,C,H,W], got shape {original_images.shape}")
+                # VAE finetuning step if enabled
+                if vae_finetuner and (global_step % args.vae_train_freq == 0):
+                    logger.debug("Running VAE finetuning step")
+                    try:
+                        vae_loss = vae_finetuner.training_step(
+                            batch["images"].to(device),  # Original images
+                            batch["latents"].to(device)  # Encoded latents
+                        )
+                        epoch_metrics['vae_loss'] += vae_loss
+                        
+                        if args.use_wandb:
+                            wandb.log({
+                                'vae_loss': vae_loss
+                            }, step=global_step)
+                            
+                    except Exception as e:
+                        logger.error(f"VAE finetuning step failed: {str(e)}")
+                        logger.error(f"Traceback: {traceback.format_exc()}")
+
             
-            # Split batch into chunks if needed
-            batch_size = original_images.shape[0]
-            chunk_size = min(batch_size, 2)  # Process max 2 images at once
+            progress_bar.update(1)
+        
+        # === End of Epoch ===
+        epoch_time = time.time() - epoch_start_time
+        
+        # Log epoch metrics
+        logger.info(f"\nEpoch {epoch+1} completed in {epoch_time:.2f}s")
+        logger.info("Average metrics:")
+        for k, v in epoch_metrics.items():
+            avg_value = v / len(train_dataloader)
+            logger.info(f"- {k}: {avg_value:.4f}")
+        
+        # Update training history
+        training_history['epoch_losses'].append(
+            epoch_metrics['loss/total'] / len(train_dataloader)
+        )
+        training_history['learning_rates'].append(
+            lr_scheduler.get_last_lr()[0]
+        )
+        training_history['step_times'].extend(step_times)
+        
+        # Run validation if scheduled
+        if (epoch + 1) % args.validation_frequency == 0:
+            logger.info("\nRunning validation...")
+            validation_metrics = validator.run_paper_validation(
+                args.validation_prompts
+            )
+            training_history['validation_scores'].append(validation_metrics)
             
-            total_loss = 0
-            for i in range(0, batch_size, chunk_size):
-                chunk = original_images[i:i+chunk_size]
-                
-                # Clear cache before processing chunk
-                torch.cuda.empty_cache()
-                
-                with torch.amp.autocast('cuda', dtype=torch.bfloat16):  # Updated autocast syntax
-                    # Encode
-                    latents_chunk = self.vae.encode(chunk).latent_dist.sample()
-                    
-                    # Update statistics for this chunk
-                    self.update_statistics(latents_chunk.detach())
-                    
-                    # Get current statistics
-                    means, stds = self.get_statistics()
-                    if means is not None and stds is not None:
-                        latents_chunk = (latents_chunk - means[None,:,None,None]) / stds[None,:,None,None]
-                        decode_latents = latents_chunk * stds[None,:,None,None] + means[None,:,None,None]
+            if args.use_wandb:
+                wandb.log({
+                    'validation': validation_metrics
+                }, step=global_step)
+        
+        # Save checkpoint if scheduled
+        if (epoch + 1) % args.save_epochs == 0:
+            logger.info("\nSaving checkpoint...")
+            save_checkpoint(
+                unet, optimizer, lr_scheduler, epoch, 
+                training_history, args.output_dir
+            )
+    
+    progress_bar.close()
+    return training_history
+
+def save_training_config(args, output_dir, training_history):
+    """Save training configuration and history"""
+    config_path = os.path.join(output_dir, "training_config.json")
+    with open(config_path, "w") as f:
+        json.dump(vars(args), f)
+
+def create_model_card(args, training_history):
+    """
+    Create a detailed model card for the trained model following HuggingFace's best practices
+    
+    Args:
+        args: Training arguments containing model configuration and training settings
+        training_history (dict): Dictionary containing training metrics and history
+        
+    Returns:
+        str: Formatted markdown text for the model card
+    """
+    try:
+        # Get final metrics
+        final_loss = training_history['epoch_losses'][-1] if training_history['epoch_losses'] else None
+        final_validation = training_history['validation_scores'][-1] if training_history['validation_scores'] else None
+        
+        # Format training parameters
+        training_params = {
+            "Learning Rate": args.learning_rate,
+            "Batch Size": args.batch_size,
+            "Number of Epochs": args.num_epochs,
+            "Gradient Accumulation Steps": args.gradient_accumulation_steps,
+            "Max Gradient Norm": args.max_grad_norm,
+            "EMA Decay": args.ema_decay,
+            "Optimizer": "Adafactor" if args.use_adafactor else "AdamW8bit"
+        }
+        
+        # Create markdown content
+        model_card = f"""
+# {os.path.basename(args.model_path)} Fine-tuned SDXL Model
+
+This is a fine-tuned version of [{args.model_path}](https://huggingface.co/{args.model_path}) trained with High Sigma training techniques.
+
+## Model Details
+
+- **Base Model**: {args.model_path}
+- **Training Type**: High Sigma Fine-tuning
+- **Training Data**: Custom dataset from {args.data_dir}
+- **Developed by**: [Your Organization]
+- **Trained by**: [Your Name/Organization]
+- **License**: [License Type]
+
+## Training Details
+
+### Training Parameters
+"""
+
+        # Add training parameters
+        for param, value in training_params.items():
+            model_card += f"- **{param}**: {value}\n"
+        
+        # Add performance metrics if available
+        if final_loss or final_validation:
+            model_card += "\n### Performance Metrics\n"
+            if final_loss:
+                model_card += f"- **Final Training Loss**: {final_loss:.4f}\n"
+            if final_validation:
+                model_card += "- **Validation Results**:\n"
+                for metric, value in final_validation.items():
+                    if isinstance(value, (int, float)):
+                        model_card += f"  - {metric}: {value:.4f}\n"
                     else:
-                        decode_latents = latents_chunk
-                    
-                    # Decode
-                    decoded = self.vae.decode(decode_latents).sample
-                
-                # Calculate loss for this chunk
-                chunk_loss = F.mse_loss(decoded, chunk, reduction="mean")
-                chunk_loss = chunk_loss / (batch_size / chunk_size)  # Scale loss by number of chunks
-                chunk_loss.backward()
-                
-                total_loss += chunk_loss.item() * (batch_size / chunk_size)
-            
-            self.optimizer.step()
-            
-            return {
-                "total_loss": total_loss,
-                "latent_means": self.latent_means.detach().cpu() if self.latent_means is not None else None,
-                "latent_stds": stds.detach().cpu() if stds is not None else None
-            }
-            
-        except Exception as e:
-            logger.error(f"Training step failed: {str(e)}")
-            logger.error(f"Training traceback: {traceback.format_exc()}")
-            logger.error(f"Device info - VAE: {self.vae.device}")
-            return {"total_loss": float('inf')}  # Return infinite loss on error
-            
-    def save_pretrained(self, path):
-        """vae diffusers compatible save"""
+                        model_card += f"  - {metric}: {value}\n"
+
+        # Add training curves if using wandb
+        if args.use_wandb:
+            model_card += """
+### Training Curves
+Training curves and additional metrics are available in the [Weights & Biases run](INSERT_WANDB_RUN_LINK).
+"""
+
+        # Add usage information
+        model_card += """
+## Usage
+
+This model can be used with the standard Stable Diffusion XL pipeline. Here's an example:
+```python
+from diffusers import StableDiffusionXLPipeline
+import torch
+model_id = "path/to/model"
+pipe = StableDiffusionXLPipeline.from_pretrained(
+model_id,
+torch_dtype=torch.float16,
+use_safetensors=True
+).to("cuda")
+prompt = "your prompt here"
+image = pipe(prompt).images[0]
+```
+
+## Training Process
+
+This model was trained using High Sigma training techniques, which includes:
+- Training with high noise levels (σ ≈ 20000)
+- Zero Terminal SNR optimization
+- High-resolution coherence preservation
+- Tag-based loss weighting
+
+## Limitations & Biases
+
+Please note:
+- This model inherits biases from its base model and training data
+- The model's performance may vary depending on the prompt complexity
+- [Add any specific limitations or known issues]
+
+## License
+[Specify License Information]
+
+## Citation
+If you use this model in your research, please cite:
+```
+bibtex
+@misc{your-model-name,
+author = {Your Name},
+title = {Model Name},
+year = {2024},
+publisher = {Hugging Face},
+journal = {Hugging Face Model Hub},
+}
+```
+"""
+
+        return model_card
+        
+    except Exception as e:
+        logger.error(f"Failed to create model card: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return """
+# Model Card Generation Failed
+
+There was an error generating the complete model card. Please check the logs for details.
+
+## Basic Information
+- **Base Model**: {args.model_path}
+- **Training Type**: High Sigma Fine-tuning
+"""
+
+def save_model_card(model_card, output_dir):
+    """
+    Save the model card to the output directory
+    
+    Args:
+        model_card (str): The formatted model card markdown text
+        output_dir (str): Directory to save the model card
+    """
+    try:
+        card_path = os.path.join(output_dir, "README.md")
+        with open(card_path, "w", encoding="utf-8") as f:
+            f.write(model_card)
+        logger.info(f"Model card saved to {card_path}")
+        
+    except Exception as e:
+        logger.error(f"Failed to save model card: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+
+def push_to_hub(
+    hub_model_id,
+    output_dir,
+    private=False,
+    model_card=None,
+    commit_message=None
+):
+    """
+    Push the trained model to HuggingFace Hub
+    
+    Args:
+        hub_model_id (str): Full model ID on HuggingFace (e.g., 'username/model-name')
+        output_dir (str): Local directory containing the model files
+        private (bool): Whether to create a private repository
+        model_card (str, optional): Model card content in markdown format
+        commit_message (str, optional): Custom commit message
+    """
+    try:
+        from huggingface_hub import (
+            HfApi, 
+            create_repo,
+            upload_folder
+        )
+        
+        logger.info(f"Pushing model to HuggingFace Hub: {hub_model_id}")
+        api = HfApi()
+        
+        # Create or get repository
         try:
-            os.makedirs(path, exist_ok=True)
-            self.vae.save_pretrained(path, safe_serialization=True)
-            
-            torch.save(self.optimizer.state_dict(), os.path.join(path, "optimizer.pt"))
-            
-            # Save statistics if available
-            if self.latent_means is not None and self.latent_m2 is not None:
-                stats = {
-                    "means": self.latent_means.cpu(),
-                    "m2": self.latent_m2.cpu(),
-                    "count": self.latent_count
-                }
-                torch.save(stats, os.path.join(path, "latent_stats.pt"))
-                
-            logger.info(f"Model saved successfully to {path}")
-            
+            logger.info("Creating repository...")
+            create_repo(
+                hub_model_id,
+                private=private,
+                exist_ok=True
+            )
         except Exception as e:
-            logger.error(f"Model save failed: {str(e)}")
-            logger.error(f"Save traceback: {traceback.format_exc()}")
-            raise
+            logger.warning(f"Repository creation warning (might already exist): {e}")
+        
+        # Prepare commit message
+        if commit_message is None:
+            commit_message = f"Upload {hub_model_id} with High Sigma training"
+        
+        # Save model card if provided
+        if model_card is not None:
+            card_path = os.path.join(output_dir, "README.md")
+            logger.info(f"Saving model card to {card_path}")
+            with open(card_path, "w", encoding="utf-8") as f:
+                f.write(model_card)
+        
+        # Upload the model
+        logger.info(f"Uploading files from {output_dir}")
+        upload_folder(
+            folder_path=output_dir,
+            repo_id=hub_model_id,
+            commit_message=commit_message,
+            ignore_patterns=[
+                "*.pt",          # Ignore pytorch state files
+                "*.bin",         # Prefer safetensors
+                "checkpoint_*",  # Ignore intermediate checkpoints
+                "events.out.*",  # Ignore tensorboard files
+                "*.ckpt",       # Ignore old checkpoint format
+                "*.pth",        # Ignore other pytorch files
+                "__pycache__",  # Ignore python cache
+                ".git",         # Ignore git files
+                "wandb",        # Ignore wandb files
+                "logs",         # Ignore log files
+                "cache"         # Ignore cache directories
+            ]
+        )
+        
+        # Get repository URL
+        repo_url = f"https://huggingface.co/{hub_model_id}"
+        logger.info(f"Model successfully pushed to {repo_url}")
+        
+        return repo_url
+        
+    except ImportError as e:
+        logger.error("huggingface_hub package not found. Please install with:")
+        logger.error("pip install huggingface_hub")
+        raise
+        
+    except Exception as e:
+        logger.error(f"Failed to push to hub: {str(e)}")
+        logger.error(f"Model ID: {hub_model_id}")
+        logger.error(f"Output directory: {output_dir}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise
+
+def verify_hub_token():
+    """
+    Verify that a HuggingFace token is available and valid
+    
+    Returns:
+        bool: True if token is valid
+    """
+    try:
+        from huggingface_hub import HfApi
+        
+        api = HfApi()
+        api.whoami()
+        return True
+        
+    except ImportError:
+        logger.error("huggingface_hub package not found")
+        return False
+        
+    except Exception as e:
+        logger.error(f"Invalid or missing HuggingFace token: {e}")
+        logger.error("Please run `huggingface-cli login` or set the HUGGING_FACE_HUB_TOKEN environment variable")
+        return False
+
+def save_final_outputs(args, models, training_history):
+    """Save final model, config and training history"""
+    logger.info("Saving final outputs...")
+    
+    output_dir = args.output_dir
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Save models
+    for name, model in models.items():
+        if hasattr(model, 'save_pretrained'):
+            model.save_pretrained(
+                os.path.join(output_dir, name),
+                safe_serialization=True
+            )
+
+    # Save config and history
+    save_training_config(args, output_dir, training_history)
+    
+    # Create model card if pushing to hub
+    if args.push_to_hub:
+        model_card = create_model_card(args, training_history)
+        with open(os.path.join(output_dir, "README.md"), "w") as f:
+            f.write(model_card)
+
+
+def verify_checkpoint_directory(checkpoint_dir):
+    """
+    Verify that a checkpoint directory contains all required model directories in diffusers format
+    
+    Args:
+        checkpoint_dir (str): Directory to verify
+        
+    Returns:
+        bool, dict: Tuple containing:
+            - bool: True if directory contains all required model directories
+            - dict: Status of optional files
+    """
+    # Optional state files - used for training resumption
+    optional_files = [
+        "training_state.pt",
+        "optimizer.pt",
+        "scheduler.pt",
+        "ema.safetensors",
+        "ema.pt"
+    ]
+    
+    # Required model directories - needed for model loading
+    required_dirs = [
+        "unet",
+        "vae",
+        "text_encoder",
+        "text_encoder_2"
+    ]
+    
+    # Check for either safetensors or pt files in model directories
+    def has_model_files(model_dir):
+        return (
+            os.path.exists(os.path.join(model_dir, "model.safetensors")) or
+            os.path.exists(os.path.join(model_dir, "pytorch_model.bin"))
+        )
+    
+    # Track optional file status
+    optional_status = {
+        f: os.path.exists(os.path.join(checkpoint_dir, f))
+        for f in optional_files
+    }
+    
+    # Check required directories and their contents
+    missing_dirs = []
+    for d in required_dirs:
+        dir_path = os.path.join(checkpoint_dir, d)
+        if not os.path.exists(dir_path):
+            missing_dirs.append(d)
+        elif not has_model_files(dir_path):
+            missing_dirs.append(f"{d} (no model files)")
+    
+    if missing_dirs:
+        logger.warning("Checkpoint directory missing required model directories:")
+        logger.warning(f"Missing or invalid directories: {missing_dirs}")
+        return False, optional_status
+    
+    # Log optional file status
+    logger.info("Optional file status:")
+    for f, exists in optional_status.items():
+        logger.info(f"- {f}: {'Found' if exists else 'Missing'}")
+    
+    return True, optional_status
+
+def load_checkpoint(checkpoint_dir, models, train_components):
+    """
+    Load a saved checkpoint in diffusers format with safetensors support
+    
+    Args:
+        checkpoint_dir (str): Directory containing the checkpoint
+        models (dict): Dictionary containing models to load
+        train_components (dict): Dictionary containing training components
+            
+    Returns:
+        dict: Training state (if available) or None
+    """
+    try:
+        logger.info(f"Loading checkpoint from {checkpoint_dir}")
+        
+        # Verify directory structure
+        is_valid, optional_status = verify_checkpoint_directory(checkpoint_dir)
+        if not is_valid:
+            raise ValueError("Invalid checkpoint directory structure")
+        
+        # Load models (required)
+        model_components = {
+            "unet": ("unet", UNet2DConditionModel),
+            "vae": ("vae", AutoencoderKL),
+            "text_encoder": ("text_encoder", CLIPTextModel),
+            "text_encoder_2": ("text_encoder_2", CLIPTextModel)
+        }
+        
+        for model_key, (subfolder, model_class) in model_components.items():
+            model_dir = os.path.join(checkpoint_dir, subfolder)
+            logger.info(f"Loading {model_key} from {model_dir}")
+            models[model_key] = model_class.from_pretrained(
+                model_dir,
+                use_safetensors=True,
+                torch_dtype=models[model_key].dtype
+            )
+        
+        # Load training state if available
+        training_state = None
+        if optional_status["training_state.pt"]:
+            logger.info("Loading training state")
+            training_state = torch.load(
+                os.path.join(checkpoint_dir, "training_state.pt"),
+                map_location='cpu'
+            )
+            
+            # Load optimizer state if available
+            if optional_status["optimizer.pt"]:
+                logger.info("Loading optimizer state")
+                train_components["optimizer"].load_state_dict(
+                    torch.load(
+                        os.path.join(checkpoint_dir, "optimizer.pt"),
+                        map_location='cpu'
+                    )
+                )
+            
+            # Load scheduler state if available
+            if optional_status["scheduler.pt"]:
+                logger.info("Loading scheduler state")
+                train_components["lr_scheduler"].load_state_dict(
+                    torch.load(
+                        os.path.join(checkpoint_dir, "scheduler.pt"),
+                        map_location='cpu'
+                    )
+                )
+            
+            # Load EMA state if available
+            if "ema_model" in train_components:
+                if optional_status["ema.safetensors"]:
+                    logger.info("Loading EMA state from safetensors")
+                    from safetensors.torch import load_file
+                    ema_state = load_file(
+                        os.path.join(checkpoint_dir, "ema.safetensors")
+                    )
+                    train_components["ema_model"].load_state_dict(ema_state)
+                elif optional_status["ema.pt"]:
+                    logger.info("Loading EMA state from pytorch")
+                    train_components["ema_model"].load_state_dict(
+                        torch.load(
+                            os.path.join(checkpoint_dir, "ema.pt"),
+                            map_location='cpu'
+                        )
+                    )
+        
+        return training_state
+        
+    except Exception as e:
+        logger.error(f"Failed to load checkpoint: {str(e)}")
+        logger.error(f"Checkpoint directory: {checkpoint_dir}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -847,714 +1204,155 @@ def parse_args():
     return args
 
 
-
-    
 def main(args):
+    """
+    Main entry point for training
+    
+    Args:
+        args: Parsed command line arguments including:
+            - use_wandb: Enable Weights & Biases logging
+            - wandb_project: W&B project name
+            - wandb_run_name: W&B run name
+            - model_path: Path to base model
+            - output_dir: Directory for saving outputs
+            - push_to_hub: Whether to push to HuggingFace Hub
+    """
+    wandb_run = None
     try:
+        # === Setup Logging ===
+        logger.info("\n=== Starting Training Pipeline ===")
+        logger.info(f"Arguments: {args}")
+        
         # Initialize wandb if enabled
         if args.use_wandb:
-            wandb.init(
+            wandb_run = wandb.init(
                 project=args.wandb_project,
                 name=args.wandb_run_name,
                 config=vars(args),
-                settings=wandb.Settings(code_dir="."),
+                resume=True  # Enable run resumption
             )
+            logger.info(f"Initialized W&B run: {wandb_run.name}")
 
-        # Set up device
+        # === Setup Environment ===
+        # Set up device and dtype
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        logger.info(f"Using device: {device}")
-
-        # Set up dtype
         dtype = torch.bfloat16
+        logger.info(f"Using device: {device}")
+        logger.info(f"Using dtype: {dtype}")
 
-        # Clear CUDA cache before training
+        # Clear CUDA cache and set memory allocator
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+            if hasattr(torch.cuda, 'memory_stats'):
+                logger.info(f"Initial CUDA memory: {torch.cuda.memory_allocated()/1e9:.2f}GB")
 
-        # Load models with bfloat16
-        unet = UNet2DConditionModel.from_pretrained(
-            args.model_path,
-            subfolder="unet",
-            torch_dtype=torch.bfloat16
-        ).to(device)
-
-        # Now we can watch the model after it's initialized
-        if args.use_wandb:
-            wandb.watch(unet, log='all', log_freq=100)
-        vae = AutoencoderKL.from_pretrained(
-            args.model_path,
-            subfolder="vae",
-            torch_dtype=torch.bfloat16
-        )
-        tokenizer = CLIPTokenizer.from_pretrained(
-            args.model_path,
-            subfolder="tokenizer"
-        )
-        tokenizer_2 = CLIPTokenizer.from_pretrained(
-            args.model_path,
-            subfolder="tokenizer_2"
-        )
-        text_encoder = CLIPTextModel.from_pretrained(
-            args.model_path,
-            subfolder="text_encoder",
-            torch_dtype=torch.bfloat16
-        )
-        text_encoder_2 = CLIPTextModel.from_pretrained(
-            args.model_path,
-            subfolder="text_encoder_2",
-            torch_dtype=torch.bfloat16
-        )
+        # === Model Setup ===
+        logger.info("\nSetting up models and components...")
         
-
-        # Keep other models on CPU
-        vae.to("cpu")
-        text_encoder.to("cpu")
-        text_encoder_2.to("cpu")
-
+        # Load and setup models
+        models = setup_models(args, device, dtype)
+        logger.info("Models loaded successfully")
         
-
-        # Enable gradient checkpointing
-        unet.enable_gradient_checkpointing()
-
-        # Setup optimizer with per-device batch size
-        dataset = CustomDataset(
-            args.data_dir,
-            vae,
-            tokenizer,
-            tokenizer_2,
-            text_encoder,
-            text_encoder_2,
-            cache_dir=args.cache_dir,
-            batch_size=args.batch_size
-        )
-        train_dataloader = DataLoader(
-            dataset,
-            batch_size=args.batch_size,
-            shuffle=True,
-            num_workers=4,
-            pin_memory=True,
-            collate_fn=custom_collate
-        )
-
-        # Setup optimizer
-        if args.use_adafactor:
-            optimizer = Adafactor(
-                unet.parameters(),
-                lr=args.learning_rate * args.batch_size,
-                scale_parameter=True,
-                relative_step=False,
-                warmup_init=False,
-                clip_threshold=1.0,
-                beta1=0.9,
-                weight_decay=1e-2,
-            )
-        else:
-            optimizer = AdamW8bit(
-                unet.parameters(),
-                lr=args.learning_rate * args.batch_size,
-                betas=(0.9, 0.999),
-                weight_decay=1e-2,
-                eps=1e-8
-            )
-
-        # Enable memory efficient attention only for models that support it
-        unet.enable_xformers_memory_efficient_attention()
-        vae.enable_xformers_memory_efficient_attention()
-
-        # Setup EMA
-        ema_model = AveragedModel(unet, avg_fn=lambda avg, new, _: args.ema_decay * avg + (1 - args.ema_decay) * new)
-
-        # Calculate total training steps
-        num_update_steps_per_epoch = len(train_dataloader) // args.gradient_accumulation_steps
-        num_training_steps = args.num_epochs * num_update_steps_per_epoch
-
-        # Setup scheduler
-        lr_scheduler = get_scheduler(
-            "cosine",
-            optimizer=optimizer,
-            num_warmup_steps=0,
-            num_training_steps=num_training_steps
-        )
-
         # Initialize training components
-        if args.finetune_vae:
-            vae = vae.to("cuda").to(dtype=torch.bfloat16)
-            vae_finetuner = VAEFineTuner(
-                vae=vae,
-                learning_rate=args.vae_learning_rate
+        train_components = setup_training(args, models, device, dtype)
+        logger.info("Training components initialized")
+        
+        # Load checkpoint if resuming
+        if args.resume_from_checkpoint:
+            logger.info(f"Loading checkpoint from {args.resume_from_checkpoint}")
+            training_state = load_checkpoint(
+                args.resume_from_checkpoint,
+                models,
+                train_components
+            )
+            start_epoch = training_state["epoch"] + 1
+            logger.info(f"Resuming from epoch {start_epoch}")
+        else:
+            start_epoch = 0
+            
+        # === Training Loop ===
+        logger.info("\nStarting training...")
+        training_history = train(
+            args=args,
+            models=models,
+            train_components=train_components,
+            device=device,
+            dtype=dtype
+        )
+        logger.info("Training completed successfully")
+
+        # === Save Outputs ===
+        logger.info("\nSaving final outputs...")
+        save_final_outputs(
+            args=args,
+            models=models,
+            training_history=training_history,
+            train_components=train_components
+        )
+        
+        # Create and save model card
+        model_card = create_model_card(args, training_history)
+        save_model_card(model_card, args.output_dir)
+        
+        # Push to Hub if requested
+        if args.push_to_hub:
+            logger.info("\nPushing to HuggingFace Hub...")
+            push_to_hub(
+                args.hub_model_id,
+                args.output_dir,
+                args.hub_private,
+                model_card
             )
 
-        # Initialize validator after model setup
-        validator = ModelValidator(
-            model=unet,
-            vae=vae,
-            tokenizer=tokenizer,
-            tokenizer_2=tokenizer_2,
-            text_encoder=text_encoder,
-            text_encoder_2=text_encoder_2,
-            device=device
-        )
+        logger.info("\n=== Training Pipeline Completed Successfully ===")
+        return True
 
-        # Move models to device and set dtype
-        unet = unet.to(device=device, dtype=dtype)
-        vae = vae.to(device=device, dtype=dtype)
-
-        # Initialize tag weighter with dataset's tag list
-        tag_weighter = TagBasedLossWeighter(
-            min_weight=args.min_tag_weight,
-            max_weight=args.max_tag_weight
-        )
-
-        # Populate tag frequencies from dataset
-        print("Initializing tag frequencies...")
-        for img_path in tqdm(dataset.image_paths):
-            caption_path = img_path.with_suffix('.txt')
-            if caption_path.exists():
-                with open(caption_path, 'r', encoding='utf-8') as f:
-                    caption = f.read().strip()
-                    tags = [t.strip() for t in caption.split(',')]
-                    tag_weighter.add_tags_to_frequency(tags)
-
-        # Training loop
-        logger.info("Starting training...")
-        total_steps = args.num_epochs * len(train_dataloader)
-        progress_bar = tqdm(total=total_steps, desc="Training", dynamic_ncols=True)
-
-        for epoch in range(args.num_epochs):
-            epoch_loss = 0
-            epoch_metrics = defaultdict(float)
-            
-            for step, batch in enumerate(train_dataloader):
-                # Convert inputs to correct dtype (bfloat16)
-                latents = batch["latents"].to(device).to(dtype=torch.bfloat16)
-                
-                # SDXL uses two text encoders concatenated
-                # First encoder output (CLIP-L): 768 dimensions
-                # Second encoder output (CLIP-G): 1280 dimensions
-                text_embeddings_1 = batch["text_embeddings"].to(device).to(dtype=torch.bfloat16)  # [batch, 77, 768]
-                text_embeddings_2 = batch["text_embeddings_2"].to(device).to(dtype=torch.bfloat16)  # [batch, 77, 1280]
-                
-                # Concatenate the embeddings from both encoders
-                # This gives us the full SDXL text conditioning: [batch, 77, 2048]
-                text_embeddings = torch.cat([text_embeddings_1, text_embeddings_2], dim=-1)
-
-                # Get pooled embeddings for added conditioning
-                pooled_text_embeddings_2 = batch["pooled_text_embeddings_2"].to(device).to(dtype=torch.bfloat16)
-
-                # Use autocast for mixed precision
-                with torch.amp.autocast('cuda', dtype=dtype):
-                    sigmas = get_sigmas(args.num_inference_steps).to(device)
-                    sigma = sigmas[step % args.num_inference_steps]
-                    sigma = sigma.expand(latents.size(0))
-
-                    loss, loss_metrics = training_loss_v_prediction(
-                        unet,
-                        latents,
-                        sigma,
-                        text_embeddings,  # Now contains concatenated embeddings [batch, 77, 2048]
-                        {
-                            "text_embeds": pooled_text_embeddings_2,
-                            "time_ids": torch.tensor([
-                                1024,  # Original height
-                                1024,  # Original width
-                                1024,  # Target height
-                                1024,  # Target width
-                                0,    # Crop top
-                                0,    # Crop left
-                            ], device=device, dtype=torch.bfloat16).repeat(latents.shape[0], 1)
-                        }
-                    )
-                    
-                    # Scale loss for gradient accumulation
-                    loss = loss / args.gradient_accumulation_steps
-
-                # Apply tag-based weighting
-                weighted_loss = tag_weighter.update_training_loss(loss, batch["tags"])
-                weighted_loss.backward()
-
-                # Update metrics
-                epoch_loss += weighted_loss.item()
-                for metric_name, metric_value in loss_metrics.items():
-                    epoch_metrics[metric_name] += metric_value
-
-                if (step + 1) % args.gradient_accumulation_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
-                    optimizer.step()
-                    optimizer.zero_grad(set_to_none=True)
-                    lr_scheduler.step()
-                    ema_model.update_parameters(unet)
-
-                    if args.finetune_vae and step % args.vae_train_freq == 0:
-                        vae_losses = vae_finetuner.training_step(
-                            batch["latents"].to("cuda"),
-                            batch["original_images"].to("cuda")
-                        )
-
-                # Update progress
-                progress_bar.update(1)
-                progress_bar.set_postfix({
-                    "epoch": f"{epoch+1}/{args.num_epochs}",
-                    "loss": f"{loss.item():.4f}",
-                    "lr": f"{lr_scheduler.get_last_lr()[0]:.2e}",
-                    **({"vae_loss": f"{vae_losses['total_loss']:.4f}"} if args.finetune_vae and step % args.vae_train_freq == 0 else {})
-                })
-
-            # Log epoch-level metrics
-            if args.use_wandb:
-                wandb.log({
-                    'epoch/average_loss': epoch_loss / len(train_dataloader),
-                    'epoch/current_epoch': epoch + 1,
-                    **{f'epoch/{k}': v / len(train_dataloader) for k, v in epoch_metrics.items()}
-                })
-
-        # Create output directory if it doesn't exist
-         
-        output_dir = args.output_dir
-        os.makedirs(output_dir, exist_ok=True)
-
-        print(f"Saving diffusers format in full model to {output_dir}")
-        # Save each component in its proper subdirectory
-        unet.save_pretrained(os.path.join(output_dir, "unet"), safe_serialization=True)
-        vae.save_pretrained(os.path.join(output_dir, "vae"), safe_serialization=True)
-        tokenizer.save_pretrained(os.path.join(output_dir, "tokenizer"))
-        tokenizer_2.save_pretrained(os.path.join(output_dir, "tokenizer_2"))
-        text_encoder.save_pretrained(os.path.join(output_dir, "text_encoder"), safe_serialization=True)
-        text_encoder_2.save_pretrained(os.path.join(output_dir, "text_encoder_2"), safe_serialization=True)
-
-
-
-        print(f"Models saved successfully to {output_dir}")
+    except KeyboardInterrupt:
+        logger.warning("\nTraining interrupted by user")
+        # Save emergency checkpoint
+        emergency_dir = os.path.join(args.output_dir, "emergency_checkpoint")
+        logger.info(f"Saving emergency checkpoint to {emergency_dir}")
+        try:
+            save_checkpoint(
+                models,
+                train_components,
+                args,
+                -1,  # Special epoch number for interrupted training
+                training_history,
+                emergency_dir
+            )
+        except Exception as save_error:
+            logger.error(f"Failed to save emergency checkpoint: {save_error}")
+        return False
 
     except Exception as e:
-        logger.error(f"Error during training: {str(e)}")
+        logger.error(f"\nTraining failed with error: {str(e)}")
         logger.error(f"Traceback: {traceback.format_exc()}")
-        if args.use_wandb:
-            wandb.finish(exit_code=1)
+        return False
+
     finally:
-        if args.use_wandb:
-            wandb.finish()
-
-def save_image_grid(images, path, nrow=1, normalize=True):
-    """Save a list of images as a grid"""
-    grid = make_grid(images, nrow=nrow, normalize=normalize)
-    TF.to_pil_image(grid).save(path)
-
-class ModelValidator:
-    def __init__(self, model, vae, tokenizer, tokenizer_2, text_encoder, text_encoder_2, device="cuda"):
-        """
-        Initialize the ModelValidator with SDXL models and tokenizers.
-        
-        Args:
-            model: The UNet model
-            vae: The VAE model
-            tokenizer: First SDXL tokenizer
-            tokenizer_2: Second SDXL tokenizer
-            text_encoder: First SDXL text encoder
-            text_encoder_2: Second SDXL text encoder
-            device: Device to run on (default: "cuda")
-        """
-        self.model = model.to(device)
-        self.vae = vae.to(device)
-        # Load default SDXL VAE for decoding validation images
-        self.default_vae = AutoencoderKL.from_pretrained(
-            "stabilityai/stable-diffusion-xl-base-1.0", 
-            subfolder="vae",
-            torch_dtype=torch.bfloat16  # Match model dtype
-        ).to(device)
-        self.default_vae.eval()  # Ensure VAE is in eval mode
-        self.tokenizer = tokenizer
-        self.tokenizer_2 = tokenizer_2
-        self.text_encoder = text_encoder.to(device)
-        self.text_encoder_2 = text_encoder_2.to(device)
-        self.device = device
-
-    def generate_at_sigma(self, prompt, target_sigma, sigma_max=20000.0):
-        """Generate a sample denoising from sigma_max down to target_sigma"""
+        # Cleanup
         try:
-            # Create custom sigma schedule from sigma_max down to target_sigma
-            sigmas = torch.linspace(sigma_max, target_sigma, steps=10).to(self.device, dtype=torch.bfloat16)
+            # Clean up CUDA memory
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                if hasattr(torch.cuda, 'memory_stats'):
+                    logger.info(f"Final CUDA memory: {torch.cuda.memory_allocated()/1e9:.2f}GB")
             
-            # Initialize random latents
-            latents = torch.randn((1, 4, 64, 64), dtype=torch.bfloat16).to(self.device)
+            # Close wandb run if it exists
+            if wandb_run is not None:
+                wandb_run.finish()
             
-            # Encode text prompt for both encoders
-            text_input = self.tokenizer(
-                prompt,
-                padding="max_length",
-                max_length=self.tokenizer.model_max_length,
-                truncation=True,
-                return_tensors="pt"
-            )
-            
-            # SDXL text encoder 2 input
-            text_input_2 = self.tokenizer_2(
-                prompt,
-                padding="max_length",
-                max_length=self.tokenizer_2.model_max_length,
-                truncation=True,
-                return_tensors="pt"
-            )
-            
-            with torch.no_grad():
-                # Process with first text encoder
-                text_input_ids = text_input.input_ids.to(self.device)
-                prompt_embeds = self.text_encoder(text_input_ids)[0].to(dtype=torch.bfloat16)
+            # Remove temporary files
+            if hasattr(args, 'cache_dir') and os.path.exists(args.cache_dir):
+                logger.info(f"Cleaning up cache directory: {args.cache_dir}")
+                shutil.rmtree(args.cache_dir, ignore_errors=True)
                 
-                # Process with second text encoder
-                text_input_ids_2 = text_input_2.input_ids.to(self.device)
-                prompt_embeds_2 = self.text_encoder_2(text_input_ids_2)
-                pooled_prompt_embeds = prompt_embeds_2[0].to(dtype=torch.bfloat16)
-                text_embeds = prompt_embeds_2.pooler_output.to(dtype=torch.bfloat16)
-            
-            # Create micro-conditioning tensors for 1024x1024 output
-            time_ids = torch.tensor([
-                1024,  # Original height
-                1024,  # Original width
-                1024,  # Target height
-                1024,  # Target width
-                0,    # Crop top
-                0,    # Crop left
-            ], device=self.device, dtype=torch.bfloat16)
-            
-            time_ids = time_ids.unsqueeze(0)  # Add batch dimension
-            
-            # Prepare added conditioning kwargs
-            added_cond_kwargs = {
-                "text_embeds": text_embeds,
-                "time_ids": time_ids
-            }
-            
-            # Combine text embeddings
-            prompt_embeds = torch.cat([prompt_embeds, pooled_prompt_embeds], dim=-1)
-            
-            # Denoise
-            for i, sigma in enumerate(sigmas):
-                with torch.no_grad():
-                    # Ensure sigma is bfloat16
-                    sigma = sigma.to(dtype=torch.bfloat16)
-                    noise_pred = self.model(
-                        latents,
-                        sigma[None].to(self.device),
-                        encoder_hidden_states=prompt_embeds,
-                        added_cond_kwargs=added_cond_kwargs
-                    ).sample
-                
-                latents = latents - noise_pred * (sigma[None, None, None] ** 2)
-                
-                if i < len(sigmas) - 1:
-                    noise = torch.randn_like(latents)
-                    latents = latents + noise * (sigmas[i + 1] ** 2 - sigmas[i] ** 2) ** 0.5
-            
-            # Decode latents using default VAE
-            with torch.no_grad():
-                image = self.default_vae.decode(latents / 0.18215).sample
-                
-            return image
-            
-        except Exception as e:
-            logger.error(f"Sample generation failed: {str(e)}")
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            return torch.zeros((1, 3, 1024, 1024), dtype=torch.bfloat16).to(self.device)
-        
-
-    def validate_ztsnr(self, prompt="completely black"):
-        """
-        Validate Zero Terminal SNR as shown in Figure 2 of the paper.
-        Tests if model can generate pure black images when prompted.
-        """
-        results = {
-            'ztsnr': self.generate_with_ztsnr(prompt),
-            'no_ztsnr': self.generate_without_ztsnr(prompt)
-        }
-        
-        metrics = {
-            'ztsnr_mean_brightness': results['ztsnr'].mean(),
-            'no_ztsnr_mean_brightness': results['no_ztsnr'].mean()
-        }
-        
-        return results, metrics
-
-    def validate_high_res_coherence(self, prompt, sigma_max_values=[14.6, 20000.0]):
-        """
-        Validate high-resolution coherence as shown in Figure 6 of the paper.
-        Tests if model maintains coherence with different sigma_max values.
-        Note: σ ≈ 20000 is used as a practical approximation of infinity for ZTSNR.
-        """
-        results = {}
-        step_sigmas = {
-            14.6: [14.6, 10.8, 8.3, 6.6, 5.4],  # From Figure 7
-            20000.0: [20000.0, 17.8, 12.4, 9.2, 7.2]  # ZTSNR regime
-        }
-        
-        for sigma_max in sigma_max_values:
-            steps = []
-            for sigma in step_sigmas[sigma_max]:
-                step = self.generate_at_sigma(prompt, sigma, sigma_max)
-                steps.append(step)
-            results[f'sigma_max_{sigma_max}'] = steps
-            
-        return results
-
-    def validate_noise_schedule(self, image):
-        """
-        Validate noise schedule as shown in Figure 1 of the paper.
-        Shows progressive noise addition up to final training timestep.
-        """
-        # Sigmas from Figure 1
-        sigmas = [0, 0.447, 3.17, 14.6]
-        noised_images = []
-        
-        for sigma in sigmas:
-            noise = torch.randn_like(image)
-            noised = image + sigma * noise
-            noised_images.append(noised)
-            
-        return noised_images
-
-    def run_paper_validation(self, prompts):
-        results = {}
-        try:
-            # ZTSNR validation (using black prompt)
-            logger.info("Running ZTSNR validation...")
-            results['ztsnr'] = self.validate_ztsnr("completely black")
-            
-            # High-res coherence validation (using first prompt)
-            logger.info("Running high-res coherence validation...")
-            results['coherence'] = self.validate_high_res_coherence(prompts[0])
-            
-            # Prompt-based validation
-            logger.info("Running prompt-based validation...")
-            for prompt in prompts:
-                results[prompt] = self.generate_sample(prompt)
-                
-            return results
-            
-        except Exception as e:
-            logger.error(f"Validation failed with error: {str(e)}")
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            return {}  # Return empty dict instead of failing
-
-    def save_validation_images(self, results, output_dir):
-        """Save validation images in a format matching paper figures"""
-        os.makedirs(output_dir, exist_ok=True)
-        
-        def prepare_image(img):
-            """Convert image tensor to proper format for saving"""
-            try:
-                # If the input is latents, decode with default VAE
-                if img.shape[1] == 4:  # Latent space has 4 channels
-                    with torch.no_grad():
-                        img = self.default_vae.decode(img / 0.18215).sample
-                
-                # Convert to float32 if needed
-                if img.dtype == torch.bfloat16:
-                    img = img.to(torch.float32)
-                
-                # Remove batch dimension if present
-                if img.dim() == 4:
-                    img = img.squeeze(0)
-                
-                # Ensure we have a valid image tensor [C, H, W]
-                assert img.dim() == 3, f"Expected 3D tensor after processing, got shape {img.shape}"
-                return img
-                
-            except Exception as e:
-                logger.error(f"Error preparing image: {str(e)}")
-                logger.error(f"Input tensor shape: {img.shape}")
-                logger.error(f"Input tensor dtype: {img.dtype}")
-                logger.error(f"Traceback: {traceback.format_exc()}")
-                raise
-        
-        try:
-            # Save ZTSNR comparison (Figure 2)
-            if 'ztsnr' in results:
-                ztsnr_results, _ = results['ztsnr']  # Unpack tuple
-                images = [
-                    prepare_image(ztsnr_results['ztsnr']),
-                    prepare_image(ztsnr_results['no_ztsnr'])
-                ]
-                save_image_grid(
-                    images,
-                    os.path.join(output_dir, 'ztsnr_comparison.png'),
-                    nrow=2,
-                    normalize=True
-                )
-            
-            # Save high-res coherence comparison (Figure 6)
-            if 'coherence' in results:
-                coherence_steps = []
-                for steps in results['coherence'].values():
-                    coherence_steps.extend([prepare_image(step) for step in steps])
-                save_image_grid(
-                    coherence_steps,
-                    os.path.join(output_dir, 'coherence_steps.png'),
-                    nrow=len(steps),
-                    normalize=True
-                )
-            
-            # Save individual prompt results
-            for key, image in results.items():
-                if isinstance(image, torch.Tensor):
-                    # Skip non-image results
-                    if not (isinstance(key, str) and key in ['ztsnr', 'coherence']):
-                        save_image_grid(
-                            [prepare_image(image)],
-                            os.path.join(output_dir, f'prompt_{key[:30]}.png'),
-                            normalize=True
-                        )
-                    
-        except Exception as e:
-            logger.error(f"Failed to save validation images: {str(e)}")
-            logger.error(f"Results keys: {results.keys()}")
-            logger.error(f"Traceback: {traceback.format_exc()}")
-
-    def generate_with_ztsnr(self, prompt):
-        """Generate image with ZTSNR (σ ≈ 20000)"""
-        return self.generate_sample(prompt, sigma_max=20000.0)
-
-    def generate_without_ztsnr(self, prompt):
-        """Generate image without ZTSNR (default σ = 14.6)"""
-        return self.generate_sample(prompt, sigma_max=14.6)
-
-    def generate_sample(self, prompt, sigma_max=14.6, num_inference_steps=28):
-        """Generate a sample image given a prompt"""
-        try:
-            # Get sigmas for sampling
-            sigmas = get_sigmas(num_inference_steps, sigma_max=sigma_max).to(self.device)
-            
-            # Initialize random latents and convert to bfloat16
-            latents = torch.randn((1, 4, 64, 64), dtype=torch.bfloat16).to(self.device)
-            
-            # Encode text prompt
-            text_input = self.tokenizer(
-                prompt,
-                padding="max_length",
-                max_length=self.tokenizer.model_max_length,
-                truncation=True,
-                return_tensors="pt"
-            )
-            
-            # SDXL text encoder 2 input
-            text_input_2 = self.tokenizer_2(
-                prompt,
-                padding="max_length",
-                max_length=self.tokenizer_2.model_max_length,
-                truncation=True,
-                return_tensors="pt"
-            )
-            
-            with torch.no_grad():
-                # Process with first text encoder
-                text_input_ids = text_input.input_ids.to(self.device)
-                prompt_embeds = self.text_encoder(text_input_ids)[0].to(dtype=torch.bfloat16)
-                
-                # Process with second text encoder
-                text_input_ids_2 = text_input_2.input_ids.to(self.device)
-                prompt_embeds_2 = self.text_encoder_2(text_input_ids_2)
-                pooled_prompt_embeds = prompt_embeds_2[0].to(dtype=torch.bfloat16)
-                text_embeds = prompt_embeds_2.pooler_output.to(dtype=torch.bfloat16)
-            
-            # Create micro-conditioning tensors for 1024x1024 output
-            time_ids = torch.tensor([
-                1024,  # Original height
-                1024,  # Original width
-                1024,  # Target height
-                1024,  # Target width
-                0,    # Crop top
-                0,    # Crop left
-            ], device=self.device, dtype=torch.bfloat16)
-            
-            time_ids = time_ids.unsqueeze(0)  # Add batch dimension
-            
-            # Prepare added conditioning kwargs
-            added_cond_kwargs = {
-                "text_embeds": text_embeds,
-                "time_ids": time_ids
-            }
-            
-            # Combine text embeddings
-            prompt_embeds = torch.cat([prompt_embeds, pooled_prompt_embeds], dim=-1)
-            
-            # Denoise
-            for i, sigma in enumerate(sigmas):
-                with torch.no_grad():
-                    # Ensure sigma is bfloat16
-                    sigma = sigma.to(dtype=torch.bfloat16)
-                    noise_pred = self.model(
-                        latents,
-                        sigma[None].to(self.device),
-                        encoder_hidden_states=prompt_embeds,
-                        added_cond_kwargs=added_cond_kwargs
-                    ).sample
-                
-                latents = latents - noise_pred * (sigma[None, None, None] ** 2)
-                
-                if i < len(sigmas) - 1:
-                    noise = torch.randn_like(latents)
-                    latents = latents + noise * (sigmas[i + 1] ** 2 - sigmas[i] ** 2) ** 0.5
-            
-            # Decode latents using default VAE
-            with torch.no_grad():
-                image = self.default_vae.decode(latents / 0.18215).sample
-                
-            return image
-            
-        except Exception as e:
-            logger.error(f"Sample generation failed: {str(e)}")
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            return torch.zeros((1, 3, 1024, 1024), dtype=torch.bfloat16).to(self.device)
-
-
-        
-
-def save_training_config(args, output_dir, total_steps, final_loss=None):
-    """Save training config with proper type handling"""
-    config = {
-        'args': {k: str(v) if not isinstance(v, (int, float, str, bool, type(None))) else v 
-                for k, v in vars(args).items()},
-        'training_steps': total_steps,
-        'final_loss': float(final_loss) if final_loss is not None else None,
-    }
-    
-    config_path = os.path.join(output_dir, 'training_config.json')
-    with open(config_path, 'w') as f:
-        json.dump(config, f, indent=2)
-    
-    logger.info(f"Saved training config to {config_path}")
-
-def create_model_card(args, train_dataloader, validation_results=None):
-    model_card = f"""
-    ---
-    language: en
-    tags:
-    - stable-diffusion-xl
-    - text-to-image
-    - diffusers
-    - ztsnr
-    license: mit
-    ---
-
-    # {args.hub_model_id}
-
-    ## Training Details
-    - Base model: SDXL 1.0
-    - Training steps: {args.num_epochs * len(train_dataloader)}
-    - Batch size: {args.batch_size}
-    - Learning rate: {args.learning_rate}
-    - Validation frequency: {args.validation_frequency} epochs
-    - Validation prompts: {args.validation_prompts}
-
-    ## Validation Results
-    """
-    
-    if validation_results:
-        model_card += "Latest validation results included in the validation_results directory."
-    else:
-        model_card += "No validation results available."
-    
-    return model_card
+        except Exception as cleanup_error:
+            logger.error(f"Error during cleanup: {cleanup_error}")
 
 if __name__ == "__main__":
     setup_logging()
     args = parse_args()
-    main(args)
+    success = main(args)
+    sys.exit(0 if success else 1)
