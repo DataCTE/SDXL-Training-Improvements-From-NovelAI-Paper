@@ -30,34 +30,31 @@ def setup_torch_backends():
     torch.backends.cuda.enable_mem_efficient_sdp(True)
 
 def custom_collate(batch):
-    """
-    Custom collate function for DataLoader that handles both single and batched samples.
+    """Custom collate function that validates dimensions"""
+    def validate_latents(latents):
+        h, w = latents.shape[-2:]
+        min_size = 256 // 8  # Minimum 256 pixels in image space
+        max_size = 2048 // 8  # Maximum 2048 pixels in image space
+        return (h >= min_size and w >= min_size and 
+                h <= max_size and w <= max_size)
+
+    # Filter out invalid samples
+    valid_batch = [item for item in batch 
+                  if validate_latents(item['latents'])]
     
-    Args:
-        batch: List of dictionaries containing dataset items
-    Returns:
-        Dictionary with properly stacked tensors and lists
-    """
-    batch_size = len(batch)
+    if not valid_batch:
+        raise ValueError("No valid samples in batch (all below minimum size)")
     
-    if batch_size == 1:
-        return batch[0]
-    else:
-        elem = batch[0]
-        collated = {}
-        
-        for key in elem:
-            if key == "tags":
-                collated[key] = [d[key] for d in batch]
-            elif key == "target_size":
-                collated[key] = [d[key] for d in batch]
-            else:
-                try:
-                    collated[key] = torch.stack([d[key] for d in batch])
-                except:
-                    collated[key] = [d[key] for d in batch]
-        
-        return collated
+    # Create batch tensors
+    batch_dict = {
+        "latents": torch.stack([x["latents"] for x in valid_batch]),
+        "text_embeddings": torch.stack([x["text_embeddings"] for x in valid_batch]),
+        "text_embeddings_2": torch.stack([x["text_embeddings_2"] for x in valid_batch]),
+        "pooled_text_embeddings_2": torch.stack([x["pooled_text_embeddings_2"] for x in valid_batch]),
+        "tags": [x["tags"] for x in valid_batch]
+    }
+    
+    return batch_dict
 
 def verify_models(models):
     """

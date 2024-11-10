@@ -9,12 +9,15 @@ import logging
 from transformers import CLIPModel, CLIPProcessor
 from utils.device import to_device
 import traceback
+import os
+import time
 
 logger = logging.getLogger(__name__)
 
 class CustomDataset(Dataset):
     def __init__(self, data_dir, vae, tokenizer, tokenizer_2, text_encoder, text_encoder_2,
                  cache_dir="latents_cache", batch_size=1):
+        super().__init__()
         self.data_dir = Path(data_dir)
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(exist_ok=True)
@@ -26,6 +29,13 @@ class CustomDataset(Dataset):
         self.tokenizer_2 = tokenizer_2
         self.text_encoder = text_encoder
         self.text_encoder_2 = text_encoder_2
+
+        # Validate dataset before processing
+        is_valid, stats = validate_dataset(data_dir)
+        if not is_valid:
+            raise ValueError("Dataset validation failed - no valid images found")
+        
+        logger.info("Dataset validation passed. Starting cache generation...")
 
         # Find all image files and their corresponding caption files
         self.image_paths = []
@@ -116,26 +126,51 @@ class CustomDataset(Dataset):
         """Transform image maintaining aspect ratio within SDXL requirements"""
         # Get original aspect ratio
         w, h = image.size
+        
+        # Log original dimensions
+        logger.debug(f"Original dimensions: {w}x{h}")
+        
+        # Calculate target dimensions maintaining aspect ratio
         aspect_ratio = w / h
         
-        # Calculate target dimensions ensuring minimum 256 pixels
-        if w < h:
-            new_w = max(256, w)
-            new_h = int(new_w / aspect_ratio)
-        else:
-            new_h = max(256, h)
-            new_w = int(new_h * aspect_ratio)
+        # Enforce minimum dimension of 256 pixels
+        min_size = 256
+        max_size = 2048
         
-        # Ensure both dimensions are at least 256
-        new_w = max(256, new_w)
-        new_h = max(256, new_h)
+        if w < h:
+            target_w = max(min_size, min(max_size, w))
+            target_h = int(target_w / aspect_ratio)
+        else:
+            target_h = max(min_size, min(max_size, h))
+            target_w = int(target_h * aspect_ratio)
+            
+        # Ensure both dimensions meet minimum size
+        target_w = max(min_size, target_w)
+        target_h = max(min_size, target_h)
+        
+        # Ensure dimensions don't exceed maximum
+        if target_w > max_size or target_h > max_size:
+            scale = max_size / max(target_w, target_h)
+            target_w = int(target_w * scale)
+            target_h = int(target_h * scale)
         
         # Round to nearest multiple of 8 for VAE
-        new_w = (new_w // 8) * 8
-        new_h = (new_h // 8) * 8
+        target_w = (target_w // 8) * 8
+        target_h = (target_h // 8) * 8
+        
+        # Log target dimensions
+        logger.debug(f"Target dimensions: {target_w}x{target_h}")
+        
+        # Validate final dimensions
+        if not (min_size <= target_w <= max_size and min_size <= target_h <= max_size):
+            raise ValueError(
+                f"Invalid target dimensions {target_w}x{target_h}. "
+                f"Must be between {min_size} and {max_size} pixels."
+            )
         
         transform = transforms.Compose([
-            transforms.Resize((new_h, new_w), interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.Resize((target_h, target_w), 
+                           interpolation=transforms.InterpolationMode.LANCZOS),
             transforms.ToTensor(),
             transforms.Normalize([0.5], [0.5])
         ])
@@ -182,14 +217,38 @@ class CustomDataset(Dataset):
                 text_encoder_2.eval()
                 clip_model.eval()
 
+                # Add validation before caching
+                def validate_dimensions(w, h):
+                    min_size = 256
+                    max_size = 2048
+                    if w < min_size or h < min_size:
+                        return False
+                    if w > max_size or h > max_size:
+                        return False
+                    return True
+
                 # Process each aspect ratio bucket
                 for bucket, files in bucket_files.items():
-                    logger.info(f"Processing bucket {bucket} with {len(files)} files...")
-                    
-                    # Calculate standard size for this bucket
                     w, h = bucket
                     target_h, target_w = self.get_target_size_for_bucket((w, h))
+                    
+                    # Validate dimensions before processing
+                    if not validate_dimensions(target_w, target_h):
+                        logger.warning(
+                            f"Skipping bucket {bucket} - target size {target_w}x{target_h} "
+                            f"outside valid range (256-2048)"
+                        )
+                        continue
+
+                    logger.info(f"Processing bucket {bucket} with {len(files)} files...")
                     logger.info(f"Bucket {bucket} target size: {target_w}x{target_h}")
+                    
+                    bucket_start = time.time()
+                    cache_stats = {
+                        'processed': 0,
+                        'skipped': 0,
+                        'failed': 0
+                    }
                     
                     # Create transform for this bucket
                     bucket_transform = transforms.Compose([
@@ -209,23 +268,45 @@ class CustomDataset(Dataset):
                         captions = []
                         
                         for img_path, caption_path in batch_files:
-                            image = Image.open(img_path).convert("RGB")
-                            vae_image = bucket_transform(image)
-                            
-                            # Validate image size meets minimum requirements
-                            if vae_image.shape[1] < 256 or vae_image.shape[2] < 256:
-                                raise ValueError(
-                                    f"Image {img_path} too small after resizing: "
-                                    f"{vae_image.shape[1]}x{vae_image.shape[2]}. "
-                                    f"Minimum size is 256x256."
-                                )
-                            
-                            vae_images.append(vae_image)
-                            clip_images.append(image)
-                            
-                            with open(caption_path, 'r', encoding='utf-8') as f:
-                                captions.append(f.read().strip())
+                            try:
+                                # Check if already cached
+                                latents_path = self.cache_dir / f"{Path(img_path).stem}_latents.pt"
+                                embeddings_path = self.cache_dir / f"{Path(img_path).stem}_embeddings.pt"
+                                
+                                if os.path.exists(latents_path) and os.path.exists(embeddings_path):
+                                    cache_stats['skipped'] += 1
+                                    continue
+                                
+                                image = Image.open(img_path).convert("RGB")
+                                vae_image = bucket_transform(image)
+                                
+                                # Validate image size meets minimum requirements
+                                if vae_image.shape[1] < 256 or vae_image.shape[2] < 256:
+                                    raise ValueError(
+                                        f"Image {img_path} too small after resizing: "
+                                        f"{vae_image.shape[1]}x{vae_image.shape[2]}. "
+                                        f"Minimum size is 256x256."
+                                    )
+                                
+                                logger.debug(f"Processed {img_path}")
+                                logger.debug(f"Tensor dimensions: {vae_image.shape}")
+                                
+                                vae_images.append(vae_image)
+                                clip_images.append(image)
+                                
+                                with open(caption_path, 'r', encoding='utf-8') as f:
+                                    captions.append(f.read().strip())
+                                    
+                                cache_stats['processed'] += 1
+                                
+                            except Exception as e:
+                                logger.error(f"Failed to process {img_path}: {str(e)}")
+                                cache_stats['failed'] += 1
+                                continue
                         
+                        if not vae_images:  # Skip if no valid images in batch
+                            continue
+                            
                         # Stack images for VAE (now guaranteed to be same size within bucket)
                         image_batch = torch.stack(vae_images).to("cuda", dtype=torch.bfloat16)
                         
@@ -283,8 +364,8 @@ class CustomDataset(Dataset):
 
                         # Save individual files from batch
                         for idx, (img_path, _) in enumerate(batch_files):
-                            cache_latents_path = self.cache_dir / f"{img_path.stem}_latents.pt"
-                            cache_embeddings_path = self.cache_dir / f"{img_path.stem}_embeddings.pt"
+                            cache_latents_path = self.cache_dir / f"{Path(img_path).stem}_latents.pt"
+                            cache_embeddings_path = self.cache_dir / f"{Path(img_path).stem}_embeddings.pt"
                             
                             # Save embeddings
                             torch.save({
@@ -303,6 +384,12 @@ class CustomDataset(Dataset):
                         del image_batch, latents_batch, text_embeddings, text_embeddings_2
                         del pooled_text_embeddings_2, clip_image_embeds, clip_tag_embeds
                         torch.cuda.empty_cache()
+                    
+                    bucket_time = time.time() - bucket_start
+                    logger.info(f"Bucket processing time: {bucket_time:.2f}s")
+                    logger.info(f"Files processed: {cache_stats['processed']}")
+                    logger.info(f"Files skipped: {cache_stats['skipped']}")
+                    logger.info(f"Files failed: {cache_stats['failed']}")
 
             # Move models back to CPU
             self.vae.to("cpu")
@@ -361,3 +448,80 @@ class CustomDataset(Dataset):
                 "tags": embeddings["tags"],
                 "original_images": original_images  # [3, H, W]
             }
+
+def validate_dataset(data_dir):
+    """Pre-process validation of all images in dataset"""
+    logger.info("Starting dataset validation...")
+    
+    invalid_images = []
+    stats = {
+        'total': 0,
+        'valid': 0,
+        'invalid': 0,
+        'min_width': float('inf'),
+        'min_height': float('inf'),
+        'max_width': 0,
+        'max_height': 0,
+        'aspect_ratios': []
+    }
+    
+    def is_valid_image(path):
+        try:
+            with Image.open(path) as img:
+                w, h = img.size
+                stats['min_width'] = min(stats['min_width'], w)
+                stats['min_height'] = min(stats['min_height'], h)
+                stats['max_width'] = max(stats['max_width'], w)
+                stats['max_height'] = max(stats['max_height'], h)
+                stats['aspect_ratios'].append(w / h)
+                
+                # Check basic image validity
+                if not img.verify():
+                    return False, "Image verification failed"
+                
+                # Check dimensions
+                if w < 256 or h < 256:
+                    return False, f"Image too small ({w}x{h})"
+                if w > 2048 or h > 2048:
+                    return False, f"Image too large ({w}x{h})"
+                    
+                # Check aspect ratio
+                aspect_ratio = w / h
+                if aspect_ratio < 0.25 or aspect_ratio > 4.0:
+                    return False, f"Invalid aspect ratio ({aspect_ratio:.2f})"
+                
+                return True, None
+                
+        except Exception as e:
+            return False, str(e)
+    
+    # Walk through dataset directory
+    for root, _, files in os.walk(data_dir):
+        for filename in tqdm(files, desc="Validating images"):
+            if not filename.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
+                continue
+                
+            stats['total'] += 1
+            image_path = os.path.join(root, filename)
+            
+            is_valid, error_msg = is_valid_image(image_path)
+            if is_valid:
+                stats['valid'] += 1
+            else:
+                stats['invalid'] += 1
+                invalid_images.append((image_path, error_msg))
+    
+    # Log validation results
+    logger.info("\n=== Dataset Validation Results ===")
+    logger.info(f"Total images: {stats['total']}")
+    logger.info(f"Valid images: {stats['valid']}")
+    logger.info(f"Invalid images: {stats['invalid']}")
+    logger.info(f"Dimension range: {stats['min_width']}x{stats['min_height']} to {stats['max_width']}x{stats['max_height']}")
+    logger.info(f"Aspect ratio range: {min(stats['aspect_ratios']):.2f} to {max(stats['aspect_ratios']):.2f}")
+    
+    if invalid_images:
+        logger.warning("\nInvalid images found:")
+        for path, error in invalid_images:
+            logger.warning(f"- {path}: {error}")
+    
+    return stats['valid'] > 0, stats
