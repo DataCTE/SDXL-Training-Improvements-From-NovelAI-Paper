@@ -57,6 +57,8 @@ def parse_args():
     
     # EMA and VAE settings
     parser.add_argument("--ema_decay", type=float, default=0.9999)
+    parser.add_argument("--use_ema", action="store_true",
+                       help="Enable Exponential Moving Average during training")
     parser.add_argument("--finetune_vae", action="store_true")
     parser.add_argument("--vae_learning_rate", type=float, default=1e-6)
     parser.add_argument("--vae_train_freq", type=int, default=10)
