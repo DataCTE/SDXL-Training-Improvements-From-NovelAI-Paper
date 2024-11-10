@@ -48,10 +48,6 @@ def train_one_epoch(
             postfix=[0.0, lr_scheduler.get_last_lr()[0]]
         )
         
-        # Get text encoders
-        text_encoder = models["text_encoder"]
-        text_encoder_2 = models["text_encoder_2"]
-        
         for step, batch in enumerate(train_dataloader):
             logger.debug(f"\n--- Step {step} ---")
             step_start = time.time()
@@ -62,36 +58,19 @@ def train_one_epoch(
                 latents = torch.stack(latents)
             latents = latents.to(device, dtype=dtype)
             
-            # Get text embeddings from both encoders
-            prompt_embeds = text_encoder(batch["input_ids"].to(device))[0]
-            prompt_embeds_2 = text_encoder_2(batch["input_ids_2"].to(device))[0]
-            
-            # Concatenate embeddings along the hidden dimension
-            text_embeddings = torch.cat([prompt_embeds, prompt_embeds_2], dim=-1)
+            # Use pre-computed text embeddings
+            text_embeddings = batch["text_embeddings"].to(device, dtype=dtype)
             
             # Get noise schedule
             sigmas = get_sigmas(args.num_inference_steps).to(device)
             sigma = sigmas[step % args.num_inference_steps].expand(latents.size(0))
             logger.debug(f"Sigma value: {sigma[0].item():.4f}")
             
-            # Get current batch size
-            current_batch_size = latents.shape[0]
-            
-            # Process embeddings with correct shape
-            pooled_embeds = batch["pooled_text_embeddings_2"].to(device, dtype=dtype)
-            
-            # Handle last batch properly
-            if step == len(train_dataloader) - 1:  # Last batch
-                if pooled_embeds.shape[0] != current_batch_size:
-                    # Maintain 2D shape [batch_size, embed_dim] as per SDXL paper
-                    pooled_embeds = pooled_embeds[:current_batch_size].view(current_batch_size, -1)
-            
-            # Create time_ids with matching batch size (SDXL uses 6 time embedding dimensions)
-            time_ids = torch.tensor(
-                [1024, 1024, 1024, 1024, 0, 0],  # 6 dimensions as specified in paper
-                device=device,
-                dtype=dtype
-            ).repeat(current_batch_size, 1)  # Shape: [batch_size, 6]
+            # Move added conditioning to device
+            added_cond_kwargs = {
+                "text_embeds": batch["added_cond_kwargs"]["text_embeds"].to(device, dtype=dtype),
+                "time_ids": batch["added_cond_kwargs"]["time_ids"].to(device, dtype=dtype)
+            }
             
             # Training step
             with torch.amp.autocast('cuda', dtype=dtype):
@@ -100,11 +79,9 @@ def train_one_epoch(
                     latents,
                     sigma,
                     text_embeddings,
-                    {
-                        "text_embeds": pooled_embeds,  # Now correctly sized
-                        "time_ids": time_ids
-                    }
+                    added_cond_kwargs
                 )
+                
                 logger.debug(f"Raw loss: {loss.item():.6f}")
                 loss = loss / args.gradient_accumulation_steps
                 logger.debug(f"Loss after accumulation scaling: {loss.item():.6f}")
