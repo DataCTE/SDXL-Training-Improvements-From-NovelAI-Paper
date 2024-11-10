@@ -67,16 +67,21 @@ def train_one_epoch(
         # Get current batch size
         current_batch_size = latents.shape[0]
         
-        # Ensure pooled_embeds has correct batch size
-        if step == len(train_dataloader) - 1:  # Last batch
-            # Adjust pooled embeddings if needed
-            if pooled_embeds.shape[0] != current_batch_size:
-                pooled_embeds = pooled_embeds[:current_batch_size]
+        # Process embeddings with correct shape
+        pooled_embeds = batch["pooled_text_embeddings_2"].to(device, dtype=dtype)
         
-        # Create time_ids with matching batch size
-        time_ids = torch.tensor([1024, 1024, 1024, 1024, 0, 0], 
-                              device=device, 
-                              dtype=dtype).repeat(current_batch_size, 1)
+        # Handle last batch properly
+        if step == len(train_dataloader) - 1:  # Last batch
+            if pooled_embeds.shape[0] != current_batch_size:
+                # Maintain 2D shape [batch_size, embed_dim] as per SDXL paper
+                pooled_embeds = pooled_embeds[:current_batch_size].view(current_batch_size, -1)
+        
+        # Create time_ids with matching batch size (SDXL uses 6 time embedding dimensions)
+        time_ids = torch.tensor(
+            [1024, 1024, 1024, 1024, 0, 0],  # 6 dimensions as specified in paper
+            device=device,
+            dtype=dtype
+        ).repeat(current_batch_size, 1)  # Shape: [batch_size, 6]
         
         # Training step
         with torch.amp.autocast('cuda', dtype=dtype):
