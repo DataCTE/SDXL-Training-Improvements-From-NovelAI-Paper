@@ -60,7 +60,14 @@ def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kw
             expected_time_dim = 2816
             if time_ids.shape[1] != expected_time_dim:
                 logger.info(f"Padding time_ids from {time_ids.shape[1]} to {expected_time_dim}")
-                time_ids = F.pad(time_ids, (0, expected_time_dim - time_ids.shape[1]))
+                # Reshape time_ids to match expected dimensions
+                time_ids = time_ids.view(time_ids.shape[0], -1)  # Flatten except batch dim
+                if time_ids.shape[1] < expected_time_dim:
+                    # Pad if needed
+                    time_ids = F.pad(time_ids, (0, expected_time_dim - time_ids.shape[1]))
+                else:
+                    # Truncate if too long
+                    time_ids = time_ids[:, :expected_time_dim]
                 added_cond_kwargs["time_ids"] = time_ids
 
         # Generate noise and noisy input
