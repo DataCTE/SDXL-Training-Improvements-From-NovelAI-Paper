@@ -4,7 +4,7 @@ import os
 import traceback
 from diffusers import UNet2DConditionModel, AutoencoderKL
 from transformers import CLIPTextModel
-from transformers.utils import load_safetensors
+
 
 
 
