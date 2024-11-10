@@ -2,8 +2,11 @@ import logging
 import torch
 import os
 import traceback
-from diffusers import UNet2DConditionModel, AutoencoderKL, CLIPTextModel
-    
+from diffusers import UNet2DConditionModel, AutoencoderKL
+from transformers import CLIPTextModel
+from transformers.utils import load_safetensors
+
+
 
 logger = logging.getLogger(__name__)
 
