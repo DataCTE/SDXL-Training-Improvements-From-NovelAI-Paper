@@ -11,6 +11,7 @@ from utils.device import to_device
 import traceback
 import os
 import time
+import glob
 
 logger = logging.getLogger(__name__)
 
@@ -452,76 +453,48 @@ class CustomDataset(Dataset):
 def validate_dataset(data_dir):
     """Pre-process validation of all images in dataset"""
     logger.info("Starting dataset validation...")
+    stats = {'valid': 0, 'invalid': 0, 'errors': {}}
     
-    invalid_images = []
-    stats = {
-        'total': 0,
-        'valid': 0,
-        'invalid': 0,
-        'min_width': float('inf'),
-        'min_height': float('inf'),
-        'max_width': 0,
-        'max_height': 0,
-        'aspect_ratios': []
-    }
-    
-    def is_valid_image(path):
+    for path in glob.glob(os.path.join(data_dir, "*.png")):
         try:
+            # Try to open and verify the image
             with Image.open(path) as img:
-                w, h = img.size
-                stats['min_width'] = min(stats['min_width'], w)
-                stats['min_height'] = min(stats['min_height'], h)
-                stats['max_width'] = max(stats['max_width'], w)
-                stats['max_height'] = max(stats['max_height'], h)
-                stats['aspect_ratios'].append(w / h)
+                # Check if image can be loaded
+                img.verify()
                 
-                # Check basic image validity
-                if not img.verify():
-                    return False, "Image verification failed"
+                # Additional checks
+                if img.mode != 'RGB':
+                    raise ValueError(f"Invalid mode: {img.mode}")
                 
-                # Check dimensions
-                if w < 256 or h < 256:
-                    return False, f"Image too small ({w}x{h})"
-                if w > 2048 or h > 2048:
-                    return False, f"Image too large ({w}x{h})"
-                    
-                # Check aspect ratio
-                aspect_ratio = w / h
-                if aspect_ratio < 0.25 or aspect_ratio > 4.0:
-                    return False, f"Invalid aspect ratio ({aspect_ratio:.2f})"
+                # Get image size
+                width, height = img.size
+                if width < 512 or height < 512:
+                    raise ValueError(f"Image too small: {width}x{height}")
                 
-                return True, None
+                stats['valid'] += 1
                 
         except Exception as e:
-            return False, str(e)
-    
-    # Walk through dataset directory
-    for root, _, files in os.walk(data_dir):
-        for filename in tqdm(files, desc="Validating images"):
-            if not filename.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
-                continue
-                
-            stats['total'] += 1
-            image_path = os.path.join(root, filename)
+            stats['invalid'] += 1
+            error_type = type(e).__name__
+            error_msg = str(e)
             
-            is_valid, error_msg = is_valid_image(image_path)
-            if is_valid:
-                stats['valid'] += 1
-            else:
-                stats['invalid'] += 1
-                invalid_images.append((image_path, error_msg))
-    
-    # Log validation results
-    logger.info("\n=== Dataset Validation Results ===")
-    logger.info(f"Total images: {stats['total']}")
-    logger.info(f"Valid images: {stats['valid']}")
-    logger.info(f"Invalid images: {stats['invalid']}")
-    logger.info(f"Dimension range: {stats['min_width']}x{stats['min_height']} to {stats['max_width']}x{stats['max_height']}")
-    logger.info(f"Aspect ratio range: {min(stats['aspect_ratios']):.2f} to {max(stats['aspect_ratios']):.2f}")
-    
-    if invalid_images:
-        logger.warning("\nInvalid images found:")
-        for path, error in invalid_images:
-            logger.warning(f"- {path}: {error}")
+            if error_type not in stats['errors']:
+                stats['errors'][error_type] = []
+            stats['errors'][error_type].append((path, error_msg))
+            
+            logger.warning(f"- {path}: {error_type}: {error_msg}")
+
+    # Log error statistics
+    if stats['errors']:
+        logger.warning("\nError Summary:")
+        for error_type, errors in stats['errors'].items():
+            logger.warning(f"\n{error_type} ({len(errors)} occurrences):")
+            # Show first 5 examples of each error type
+            for path, msg in errors[:5]:
+                logger.warning(f"  - {os.path.basename(path)}: {msg}")
+            if len(errors) > 5:
+                logger.warning(f"  ... and {len(errors)-5} more")
+
+    logger.info(f"\nValidation complete: {stats['valid']} valid, {stats['invalid']} invalid images")
     
     return stats['valid'] > 0, stats
