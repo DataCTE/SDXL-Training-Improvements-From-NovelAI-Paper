@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 class CustomDataset(Dataset):
     def __init__(self, data_dir, vae, tokenizer, tokenizer_2, text_encoder, text_encoder_2,
-                 cache_dir="latents_cache", batch_size=1):
+             cache_dir="latents_cache", batch_size=1):
         super().__init__()
         self.data_dir = Path(data_dir)
         self.cache_dir = Path(cache_dir)
@@ -36,7 +36,17 @@ class CustomDataset(Dataset):
         if not is_valid:
             raise ValueError("Dataset validation failed - no valid images found")
         
-        logger.info("Dataset validation passed. Starting cache generation...")
+        # Log validation statistics
+        logger.info(f"Dataset validation passed:")
+        logger.info(f"- Valid images: {stats['valid']}")
+        logger.info(f"- Invalid images: {stats['invalid']}")
+        if stats['errors']:
+            logger.info("- Error summary:")
+            for error_type, errors in stats['errors'].items():
+                logger.info(f"  - {error_type}: {len(errors)} occurrences")
+        
+        logger.info("Starting cache generation...")
+
 
         # Find all image files and their corresponding caption files
         self.image_paths = []
@@ -48,6 +58,19 @@ class CustomDataset(Dataset):
                     self.image_paths.append(img_path)
                     self.caption_paths.append(caption_path)
 
+        # Initialize samples list
+        self.samples = []
+        for img_path in self.image_paths:
+            latents_path = self.cache_dir / f"{img_path.stem}_latents.pt"
+            embeddings_path = self.cache_dir / f"{img_path.stem}_embeddings.pt"
+            if latents_path.exists() and embeddings_path.exists():
+                self.samples.append({
+                    "latents_path": latents_path,
+                    "embeddings_path": embeddings_path,
+                    "image_path": img_path,
+                    "caption_path": img_path.with_suffix('.txt')
+                })
+
         # Initialize aspect buckets
         self.aspect_buckets = self.create_aspect_buckets()
 
@@ -58,6 +81,19 @@ class CustomDataset(Dataset):
 
         # Cache latents and embeddings
         self._cache_latents_and_embeddings_optimized()
+        
+        # Update samples list after caching
+        self.samples = []
+        for img_path in self.image_paths:
+            latents_path = self.cache_dir / f"{img_path.stem}_latents.pt"
+            embeddings_path = self.cache_dir / f"{img_path.stem}_embeddings.pt"
+            if latents_path.exists() and embeddings_path.exists():
+                self.samples.append({
+                    "latents_path": latents_path,
+                    "embeddings_path": embeddings_path,
+                    "image_path": img_path,
+                    "caption_path": img_path.with_suffix('.txt')
+                })
 
     def create_aspect_buckets(self):
         aspect_buckets = {
@@ -402,46 +438,35 @@ class CustomDataset(Dataset):
             logger.error(f"Caching failed: {str(e)}")
             logger.error(f"Traceback: {traceback.format_exc()}")
             raise
-    def __len__(self):
-        return len(self.image_paths)
 
     def __getitem__(self, idx):
         """Get a training sample"""
         item = self.samples[idx]
         
-        # Get tokenized inputs for both encoders
-        input_ids = self.tokenizer(
-            item["prompt"],
-            padding="max_length",
-            max_length=77,
-            truncation=True,
-            return_tensors="pt"
-        ).input_ids[0]
-        
-        input_ids_2 = self.tokenizer_2(
-            item["prompt"],
-            padding="max_length",
-            max_length=77,
-            truncation=True,
-            return_tensors="pt"
-        ).input_ids[0]
-        
-        # Load cached latents and embeddings
+        # Load cached data
         latents = torch.load(item["latents_path"], map_location='cpu')
+        embeddings = torch.load(item["embeddings_path"], map_location='cpu')
         
-        # Prepare added conditioning
-        added_cond_kwargs = {
-            "text_embeds": item["pooled_embeds"].to(dtype=torch.bfloat16),
-            "time_ids": item["time_ids"].to(dtype=torch.bfloat16)
-        }
+        # Create time embedding
+        time_ids = torch.tensor(
+            [1024, 1024, 1024, 1024, 0, 0],
+            dtype=torch.float32
+        )
         
         return {
             "latents": latents,
-            "input_ids": input_ids,
-            "input_ids_2": input_ids_2,  # Add second encoder input IDs
-            "sigmas": item["sigmas"],
-            "added_cond_kwargs": added_cond_kwargs
+            "text_embeddings": torch.cat([
+                embeddings["text_embeddings"],
+                embeddings["text_embeddings_2"]
+            ], dim=-1),  # Concatenate embeddings here
+            "added_cond_kwargs": {
+                "text_embeds": embeddings["pooled_text_embeddings_2"],
+                "time_ids": time_ids
+            }
         }
+
+    def __len__(self):
+        return len(self.samples)
 
 def validate_dataset(data_dir):
     """Pre-process validation of all images in dataset"""
