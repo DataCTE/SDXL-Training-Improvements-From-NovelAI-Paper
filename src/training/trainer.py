@@ -7,6 +7,8 @@ import logging
 import traceback
 from safetensors.torch import load_file
 from training.loss import get_sigmas, training_loss_v_prediction
+from training.ema import EMAModel
+from training.utils import save_checkpoint, load_checkpoint
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +74,10 @@ def train_one_epoch(
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             lr_scheduler.step()
-            ema_model.update_parameters(unet)
+            
+            # Only update EMA if it exists
+            if ema_model is not None:
+                ema_model.update_parameters(unet)
             
             # VAE finetuning step
             if vae_finetuner and (global_step % args.vae_train_freq == 0):
@@ -97,6 +102,7 @@ def train_one_epoch(
             }, step=global_step)
         
         progress_bar.update(1)
+        step_metrics['step_time'] = time.time() - step_start
         global_step += 1
     
     progress_bar.close()
@@ -192,3 +198,4 @@ def train(args, models, train_components, device, dtype):
     
     logger.info("\n=== Training Complete ===")
     return training_history
+

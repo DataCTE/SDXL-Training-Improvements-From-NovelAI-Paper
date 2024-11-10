@@ -12,7 +12,7 @@ from training.trainer import train
 from training.utils import setup_torch_backends, cleanup
 from models.setup import setup_models
 from training.setup import setup_training
-from utils.checkpoint import load_checkpoint, save_checkpoint
+from training.utils import load_checkpoint, save_checkpoint, save_final_outputs
 from utils.model_card import create_model_card, save_model_card, push_to_hub
 from utils.logging import (
     setup_logging,

@@ -6,6 +6,7 @@ import traceback
 from safetensors.torch import load_file
 from pathlib import Path
 from torch.utils.data import DataLoader
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +132,66 @@ def verify_checkpoint_directory(checkpoint_dir):
     
     return True, optional_status
 
+def save_checkpoint(checkpoint_dir, models, train_components, training_state, use_safetensors=True):
+    """
+    Save training checkpoint in diffusers format with safetensors support
+    
+    Args:
+        checkpoint_dir: Directory to save the checkpoint
+        models: Dictionary containing models to save
+        train_components: Dictionary containing training components
+        training_state: Dictionary containing training state
+        use_safetensors: Whether to use safetensors format for model weights
+    """
+    try:
+        logger.info(f"Saving checkpoint to {checkpoint_dir}")
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        
+        # Save training state
+        if training_state is not None:
+            logger.info("Saving training state")
+            torch.save(
+                training_state,
+                os.path.join(checkpoint_dir, "training_state.pt")
+            )
+        
+        # Save optimizer state
+        if "optimizer" in train_components:
+            logger.info("Saving optimizer state")
+            torch.save(
+                train_components["optimizer"].state_dict(),
+                os.path.join(checkpoint_dir, "optimizer.pt")
+            )
+        
+        # Save scheduler state
+        if "lr_scheduler" in train_components:
+            logger.info("Saving scheduler state")
+            torch.save(
+                train_components["lr_scheduler"].state_dict(),
+                os.path.join(checkpoint_dir, "scheduler.pt")
+            )
+        
+        # Save EMA state
+        if "ema_model" in train_components and train_components["ema_model"] is not None:
+            logger.info("Saving EMA state")
+            if use_safetensors:
+                from safetensors.torch import save_file
+                save_file(
+                    train_components["ema_model"].state_dict(),
+                    os.path.join(checkpoint_dir, "ema.safetensors")
+                )
+            else:
+                torch.save(
+                    train_components["ema_model"].state_dict(),
+                    os.path.join(checkpoint_dir, "ema.pt")
+                )
+        
+    except Exception as e:
+        logger.error(f"Failed to save checkpoint: {str(e)}")
+        logger.error(f"Checkpoint directory: {checkpoint_dir}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise
+
 def load_checkpoint(checkpoint_dir, models, train_components):
     """
     Load a saved checkpoint in diffusers format with safetensors support
@@ -160,7 +221,7 @@ def load_checkpoint(checkpoint_dir, models, train_components):
             )
             
             # Load optimizer state
-            if optional_status["optimizer.pt"]:
+            if optional_status["optimizer.pt"] and "optimizer" in train_components:
                 logger.info("Loading optimizer state")
                 train_components["optimizer"].load_state_dict(
                     torch.load(
@@ -170,7 +231,7 @@ def load_checkpoint(checkpoint_dir, models, train_components):
                 )
             
             # Load scheduler state
-            if optional_status["scheduler.pt"]:
+            if optional_status["scheduler.pt"] and "lr_scheduler" in train_components:
                 logger.info("Loading scheduler state")
                 train_components["lr_scheduler"].load_state_dict(
                     torch.load(
@@ -180,7 +241,7 @@ def load_checkpoint(checkpoint_dir, models, train_components):
                 )
             
             # Load EMA state
-            if "ema_model" in train_components:
+            if "ema_model" in train_components and train_components["ema_model"] is not None:
                 if optional_status["ema.safetensors"]:
                     logger.info("Loading EMA state from safetensors")
                     ema_state = load_file(
@@ -224,3 +285,140 @@ def cleanup(args, wandb_run=None):
             
     except Exception as cleanup_error:
         logger.error(f"Error during cleanup: {cleanup_error}")
+
+def save_final_outputs(args, models, training_history, train_components):
+    """
+    Save final model outputs in diffusers format with EMA support
+    
+    Args:
+        args: Training arguments
+        models: Dictionary containing models
+        training_history: Dictionary containing training metrics and history
+        train_components: Dictionary containing training components
+    """
+    try:
+        logger.info(f"Saving final outputs to {args.output_dir}")
+        final_output_dir = os.path.join(args.output_dir, "final")
+        os.makedirs(final_output_dir, exist_ok=True)
+        
+        # Create diffusers format directories
+        for model_name in ["unet", "text_encoder", "text_encoder_2", "vae"]:
+            os.makedirs(os.path.join(final_output_dir, model_name), exist_ok=True)
+        
+        # Save models in diffusers format
+        logger.info("Saving models in diffusers format")
+        
+        # Save UNet (using EMA weights if available)
+        if train_components.get("ema_model") is not None:
+            logger.info("Using EMA weights for final UNet save")
+            unet_state_dict = train_components["ema_model"].state_dict()
+        else:
+            unet_state_dict = models["unet"].state_dict()
+            
+        if args.use_safetensors:
+            from safetensors.torch import save_file
+            save_file(
+                unet_state_dict,
+                os.path.join(final_output_dir, "unet", "diffusion_pytorch_model.safetensors")
+            )
+            save_file(
+                models["text_encoder"].state_dict(),
+                os.path.join(final_output_dir, "text_encoder", "model.safetensors")
+            )
+            save_file(
+                models["text_encoder_2"].state_dict(),
+                os.path.join(final_output_dir, "text_encoder_2", "model.safetensors")
+            )
+            save_file(
+                models["vae"].state_dict(),
+                os.path.join(final_output_dir, "vae", "diffusion_pytorch_model.safetensors")
+            )
+        else:
+            torch.save(
+                unet_state_dict,
+                os.path.join(final_output_dir, "unet", "diffusion_pytorch_model.bin")
+            )
+            torch.save(
+                models["text_encoder"].state_dict(),
+                os.path.join(final_output_dir, "text_encoder", "pytorch_model.bin")
+            )
+            torch.save(
+                models["text_encoder_2"].state_dict(),
+                os.path.join(final_output_dir, "text_encoder_2", "pytorch_model.bin")
+            )
+            torch.save(
+                models["vae"].state_dict(),
+                os.path.join(final_output_dir, "vae", "diffusion_pytorch_model.bin")
+            )
+        
+        # Save EMA separately if available
+        if train_components.get("ema_model") is not None:
+            logger.info("Saving separate EMA weights")
+            if args.use_safetensors:
+                save_file(
+                    train_components["ema_model"].state_dict(),
+                    os.path.join(final_output_dir, "ema.safetensors")
+                )
+            else:
+                torch.save(
+                    train_components["ema_model"].state_dict(),
+                    os.path.join(final_output_dir, "ema.bin")
+                )
+        
+        # Save model configs
+        logger.info("Saving model configs")
+        for model_name in ["unet", "text_encoder", "text_encoder_2", "vae"]:
+            if hasattr(models[model_name], "config"):
+                config = models[model_name].config
+                if hasattr(config, "to_json_file"):
+                    config.to_json_file(
+                        os.path.join(final_output_dir, model_name, "config.json")
+                    )
+        
+        # Save scheduler config
+        if hasattr(models["unet"], "scheduler"):
+            models["unet"].scheduler.save_pretrained(
+                os.path.join(final_output_dir, "scheduler")
+            )
+            
+        # Save training history and metrics
+        logger.info("Saving training history")
+        history_path = os.path.join(final_output_dir, "training_history.pt")
+        torch.save(training_history, history_path)
+        
+        # Save training configuration
+        logger.info("Saving training configuration")
+        config_path = os.path.join(final_output_dir, "training_config.json")
+        with open(config_path, "w") as f:
+            json.dump(vars(args), f, indent=2)
+                
+        # Save a training summary
+        logger.info("Saving training summary")
+        summary_path = os.path.join(final_output_dir, "training_summary.txt")
+        with open(summary_path, "w") as f:
+            f.write("=== Training Summary ===\n\n")
+            
+            # Write final metrics
+            if training_history and "metrics" in training_history:
+                f.write("Final Metrics:\n")
+                for metric, value in training_history["metrics"].items():
+                    if isinstance(value, (int, float)):
+                        f.write(f"{metric}: {value:.6f}\n")
+                    else:
+                        f.write(f"{metric}: {value}\n")
+            
+            # Write training duration and other stats
+            if training_history and "training_duration" in training_history:
+                hours = training_history["training_duration"] / 3600
+                f.write(f"\nTraining Duration: {hours:.2f} hours\n")
+            
+            if training_history and "total_steps" in training_history:
+                f.write(f"Total Steps: {training_history['total_steps']}\n")
+                
+        logger.info("Successfully saved all final outputs")
+        
+    except Exception as e:
+        logger.error(f"Failed to save final outputs: {str(e)}")
+        logger.error(f"Output directory: {final_output_dir}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise
