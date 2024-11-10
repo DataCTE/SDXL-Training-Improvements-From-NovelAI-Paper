@@ -2,8 +2,10 @@
 
 Most SDXL implementations blindly port the 14% maximum allowed deviation value from SD1.5/1.4, ignoring that larger-scale diffusion models require a wider deviation range to reach their full potential. Research from NovelAI (arXiv:2409.15997v2) demonstrates this significantly impacts color accuracy and composition. This along with including Zero Terminal SNR (ZTSNR) and VAE finetuning, are implemented in this repository.
 
-### Weights
+### Weights and Todolist
 
+- [ ] Working decoding of validation images
+  - [ ] proof that the validation generation is working correctly
 - [ ] 10k dataset proof of concept (currently training/ in testing)
 - [ ] 200k+ dataset finetune (coming soon)
 
