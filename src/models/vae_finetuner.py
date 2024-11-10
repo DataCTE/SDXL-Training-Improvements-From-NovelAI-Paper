@@ -3,7 +3,7 @@ import logging
 import traceback
 import os
 import torch.nn.functional as F
-from diffusers.optimizations import AdamW8bit
+from bitsandbytes.optim import AdamW8bit
 
 logger = logging.getLogger(__name__)
 
