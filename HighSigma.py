@@ -1027,7 +1027,18 @@ def main(args):
             for step, batch in enumerate(train_dataloader):
                 # Convert inputs to correct dtype (bfloat16)
                 latents = batch["latents"].to(device).to(dtype=torch.bfloat16)
-                text_embeddings = batch["text_embeddings"].to(device).to(dtype=torch.bfloat16)
+                
+                # SDXL uses two text encoders concatenated
+                # First encoder output (CLIP-L): 768 dimensions
+                # Second encoder output (CLIP-G): 1280 dimensions
+                text_embeddings_1 = batch["text_embeddings"].to(device).to(dtype=torch.bfloat16)  # [batch, 77, 768]
+                text_embeddings_2 = batch["text_embeddings_2"].to(device).to(dtype=torch.bfloat16)  # [batch, 77, 1280]
+                
+                # Concatenate the embeddings from both encoders
+                # This gives us the full SDXL text conditioning: [batch, 77, 2048]
+                text_embeddings = torch.cat([text_embeddings_1, text_embeddings_2], dim=-1)
+
+                # Get pooled embeddings for added conditioning
                 pooled_text_embeddings_2 = batch["pooled_text_embeddings_2"].to(device).to(dtype=torch.bfloat16)
 
                 # Use autocast for mixed precision
@@ -1040,7 +1051,7 @@ def main(args):
                         unet,
                         latents,
                         sigma,
-                        text_embeddings,
+                        text_embeddings,  # Now contains concatenated embeddings [batch, 77, 2048]
                         {
                             "text_embeds": pooled_text_embeddings_2,
                             "time_ids": torch.tensor([
@@ -1050,7 +1061,7 @@ def main(args):
                                 1024,  # Target width
                                 0,    # Crop top
                                 0,    # Crop left
-                            ], device=device, dtype=torch.bfloat16).repeat(latents.shape[0], 1)  # Expand for batch
+                            ], device=device, dtype=torch.bfloat16).repeat(latents.shape[0], 1)
                         }
                     )
                     
