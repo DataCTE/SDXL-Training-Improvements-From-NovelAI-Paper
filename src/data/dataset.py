@@ -8,6 +8,7 @@ from tqdm import tqdm
 import logging
 from transformers import CLIPModel, CLIPProcessor
 from utils.device import to_device
+import traceback
 
 logger = logging.getLogger(__name__)
 
@@ -126,7 +127,7 @@ class CustomDataset(Dataset):
         return transform(image)  # Remove unsqueeze(0)
 
     def _cache_latents_and_embeddings_optimized(self):
-        """Optimized version of caching that uses bfloat16"""
+        """Optimized version of caching that uses bfloat16 and batch processing"""
         try:
             # First check which files need processing
             files_to_process = []
@@ -141,6 +142,9 @@ class CustomDataset(Dataset):
                 logger.info("All latents and embeddings already cached, skipping...")
                 return
 
+            # Process in batches of 8 (or adjust based on your GPU memory)
+            BATCH_SIZE = 8
+            
             with to_device(self.vae, "cuda") as vae, \
                  to_device(self.text_encoder, "cuda") as text_encoder, \
                  to_device(self.text_encoder_2, "cuda") as text_encoder_2, \
@@ -150,73 +154,94 @@ class CustomDataset(Dataset):
                 text_encoder.eval()
                 text_encoder_2.eval()
                 clip_model.eval()
-                
-                # Add progress bar only for files that need processing
+
+                # Process files in batches
                 logger.info(f"Caching {len(files_to_process)} new files...")
-                for img_path, caption_path in tqdm(files_to_process,
-                                                 desc="Caching"):
-                    cache_latents_path = self.cache_dir / f"{img_path.stem}_latents.pt"
-                    cache_embeddings_path = self.cache_dir / f"{img_path.stem}_embeddings.pt"
-
-                    if not cache_latents_path.exists() or not cache_embeddings_path.exists():
+                for i in tqdm(range(0, len(files_to_process), BATCH_SIZE), desc="Caching"):
+                    batch_files = files_to_process[i:i + BATCH_SIZE]
+                    
+                    # Prepare batch data
+                    images = []
+                    captions = []
+                    for img_path, caption_path in batch_files:
                         image = Image.open(img_path).convert("RGB")
-                        image_tensor = self.transform_image(image).unsqueeze(0)  # Add batch dim only for VAE
+                        images.append(self.transform_image(image))
+                        
+                        with open(caption_path, 'r', encoding='utf-8') as f:
+                            captions.append(f.read().strip())
+                    
+                    # Stack images into a single batch tensor
+                    image_batch = torch.stack(images).to("cuda", dtype=torch.bfloat16)
+                    
+                    with torch.no_grad():
+                        # Process image batch
+                        latents_batch = self.vae.encode(image_batch).latent_dist.sample() * 0.18215
 
-                        with torch.no_grad():
-                            # Get tags from caption
-                            with open(caption_path, 'r', encoding='utf-8') as f:
-                                caption = f.read().strip()
-                                tags = [t.strip() for t in caption.split(',')]
+                        # Process text embeddings in batch
+                        text_inputs = self.tokenizer(
+                            captions,
+                            padding="max_length",
+                            max_length=self.tokenizer.model_max_length,
+                            truncation=True,
+                            return_tensors="pt"
+                        ).to("cuda")
+                        
+                        text_embeddings = self.text_encoder(text_inputs.input_ids)[0]
 
-                            # Get CLIP embeddings
-                            clip_image_embed, clip_tag_embeds = self._get_clip_embeddings(image, tags)
+                        text_inputs_2 = self.tokenizer_2(
+                            captions,
+                            padding="max_length",
+                            max_length=self.tokenizer_2.model_max_length,
+                            truncation=True,
+                            return_tensors="pt"
+                        ).to("cuda")
+                        
+                        text_outputs_2 = self.text_encoder_2(text_inputs_2.input_ids)
+                        text_embeddings_2 = text_outputs_2.last_hidden_state
+                        pooled_text_embeddings_2 = text_outputs_2.pooler_output
 
-                            # Regular processing
-                            image_tensor = image_tensor.to("cuda", dtype=torch.bfloat16)
-                            latents = self.vae.encode(image_tensor).latent_dist.sample()  # [1, 4, H/8, W/8]
-                            latents = latents * 0.18215  # Scaling factor
+                        # Get CLIP embeddings for batch
+                        clip_inputs = self.clip_processor(
+                            images=images,
+                            return_tensors="pt"
+                        ).to("cuda")
+                        clip_image_embeds = self.clip_model.get_image_features(**clip_inputs)
+                        
+                        # Process tags
+                        all_tags = [t.strip() for caption in captions for t in caption.split(',')]
+                        clip_text_inputs = self.clip_processor(
+                            text=all_tags,
+                            return_tensors="pt",
+                            padding=True,
+                            max_length=77,
+                            truncation=True
+                        ).to("cuda")
+                        clip_tag_embeds = self.clip_model.get_text_features(**clip_text_inputs)
 
-                            # Process text embeddings
-                            text_input = self.tokenizer(
-                                caption,
-                                padding="max_length",
-                                max_length=self.tokenizer.model_max_length,
-                                truncation=True,
-                                return_tensors="pt"
-                            ).to("cuda")
+                    # Save individual files from batch
+                    for idx, (img_path, _) in enumerate(batch_files):
+                        cache_latents_path = self.cache_dir / f"{img_path.stem}_latents.pt"
+                        cache_embeddings_path = self.cache_dir / f"{img_path.stem}_embeddings.pt"
+                        
+                        # Save embeddings
+                        torch.save({
+                            "text_embeddings": text_embeddings[idx].cpu(),
+                            "text_embeddings_2": text_embeddings_2[idx].cpu(),
+                            "pooled_text_embeddings_2": pooled_text_embeddings_2[idx].cpu(),
+                            "clip_image_embed": clip_image_embeds[idx].cpu(),
+                            "clip_tag_embeds": clip_tag_embeds[idx].cpu(),
+                            "tags": all_tags[idx] if idx < len(all_tags) else []
+                        }, cache_embeddings_path)
+                        
+                        # Save latents
+                        torch.save(latents_batch[idx].cpu(), cache_latents_path)
 
-                            text_embeddings = self.text_encoder(text_input.input_ids)[0]  # [1, 77, 768]
+                    # Clear memory
+                    del image_batch, latents_batch, text_embeddings, text_embeddings_2
+                    del pooled_text_embeddings_2, clip_image_embeds, clip_tag_embeds
+                    torch.cuda.empty_cache()
 
-                            # SDXL text encoder 2
-                            text_input_2 = self.tokenizer_2(
-                                caption,
-                                padding="max_length",
-                                max_length=self.tokenizer_2.model_max_length,
-                                truncation=True,
-                                return_tensors="pt"
-                            ).to("cuda")
-
-                            text_encoder_output_2 = self.text_encoder_2(text_input_2.input_ids)
-                            text_embeddings_2 = text_encoder_output_2.last_hidden_state  # [1, 77, 1280]
-                            pooled_text_embeddings_2 = text_encoder_output_2.pooler_output  # [1, 1280]
-
-                            # Save all embeddings
-                            torch.save({
-                                "text_embeddings": text_embeddings.cpu(),
-                                "text_embeddings_2": text_embeddings_2.cpu(),
-                                "pooled_text_embeddings_2": pooled_text_embeddings_2.cpu(),
-                                "clip_image_embed": clip_image_embed.cpu(),
-                                "clip_tag_embeds": clip_tag_embeds.cpu(),
-                                "tags": tags
-                            }, cache_embeddings_path)
-
-                            torch.save(latents.cpu(), cache_latents_path)
-
-                            # Clear memory
-                            del image_tensor, latents, text_embeddings, text_embeddings_2, pooled_text_embeddings_2
-                            torch.cuda.empty_cache()
-
-            # Move models back to CPU after the loop
+            # Move models back to CPU
             self.vae.to("cpu")
             self.text_encoder.to("cpu")
             self.text_encoder_2.to("cpu")
@@ -224,6 +249,7 @@ class CustomDataset(Dataset):
 
         except Exception as e:
             logger.error(f"Caching failed: {str(e)}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
             raise
 
     def __len__(self):
