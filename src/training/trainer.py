@@ -84,14 +84,7 @@ def train_one_epoch(
             added_cond_kwargs = {
                 "text_embeds": batch["added_cond_kwargs"]["text_embeds"].to(device, dtype=dtype),
                 "time_ids": batch["added_cond_kwargs"]["time_ids"].to(device, dtype=dtype)
-            } if "added_cond_kwargs" in batch else {
-                "text_embeds": torch.zeros(latents.shape[0], 1280, device=device, dtype=dtype),
-                "time_ids": torch.tensor(
-                    [[1024, 1024, 1024, 1024, 0, 0]] * latents.shape[0],
-                    device=device,
-                    dtype=dtype
-                )
-            }
+            } 
             
             # Training step
             with torch.amp.autocast('cuda', dtype=dtype):
