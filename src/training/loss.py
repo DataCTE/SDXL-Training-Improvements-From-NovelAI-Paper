@@ -41,6 +41,26 @@ def v_prediction_scaling_factors(sigma, sigma_data=1.0):
 def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kwargs):
     """Training loss using v-prediction with MinSNR weighting as described in NovelAI V3 paper"""
     try:
+        # Validate input dimensions
+        batch_size, channels, height, width = x_0.shape
+        embed_dim = text_embeddings.shape[-1]  # Get just the embedding dimension
+        
+        # Validate text embedding dimensions
+        if embed_dim != 2048:
+            # Check if we need to concatenate embeddings
+            if embed_dim == 768:
+                logger.warning("Got 768-dim embeddings, expecting concatenated SDXL embeddings (2048-dim)")
+                logger.warning("Please ensure both text encoders' outputs are being concatenated")
+                raise ValueError(
+                    f"Text embedding context dimension ({embed_dim}) must be 2048 for SDXL. "
+                    "Make sure to concatenate both text encoders' outputs."
+                )
+            else:
+                raise ValueError(
+                    f"Unexpected embedding dimension: {embed_dim}. "
+                    "SDXL requires 2048-dim embeddings (768 from encoder 1 + 1280 from encoder 2)"
+                )
+        
         # Get latent dimensions and validate
         batch_size, channels, height, width = x_0.shape
         

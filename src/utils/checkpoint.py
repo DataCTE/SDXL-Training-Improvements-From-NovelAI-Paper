@@ -127,13 +127,25 @@ def verify_models(models):
         for model_name in required_models:
             if model_name not in models:
                 raise ValueError(f"Missing required model: {model_name}")
+        
+        # Verify model types
+        if not isinstance(models["text_encoder"], CLIPTextModel):
+            raise TypeError("text_encoder must be CLIPTextModel")
+        if not isinstance(models["text_encoder_2"], CLIPTextModel):
+            raise TypeError("text_encoder_2 must be CLIPTextModel")
+            
+        # Verify output dimensions
+        if models["text_encoder"].config.hidden_size != 768:
+            raise ValueError(f"text_encoder hidden size must be 768, got {models['text_encoder'].config.hidden_size}")
+        if models["text_encoder_2"].config.hidden_size != 1280:
+            raise ValueError(f"text_encoder_2 hidden size must be 1280, got {models['text_encoder_2'].config.hidden_size}")
             
         # Verify model states
         assert not models["text_encoder"].training, "Text encoder should be in eval mode"
         assert not models["text_encoder_2"].training, "Text encoder 2 should be in eval mode"
         assert not models["vae"].training, "VAE should be in eval mode"
         
-        # Verify gradient states
+        # Verify gradient states  
         assert not models["text_encoder"].requires_grad, "Text encoder should not require gradients"
         assert not models["text_encoder_2"].requires_grad, "Text encoder 2 should not require gradients"
         assert not models["vae"].requires_grad, "VAE should not require gradients"
