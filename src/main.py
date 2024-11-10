@@ -191,7 +191,7 @@ def main(args):
         cleanup_wandb(wandb_run)
 
 def setup_wandb(args):
-    """Initialize Weights & Biases logging with custom charts"""
+    """Initialize Weights & Biases logging"""
     if args.use_wandb:
         wandb.init(
             project=args.wandb_project,
@@ -200,53 +200,18 @@ def setup_wandb(args):
             group="training",
         )
         
-        # Define metric groupings and their properties
+        # Define metric groupings
         wandb.define_metric("loss/*", summary="min")
         wandb.define_metric("model/*", summary="last")
         wandb.define_metric("noise/*", summary="mean")
         wandb.define_metric("lr/*", summary="last")
         
         # Create custom panels
-        wandb.log({
-            "custom_charts": {
-                "Training Progress": {
-                    "Training Loss": {
-                        "value": ["loss/current", "loss/average", "loss/running"],
-                        "type": "line",
-                        "title": "Training Loss Over Time"
-                    },
-                    "Learning Rate": {
-                        "value": ["lr/textencoder", "lr/unet"],
-                        "type": "line",
-                        "title": "Learning Rate Schedule"
-                    }
-                },
-                "Loss Components": {
-                    "MSE Loss": {
-                        "value": ["loss/mse_mean", "loss/mse_std"],
-                        "type": "line",
-                        "title": "MSE Loss Components"
-                    },
-                    "SNR Metrics": {
-                        "value": ["loss/snr_mean", "loss/min_snr_gamma_mean"],
-                        "type": "line",
-                        "title": "SNR Metrics"
-                    }
-                },
-                "Model Statistics": {
-                    "Model Stats": {
-                        "value": ["model/v_pred_std", "model/v_target_std", "model/alpha_t_mean"],
-                        "type": "line",
-                        "title": "Model Statistics"
-                    },
-                    "Noise Stats": {
-                        "value": ["noise/sigma_mean", "noise/x_t_std"],
-                        "type": "line",
-                        "title": "Noise Statistics"
-                    }
-                }
-            }
-        })
+        wandb.define_metric("loss/current", step_metric="step")
+        wandb.define_metric("loss/average", step_metric="step")
+        wandb.define_metric("loss/running", step_metric="step")
+        wandb.define_metric("lr/textencoder", step_metric="step")
+        wandb.define_metric("lr/unet", step_metric="step")
         
         return wandb.run
     return None

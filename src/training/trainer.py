@@ -123,7 +123,6 @@ def train_one_epoch(
         
         # Log metrics to wandb
         if args.use_wandb and step % args.logging_steps == 0:
-            logger.debug("\nLogging to wandb:")
             metrics = {
                 # Loss metrics
                 "loss/current": weighted_loss.item(),
@@ -137,7 +136,7 @@ def train_one_epoch(
                 "lr/unet": lr_scheduler.get_last_lr()[0],
                 "lr/textencoder": lr_scheduler.get_last_lr()[0],
                 
-                # Loss components from step_metrics
+                # Loss components
                 "loss/mse_mean": step_metrics['loss/mse_mean'],
                 "loss/mse_std": step_metrics['loss/mse_std'],
                 "loss/snr_mean": step_metrics['loss/snr_mean'],
@@ -151,9 +150,12 @@ def train_one_epoch(
                 # Noise metrics
                 "noise/sigma_mean": step_metrics['noise/sigma_mean'],
                 "noise/x_t_std": step_metrics['noise/x_t_std'],
+                
+                # Step counter for x-axis
+                "step": global_step
             }
             
-            wandb.log(metrics, step=global_step)
+            wandb.log(metrics)
             
             # Debug print all metrics
             logger.debug("Wandb metrics:")
