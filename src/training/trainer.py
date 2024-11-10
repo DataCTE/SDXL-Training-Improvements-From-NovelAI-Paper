@@ -147,22 +147,9 @@ def train_one_epoch(
                     
                     # Learning rates
                     "lr/unet": lr_scheduler.get_last_lr()[0],
-                    "lr/textencoder": lr_scheduler.get_last_lr()[0],
                     
-                    # Loss components
-                    "loss/mse_mean": step_metrics['loss/mse_mean'],
-                    "loss/mse_std": step_metrics['loss/mse_std'],
-                    "loss/snr_mean": step_metrics['loss/snr_mean'],
-                    "loss/min_snr_gamma_mean": step_metrics['loss/min_snr_gamma_mean'],
-                    
-                    # Model metrics
-                    "model/v_pred_std": step_metrics['model/v_pred_std'],
-                    "model/v_target_std": step_metrics['model/v_target_std'],
-                    "model/alpha_t_mean": step_metrics['model/alpha_t_mean'],
-                    
-                    # Noise metrics
-                    "noise/sigma_mean": step_metrics['noise/sigma_mean'],
-                    "noise/x_t_std": step_metrics['noise/x_t_std'],
+                    # Step metrics from loss function
+                    **step_metrics,  # This will include all metrics from training_loss_v_prediction
                     
                     # Step counter for x-axis
                     "step": global_step

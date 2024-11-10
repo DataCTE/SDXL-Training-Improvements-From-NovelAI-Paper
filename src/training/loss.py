@@ -168,14 +168,20 @@ def training_loss_v_prediction(
         
         # Collect metrics
         loss_metrics = {
-            'loss/current': loss.item(),
+            # Loss metrics
+            'loss/mse_mean': loss.item(),
+            'loss/mse_std': torch.nn.functional.mse_loss(scaled_output, v_target).std().item(),
+            'loss/snr_mean': snr.mean().item(),
+            'loss/min_snr_gamma_mean': loss_weight.mean().item(),
+            
+            # Model metrics
+            'model/v_pred_std': v_pred.std().item(),
+            'model/v_target_std': v_target.std().item(),
+            'model/alpha_t_mean': (1 / torch.sqrt(1 + sigma**2)).mean().item(),
+            
+            # Noise metrics
             'noise/sigma_mean': sigma.mean().item(),
             'noise/x_t_std': x_t.std().item(),
-            'resolution/height': height,
-            'resolution/width': width,
-            'resolution/sigma_max': sigma_max.item() if torch.is_tensor(sigma_max) else sigma_max,
-            'snr/current': snr.mean().item(),
-            'snr/weight': loss_weight.mean().item()
         }
         
         return loss, loss_metrics
