@@ -67,24 +67,20 @@ class CustomDataset(Dataset):
         return aspect_buckets
 
     def get_target_size_for_bucket(self, ratio):
-        """Calculate target size maintaining aspect ratio and ~1024x1024 total pixels
-        Args:
-            ratio: (width, height) tuple of aspect ratio
-        Returns:
-            (height, width) tuple of target size
-        """
+        """Calculate target size maintaining aspect ratio and ~1024x1024 total pixels"""
+        w, h = ratio
         # Calculate scale to maintain ~1024x1024 pixels
-        scale = math.sqrt(1024 * 1024 / (ratio[0] * ratio[1]))
-
-        # Calculate dimensions and ensure multiple of 64
-        w = int(round(ratio[0] * scale / 64)) * 64
-        h = int(round(ratio[1] * scale / 64)) * 64
-
-        # Clamp to max dimension of 2048
-        w = min(2048, w)
-        h = min(2048, h)
-
-        return (h, w)
+        scale = math.sqrt(1024 * 1024 / (w * h))
+        
+        # Calculate dimensions and ensure multiple of 64 (VAE requirement)
+        target_w = int(round(w * scale / 64)) * 64
+        target_h = int(round(h * scale / 64)) * 64
+        
+        # Ensure minimum dimension of 256 (NovelAI V3 requirement)
+        target_w = max(256, min(2048, target_w))
+        target_h = max(256, min(2048, target_h))
+        
+        return (target_h, target_w)
 
     def _build_tag_list(self):
         """Build a list of all unique tags from captions"""
@@ -117,14 +113,17 @@ class CustomDataset(Dataset):
             return image_features, text_features
 
     def transform_image(self, image):
-        """Transform image to tensor without extra batch dimension"""
+        """Transform image maintaining aspect ratio within SDXL requirements"""
+        w, h = image.size
+        ratio = (w, h)
+        target_h, target_w = self.get_target_size_for_bucket(ratio)
+        
         transform = transforms.Compose([
-            transforms.Resize(1024),
-            transforms.CenterCrop(1024),
+            transforms.Resize((target_h, target_w), interpolation=transforms.InterpolationMode.LANCZOS),
             transforms.ToTensor(),
             transforms.Normalize([0.5], [0.5])
         ])
-        return transform(image)  # Remove unsqueeze(0)
+        return transform(image)
 
     def _cache_latents_and_embeddings_optimized(self):
         """Optimized version of caching that uses bfloat16 and batch processing"""
@@ -161,15 +160,23 @@ class CustomDataset(Dataset):
                     batch_files = files_to_process[i:i + BATCH_SIZE]
                     
                     # Prepare batch data
-                    vae_images = []  # For VAE
-                    clip_images = []  # For CLIP
+                    vae_images = []
+                    clip_images = []
                     captions = []
                     for img_path, caption_path in batch_files:
                         image = Image.open(img_path).convert("RGB")
-                        # Store original image for CLIP
-                        clip_images.append(image)
-                        # Transform image for VAE
-                        vae_images.append(self.transform_image(image))
+                        # Transform image maintaining aspect ratio
+                        vae_image = self.transform_image(image)
+                        
+                        # Validate image size meets minimum requirements
+                        if vae_image.shape[1] < 256 or vae_image.shape[2] < 256:
+                            raise ValueError(
+                                f"Image {img_path} too small after resizing: {vae_image.shape[1]}x{vae_image.shape[2]}. "
+                                f"Minimum size is 256x256."
+                            )
+                        
+                        vae_images.append(vae_image)
+                        clip_images.append(image)  # Original image for CLIP
                         
                         with open(caption_path, 'r', encoding='utf-8') as f:
                             captions.append(f.read().strip())
@@ -255,7 +262,6 @@ class CustomDataset(Dataset):
             logger.error(f"Caching failed: {str(e)}")
             logger.error(f"Traceback: {traceback.format_exc()}")
             raise
-
     def __len__(self):
         return len(self.image_paths)
 
