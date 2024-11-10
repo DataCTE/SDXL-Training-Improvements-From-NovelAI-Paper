@@ -139,10 +139,12 @@ class VAEFineTuner:
     def _finalize_step(self, total_loss):
         self.optimizer.step()
         
+        _, latent_stds = self.get_statistics()
+        
         return {
             "total_loss": total_loss,
             "latent_means": self.latent_means.detach().cpu() if self.latent_means is not None else None,
-            "latent_stds": stds.detach().cpu() if stds is not None else None
+            "latent_stds": latent_stds.detach().cpu() if latent_stds is not None else None
         }
 
     def save_pretrained(self, path):
