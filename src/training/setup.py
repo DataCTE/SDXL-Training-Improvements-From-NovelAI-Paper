@@ -41,13 +41,40 @@ def setup_training(args, models, device, dtype):
             batch_size=args.batch_size
         )
         
+        # Group dataset samples by aspect ratio and size
+        def collate_fn(batch):
+            # Sort by height, width to group similar sizes
+            batch.sort(key=lambda x: (x["latents"].shape[1], x["latents"].shape[2]))
+            
+            # Group by exact dimensions
+            grouped = {}
+            for item in batch:
+                size = (item["latents"].shape[1], item["latents"].shape[2])
+                if size not in grouped:
+                    grouped[size] = []
+                grouped[size].append(item)
+            
+            # Take the largest group that fits in a batch
+            largest_group = max(grouped.values(), key=len)
+            
+            # Create batch tensors
+            batch_dict = {
+                "latents": torch.stack([x["latents"] for x in largest_group]),
+                "text_embeddings": torch.stack([x["text_embeddings"] for x in largest_group]),
+                "pooled_text_embeddings_2": torch.stack([x["pooled_text_embeddings_2"] for x in largest_group]),
+                "tags": [x["tags"] for x in largest_group]
+            }
+            
+            return batch_dict
+        
+        # Create dataloader with custom collate
         train_dataloader = DataLoader(
             dataset,
             batch_size=args.batch_size,
             shuffle=True,
+            collate_fn=collate_fn,
             num_workers=4,
-            pin_memory=True,
-            collate_fn=custom_collate
+            pin_memory=True
         )
         
         # Initialize optimizer
