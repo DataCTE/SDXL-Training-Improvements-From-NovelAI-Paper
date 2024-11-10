@@ -161,20 +161,24 @@ class CustomDataset(Dataset):
                     batch_files = files_to_process[i:i + BATCH_SIZE]
                     
                     # Prepare batch data
-                    images = []
+                    vae_images = []  # For VAE
+                    clip_images = []  # For CLIP
                     captions = []
                     for img_path, caption_path in batch_files:
                         image = Image.open(img_path).convert("RGB")
-                        images.append(self.transform_image(image))
+                        # Store original image for CLIP
+                        clip_images.append(image)
+                        # Transform image for VAE
+                        vae_images.append(self.transform_image(image))
                         
                         with open(caption_path, 'r', encoding='utf-8') as f:
                             captions.append(f.read().strip())
                     
-                    # Stack images into a single batch tensor
-                    image_batch = torch.stack(images).to("cuda", dtype=torch.bfloat16)
+                    # Stack images for VAE
+                    image_batch = torch.stack(vae_images).to("cuda", dtype=torch.bfloat16)
                     
                     with torch.no_grad():
-                        # Process image batch
+                        # VAE encoding
                         latents_batch = self.vae.encode(image_batch).latent_dist.sample() * 0.18215
 
                         # Process text embeddings in batch
@@ -200,9 +204,9 @@ class CustomDataset(Dataset):
                         text_embeddings_2 = text_outputs_2.last_hidden_state
                         pooled_text_embeddings_2 = text_outputs_2.pooler_output
 
-                        # Get CLIP embeddings for batch
+                        # CLIP processing with original images
                         clip_inputs = self.clip_processor(
-                            images=images,
+                            images=clip_images,  # Use original images
                             return_tensors="pt"
                         ).to("cuda")
                         clip_image_embeds = self.clip_model.get_image_features(**clip_inputs)
