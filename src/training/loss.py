@@ -38,7 +38,13 @@ def v_prediction_scaling_factors(sigma, sigma_data=1.0):
     
     return alpha_t, c_skip, c_out, c_in
 
-def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kwargs):
+def training_loss_v_prediction(
+    model,
+    x_0,
+    sigma,
+    text_embeddings,
+    added_cond_kwargs=None
+):
     """Training loss using v-prediction with MinSNR weighting as described in NovelAI V3 paper"""
     try:
         # Validate input dimensions
@@ -133,7 +139,12 @@ def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kw
         
         # Scale model input and get prediction
         model_input = c_in.view(-1, 1, 1, 1) * x_t
-        v_pred = model(model_input, sigma, text_embeddings, added_cond_kwargs)
+        v_pred = model(
+            model_input, 
+            sigma, 
+            text_embeddings, 
+            added_cond_kwargs=added_cond_kwargs
+        )
         
         # Validate model output shape
         if v_pred.shape != x_t.shape:
