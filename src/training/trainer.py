@@ -64,6 +64,14 @@ def train_one_epoch(
         sigma = sigmas[step % args.num_inference_steps].expand(latents.size(0))
         logger.debug(f"Sigma value: {sigma[0].item():.4f}")
         
+        # Get current batch size
+        batch_size = latents.shape[0]
+        
+        # Create correctly sized time_ids
+        time_ids = torch.tensor([1024, 1024, 1024, 1024, 0, 0], 
+                              device=device, 
+                              dtype=dtype).repeat(batch_size, 1)  # Shape: [batch_size, 6]
+        
         # Training step
         with torch.amp.autocast('cuda', dtype=dtype):
             loss, step_metrics = training_loss_v_prediction(
@@ -73,8 +81,7 @@ def train_one_epoch(
                 text_embeddings,
                 {
                     "text_embeds": pooled_embeds,
-                    "time_ids": torch.tensor([1024, 1024, 1024, 1024, 0, 0], 
-                                          device=device, dtype=dtype).repeat(latents.shape[0], 1)
+                    "time_ids": time_ids
                 }
             )
             logger.debug(f"Raw loss: {loss.item():.6f}")
