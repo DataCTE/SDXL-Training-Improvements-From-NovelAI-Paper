@@ -107,7 +107,7 @@ def setup_training(args, models, device, dtype):
             "vae_finetuner": vae_finetuner,
             "num_update_steps_per_epoch": num_update_steps_per_epoch,
             "num_training_steps": num_training_steps,
-            "ema_model": models["ema_model"]
+            "ema_model": models.get("ema_model", None)
         }
         
         logger.info("Training setup completed successfully")

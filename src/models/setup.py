@@ -82,6 +82,7 @@ def setup_models(args, device, dtype):
         text_encoder_2.eval()
         
         # Initialize EMA model if enabled
+        ema_model = None
         if args.use_ema:
             logger.info("Initializing EMA model...")
             ema_model = AveragedModel(
@@ -91,8 +92,6 @@ def setup_models(args, device, dtype):
                     (1 - args.ema_decay) * model_parameter
                 )
             )
-        else:
-            ema_model = None
         
         # Initialize model validator
         logger.info("Initializing model validator...")
@@ -114,7 +113,8 @@ def setup_models(args, device, dtype):
             "tokenizer_2": tokenizer_2,
             "text_encoder": text_encoder,
             "text_encoder_2": text_encoder_2,
-            "validator": validator
+            "validator": validator,
+            "ema_model": ema_model
         }
         
         logger.info("Model setup completed successfully")
