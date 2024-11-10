@@ -462,7 +462,8 @@ class CustomDataset(Dataset):
             "added_cond_kwargs": {
                 "text_embeds": embeddings["pooled_text_embeddings_2"],
                 "time_ids": time_ids
-            }
+            },
+            "tags": embeddings["tags"]  # Add tags to the returned dictionary
         }
 
     def __len__(self):
