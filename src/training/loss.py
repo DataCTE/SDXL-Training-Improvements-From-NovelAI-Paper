@@ -144,7 +144,7 @@ def training_loss_v_prediction(
             sigma, 
             text_embeddings, 
             added_cond_kwargs=added_cond_kwargs
-        )
+        ).sample
         
         # Validate model output shape
         if v_pred.shape != x_t.shape:
