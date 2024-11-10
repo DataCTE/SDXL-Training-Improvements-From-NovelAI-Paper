@@ -85,9 +85,18 @@ def train_one_epoch(
                 loss = loss / args.gradient_accumulation_steps
                 logger.debug(f"Loss after accumulation scaling: {loss.item():.6f}")
             
-            # Apply tag-based weighting
-            weighted_loss = tag_weighter.update_training_loss(loss, batch["tags"])
-            logger.debug(f"Weighted loss: {weighted_loss.item():.6f}")
+            # Apply tag-based weighting only if enabled
+            if args.use_tag_weighting and tag_weighter is not None:
+                if "tags" in batch:
+                    weighted_loss = tag_weighter.update_training_loss(loss, batch["tags"])
+                    logger.debug(f"Weighted loss: {weighted_loss.item():.6f}")
+                else:
+                    logger.warning("Tag weighter provided but no tags found in batch")
+                    weighted_loss = loss
+            else:
+                weighted_loss = loss
+                logger.debug("Tag weighting disabled or no weighter available")
+            
             weighted_loss.backward()
             
             # Update model if gradient accumulation complete

@@ -78,6 +78,8 @@ def parse_args():
     # Tag weighting
     parser.add_argument("--min_tag_weight", type=float, default=0.1)
     parser.add_argument("--max_tag_weight", type=float, default=3.0)
+    parser.add_argument("--use_tag_weighting", action="store_true",
+                       help="Enable tag-based loss weighting during training")
     
     # Checkpointing
     parser.add_argument("--save_checkpoints", action="store_true")
