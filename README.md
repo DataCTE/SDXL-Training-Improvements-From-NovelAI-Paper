@@ -135,36 +135,6 @@ character_tags, style_tags, setting_tags, quality_tags
 ```
 Example: `1girl, anime style, outdoor, high quality`
 
-## Arguments Reference
-
-### Model Arguments
-```
---model_path              : Base SDXL model path
---output_dir             : Output directory
---learning_rate          : Training learning rate
---num_epochs            : Number of epochs
---batch_size            : Batch size per GPU
---gradient_accumulation : Gradient accumulation steps
-```
-
-### Training Options
-```
---finetune_vae          : Enable VAE finetuning
---vae_learning_rate     : VAE learning rate
---use_adafactor        : Use Adafactor optimizer
---enable_compile       : Enable torch.compile
---compile_mode         : Compilation mode
-```
-
-### Monitoring
-```
---use_wandb            : Enable W&B logging
---wandb_project        : W&B project name
---wandb_run_name       : W&B run name
---save_checkpoints     : Enable checkpoint saving
---validation_prompts   : Validation prompt file
-```
-
 ## Project Structure
 See [Project Structure Documentation](src/filestruc.md) for detailed component descriptions.
 
