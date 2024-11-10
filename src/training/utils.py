@@ -305,12 +305,22 @@ def cleanup(args, wandb_run=None):
         logger.error(f"Error during cleanup: {cleanup_error}")
 
 def save_final_outputs(args, models, training_history, train_components):
-    """Save all final training outputs"""
+    """Save all final training outputs with proper tensor dimension handling"""
     logger.info(f"Saving final outputs to {args.output_dir}")
     final_output_dir = os.path.join(args.output_dir, "final")
     
     try:
         logger.info("Saving models in diffusers format")
+        
+        # Ensure pooled embeddings maintain correct shape before saving
+        if "pooled_text_embeddings_2" in train_components:
+            pooled_embeds = train_components["pooled_text_embeddings_2"]
+            if pooled_embeds.ndim == 1:
+                # Get batch size from UNet config
+                batch_size = models["unet"].config.sample_size
+                # Reshape to [batch_size, embed_dim] if flattened
+                pooled_embeds = pooled_embeds.view(batch_size, -1)
+                train_components["pooled_text_embeddings_2"] = pooled_embeds
         
         # Save using diffusers built-in methods
         models["unet"].save_pretrained(os.path.join(final_output_dir, "unet"))
