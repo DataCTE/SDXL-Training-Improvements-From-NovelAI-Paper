@@ -1,5 +1,7 @@
 # SDXL Training with ZTSNR and NovelAI V3 Improvements
 
+Most SDXL implementations blindly port the 14% maximum allowed deviation value from SD1.5/1.4, ignoring that larger-scale diffusion models require a wider deviation range to reach their full potential. Research from NovelAI (arXiv:2409.15997v2) demonstrates this significantly impacts color accuracy and composition. This along with other improvements are implemented in this repository.
+
 This repository implements the improvements described in "Improvements to SDXL in NovelAI Diffusion V3" (arXiv:2409.15997v2), including Zero Terminal SNR (ZTSNR), high-resolution coherence, and VAE improvements.
 
 ### Weights
