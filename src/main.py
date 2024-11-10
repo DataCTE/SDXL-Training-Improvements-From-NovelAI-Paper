@@ -4,7 +4,9 @@ import os
 import sys
 import wandb
 import torch
+import traceback
 from pathlib import Path
+
 
 from training.trainer import train
 from training.utils import setup_torch_backends, cleanup
@@ -50,6 +52,8 @@ def parse_args():
                        type=str, 
                        choices=['default', 'reduce-overhead', 'max-autotune'],
                        default='default')
+    parser.add_argument("--gradient_checkpointing", action="store_true",
+                       help="Enable gradient checkpointing to save memory at the expense of speed")
     
     # EMA and VAE settings
     parser.add_argument("--ema_decay", type=float, default=0.9999)
