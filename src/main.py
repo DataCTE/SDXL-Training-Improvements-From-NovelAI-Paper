@@ -77,6 +77,10 @@ def parse_args():
     parser.add_argument("--use_wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="sdxl-training")
     parser.add_argument("--wandb_run_name", type=str)
+    parser.add_argument("--logging_steps", type=int, default=10,
+                       help="Number of steps between logging updates")
+    parser.add_argument("--save_epochs", type=int, default=1,
+                       help="Number of epochs between saving checkpoints")
     
     # Validation
     parser.add_argument("--validation_frequency", type=int, default=1)
