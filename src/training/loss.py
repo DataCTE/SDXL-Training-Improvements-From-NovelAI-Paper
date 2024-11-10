@@ -42,37 +42,59 @@ def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kw
     """Training loss using v-prediction with MinSNR weighting as described in NovelAI V3 paper"""
     try:
         # Get image dimensions and validate
-        _, _, height, width = x_0.shape
+        batch_size, channels, height, width = x_0.shape
         
+        # Validate channel dimension (SDXL uses 4 channels in latent space)
+        if channels != 4:
+            raise ValueError(
+                f"Input must have 4 channels for SDXL latent space. "
+                f"Got {channels} channels. Shape: {x_0.shape}"
+            )
+            
+        # Validate UNet architecture requirements
+        if height % 8 != 0 or width % 8 != 0:
+            raise ValueError(
+                f"Height ({height}) and width ({width}) must be divisible by 8 for UNet. "
+                f"Please adjust input resolution."
+            )
+            
         # Validate resolution bounds (NovelAI V3 section 4.1)
-        if height * width < 256 * 256 or height * width > 2048 * 2048:
-            raise ValueError(f"Resolution ({height}x{width}) outside supported range (256x256 to 2048x2048)")
+        total_pixels = height * width
+        if total_pixels < 256 * 256 or total_pixels > 2048 * 2048:
+            raise ValueError(
+                f"Resolution ({height}x{width}) outside supported range (256x256 to 2048x2048). "
+                f"Current pixels: {total_pixels:,}"
+            )
             
         # Validate text embedding context dimension (SDXL requirement)
         if text_embeddings.shape[-1] != 2048:
-            raise ValueError(f"Text embedding context dimension ({text_embeddings.shape[-1]}) must be 2048")
+            raise ValueError(
+                f"Text embedding context dimension ({text_embeddings.shape[-1]}) must be 2048 for SDXL"
+            )
             
-        # Validate sigma shape matches batch dimension
-        if sigma.ndim == 1 and len(sigma) != x_0.shape[0]:
-            raise ValueError(f"Sigma length ({len(sigma)}) must match batch size ({x_0.shape[0]})")
+        # Validate batch dimensions match
+        if sigma.ndim == 1 and len(sigma) != batch_size:
+            raise ValueError(
+                f"Sigma length ({len(sigma)}) must match batch size ({batch_size})"
+            )
             
-        # Validate text embeddings shape
-        if text_embeddings.shape[0] != x_0.shape[0]:
-            raise ValueError(f"Text embedding batch size ({text_embeddings.shape[0]}) must match image batch size ({x_0.shape[0]})")
+        if text_embeddings.shape[0] != batch_size:
+            raise ValueError(
+                f"Text embedding batch size ({text_embeddings.shape[0]}) must match image batch size ({batch_size})"
+            )
         
         # Validate aspect ratio is within supported range
         aspect_ratio = width / height
         if aspect_ratio < 0.25 or aspect_ratio > 4.0:  # Values from SDXL paper
-            raise ValueError(f"Aspect ratio ({aspect_ratio:.2f}) outside supported range (0.25 to 4.0)")
+            raise ValueError(
+                f"Aspect ratio ({aspect_ratio:.2f}) outside supported range (0.25 to 4.0)"
+            )
         
         # Scale sigma based on resolution as per paper section 2.3
-        # "rule of thumb: if you double the canvas length (quadrupling the canvas area): 
-        # you should double σmax (quadrupling the noise variance) to maintain SNR"
         if sigma.ndim == 1:
             base_res = 1024 * 1024  # Base resolution from paper
-            current_res = height * width
-            scale_factor = (current_res / base_res) ** 0.5
-            sigma_max = 20000.0 * scale_factor  # Using practical ZTSNR approximation from paper appendix A.2
+            scale_factor = (total_pixels / base_res) ** 0.5
+            sigma_max = 20000.0 * scale_factor  # Using practical ZTSNR approximation
             sigma = sigma * (sigma_max / 20000.0)
         
         # Generate noise and noisy input
@@ -85,17 +107,21 @@ def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kw
         c_out = -sigma * sigma_data / torch.sqrt(sigma**2 + sigma_data**2)
         c_in = 1 / torch.sqrt(sigma**2 + sigma_data**2)
         
-        # Scale model input
+        # Scale model input and get prediction
         model_input = c_in.view(-1, 1, 1, 1) * x_t
-        
-        # Get model prediction and apply scaling
         v_pred = model(model_input, sigma, text_embeddings, added_cond_kwargs)
-        scaled_output = c_skip.view(-1, 1, 1, 1) * x_t + c_out.view(-1, 1, 1, 1) * v_pred
         
-        # Calculate target
+        # Validate model output shape
+        if v_pred.shape != x_t.shape:
+            raise ValueError(
+                f"Model output shape ({v_pred.shape}) must match input shape ({x_t.shape})"
+            )
+        
+        # Apply v-prediction scaling
+        scaled_output = c_skip.view(-1, 1, 1, 1) * x_t + c_out.view(-1, 1, 1, 1) * v_pred
         v_target = c_in.view(-1, 1, 1, 1) * noise
         
-        # Calculate SNR for MinSNR weighting as described in paper section 2.4
+        # Calculate MinSNR weighting (NovelAI V3 section 2.4)
         snr = (sigma_data / sigma) ** 2
         min_snr = 1.0  # Minimum SNR threshold
         snr_clipped = torch.minimum(snr, torch.tensor(min_snr))
@@ -105,7 +131,7 @@ def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kw
         loss = torch.nn.functional.mse_loss(scaled_output, v_target, reduction='none')
         loss = (loss * loss_weight.view(-1, 1, 1, 1)).mean()
         
-        # Add metrics including MinSNR details
+        # Collect metrics
         loss_metrics = {
             'loss/current': loss.item(),
             'noise/sigma_mean': sigma.mean().item(),
@@ -116,10 +142,6 @@ def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kw
             'snr/current': snr.mean().item(),
             'snr/weight': loss_weight.mean().item()
         }
-        
-        # Validate model output shape
-        if v_pred.shape != x_t.shape:
-            raise ValueError(f"Model output shape ({v_pred.shape}) must match input shape ({x_t.shape})")
         
         return loss, loss_metrics
 
