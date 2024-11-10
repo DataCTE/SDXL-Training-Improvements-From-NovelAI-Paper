@@ -130,6 +130,10 @@ class CustomDataset(Dataset):
         new_w = max(256, new_w)
         new_h = max(256, new_h)
         
+        # Round to nearest multiple of 8 for VAE
+        new_w = (new_w // 8) * 8
+        new_h = (new_h // 8) * 8
+        
         transform = transforms.Compose([
             transforms.Resize((new_h, new_w), interpolation=transforms.InterpolationMode.BILINEAR),
             transforms.ToTensor(),

@@ -43,13 +43,24 @@ def setup_training(args, models, device, dtype):
         
         # Group dataset samples by aspect ratio and size
         def collate_fn(batch):
-            # Sort by height, width to group similar sizes
-            batch.sort(key=lambda x: (x["latents"].shape[1], x["latents"].shape[2]))
+            # Filter out samples that are too small
+            valid_batch = []
+            for item in batch:
+                latent_h, latent_w = item["latents"].shape[-2:]
+                # Check if latent dimensions meet minimum size (32x32 for 256x256 pixel images)
+                if latent_h >= 32 and latent_w >= 32:
+                    valid_batch.append(item)
+            
+            if not valid_batch:
+                raise ValueError("No valid samples in batch (all below minimum size)")
+                
+            # Sort remaining samples by size
+            valid_batch.sort(key=lambda x: (x["latents"].shape[-2], x["latents"].shape[-1]))
             
             # Group by exact dimensions
             grouped = {}
-            for item in batch:
-                size = (item["latents"].shape[1], item["latents"].shape[2])
+            for item in valid_batch:
+                size = (item["latents"].shape[-2], item["latents"].shape[-1])
                 if size not in grouped:
                     grouped[size] = []
                 grouped[size].append(item)
@@ -61,20 +72,22 @@ def setup_training(args, models, device, dtype):
             batch_dict = {
                 "latents": torch.stack([x["latents"] for x in largest_group]),
                 "text_embeddings": torch.stack([x["text_embeddings"] for x in largest_group]),
+                "text_embeddings_2": torch.stack([x["text_embeddings_2"] for x in largest_group]),
                 "pooled_text_embeddings_2": torch.stack([x["pooled_text_embeddings_2"] for x in largest_group]),
                 "tags": [x["tags"] for x in largest_group]
             }
             
             return batch_dict
         
-        # Create dataloader with custom collate
+        # Create dataloader with updated collate function
         train_dataloader = DataLoader(
             dataset,
             batch_size=args.batch_size,
             shuffle=True,
             collate_fn=collate_fn,
             num_workers=4,
-            pin_memory=True
+            pin_memory=True,
+            drop_last=True  # Drop incomplete batches
         )
         
         # Initialize optimizer
