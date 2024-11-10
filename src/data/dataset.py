@@ -299,42 +299,46 @@ class CustomDataset(Dataset):
         return len(self.image_paths)
 
     def __getitem__(self, idx):
-        """Get item with separate handling for batch_size=1 and batch_size>1"""
+        """Get item with proper tensor handling"""
         img_path = self.image_paths[idx]
         latents_path = self.cache_dir / f"{img_path.stem}_latents.pt"
         embeddings_path = self.cache_dir / f"{img_path.stem}_embeddings.pt"
 
         # Load cached data
-        latents = torch.load(latents_path, map_location='cpu', weights_only=True)
-        embeddings = torch.load(embeddings_path, map_location='cpu', weights_only=True)
+        latents = torch.load(latents_path, map_location='cpu')
+        embeddings = torch.load(embeddings_path, map_location='cpu')
 
         # Load original image
         image = Image.open(img_path).convert("RGB")
         original_images = self.transform_image(image)  # [3, H, W]
 
+        # Ensure latents is a tensor and has correct shape
+        if isinstance(latents, list):
+            latents = torch.stack(latents)
+
         if self.batch_size == 1:
-            # Original single sample processing
+            # Single sample processing
             return {
-                "latents": latents,  # [1, 4, 128, 128]
-                "text_embeddings": embeddings["text_embeddings"],  # [1, 77, 768]
-                "text_embeddings_2": embeddings["text_embeddings_2"],  # [1, 77, 1280]
-                "pooled_text_embeddings_2": embeddings["pooled_text_embeddings_2"],  # [1, 1280]
-                "target_size": (original_images.shape[1], original_images.shape[2]),  # tuple of (H, W)
-                "clip_image_embed": embeddings["clip_image_embed"],
-                "clip_tag_embeds": embeddings["clip_tag_embeds"],
+                "latents": latents.unsqueeze(0),  # [1, 4, H/8, W/8]
+                "text_embeddings": embeddings["text_embeddings"].unsqueeze(0),  # [1, 77, 768]
+                "text_embeddings_2": embeddings["text_embeddings_2"].unsqueeze(0),  # [1, 77, 1280]
+                "pooled_text_embeddings_2": embeddings["pooled_text_embeddings_2"].unsqueeze(0),  # [1, 1280]
+                "target_size": torch.tensor([original_images.shape[1], original_images.shape[2]], dtype=torch.long),
+                "clip_image_embed": embeddings["clip_image_embed"].unsqueeze(0),
+                "clip_tag_embeds": embeddings["clip_tag_embeds"].unsqueeze(0),
                 "tags": embeddings["tags"],
-                "original_images": original_images  # [3, H, W]
+                "original_images": original_images.unsqueeze(0)  # [1, 3, H, W]
             }
         else:
             # Batch processing
             return {
-                "latents": latents.squeeze(0),  # [4, 128, 128]
-                "text_embeddings": embeddings["text_embeddings"].squeeze(0),  # [77, 768]
-                "text_embeddings_2": embeddings["text_embeddings_2"].squeeze(0),  # [77, 1280]
-                "pooled_text_embeddings_2": embeddings["pooled_text_embeddings_2"].squeeze(0),  # [1280]
-                "target_size": torch.tensor([original_images.shape[1], original_images.shape[2]], dtype=torch.long),  # [2]
-                "clip_image_embed": embeddings["clip_image_embed"].squeeze(0),
-                "clip_tag_embeds": embeddings["clip_tag_embeds"].squeeze(0),
+                "latents": latents,  # [4, H/8, W/8]
+                "text_embeddings": embeddings["text_embeddings"],  # [77, 768]
+                "text_embeddings_2": embeddings["text_embeddings_2"],  # [77, 1280]
+                "pooled_text_embeddings_2": embeddings["pooled_text_embeddings_2"],  # [1280]
+                "target_size": torch.tensor([original_images.shape[1], original_images.shape[2]], dtype=torch.long),
+                "clip_image_embed": embeddings["clip_image_embed"],
+                "clip_tag_embeds": embeddings["clip_tag_embeds"],
                 "tags": embeddings["tags"],
                 "original_images": original_images  # [3, H, W]
             }
