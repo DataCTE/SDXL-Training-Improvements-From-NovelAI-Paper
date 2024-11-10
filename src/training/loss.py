@@ -39,75 +39,94 @@ def v_prediction_scaling_factors(sigma, sigma_data=1.0):
     return alpha_t, c_skip, c_out, c_in
 
 def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kwargs):
-    """Training loss using v-prediction with MinSNR weighting"""
+    """Training loss using v-prediction with MinSNR weighting as described in NovelAI V3 paper"""
     try:
-        # Get image dimensions for sigma scaling
+        # Get image dimensions and validate
         _, _, height, width = x_0.shape
         
-        # Scale sigma based on resolution if not already scaled
-        if sigma.ndim == 1:  # Only scale if sigma hasn't been scaled yet
-            sigma_max = get_resolution_dependent_sigma_max(height, width)
-            sigma = sigma * (sigma_max / 20000.0)  # Scale relative to base sigma_max
-        
+        # Validate resolution bounds (NovelAI V3 section 4.1)
+        if height * width < 256 * 256 or height * width > 2048 * 2048:
+            raise ValueError(f"Resolution ({height}x{width}) outside supported range (256x256 to 2048x2048)")
+            
+        # Validate text embedding context dimension (SDXL requirement)
+        if text_embeddings.shape[-1] != 2048:
+            raise ValueError(f"Text embedding context dimension ({text_embeddings.shape[-1]}) must be 2048")
+            
+        # Validate sigma shape matches batch dimension
+        if sigma.ndim == 1 and len(sigma) != x_0.shape[0]:
+            raise ValueError(f"Sigma length ({len(sigma)}) must match batch size ({x_0.shape[0]})")
+            
         # Validate text embeddings shape
-        expected_embed_dim = 2048  # SDXL context dimension
-        if text_embeddings.shape[-1] != expected_embed_dim:
-            logger.warning(f"Unexpected text embedding dimension: {text_embeddings.shape[-1]}, expected {expected_embed_dim}")
-
-        # Handle additional conditioning
-        if "time_ids" in added_cond_kwargs:
-            time_ids = added_cond_kwargs["time_ids"]
-            expected_time_dim = 2816
-            
-            # Important: Only reshape the time embeddings, not the spatial dimensions
-            batch_size = time_ids.shape[0]
-            time_ids = time_ids.reshape(batch_size, -1)  # Flatten only the time embedding dimensions
-            
-            if time_ids.shape[1] != expected_time_dim:
-                logger.info(f"Padding time_ids from {time_ids.shape[1]} to {expected_time_dim}")
-                time_ids = F.pad(time_ids, (0, expected_time_dim - time_ids.shape[1]))
-                added_cond_kwargs["time_ids"] = time_ids
-
+        if text_embeddings.shape[0] != x_0.shape[0]:
+            raise ValueError(f"Text embedding batch size ({text_embeddings.shape[0]}) must match image batch size ({x_0.shape[0]})")
+        
+        # Validate aspect ratio is within supported range
+        aspect_ratio = width / height
+        if aspect_ratio < 0.25 or aspect_ratio > 4.0:  # Values from SDXL paper
+            raise ValueError(f"Aspect ratio ({aspect_ratio:.2f}) outside supported range (0.25 to 4.0)")
+        
+        # Scale sigma based on resolution as per paper section 2.3
+        # "rule of thumb: if you double the canvas length (quadrupling the canvas area): 
+        # you should double σmax (quadrupling the noise variance) to maintain SNR"
+        if sigma.ndim == 1:
+            base_res = 1024 * 1024  # Base resolution from paper
+            current_res = height * width
+            scale_factor = (current_res / base_res) ** 0.5
+            sigma_max = 20000.0 * scale_factor  # Using practical ZTSNR approximation from paper appendix A.2
+            sigma = sigma * (sigma_max / 20000.0)
+        
         # Generate noise and noisy input
         noise = torch.randn_like(x_0)
         x_t = x_0 + noise * sigma.view(-1, 1, 1, 1)
         
-        # Calculate scaling factors
-        alpha_t = 1 / torch.sqrt(1 + sigma**2)
+        # Calculate v-prediction scaling factors
+        sigma_data = 1.0  # Using σdata = 1.0 as per EDM formulation
+        c_skip = sigma_data**2 / (sigma**2 + sigma_data**2)
+        c_out = -sigma * sigma_data / torch.sqrt(sigma**2 + sigma_data**2)
+        c_in = 1 / torch.sqrt(sigma**2 + sigma_data**2)
         
-        # Get model prediction
-        v_pred = model(
-            x_t,
-            sigma,
-            encoder_hidden_states=text_embeddings,
-            added_cond_kwargs=added_cond_kwargs,
-        )
+        # Scale model input
+        model_input = c_in.view(-1, 1, 1, 1) * x_t
         
-        # Calculate loss
-        target = noise
-        loss = F.mse_loss(v_pred, target, reduction="none")
-        loss = loss.mean([1, 2, 3])
-        loss = loss.mean()
+        # Get model prediction and apply scaling
+        v_pred = model(model_input, sigma, text_embeddings, added_cond_kwargs)
+        scaled_output = c_skip.view(-1, 1, 1, 1) * x_t + c_out.view(-1, 1, 1, 1) * v_pred
         
-        # Add resolution info to metrics
+        # Calculate target
+        v_target = c_in.view(-1, 1, 1, 1) * noise
+        
+        # Calculate SNR for MinSNR weighting as described in paper section 2.4
+        snr = (sigma_data / sigma) ** 2
+        min_snr = 1.0  # Minimum SNR threshold
+        snr_clipped = torch.minimum(snr, torch.tensor(min_snr))
+        loss_weight = snr_clipped / snr
+        
+        # Calculate weighted MSE loss
+        loss = torch.nn.functional.mse_loss(scaled_output, v_target, reduction='none')
+        loss = (loss * loss_weight.view(-1, 1, 1, 1)).mean()
+        
+        # Add metrics including MinSNR details
         loss_metrics = {
             'loss/current': loss.item(),
-            'model/alpha_t_mean': alpha_t.mean().item(),
             'noise/sigma_mean': sigma.mean().item(),
             'noise/x_t_std': x_t.std().item(),
             'resolution/height': height,
             'resolution/width': width,
-            'resolution/sigma_max': sigma_max.item() if torch.is_tensor(sigma_max) else sigma_max
+            'resolution/sigma_max': sigma_max.item() if torch.is_tensor(sigma_max) else sigma_max,
+            'snr/current': snr.mean().item(),
+            'snr/weight': loss_weight.mean().item()
         }
+        
+        # Validate model output shape
+        if v_pred.shape != x_t.shape:
+            raise ValueError(f"Model output shape ({v_pred.shape}) must match input shape ({x_t.shape})")
         
         return loss, loss_metrics
 
     except Exception as e:
         logger.error("\n=== Error in v-prediction training ===")
         logger.error(f"Error message: {str(e)}")
-        logger.error("Full traceback:")
         logger.error(traceback.format_exc())
-        # Log additional debugging info
         logger.error(f"Input shapes:")
         logger.error(f"x_0: {x_0.shape}")
         logger.error(f"sigma: {sigma.shape}")
