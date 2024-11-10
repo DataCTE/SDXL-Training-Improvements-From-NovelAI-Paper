@@ -127,15 +127,6 @@ Results are saved as images and logged to W&B if enabled.
 2. Create matching .txt files with comma-separated tags
 3. Optional: Enable tag-based loss weighting for balanced training
 
-## Paper Implementation Details
-
-This codebase follows the paper's specifications:
-- σ ≈ 20000 for ZTSNR
-- CFG scale range: 3.5-5.0 (optimal)
-- bfloat16 precision with tf32 optimizations
-- Aspect ratio bucketing for proper framing
-- Tag-based loss weighting for balanced concept learning
-
 
 ## Contributing
 
