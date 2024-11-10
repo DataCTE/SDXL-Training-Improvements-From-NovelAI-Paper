@@ -1,4 +1,4 @@
-from diffusers import AutoencoderKL, CLIPModel, CLIPProcessor
+from diffusers import AutoencoderKL
 import torch
 import logging
 import traceback
