@@ -46,6 +46,11 @@ Most SDXL implementations use a maximum noise deviation (σ_max) of 14.6 [meanin
      * Statistical distribution monitoring
      * Latent space stability measurements
 
+## Project Structure
+
+See [Project Structure Documentation](src/filestruc.md) for detailed component descriptions.
+
+
 ## Tag-Based CLIP Weighting System
 
 The training implements an intelligent tag weighting system that uses CLIP embeddings to dynamically adjust loss weights based on tag categories and frequencies.
