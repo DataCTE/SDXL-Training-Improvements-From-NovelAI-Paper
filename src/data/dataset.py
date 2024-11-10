@@ -114,15 +114,28 @@ class CustomDataset(Dataset):
 
     def transform_image(self, image):
         """Transform image maintaining aspect ratio within SDXL requirements"""
+        # Get original aspect ratio
         w, h = image.size
-        ratio = (w, h)
-        target_h, target_w = self.get_target_size_for_bucket(ratio)
+        aspect_ratio = w / h
+        
+        # Calculate target dimensions ensuring minimum 256 pixels
+        if w < h:
+            new_w = max(256, w)
+            new_h = int(new_w / aspect_ratio)
+        else:
+            new_h = max(256, h)
+            new_w = int(new_h * aspect_ratio)
+        
+        # Ensure both dimensions are at least 256
+        new_w = max(256, new_w)
+        new_h = max(256, new_h)
         
         transform = transforms.Compose([
-            transforms.Resize((target_h, target_w), interpolation=transforms.InterpolationMode.LANCZOS),
+            transforms.Resize((new_h, new_w), interpolation=transforms.InterpolationMode.BILINEAR),
             transforms.ToTensor(),
             transforms.Normalize([0.5], [0.5])
         ])
+        
         return transform(image)
 
     def _cache_latents_and_embeddings_optimized(self):
@@ -131,19 +144,22 @@ class CustomDataset(Dataset):
             # Group files by aspect ratio bucket
             bucket_files = {}
             for img_path, caption_path in zip(self.image_paths, self.caption_paths):
-                cache_latents_path = self.cache_dir / f"{img_path.stem}_latents.pt"
-                cache_embeddings_path = self.cache_dir / f"{img_path.stem}_embeddings.pt"
-                
-                if not cache_latents_path.exists() or not cache_embeddings_path.exists():
-                    # Find which bucket this image belongs to
-                    with Image.open(img_path) as img:
-                        w, h = img.size
-                        ratio = w / h
-                        bucket = min(self.aspect_buckets.keys(),
-                                   key=lambda x: abs(x[0]/x[1] - ratio))
-                        if bucket not in bucket_files:
-                            bucket_files[bucket] = []
-                        bucket_files[bucket].append((img_path, caption_path))
+                with Image.open(img_path) as img:
+                    w, h = img.size
+                    # Calculate minimum size that maintains aspect ratio
+                    if w < h:
+                        scale = 256 / w
+                    else:
+                        scale = 256 / h
+                        
+                    target_w = max(256, int(w * scale))
+                    target_h = max(256, int(h * scale))
+                    
+                    bucket = (target_w // 64, target_h // 64)  # Round to nearest multiple of 64
+                    
+                    if bucket not in bucket_files:
+                        bucket_files[bucket] = []
+                    bucket_files[bucket].append((img_path, caption_path))
             
             if not bucket_files:
                 logger.info("All latents and embeddings already cached, skipping...")
@@ -173,8 +189,7 @@ class CustomDataset(Dataset):
                     
                     # Create transform for this bucket
                     bucket_transform = transforms.Compose([
-                        transforms.Resize((target_h, target_w), 
-                                       interpolation=transforms.InterpolationMode.LANCZOS),
+                        transforms.Resize((target_h, target_w), interpolation=transforms.InterpolationMode.BILINEAR),
                         transforms.ToTensor(),
                         transforms.Normalize([0.5], [0.5])
                     ])
