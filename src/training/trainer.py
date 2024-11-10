@@ -33,6 +33,7 @@ def train_one_epoch(
     # Initialize running averages for smoothed metrics
     running_loss = 0.0
     loss_history = []
+    grad_norm_value = 0.0  # Add this to store grad norm
     
     # Initialize metric histories for averaging
     metric_histories = defaultdict(list)
@@ -81,10 +82,12 @@ def train_one_epoch(
         
         # Update model if gradient accumulation complete
         if (step + 1) % args.gradient_accumulation_steps == 0:
-            grad_norm = torch.nn.utils.clip_grad_norm_(
+            # Store the gradient norm value
+            grad_norm_value = torch.nn.utils.clip_grad_norm_(
                 unet.parameters(), 
                 args.max_grad_norm
-            )
+            ).item()  # Convert to Python float
+            
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             lr_scheduler.step()
@@ -123,12 +126,19 @@ def train_one_epoch(
         # Log metrics to wandb
         if args.use_wandb and step % args.logging_steps == 0:
             metrics = {
-                # Main loss metrics
+                # Loss metrics
                 "loss/current": loss.item(),
                 "loss/average": average_loss,
                 "loss/running": running_loss,
                 
-                # Detailed loss metrics from loss.py
+                # Gradient metrics
+                "gradients/norm": grad_norm_value,  # Now we can safely access this
+                
+                # Learning rates
+                "lr/unet": lr_scheduler.get_last_lr()[0],
+                "lr/textencoder": lr_scheduler.get_last_lr()[0],
+                
+                # Loss components from step_metrics
                 "loss/mse_mean": step_metrics['loss/mse_mean'],
                 "loss/mse_std": step_metrics['loss/mse_std'],
                 "loss/snr_mean": step_metrics['loss/snr_mean'],
@@ -142,16 +152,7 @@ def train_one_epoch(
                 # Noise metrics
                 "noise/sigma_mean": step_metrics['noise/sigma_mean'],
                 "noise/x_t_std": step_metrics['noise/x_t_std'],
-                
-                # Learning rates
-                "lr/unet": lr_scheduler.get_last_lr()[0],
-                "lr/textencoder": lr_scheduler.get_last_lr()[0],  # Adjust if using different LRs
             }
-            
-            # Add averaged metrics
-            for k, v in metric_histories.items():
-                if v:  # Only add if we have values
-                    metrics[f"{k}/average"] = sum(v) / len(v)
             
             wandb.log(metrics, step=global_step)
         

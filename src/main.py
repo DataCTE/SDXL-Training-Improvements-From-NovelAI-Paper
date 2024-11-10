@@ -190,26 +190,50 @@ def setup_wandb(args):
             group="training",
         )
         
-        # Define metric groupings
+        # Define metric groupings and their properties
         wandb.define_metric("loss/*", summary="min")
         wandb.define_metric("model/*", summary="last")
         wandb.define_metric("noise/*", summary="mean")
         wandb.define_metric("lr/*", summary="last")
         
-        # Create custom layout configuration
-        wandb.run.log_config({
-            "layouts": {
+        # Create custom panels
+        wandb.log({
+            "custom_charts": {
                 "Training Progress": {
-                    "loss": {"type": "line", "x": "step", "y": ["loss/current", "loss/average", "loss/running"]},
-                    "learning_rate": {"type": "line", "x": "step", "y": ["lr/textencoder", "lr/unet"]},
+                    "Training Loss": {
+                        "value": ["loss/current", "loss/average", "loss/running"],
+                        "type": "line",
+                        "title": "Training Loss Over Time"
+                    },
+                    "Learning Rate": {
+                        "value": ["lr/textencoder", "lr/unet"],
+                        "type": "line",
+                        "title": "Learning Rate Schedule"
+                    }
                 },
                 "Loss Components": {
-                    "mse": {"type": "line", "x": "step", "y": ["loss/mse_mean", "loss/mse_std"]},
-                    "snr": {"type": "line", "x": "step", "y": ["loss/snr_mean", "loss/min_snr_gamma_mean"]},
+                    "MSE Loss": {
+                        "value": ["loss/mse_mean", "loss/mse_std"],
+                        "type": "line",
+                        "title": "MSE Loss Components"
+                    },
+                    "SNR Metrics": {
+                        "value": ["loss/snr_mean", "loss/min_snr_gamma_mean"],
+                        "type": "line",
+                        "title": "SNR Metrics"
+                    }
                 },
-                "Model Metrics": {
-                    "model_stats": {"type": "line", "x": "step", "y": ["model/v_pred_std", "model/v_target_std", "model/alpha_t_mean"]},
-                    "noise_stats": {"type": "line", "x": "step", "y": ["noise/sigma_mean", "noise/x_t_std"]},
+                "Model Statistics": {
+                    "Model Stats": {
+                        "value": ["model/v_pred_std", "model/v_target_std", "model/alpha_t_mean"],
+                        "type": "line",
+                        "title": "Model Statistics"
+                    },
+                    "Noise Stats": {
+                        "value": ["noise/sigma_mean", "noise/x_t_std"],
+                        "type": "line",
+                        "title": "Noise Statistics"
+                    }
                 }
             }
         })
