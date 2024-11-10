@@ -164,12 +164,6 @@ Example: `1girl, anime style, outdoor, high quality`
 --save_checkpoints     : Enable checkpoint saving
 --validation_prompts   : Validation prompt file
 ```
-## Dataset Preparation
-
-1. Place training images in data directory
-2. Create matching .txt files with comma-separated tags
-3. Optional: Enable tag-based loss weighting for balanced training
-
 
 ## Project Structure
 See [Project Structure Documentation](src/filestruc.md) for detailed component descriptions.
