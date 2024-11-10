@@ -6,7 +6,7 @@ from torch.utils.data import Dataset
 import math
 from tqdm import tqdm
 import logging
-from diffusers import CLIPModel, CLIPProcessor
+from transformers import CLIPModel, CLIPProcessor
 from utils.device import to_device
 
 logger = logging.getLogger(__name__)
