@@ -49,7 +49,6 @@ def train_one_epoch(
         )
         
         for step, batch in enumerate(train_dataloader):
-            logger.debug(f"\n--- Step {step} ---")
             step_start = time.time()
             
             # Validate batch contents
@@ -58,33 +57,19 @@ def train_one_epoch(
             if missing_keys:
                 raise ValueError(f"Batch missing required keys: {missing_keys}")
             
-            if "added_cond_kwargs" not in batch or not isinstance(batch["added_cond_kwargs"], dict):
-                raise ValueError("Batch has invalid added_cond_kwargs format")
-                
-            required_cond_keys = ["text_embeds", "time_ids"]
-            missing_cond_keys = [key for key in required_cond_keys if key not in batch["added_cond_kwargs"]]
-            if missing_cond_keys:
-                raise ValueError(f"added_cond_kwargs missing required keys: {missing_cond_keys}")
-            
             # Move batch to device and handle tensor conversion
-            latents = batch["latents"]
-            if isinstance(latents, list):
-                latents = torch.stack(latents)
-            latents = latents.to(device, dtype=dtype)
-            
-            # Use pre-computed text embeddings
+            latents = batch["latents"].to(device, dtype=dtype)
             text_embeddings = batch["text_embeddings"].to(device, dtype=dtype)
             
             # Get noise schedule
             sigmas = get_sigmas(args.num_inference_steps).to(device)
             sigma = sigmas[step % args.num_inference_steps].expand(latents.size(0))
-            logger.debug(f"Sigma value: {sigma[0].item():.4f}")
             
-            # Ensure added_cond_kwargs is properly formatted
+            # Properly format added conditioning
             added_cond_kwargs = {
                 "text_embeds": batch["added_cond_kwargs"]["text_embeds"].to(device, dtype=dtype),
                 "time_ids": batch["added_cond_kwargs"]["time_ids"].to(device, dtype=dtype)
-            } 
+            }
             
             # Training step
             with torch.amp.autocast('cuda', dtype=dtype):
