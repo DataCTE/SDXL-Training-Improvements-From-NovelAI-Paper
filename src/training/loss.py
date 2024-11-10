@@ -41,7 +41,7 @@ def v_prediction_scaling_factors(sigma, sigma_data=1.0):
 def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kwargs):
     """Training loss using v-prediction with MinSNR weighting as described in NovelAI V3 paper"""
     try:
-        # Get image dimensions and validate
+        # Get latent dimensions and validate
         batch_size, channels, height, width = x_0.shape
         
         # Validate channel dimension (SDXL uses 4 channels in latent space)
@@ -51,19 +51,30 @@ def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kw
                 f"Got {channels} channels. Shape: {x_0.shape}"
             )
             
-        # Validate UNet architecture requirements
-        if height % 8 != 0 or width % 8 != 0:
+        # Validate UNet architecture requirements (in latent space)
+        min_size = 32  # 256 pixels / 8 (VAE scaling)
+        max_size = 256  # 2048 pixels / 8 (VAE scaling)
+        
+        if height < min_size or width < min_size:
             raise ValueError(
-                f"Height ({height}) and width ({width}) must be divisible by 8 for UNet. "
-                f"Please adjust input resolution."
+                f"Latent dimensions too small. Minimum size is {min_size}x{min_size} "
+                f"(256x256 in pixel space). Got {height}x{width}"
             )
             
-        # Validate resolution bounds (NovelAI V3 section 4.1)
-        total_pixels = height * width
-        if total_pixels < 256 * 256 or total_pixels > 2048 * 2048:
+        if height > max_size or width > max_size:
             raise ValueError(
-                f"Resolution ({height}x{width}) outside supported range (256x256 to 2048x2048). "
-                f"Current pixels: {total_pixels:,}"
+                f"Latent dimensions too large. Maximum size is {max_size}x{max_size} "
+                f"(2048x2048 in pixel space). Got {height}x{width}"
+            )
+        
+        # Calculate total pixels in latent space
+        total_pixels = height * width
+        
+        # Validate aspect ratio is within supported range
+        aspect_ratio = width / height
+        if aspect_ratio < 0.25 or aspect_ratio > 4.0:  # Values from SDXL paper
+            raise ValueError(
+                f"Aspect ratio ({aspect_ratio:.2f}) outside supported range (0.25 to 4.0)"
             )
             
         # Validate text embedding context dimension (SDXL requirement)
@@ -81,13 +92,6 @@ def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kw
         if text_embeddings.shape[0] != batch_size:
             raise ValueError(
                 f"Text embedding batch size ({text_embeddings.shape[0]}) must match image batch size ({batch_size})"
-            )
-        
-        # Validate aspect ratio is within supported range
-        aspect_ratio = width / height
-        if aspect_ratio < 0.25 or aspect_ratio > 4.0:  # Values from SDXL paper
-            raise ValueError(
-                f"Aspect ratio ({aspect_ratio:.2f}) outside supported range (0.25 to 4.0)"
             )
         
         # Scale sigma based on resolution as per paper section 2.3

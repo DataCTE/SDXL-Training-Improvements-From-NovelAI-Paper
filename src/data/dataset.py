@@ -498,3 +498,24 @@ def validate_dataset(data_dir):
     logger.info(f"\nValidation complete: {stats['valid']} valid, {stats['invalid']} invalid images")
     
     return stats['valid'] > 0, stats
+
+def validate_image_dimensions(width, height):
+    """Validate image dimensions for SDXL training"""
+    # Convert to latent dimensions
+    latent_width = width // 8
+    latent_height = height // 8
+    
+    # Check minimum dimensions
+    if latent_width < 32 or latent_height < 32:  # 256 pixels in image space
+        return False, f"Latent dimensions too small: {latent_width}x{latent_height}"
+        
+    # Check maximum dimensions
+    if latent_width > 256 or latent_height > 256:  # 2048 pixels in image space
+        return False, f"Latent dimensions too large: {latent_width}x{latent_height}"
+        
+    # Check aspect ratio
+    aspect_ratio = width / height
+    if aspect_ratio < 0.25 or aspect_ratio > 4.0:
+        return False, f"Aspect ratio ({aspect_ratio:.2f}) outside supported range"
+        
+    return True, None
