@@ -68,13 +68,18 @@ def setup_training(args, models, device, dtype):
             # Take the largest group that fits in a batch
             largest_group = max(grouped.values(), key=len)
             
-            # Create batch tensors
+            # Create batch tensors with updated keys
             batch_dict = {
                 "latents": torch.stack([x["latents"] for x in largest_group]),
                 "text_embeddings": torch.stack([x["text_embeddings"] for x in largest_group]),
-                "text_embeddings_2": torch.stack([x["text_embeddings_2"] for x in largest_group]),
-                "pooled_text_embeddings_2": torch.stack([x["pooled_text_embeddings_2"] for x in largest_group]),
-                "tags": [x["tags"] for x in largest_group]
+                "added_cond_kwargs": {
+                    "text_embeds": torch.stack([
+                        x["added_cond_kwargs"]["text_embeds"] for x in largest_group
+                    ]),
+                    "time_ids": torch.stack([
+                        x["added_cond_kwargs"]["time_ids"] for x in largest_group
+                    ])
+                }
             }
             
             return batch_dict
