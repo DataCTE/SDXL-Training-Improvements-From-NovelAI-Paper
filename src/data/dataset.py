@@ -128,6 +128,19 @@ class CustomDataset(Dataset):
     def _cache_latents_and_embeddings_optimized(self):
         """Optimized version of caching that uses bfloat16"""
         try:
+            # First check which files need processing
+            files_to_process = []
+            for img_path, caption_path in zip(self.image_paths, self.caption_paths):
+                cache_latents_path = self.cache_dir / f"{img_path.stem}_latents.pt"
+                cache_embeddings_path = self.cache_dir / f"{img_path.stem}_embeddings.pt"
+                
+                if not cache_latents_path.exists() or not cache_embeddings_path.exists():
+                    files_to_process.append((img_path, caption_path))
+            
+            if not files_to_process:
+                logger.info("All latents and embeddings already cached, skipping...")
+                return
+
             with to_device(self.vae, "cuda") as vae, \
                  to_device(self.text_encoder, "cuda") as text_encoder, \
                  to_device(self.text_encoder_2, "cuda") as text_encoder_2, \
@@ -138,11 +151,10 @@ class CustomDataset(Dataset):
                 text_encoder_2.eval()
                 clip_model.eval()
                 
-                # Add progress bar
-                print("Caching latents and embeddings...")
-                for img_path, caption_path in tqdm(zip(self.image_paths, self.caption_paths),
-                                                   total=len(self.image_paths),
-                                                   desc="Caching"):
+                # Add progress bar only for files that need processing
+                logger.info(f"Caching {len(files_to_process)} new files...")
+                for img_path, caption_path in tqdm(files_to_process,
+                                                 desc="Caching"):
                     cache_latents_path = self.cache_dir / f"{img_path.stem}_latents.pt"
                     cache_embeddings_path = self.cache_dir / f"{img_path.stem}_embeddings.pt"
 
