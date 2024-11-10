@@ -2,144 +2,76 @@
 
 Most SDXL implementations use a maximum noise deviation (σ_max) of 14.6 [meaning that only 14.6% of the noise is removed at maximum] inherited from SD1.5/1.4, without accounting for SDXL's larger scale. Research shows that larger models benefit from higher σ_max values to fully utilize their denoising capacity. This repository implements an increased σ_max ≈ 20000.0 (as recommended by NovelAI research arXiv:2409.15997v2), which significantly improves color accuracy and composition stability. Combined with Zero Terminal SNR (ZTSNR) and VAE finetuning.
 
-### Weights
 
-- [ ] 10k dataset proof of concept (currently training/ in testing)
-- [ ] 200k+ dataset finetune (coming soon)
+### Current Status
 
-## Key Technical Improvements
+- [x] Core ZTSNR implementation
+- [x] v-prediction loss
+- [x] perceptual loss
+- [x] Sigma max 20000.0
+- [x] High-resolution coherence enhancements
+- [x] VAE improvements
+- [x] Tag-based CLIP weighting
 
-1. **Zero Terminal SNR (ZTSNR) Implementation**
-   - Implements σ ≈ 20000 as practical approximation of infinity for terminal SNR
-   - Enables true black image generation through complete noise elimination
-   - Prevents mean-color leakage from residual noise components
-   - Theoretical basis: Extends the noise schedule to infinity, allowing complete denoising
-   - Implementation: Modified diffusion schedule with σ_max ≈ 20000 instead of traditional 14.6
-   - Validation: Measurable improvement in color fidelity and dark tone reproduction
+- [ ] 10k dataset proof of concept (in testing)
+- [ ] 200k+ dataset finetune (planned)
 
-2. **High-Resolution Coherence Enhancement**
-   - Noise scheduling optimized for σ ≈ 20000 to σ ≈ 0.0292
-   - Technical implementation:
-     * Progressive σ reduction: [20000, 17.8, 12.4, 9.2, 7.2, 5.4, 3.9, 2.1, 0.9, 0.0292]
-     * Resolution-adaptive σ steps (scaled by √(H×W)/1024)
-     * Cross-attention optimization for 1024×1024+ resolutions
-   - Measurable improvements:
-     * 47% reduction in high-frequency artifacts at σ < 5.0
-     * Global composition coherence maintained at σ > 12.4
-     * Detail consistency improved by 31% across σ transitions
+## Technical Implementation
 
-3. **VAE Training Improvements**
-   - Adaptive Statistics Normalization:
-     * Online Welford algorithm for latent space statistics
-     * Per-channel mean and variance tracking
-     * Dynamic normalization based on batch statistics
-   - Training Optimizations:
-     * Chunked processing for memory efficiency
-     * bfloat16 precision with gradient checkpointing
-     * Memory-efficient attention via xformers
-   - Implementation Features:
-     * Automatic latent caching for faster training
-     * Progressive batch processing
-     * Separate optimizer and learning rate scheduling
-   - Validation Metrics:
-     * Real-time reconstruction loss tracking
-     * Statistical distribution monitoring
-     * Latent space stability measurements
+### 1. Zero Terminal SNR (ZTSNR)
+- **Noise Schedule**: σ_max ≈ 20000.0 to σ_min ≈ 0.0292
+- **Progressive Steps**: [20000, 17.8, 12.4, 9.2, 7.2, 5.4, 3.9, 2.1, 0.9, 0.0292]
+- **Benefits**:
+  - Complete noise elimination
+  - True black generation
+  - Prevents color leakage
+  - Improved dark tone reproduction
 
-## Project Structure
+### 2. High-Resolution Coherence
+- **Resolution Scaling**: √(H×W)/1024
+- **Attention Optimization**: Memory-efficient cross-attention
+- **Measurable Improvements**:
+  - 47% fewer artifacts at σ < 5.0
+  - Stable composition at σ > 12.4
+  - 31% better detail consistency
 
-See [Project Structure Documentation](src/filestruc.md) for detailed component descriptions.
+### 3. VAE Improvements
+- **Statistics Tracking**: Welford algorithm
+- **Memory Optimization**:
+  - Chunked processing
+  - bfloat16 precision
+  - Gradient checkpointing
+- **Features**:
+  - Latent caching
+  - Progressive batching
+  - Dynamic normalization
 
+## Quick Start
 
-## Tag-Based CLIP Weighting System
-
-The training implements an intelligent tag weighting system that uses CLIP embeddings to dynamically adjust loss weights based on tag categories and frequencies.
-
-### Tag Classification System
-```python
-tag_classes = {
-    'character': set(),  # Character-related tags
-    'style': set(),     # Artistic style tags
-    'setting': set(),   # Location/environment tags
-    'action': set(),    # Action/pose tags
-    'object': set(),    # Object/item tags
-    'quality': set()    # Quality/technical tags
-}
-```
-
-### Features
-1. **CLIP-Based Tag Analysis**
-   - Automatic tag categorization using CLIP embeddings
-   - Dynamic weight adjustment based on tag frequencies
-   - Per-class weight customization
-   - Cached embeddings for performance
-
-2. **Weight Calculation**
-   ```python
-   min_weight = 0.1  # Minimum loss multiplier
-   max_weight = 3.0  # Maximum loss multiplier
-   ```
-   - Weights automatically scaled between min/max bounds
-   - Class-specific weight adjustments
-   - Frequency-based importance scaling
-
-3. **Tag Frequency Tracking**
-   - Automatic tracking of tag occurrences
-   - Class-based frequency normalization
-   - Dynamic weight adjustment based on dataset statistics
-
-### Usage
-1. **Tag File Format**
-   ```plain
-   character_tag, style_tag, setting_tag, quality_tag
-   ```
-   Example: `1girl, anime style, outdoor, high quality`
-
-2. **Custom Weight Configuration**
-   ```bash
-   python HighSigma.py \
-     --min_tag_weight 0.1 \
-     --max_tag_weight 3.0 \
-     --character_weight 1.5 \
-     --style_weight 1.2 \
-     --quality_weight 0.8
-   ```
-
-3. **Monitoring**
-   - Tag frequency statistics logged to W&B
-   - Per-class weight distributions
-   - CLIP embedding visualizations
-
-### Benefits
-- Balanced training across different tag categories
-- Improved handling of rare vs common tags
-- Semantic-aware loss weighting
-- Automatic handling of dataset imbalances
-
-## Prerequisites
-
-Required packages:
+### Installation
 ```bash
-torch 
-torchvision 
-diffusers 
-transformers 
-bitsandbytes 
-tqdm 
-Pillow
-sentencepiece
-accelerate
-xformers
-wandb
+git clone https://github.com/DataCTE/SDXL-Training-Improvements.git
+cd SDXL-Training-Improvements
+pip install -r requirements.txt
 ```
 
-## Basic Usage
-
-Basic training command:
+### Basic Training
 ```bash
 python src/main.py \
   --model_path /path/to/sdxl/model \
   --data_dir /path/to/training/data \
+  --output_dir ./output \
+  --learning_rate 1e-6 \
+  --batch_size 1 \
+  --enable_compile \
+  --finetune_vae
+```
+
+### Advanced Configuration
+```bash
+python src/main.py \
+  --model_path /path/to/sdxl/model \
+  --data_dir /path/to/data \
   --output_dir ./output \
   --learning_rate 1e-6 \
   --num_epochs 1 \
@@ -151,41 +83,101 @@ python src/main.py \
   --vae_learning_rate 1e-6 \
   --use_wandb \
   --wandb_project "sdxl-training" \
-  --wandb_run_name "high-sigma-training"
+  --wandb_run_name "ztsnr-training"
 ```
 
-### All Arguments
+## Tag-Based CLIP Weighting
 
-```
---model_path                    : Path to base SDXL model
---data_dir                     : Training data directory
---learning_rate                : Learning rate (default: 1e-6)
---num_epochs                   : Number of training epochs
---batch_size                   : Training batch size per GPU
---gradient_accumulation_steps  : Number of steps for gradient accumulation
---finetune_vae                : Enable VAE finetuning
---vae_learning_rate           : VAE learning rate when finetuning
---use_adafactor               : Use Adafactor optimizer instead of AdamW8bit
---enable_compile              : Enable torch.compile optimization
---compile_mode                : Torch compile mode (default/reduce-overhead/max-autotune)
---save_checkpoints           : Save checkpoints after each epoch
---cache_dir                  : Directory for caching latents and embeddings
---use_wandb                   : Enable Weights & Biases logging
---wandb_project               : W&B project name
---wandb_run_name              : W&B run name
---push_to_hub                 : Push model to HuggingFace Hub
---hub_model_id                : HuggingFace Hub model ID
---hub_private                 : Make the HuggingFace repo private
+### Configuration
+```bash
+python src/main.py \
+  --min_tag_weight 0.1 \
+  --max_tag_weight 3.0 \
+  --character_weight 1.5 \
+  --style_weight 1.2 \
+  --quality_weight 0.8 \
+  --setting_weight 1.0 \
+  --action_weight 1.1 \
+  --object_weight 0.9 \
+  --tag_frequency_path "tag_frequencies.json" \
+  --tag_embedding_cache "tag_embeddings.pt"
 ```
 
-## Validation
+### Weight Ranges
+- `min_tag_weight`: 0.1 to 1.0 (default: 0.1)
+- `max_tag_weight`: 1.0 to 5.0 (default: 3.0)
 
-The training includes automatic validation of:
-1. ZTSNR effectiveness (black image generation)
-2. High-resolution coherence
-3. Noise schedule visualization
-4. Progressive denoising steps
+### Class Weights
+- `character_weight`: 1.5 (character emphasis)
+- `style_weight`: 1.2 (style consistency)
+- `quality_weight`: 0.8 (quality control)
+- `setting_weight`: 1.0 (background balance)
+- `action_weight`: 1.1 (pose emphasis)
+- `object_weight`: 0.9 (object balance)
 
+## Dataset Format
+
+### Directory Structure
+```
+data_dir/
+├── image1.png
+├── image1.txt
+├── image2.jpg
+├── image2.txt
+...
+```
+
+### Tag Format
+```plain
+character_tags, style_tags, setting_tags, quality_tags
+```
+Example: `1girl, anime style, outdoor, high quality`
+
+## Arguments Reference
+
+### Model Arguments
+```
+--model_path              : Base SDXL model path
+--output_dir             : Output directory
+--learning_rate          : Training learning rate
+--num_epochs            : Number of epochs
+--batch_size            : Batch size per GPU
+--gradient_accumulation : Gradient accumulation steps
+```
+
+### Training Options
+```
+--finetune_vae          : Enable VAE finetuning
+--vae_learning_rate     : VAE learning rate
+--use_adafactor        : Use Adafactor optimizer
+--enable_compile       : Enable torch.compile
+--compile_mode         : Compilation mode
+```
+
+### Monitoring
+```
+--use_wandb            : Enable W&B logging
+--wandb_project        : W&B project name
+--wandb_run_name       : W&B run name
+--save_checkpoints     : Enable checkpoint saving
+--validation_prompts   : Validation prompt file
+```
+
+## Project Structure
+See [Project Structure Documentation](src/filestruc.md) for detailed component descriptions.
+
+## License
+Apache 2.0
+
+## Citation
+```bibtex
+@article{ossa2024improvements,
+  title={Improvements to SDXL in NovelAI Diffusion V3},
+  author={Ossa, Juan and Doğan, Eren and Birch, Alex and Johnson, F.},
+  journal={arXiv preprint arXiv:2409.15997v2},
+  year={2024}
+}
+```
 Results are saved as images and logged to W&B if enabled.
 
 ## Dataset Preparation
