@@ -137,7 +137,7 @@ wandb
 
 Basic training command:
 ```bash
-python HighSigma.py \
+python src/main.py \
   --model_path /path/to/sdxl/model \
   --data_dir /path/to/training/data \
   --output_dir ./output \
@@ -145,12 +145,16 @@ python HighSigma.py \
   --num_epochs 1 \
   --batch_size 1 \
   --gradient_accumulation_steps 1 \
+  --enable_compile \
+  --compile_mode "reduce-overhead" \
+  --finetune_vae \
+  --vae_learning_rate 1e-6 \
   --use_wandb \
   --wandb_project "sdxl-training" \
   --wandb_run_name "high-sigma-training"
 ```
 
-### Key Arguments
+### All Arguments
 
 ```
 --model_path                    : Path to base SDXL model
@@ -212,3 +216,4 @@ journal={arXiv preprint arXiv:2409.15997v2},
 year={2024}
 }
 ```
+
