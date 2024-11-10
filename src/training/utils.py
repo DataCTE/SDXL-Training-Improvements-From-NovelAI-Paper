@@ -61,7 +61,7 @@ def custom_collate(batch):
 
 def verify_models(models):
     """
-    Verify that all required models are present and properly configured
+    Verify that all models are present and properly configured
     
     Args:
         models (dict): Dictionary of model components
@@ -83,7 +83,12 @@ def verify_models(models):
         for model_name in required_models:
             if model_name not in models:
                 raise ValueError(f"Missing required model: {model_name}")
-            
+        
+        # Put models in eval mode before verification
+        models["text_encoder"].eval()
+        models["text_encoder_2"].eval()
+        models["vae"].eval()
+        
         # Verify model states
         assert not models["text_encoder"].training, "Text encoder should be in eval mode"
         assert not models["text_encoder_2"].training, "Text encoder 2 should be in eval mode"
@@ -93,6 +98,10 @@ def verify_models(models):
         assert not models["text_encoder"].requires_grad, "Text encoder should not require gradients"
         assert not models["text_encoder_2"].requires_grad, "Text encoder 2 should not require gradients"
         assert not models["vae"].requires_grad, "VAE should not require gradients"
+        
+        # Put UNet back in train mode if it was in training
+        if models["unet"].training:
+            models["unet"].train()
         
         return True
         
@@ -147,6 +156,11 @@ def save_checkpoint(checkpoint_dir, models, train_components, training_state, us
         logger.info(f"Saving checkpoint to {checkpoint_dir}")
         os.makedirs(checkpoint_dir, exist_ok=True)
         
+        # Temporarily put models in eval mode for saving
+        training_mode = models["unet"].training
+        if training_mode:
+            models["unet"].eval()
+        
         # Save training state
         if training_state is not None:
             logger.info("Saving training state")
@@ -186,6 +200,10 @@ def save_checkpoint(checkpoint_dir, models, train_components, training_state, us
                     os.path.join(checkpoint_dir, "ema.pt")
                 )
         
+        # Restore UNet training mode if it was training
+        if training_mode:
+            models["unet"].train()
+            
     except Exception as e:
         logger.error(f"Failed to save checkpoint: {str(e)}")
         logger.error(f"Checkpoint directory: {checkpoint_dir}")

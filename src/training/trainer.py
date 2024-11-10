@@ -65,12 +65,18 @@ def train_one_epoch(
         logger.debug(f"Sigma value: {sigma[0].item():.4f}")
         
         # Get current batch size
-        batch_size = latents.shape[0]
+        current_batch_size = latents.shape[0]
         
-        # Create correctly sized time_ids
+        # Ensure pooled_embeds has correct batch size
+        if step == len(train_dataloader) - 1:  # Last batch
+            # Adjust pooled embeddings if needed
+            if pooled_embeds.shape[0] != current_batch_size:
+                pooled_embeds = pooled_embeds[:current_batch_size]
+        
+        # Create time_ids with matching batch size
         time_ids = torch.tensor([1024, 1024, 1024, 1024, 0, 0], 
                               device=device, 
-                              dtype=dtype).repeat(batch_size, 1)  # Shape: [batch_size, 6]
+                              dtype=dtype).repeat(current_batch_size, 1)
         
         # Training step
         with torch.amp.autocast('cuda', dtype=dtype):
@@ -80,7 +86,7 @@ def train_one_epoch(
                 sigma,
                 text_embeddings,
                 {
-                    "text_embeds": pooled_embeds,
+                    "text_embeds": pooled_embeds,  # Now correctly sized
                     "time_ids": time_ids
                 }
             )
