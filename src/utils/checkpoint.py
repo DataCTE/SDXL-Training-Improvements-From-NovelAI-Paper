@@ -1,7 +1,82 @@
 
 import logging
+import torch
+import os
 
 logger = logging.getLogger(__name__)
+
+def load_checkpoint(checkpoint_dir, models, train_components):
+    """
+    Load a saved checkpoint in diffusers format with safetensors support
+    
+    Args:
+        checkpoint_dir: Directory containing the checkpoint
+        models: Dictionary containing models to load
+        train_components: Dictionary containing training components
+            
+    Returns:
+        dict: Training state (if available) or None
+    """
+    try:
+        logger.info(f"Loading checkpoint from {checkpoint_dir}")
+        
+        is_valid, optional_status = verify_checkpoint_directory(checkpoint_dir)
+        if not is_valid:
+            raise ValueError("Invalid checkpoint directory structure")
+        
+        # Load training state if available
+        training_state = None
+        if optional_status["training_state.pt"]:
+            logger.info("Loading training state")
+            training_state = torch.load(
+                os.path.join(checkpoint_dir, "training_state.pt"),
+                map_location='cpu'
+            )
+            
+            # Load optimizer state
+            if optional_status["optimizer.pt"]:
+                logger.info("Loading optimizer state")
+                train_components["optimizer"].load_state_dict(
+                    torch.load(
+                        os.path.join(checkpoint_dir, "optimizer.pt"),
+                        map_location='cpu'
+                    )
+                )
+            
+            # Load scheduler state
+            if optional_status["scheduler.pt"]:
+                logger.info("Loading scheduler state")
+                train_components["lr_scheduler"].load_state_dict(
+                    torch.load(
+                        os.path.join(checkpoint_dir, "scheduler.pt"),
+                        map_location='cpu'
+                    )
+                )
+            
+            # Load EMA state
+            if "ema_model" in train_components:
+                if optional_status["ema.safetensors"]:
+                    logger.info("Loading EMA state from safetensors")
+                    ema_state = load_file(
+                        os.path.join(checkpoint_dir, "ema.safetensors")
+                    )
+                    train_components["ema_model"].load_state_dict(ema_state)
+                elif optional_status["ema.pt"]:
+                    logger.info("Loading EMA state from pytorch")
+                    train_components["ema_model"].load_state_dict(
+                        torch.load(
+                            os.path.join(checkpoint_dir, "ema.pt"),
+                            map_location='cpu'
+                        )
+                    )
+        
+        return training_state
+        
+    except Exception as e:
+        logger.error(f"Failed to load checkpoint: {str(e)}")
+        logger.error(f"Checkpoint directory: {checkpoint_dir}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise
 
 def verify_models(models):
     """
