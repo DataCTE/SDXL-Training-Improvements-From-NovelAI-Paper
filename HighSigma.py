@@ -23,6 +23,7 @@ import traceback
 from collections import defaultdict
 
 from model import UNet2DConditionModel
+from vae import SWYCCAutoencoder
 
 def setup_logging():
     logging.basicConfig(
@@ -892,11 +893,7 @@ def main(args):
         # Now we can watch the model after it's initialized
         if args.use_wandb:
             wandb.watch(unet, log='all', log_freq=100)
-        vae = AutoencoderKL.from_pretrained(
-            args.model_path,
-            subfolder="vae",
-            torch_dtype=torch.bfloat16
-        )
+        vae = SWYCCAutoencoder().to(device)
         tokenizer = CLIPTokenizer.from_pretrained(
             args.model_path,
             subfolder="tokenizer"
@@ -1135,11 +1132,7 @@ class ModelValidator:
         self.model = model.to(device)
         self.vae = vae.to(device)
         # Load default SDXL VAE for decoding validation images
-        self.default_vae = AutoencoderKL.from_pretrained(
-            "stabilityai/stable-diffusion-xl-base-1.0", 
-            subfolder="vae",
-            torch_dtype=torch.bfloat16  # Match model dtype
-        ).to(device)
+        self.default_vae = SWYCCAutoencoder().to(device)
         self.default_vae.eval()  # Ensure VAE is in eval mode
         self.tokenizer = tokenizer
         self.tokenizer_2 = tokenizer_2
