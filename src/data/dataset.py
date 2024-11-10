@@ -406,49 +406,42 @@ class CustomDataset(Dataset):
         return len(self.image_paths)
 
     def __getitem__(self, idx):
-        """Get item with proper tensor handling"""
-        img_path = self.image_paths[idx]
-        latents_path = self.cache_dir / f"{img_path.stem}_latents.pt"
-        embeddings_path = self.cache_dir / f"{img_path.stem}_embeddings.pt"
-
-        # Load cached data
-        latents = torch.load(latents_path, map_location='cpu')
-        embeddings = torch.load(embeddings_path, map_location='cpu')
-
-        # Load original image
-        image = Image.open(img_path).convert("RGB")
-        original_images = self.transform_image(image)  # [3, H, W]
-
-        # Ensure latents is a tensor and has correct shape
-        if isinstance(latents, list):
-            latents = torch.stack(latents)
-
-        if self.batch_size == 1:
-            # Single sample processing
-            return {
-                "latents": latents.unsqueeze(0),  # [1, 4, H/8, W/8]
-                "text_embeddings": embeddings["text_embeddings"].unsqueeze(0),  # [1, 77, 768]
-                "text_embeddings_2": embeddings["text_embeddings_2"].unsqueeze(0),  # [1, 77, 1280]
-                "pooled_text_embeddings_2": embeddings["pooled_text_embeddings_2"].unsqueeze(0),  # [1, 1280]
-                "target_size": torch.tensor([original_images.shape[1], original_images.shape[2]], dtype=torch.long),
-                "clip_image_embed": embeddings["clip_image_embed"].unsqueeze(0),
-                "clip_tag_embeds": embeddings["clip_tag_embeds"].unsqueeze(0),
-                "tags": embeddings["tags"],
-                "original_images": original_images.unsqueeze(0)  # [1, 3, H, W]
-            }
-        else:
-            # Batch processing
-            return {
-                "latents": latents,  # [4, H/8, W/8]
-                "text_embeddings": embeddings["text_embeddings"],  # [77, 768]
-                "text_embeddings_2": embeddings["text_embeddings_2"],  # [77, 1280]
-                "pooled_text_embeddings_2": embeddings["pooled_text_embeddings_2"],  # [1280]
-                "target_size": torch.tensor([original_images.shape[1], original_images.shape[2]], dtype=torch.long),
-                "clip_image_embed": embeddings["clip_image_embed"],
-                "clip_tag_embeds": embeddings["clip_tag_embeds"],
-                "tags": embeddings["tags"],
-                "original_images": original_images  # [3, H, W]
-            }
+        """Get a training sample"""
+        item = self.samples[idx]
+        
+        # Get tokenized inputs for both encoders
+        input_ids = self.tokenizer(
+            item["prompt"],
+            padding="max_length",
+            max_length=77,
+            truncation=True,
+            return_tensors="pt"
+        ).input_ids[0]
+        
+        input_ids_2 = self.tokenizer_2(
+            item["prompt"],
+            padding="max_length",
+            max_length=77,
+            truncation=True,
+            return_tensors="pt"
+        ).input_ids[0]
+        
+        # Load cached latents and embeddings
+        latents = torch.load(item["latents_path"], map_location='cpu')
+        
+        # Prepare added conditioning
+        added_cond_kwargs = {
+            "text_embeds": item["pooled_embeds"].to(dtype=torch.bfloat16),
+            "time_ids": item["time_ids"].to(dtype=torch.bfloat16)
+        }
+        
+        return {
+            "latents": latents,
+            "input_ids": input_ids,
+            "input_ids_2": input_ids_2,  # Add second encoder input IDs
+            "sigmas": item["sigmas"],
+            "added_cond_kwargs": added_cond_kwargs
+        }
 
 def validate_dataset(data_dir):
     """Pre-process validation of all images in dataset"""

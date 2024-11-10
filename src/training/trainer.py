@@ -26,9 +26,9 @@ def train_one_epoch(
     dtype,
     epoch,
     global_step,
-    models=None,
-    train_components=None,
-    training_history=None
+    models,
+    train_components,
+    training_history
 ):
     """Single epoch training loop"""
     try:
@@ -48,6 +48,10 @@ def train_one_epoch(
             postfix=[0.0, lr_scheduler.get_last_lr()[0]]
         )
         
+        # Get text encoders
+        text_encoder = models["text_encoder"]
+        text_encoder_2 = models["text_encoder_2"]
+        
         for step, batch in enumerate(train_dataloader):
             logger.debug(f"\n--- Step {step} ---")
             step_start = time.time()
@@ -58,8 +62,12 @@ def train_one_epoch(
                 latents = torch.stack(latents)
             latents = latents.to(device, dtype=dtype)
             
-            text_embeddings = batch["text_embeddings"].to(device, dtype=dtype)
-            logger.debug(f"Text embeddings shape: {text_embeddings.shape}")
+            # Get text embeddings from both encoders
+            prompt_embeds = text_encoder(batch["input_ids"].to(device))[0]
+            prompt_embeds_2 = text_encoder_2(batch["input_ids_2"].to(device))[0]
+            
+            # Concatenate embeddings along the hidden dimension
+            text_embeddings = torch.cat([prompt_embeds, prompt_embeds_2], dim=-1)
             
             # Get noise schedule
             sigmas = get_sigmas(args.num_inference_steps).to(device)
