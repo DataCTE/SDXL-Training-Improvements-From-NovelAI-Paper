@@ -128,20 +128,28 @@ class CustomDataset(Dataset):
     def _cache_latents_and_embeddings_optimized(self):
         """Optimized version of caching that uses bfloat16 and batch processing"""
         try:
-            # First check which files need processing
-            files_to_process = []
+            # Group files by aspect ratio bucket
+            bucket_files = {}
             for img_path, caption_path in zip(self.image_paths, self.caption_paths):
                 cache_latents_path = self.cache_dir / f"{img_path.stem}_latents.pt"
                 cache_embeddings_path = self.cache_dir / f"{img_path.stem}_embeddings.pt"
                 
                 if not cache_latents_path.exists() or not cache_embeddings_path.exists():
-                    files_to_process.append((img_path, caption_path))
+                    # Find which bucket this image belongs to
+                    with Image.open(img_path) as img:
+                        w, h = img.size
+                        ratio = w / h
+                        bucket = min(self.aspect_buckets.keys(),
+                                   key=lambda x: abs(x[0]/x[1] - ratio))
+                        if bucket not in bucket_files:
+                            bucket_files[bucket] = []
+                        bucket_files[bucket].append((img_path, caption_path))
             
-            if not files_to_process:
+            if not bucket_files:
                 logger.info("All latents and embeddings already cached, skipping...")
                 return
 
-            # Process in batches of 8 (or adjust based on your GPU memory)
+            # Process each bucket separately
             BATCH_SIZE = 8
             
             with to_device(self.vae, "cuda") as vae, \
@@ -154,103 +162,108 @@ class CustomDataset(Dataset):
                 text_encoder_2.eval()
                 clip_model.eval()
 
-                # Process files in batches
-                logger.info(f"Caching {len(files_to_process)} new files...")
-                for i in tqdm(range(0, len(files_to_process), BATCH_SIZE), desc="Caching"):
-                    batch_files = files_to_process[i:i + BATCH_SIZE]
+                # Process each aspect ratio bucket
+                for bucket, files in bucket_files.items():
+                    logger.info(f"Processing bucket {bucket} with {len(files)} files...")
                     
-                    # Prepare batch data
-                    vae_images = []
-                    clip_images = []
-                    captions = []
-                    for img_path, caption_path in batch_files:
-                        image = Image.open(img_path).convert("RGB")
-                        # Transform image maintaining aspect ratio
-                        vae_image = self.transform_image(image)
+                    # Process files in batches within each bucket
+                    for i in tqdm(range(0, len(files), BATCH_SIZE), 
+                                desc=f"Caching bucket {bucket}"):
+                        batch_files = files[i:i + BATCH_SIZE]
                         
-                        # Validate image size meets minimum requirements
-                        if vae_image.shape[1] < 256 or vae_image.shape[2] < 256:
-                            raise ValueError(
-                                f"Image {img_path} too small after resizing: {vae_image.shape[1]}x{vae_image.shape[2]}. "
-                                f"Minimum size is 256x256."
-                            )
+                        # Prepare batch data
+                        vae_images = []
+                        clip_images = []
+                        captions = []
                         
-                        vae_images.append(vae_image)
-                        clip_images.append(image)  # Original image for CLIP
+                        for img_path, caption_path in batch_files:
+                            image = Image.open(img_path).convert("RGB")
+                            vae_image = self.transform_image(image)
+                            
+                            # Validate image size meets minimum requirements
+                            if vae_image.shape[1] < 256 or vae_image.shape[2] < 256:
+                                raise ValueError(
+                                    f"Image {img_path} too small after resizing: "
+                                    f"{vae_image.shape[1]}x{vae_image.shape[2]}. "
+                                    f"Minimum size is 256x256."
+                                )
+                            
+                            vae_images.append(vae_image)
+                            clip_images.append(image)
+                            
+                            with open(caption_path, 'r', encoding='utf-8') as f:
+                                captions.append(f.read().strip())
                         
-                        with open(caption_path, 'r', encoding='utf-8') as f:
-                            captions.append(f.read().strip())
-                    
-                    # Stack images for VAE
-                    image_batch = torch.stack(vae_images).to("cuda", dtype=torch.bfloat16)
-                    
-                    with torch.no_grad():
-                        # VAE encoding
-                        latents_batch = self.vae.encode(image_batch).latent_dist.sample() * 0.18215
+                        # Stack images for VAE (now guaranteed to be same size within bucket)
+                        image_batch = torch.stack(vae_images).to("cuda", dtype=torch.bfloat16)
+                        
+                        with torch.no_grad():
+                            # VAE encoding
+                            latents_batch = self.vae.encode(image_batch).latent_dist.sample() * 0.18215
 
-                        # Process text embeddings in batch
-                        text_inputs = self.tokenizer(
-                            captions,
-                            padding="max_length",
-                            max_length=self.tokenizer.model_max_length,
-                            truncation=True,
-                            return_tensors="pt"
-                        ).to("cuda")
-                        
-                        text_embeddings = self.text_encoder(text_inputs.input_ids)[0]
+                            # Process text embeddings in batch
+                            text_inputs = self.tokenizer(
+                                captions,
+                                padding="max_length",
+                                max_length=self.tokenizer.model_max_length,
+                                truncation=True,
+                                return_tensors="pt"
+                            ).to("cuda")
+                            
+                            text_embeddings = self.text_encoder(text_inputs.input_ids)[0]
 
-                        text_inputs_2 = self.tokenizer_2(
-                            captions,
-                            padding="max_length",
-                            max_length=self.tokenizer_2.model_max_length,
-                            truncation=True,
-                            return_tensors="pt"
-                        ).to("cuda")
-                        
-                        text_outputs_2 = self.text_encoder_2(text_inputs_2.input_ids)
-                        text_embeddings_2 = text_outputs_2.last_hidden_state
-                        pooled_text_embeddings_2 = text_outputs_2.pooler_output
+                            text_inputs_2 = self.tokenizer_2(
+                                captions,
+                                padding="max_length",
+                                max_length=self.tokenizer_2.model_max_length,
+                                truncation=True,
+                                return_tensors="pt"
+                            ).to("cuda")
+                            
+                            text_outputs_2 = self.text_encoder_2(text_inputs_2.input_ids)
+                            text_embeddings_2 = text_outputs_2.last_hidden_state
+                            pooled_text_embeddings_2 = text_outputs_2.pooler_output
 
-                        # CLIP processing with original images
-                        clip_inputs = self.clip_processor(
-                            images=clip_images,  # Use original images
-                            return_tensors="pt"
-                        ).to("cuda")
-                        clip_image_embeds = self.clip_model.get_image_features(**clip_inputs)
-                        
-                        # Process tags
-                        all_tags = [t.strip() for caption in captions for t in caption.split(',')]
-                        clip_text_inputs = self.clip_processor(
-                            text=all_tags,
-                            return_tensors="pt",
-                            padding=True,
-                            max_length=77,
-                            truncation=True
-                        ).to("cuda")
-                        clip_tag_embeds = self.clip_model.get_text_features(**clip_text_inputs)
+                            # CLIP processing with original images
+                            clip_inputs = self.clip_processor(
+                                images=clip_images,  # Use original images
+                                return_tensors="pt"
+                            ).to("cuda")
+                            clip_image_embeds = self.clip_model.get_image_features(**clip_inputs)
+                            
+                            # Process tags
+                            all_tags = [t.strip() for caption in captions for t in caption.split(',')]
+                            clip_text_inputs = self.clip_processor(
+                                text=all_tags,
+                                return_tensors="pt",
+                                padding=True,
+                                max_length=77,
+                                truncation=True
+                            ).to("cuda")
+                            clip_tag_embeds = self.clip_model.get_text_features(**clip_text_inputs)
 
-                    # Save individual files from batch
-                    for idx, (img_path, _) in enumerate(batch_files):
-                        cache_latents_path = self.cache_dir / f"{img_path.stem}_latents.pt"
-                        cache_embeddings_path = self.cache_dir / f"{img_path.stem}_embeddings.pt"
-                        
-                        # Save embeddings
-                        torch.save({
-                            "text_embeddings": text_embeddings[idx].cpu(),
-                            "text_embeddings_2": text_embeddings_2[idx].cpu(),
-                            "pooled_text_embeddings_2": pooled_text_embeddings_2[idx].cpu(),
-                            "clip_image_embed": clip_image_embeds[idx].cpu(),
-                            "clip_tag_embeds": clip_tag_embeds[idx].cpu(),
-                            "tags": all_tags[idx] if idx < len(all_tags) else []
-                        }, cache_embeddings_path)
-                        
-                        # Save latents
-                        torch.save(latents_batch[idx].cpu(), cache_latents_path)
+                        # Save individual files from batch
+                        for idx, (img_path, _) in enumerate(batch_files):
+                            cache_latents_path = self.cache_dir / f"{img_path.stem}_latents.pt"
+                            cache_embeddings_path = self.cache_dir / f"{img_path.stem}_embeddings.pt"
+                            
+                            # Save embeddings
+                            torch.save({
+                                "text_embeddings": text_embeddings[idx].cpu(),
+                                "text_embeddings_2": text_embeddings_2[idx].cpu(),
+                                "pooled_text_embeddings_2": pooled_text_embeddings_2[idx].cpu(),
+                                "clip_image_embed": clip_image_embeds[idx].cpu(),
+                                "clip_tag_embeds": clip_tag_embeds[idx].cpu(),
+                                "tags": all_tags[idx] if idx < len(all_tags) else []
+                            }, cache_embeddings_path)
+                            
+                            # Save latents
+                            torch.save(latents_batch[idx].cpu(), cache_latents_path)
 
-                    # Clear memory
-                    del image_batch, latents_batch, text_embeddings, text_embeddings_2
-                    del pooled_text_embeddings_2, clip_image_embeds, clip_tag_embeds
-                    torch.cuda.empty_cache()
+                        # Clear memory
+                        del image_batch, latents_batch, text_embeddings, text_embeddings_2
+                        del pooled_text_embeddings_2, clip_image_embeds, clip_tag_embeds
+                        torch.cuda.empty_cache()
 
             # Move models back to CPU
             self.vae.to("cpu")
