@@ -196,66 +196,20 @@ def setup_wandb(args):
         wandb.define_metric("noise/*", summary="mean")
         wandb.define_metric("lr/*", summary="last")
         
-        # Create custom charts
-        wandb.run.log({
-            "Loss Curves": wandb.plot.line_series(
-                xs=[],
-                ys=[],
-                keys=["loss/current", "loss/average", "loss/running"],
-                title="Training Loss",
-                xname="Step"
-            ),
-            "Learning Rates": wandb.plot.line_series(
-                xs=[],
-                ys=[],
-                keys=["lr/textencoder", "lr/unet"],
-                title="Learning Rate Schedule",
-                xname="Step"
-            ),
-            "MSE Components": wandb.plot.line_series(
-                xs=[],
-                ys=[],
-                keys=["loss/mse_mean", "loss/mse_std"],
-                title="MSE Loss Components",
-                xname="Step"
-            ),
-            "SNR Metrics": wandb.plot.line_series(
-                xs=[],
-                ys=[],
-                keys=["loss/snr_mean", "loss/min_snr_gamma_mean"],
-                title="SNR Metrics",
-                xname="Step"
-            ),
-            "Model Statistics": wandb.plot.line_series(
-                xs=[],
-                ys=[],
-                keys=["model/v_pred_std", "model/v_target_std", "model/alpha_t_mean"],
-                title="Model Statistics",
-                xname="Step"
-            ),
-            "Noise Statistics": wandb.plot.line_series(
-                xs=[],
-                ys=[],
-                keys=["noise/sigma_mean", "noise/x_t_std"],
-                title="Noise Statistics",
-                xname="Step"
-            )
-        })
-        
-        # Configure chart layouts
+        # Create custom layout configuration
         wandb.run.log_config({
             "layouts": {
                 "Training Progress": {
-                    "Loss Curves": {"type": "plot", "size": 8},
-                    "Learning Rates": {"type": "plot", "size": 8},
+                    "loss": {"type": "line", "x": "step", "y": ["loss/current", "loss/average", "loss/running"]},
+                    "learning_rate": {"type": "line", "x": "step", "y": ["lr/textencoder", "lr/unet"]},
                 },
                 "Loss Components": {
-                    "MSE Components": {"type": "plot", "size": 6},
-                    "SNR Metrics": {"type": "plot", "size": 6},
+                    "mse": {"type": "line", "x": "step", "y": ["loss/mse_mean", "loss/mse_std"]},
+                    "snr": {"type": "line", "x": "step", "y": ["loss/snr_mean", "loss/min_snr_gamma_mean"]},
                 },
                 "Model Metrics": {
-                    "Model Statistics": {"type": "plot", "size": 6},
-                    "Noise Statistics": {"type": "plot", "size": 6},
+                    "model_stats": {"type": "line", "x": "step", "y": ["model/v_pred_std", "model/v_target_std", "model/alpha_t_mean"]},
+                    "noise_stats": {"type": "line", "x": "step", "y": ["noise/sigma_mean", "noise/x_t_std"]},
                 }
             }
         })
