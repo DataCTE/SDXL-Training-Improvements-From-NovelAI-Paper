@@ -39,6 +39,8 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument("--warmup_steps", type=int, default=0,
+                       help="Number of steps for scheduler warm up")
     
     # Data arguments
     parser.add_argument("--data_dir", type=str, required=True)

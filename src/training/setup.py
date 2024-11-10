@@ -72,9 +72,9 @@ def setup_training(args, models, device, dtype):
         num_training_steps = args.num_epochs * num_update_steps_per_epoch
         
         # Initialize learning rate scheduler
-        logger.info("Setting up learning rate scheduler...")
+        logger.info("Setting up cosine learning rate scheduler...")
         lr_scheduler = get_scheduler(
-            args.lr_scheduler,
+            "cosine",
             optimizer=optimizer,
             num_warmup_steps=args.warmup_steps,
             num_training_steps=num_training_steps
