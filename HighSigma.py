@@ -1028,17 +1028,13 @@ def main(args):
                 # Convert inputs to correct dtype (bfloat16)
                 latents = batch["latents"].to(device).to(dtype=torch.bfloat16)
                 text_embeddings = batch["text_embeddings"].to(device).to(dtype=torch.bfloat16)
-                text_embeddings_2 = batch["text_embeddings_2"].to(device).to(dtype=torch.bfloat16)
                 pooled_text_embeddings_2 = batch["pooled_text_embeddings_2"].to(device).to(dtype=torch.bfloat16)
-                target_size = batch["target_size"]
 
                 # Use autocast for mixed precision
                 with torch.amp.autocast('cuda', dtype=dtype):
                     sigmas = get_sigmas(args.num_inference_steps).to(device)
                     sigma = sigmas[step % args.num_inference_steps]
                     sigma = sigma.expand(latents.size(0))
-
-                    timestep = torch.ones(latents.shape[0], device=device).long() * (step % args.num_inference_steps)
 
                     loss, loss_metrics = training_loss_v_prediction(
                         unet,
@@ -1054,7 +1050,7 @@ def main(args):
                                 1024,  # Target width
                                 0,    # Crop top
                                 0,    # Crop left
-                            ], device=device, dtype=torch.bfloat16)
+                            ], device=device, dtype=torch.bfloat16).repeat(latents.shape[0], 1)  # Expand for batch
                         }
                     )
                     
