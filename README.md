@@ -12,9 +12,11 @@ Most SDXL implementations use a maximum noise deviation (σ_max) of 14.6 [meanin
 - [x] High-resolution coherence enhancements
 - [x] VAE improvements
 - [x] Tag-based CLIP weighting
+- [ ] functional detailed wandb logging
 
 - [ ] 10k dataset proof of concept (in testing)
 - [ ] 200k+ dataset finetune (planned)
+- [ ] 12M million dataset finetune (planned)
 
 ## Technical Implementation
 
