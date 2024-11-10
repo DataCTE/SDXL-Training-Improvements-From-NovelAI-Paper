@@ -208,58 +208,92 @@ def train(args, models, train_components, device, dtype):
     
     logger.info("\n=== Starting Training ===")
     
-    for epoch in range(args.num_epochs):
-        logger.info(f"\nEpoch {epoch+1}/{args.num_epochs}")
+    try:    
+        for epoch in range(args.num_epochs):
+            logger.info(f"\nEpoch {epoch+1}/{args.num_epochs}")
         
-        # Train one epoch
-        epoch_metrics, global_step = train_one_epoch(
-            unet=unet,
-            train_dataloader=train_dataloader,
-            optimizer=optimizer,
-            lr_scheduler=lr_scheduler,
-            ema_model=ema_model,
-            validator=validator,
-            tag_weighter=tag_weighter,
-            vae_finetuner=vae_finetuner,
-            args=args,
-            device=device,
-            dtype=dtype,
-            epoch=epoch,
-            global_step=global_step
-        )
-        
-        # Log epoch metrics
-        avg_loss = epoch_metrics['loss/total'] / len(train_dataloader)
-        logger.info(f"Epoch {epoch+1} - Average loss: {avg_loss:.4f}")
-        
-        # Update training history
-        training_history['epoch_losses'].append(avg_loss)
-        training_history['learning_rates'].append(lr_scheduler.get_last_lr()[0])
-        
-        # Run validation
-        if not args.skip_validation and (epoch + 1) % args.validation_frequency == 0:
-            logger.info("Running validation...")
-            validation_metrics = validator.run_paper_validation(args.validation_prompts)
-            training_history['validation_scores'].append(validation_metrics)
+            # Train one epoch
+            epoch_metrics, global_step = train_one_epoch(
+                unet=unet,
+                train_dataloader=train_dataloader,
+                optimizer=optimizer,
+                lr_scheduler=lr_scheduler,
+                ema_model=ema_model,
+                validator=validator,
+                tag_weighter=tag_weighter,
+                vae_finetuner=vae_finetuner,
+                args=args,
+                device=device,
+                dtype=dtype,
+                epoch=epoch,
+                global_step=global_step
+            )
             
-            if args.use_wandb:
-                wandb.log({
-                    'validation': validation_metrics,
-                    'epoch': epoch + 1
-                }, step=global_step)
+            # Log epoch metrics
+            avg_loss = epoch_metrics['loss/total'] / len(train_dataloader)
+            logger.info(f"Epoch {epoch+1} - Average loss: {avg_loss:.4f}")
+            
+            # Update training history
+            training_history['epoch_losses'].append(avg_loss)
+            training_history['learning_rates'].append(lr_scheduler.get_last_lr()[0])
+            
+            # Run validation
+            if not args.skip_validation and (epoch + 1) % args.validation_frequency == 0:
+                logger.info("Running validation...")
+                validation_metrics = validator.run_paper_validation(args.validation_prompts)
+                training_history['validation_scores'].append(validation_metrics)
+                
+                if args.use_wandb:
+                    wandb.log({
+                        'validation': validation_metrics,
+                        'epoch': epoch + 1
+                    }, step=global_step)
+            
+            
+            # Regular checkpoint saving during training
+            if args.save_checkpoints and (epoch + 1) % args.save_epochs == 0:
+                logger.info("Saving checkpoint...")
+                save_checkpoint(
+                    models=models,
+                    train_components=train_components,
+                    args=args,
+                    epoch=epoch,
+                    training_history=training_history,
+                    output_dir=args.output_dir
+                )
+            
+            # Always save final checkpoint
+            logger.info("Saving final checkpoint...")
+            save_checkpoint(
+                models=models,
+                train_components=train_components,
+                args=args,
+                epoch=args.num_epochs - 1,
+                training_history=training_history,
+                output_dir=args.output_dir,
+                is_final=True  # Optional flag to indicate final checkpoint
+            )
+            
+            logger.info("\n=== Training Complete ===")
+            return training_history
         
-        # Save checkpoint
-        if args.save_checkpoints and (epoch + 1) % args.save_epochs == 0:
-            logger.info("Saving checkpoint...")
+    except Exception as e:
+        # Save checkpoint even if training fails
+        logger.error(f"Training failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        
+        logger.info("Attempting to save checkpoint after failure...")
+        try:
             save_checkpoint(
                 models=models,
                 train_components=train_components,
                 args=args,
                 epoch=epoch,
                 training_history=training_history,
-                output_dir=args.output_dir
+                output_dir=args.output_dir,
+                is_final=True
             )
-    
-    logger.info("\n=== Training Complete ===")
-    return training_history
-
+        except Exception as save_error:
+            logger.error(f"Failed to save checkpoint after training error: {str(save_error)}")
+        
+        raise  # Re-raise the original training error
