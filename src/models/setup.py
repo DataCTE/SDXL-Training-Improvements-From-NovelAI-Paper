@@ -179,10 +179,10 @@ def _setup_reward_models(device, dtype):
             if not isinstance(model, BaseRewardModel):
                 raise TypeError(f"Invalid reward model type for {name}")
                 
-            # Check device
+            # Check device - compare device types instead of exact string match
             model_device = next(model.parameters()).device
-            if model_device != device:
-                raise ValueError(f"Reward model {name} on wrong device: {model_device} vs {device}")
+            if model_device.type != device.type:
+                raise ValueError(f"Reward model {name} on wrong device type: {model_device.type} vs {device.type}")
                 
             # Check dtype if specified
             if dtype in [torch.float16, torch.bfloat16]:
