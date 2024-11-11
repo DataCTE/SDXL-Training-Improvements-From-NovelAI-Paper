@@ -49,15 +49,25 @@ Most SDXL implementations use a maximum noise deviation (σ_max) of 14.6 [meanin
   - Dynamic normalization
 
 ### 4. IterComp Composition-Aware Learning
-- **Model Gallery**: Aggregates preferences from 6 powerful models
+- **Model Gallery**: Aggregates preferences from 6 powerful models:
+  - FLUX-dev
+  - Stable Diffusion 3
+  - SDXL
+  - Stable Diffusion 1.5
+  - RPG
+  - InstanceDiffusion
 - **Compositional Metrics**:
-  - Attribute binding
+  - Attribute binding (color, shape, texture)
   - Spatial relationships
   - Non-spatial relationships
 - **Iterative Feedback**:
-  - Progressive self-refinement
-  - Multi-aspect reward models
-  - Closed-loop optimization
+  - Progressive self-refinement over multiple iterations
+  - Multi-aspect reward models for comprehensive guidance
+  - Closed-loop optimization between base model and reward models
+- **Benefits**:
+  - 47% fewer compositional errors
+  - 31% better spatial awareness
+  - 5.63s/img inference time (vs 23.02s for FLUX-dev)
 
 ## Quick Start
 
@@ -165,6 +175,13 @@ Apache 2.0
   title={Improvements to SDXL in NovelAI Diffusion V3},
   author={Ossa, Juan and Doğan, Eren and Birch, Alex and Johnson, F.},
   journal={arXiv preprint arXiv:2409.15997v2},
+  year={2024}
+}
+
+@article{zhang2024itercomp,
+  title={IterComp: Iterative Composition-Aware Feedback Learning from Model Gallery for Text-to-Image Generation},
+  author={Zhang, Xinchen and Yang, Ling and Li, Guohao and Cai, Yaqi and Xie, Jiake and Tang, Yong and Yang, Yujiu and Wang, Mengdi and Cui, Bin},
+  journal={arXiv preprint arXiv:2410.07171v1},
   year={2024}
 }
 ```
