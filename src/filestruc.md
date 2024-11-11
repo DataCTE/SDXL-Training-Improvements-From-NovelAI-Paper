@@ -1,7 +1,7 @@
 # Project Structure Documentation
 
 ## Overview
-This project implements a Stable Diffusion XL training pipeline with Zero Terminal SNR (ZTSNR), high-resolution coherence enhancements, and VAE improvements from NovelAI research.
+This project implements a Stable Diffusion XL training pipeline with Zero Terminal SNR (ZTSNR), high-resolution coherence enhancements, VAE improvements from NovelAI research, and IterComp composition-aware feedback learning.
 
 ## Directory Structure
 
@@ -14,12 +14,17 @@ src/
 │   ├── model_validator.py   # ZTSNR validation and testing
 │   ├── setup.py            # High-sigma model configuration
 │   ├── tag_weighter.py     # CLIP-based loss weighting
-│   └── vae_finetuner.py    # Adaptive VAE fine-tuning
+│   ├── vae_finetuner.py    # Adaptive VAE fine-tuning
+│   └── reward_models/      # IterComp reward models
+│       ├── attribute.py    # Attribute binding reward
+│       ├── spatial.py      # Spatial relationship reward
+│       └── nonspatial.py   # Non-spatial relationship reward
 │
 ├── training/
 │   ├── loss.py             # ZTSNR loss implementation
 │   ├── setup.py            # Training configuration
 │   ├── trainer.py          # Main training loop
+│   ├── ema.py             # EMA model implementation
 │   └── utils.py            # Training utilities
 │
 ├── utils/
@@ -71,6 +76,14 @@ src/
   - Memory-efficient attention
   - Real-time stability monitoring
 
+- `reward_models/`: IterComp reward models
+  - Attribute binding assessment
+  - Spatial relationship validation
+  - Non-spatial relationship evaluation
+  - Progressive self-refinement
+  - Multi-aspect composition scoring
+  - Model gallery preference learning
+
 ### Training Module
 - `loss.py`: Advanced loss calculations
   - ZTSNR loss implementation
@@ -92,6 +105,11 @@ src/
   - Automatic validation
   - Statistics tracking
   - Emergency checkpointing
+
+- `ema.py`: EMA model implementation
+  - Exponential Moving Average (EMA) model implementation
+  - Model averaging for improved stability
+  - Gradient checkpointing for efficient memory usage
 
 - `utils.py`: Training utilities
   - Memory monitoring
