@@ -103,9 +103,9 @@ def train_one_epoch(
                         added_cond_kwargs=added_cond_kwargs
                     )
                     
-                    if torch.isnan(loss) or torch.isinf(loss) or loss > 1e5:
-                        logger.warning(f"Skipping batch due to unstable loss: {loss.item()}")
-                        continue
+                    # Skip batch if loss was unstable
+                    if loss is None:
+                        continue  # This continue is valid as we're in the training loop
                     
                     loss = loss / args.gradient_accumulation_steps
                 
