@@ -131,8 +131,8 @@ def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kw
         noise = torch.randn_like(x_0)
         noise = noise / (noise.norm(p=2, dim=(1,2,3), keepdim=True) + 1e-5)
         
-        # Get scaling factors
-        c_skip, c_out, c_in = v_prediction_scaling_factors(sigma, sigma_data)
+        # Get scaling factors (we'll only use c_out and c_in)
+        _, c_out, c_in = v_prediction_scaling_factors(sigma, sigma_data)
         
         # Add noise to input
         x_t = x_0 + noise * sigma.view(-1, 1, 1, 1)
@@ -148,8 +148,8 @@ def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kw
         # Clamp predictions to prevent extreme values
         v_pred = torch.clamp(v_pred, -10.0, 10.0)
         
-        # Scale output and compute target using all scaling factors
-        scaled_output = c_skip.view(-1, 1, 1, 1) * x_t + c_out.view(-1, 1, 1, 1) * v_pred 
+        # Scale output and compute target (without skip connection)
+        scaled_output = c_out.view(-1, 1, 1, 1) * v_pred 
         v_target = c_in.view(-1, 1, 1, 1) * noise
 
         # Modified SNR weighting with paper-specified values
