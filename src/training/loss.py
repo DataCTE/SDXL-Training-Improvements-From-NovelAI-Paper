@@ -127,15 +127,14 @@ def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kw
             sigma_max = 20000.0 * scale_factor  # Using practical ZTSNR approximation
             sigma = sigma * (sigma_max / 20000.0)
         
-        # Generate and normalize noise
+        # Generate noise without normalization
         noise = torch.randn_like(x_0)
-        noise = noise / (noise.norm(p=2, dim=(1,2,3), keepdim=True) + 1e-5)
+        
+        # Add noise to input (using unnormalized noise)
+        x_t = x_0 + noise * sigma.view(-1, 1, 1, 1)
         
         # Get scaling factors (we'll only use c_out and c_in)
         _, c_out, c_in = v_prediction_scaling_factors(sigma, sigma_data)
-        
-        # Add noise to input
-        x_t = x_0 + noise * sigma.view(-1, 1, 1, 1)
         
         # Get model prediction
         v_pred = model(
@@ -148,7 +147,7 @@ def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kw
         # Clamp predictions to prevent extreme values
         v_pred = torch.clamp(v_pred, -10.0, 10.0)
         
-        # Scale output and compute target (without skip connection)
+        # Scale output and compute target (using unnormalized noise)
         scaled_output = c_out.view(-1, 1, 1, 1) * v_pred 
         v_target = c_in.view(-1, 1, 1, 1) * noise
 
