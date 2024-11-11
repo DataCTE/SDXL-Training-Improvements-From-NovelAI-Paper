@@ -10,7 +10,6 @@ from transformers import (
     DetrImageProcessor, 
     DetrForObjectDetection
 )
-from torch.nn import MLP
 from typing import Dict, Any, List, Union
 from PIL import Image
 import numpy as np
