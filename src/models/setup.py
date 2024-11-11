@@ -5,7 +5,12 @@ from diffusers import UNet2DConditionModel, AutoencoderKL
 from transformers import CLIPTokenizer, CLIPTextModel, CLIPModel
 from torch.optim.swa_utils import AveragedModel
 from models.model_validator import ModelValidator
-from models.reward_model import RewardModel
+from models.reward_model import (
+    AttributeBindingRewardModel,
+    SpatialRewardModel,
+    NonSpatialRewardModel,
+    BaseRewardModel
+)
 
 logger = logging.getLogger(__name__)
 
@@ -21,118 +26,176 @@ def setup_models(args, device, dtype):
     Returns:
         dict: Dictionary containing all model components
     """
-    logger.info("Setting up models...")
+    try:
+        # Validate device and dtype compatibility
+        if dtype == torch.float16 and not device.type == 'cuda':
+            raise ValueError("float16 precision requires CUDA device")
+            
+        # Clear CUDA cache if using GPU
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+            logger.info(f"GPU memory before model setup: {torch.cuda.memory_allocated()/1e9:.2f}GB")
+
+        models = {}
+        
+        # Setup core models with validation
+        models.update(_setup_core_models(args, device, dtype))
+        
+        # Setup EMA if enabled
+        if args.use_ema:
+            models["ema_model"] = _setup_ema_model(models["unet"], args)
+            
+        # Setup reward models if using IterComp
+        if args.use_itercomp:
+            models["reward_models"] = _setup_reward_models(device, dtype)
+            
+        # Verify model configuration
+        if not verify_models(models):
+            raise ValueError("Model verification failed")
+            
+        logger.info("Model setup completed successfully")
+        return models
+        
+    except Exception as e:
+        logger.error("Critical error during model setup")
+        logger.error(traceback.format_exc())
+        raise
+
+def _setup_core_models(args, device, dtype):
+    """Setup and validate core model components"""
+    models = {}
     
     try:
-        # Load UNet
-        logger.info("Loading UNet...")
-        unet = UNet2DConditionModel.from_pretrained(
+        # Setup UNet with memory optimization
+        logger.info("Setting up UNet...")
+        models["unet"] = UNet2DConditionModel.from_pretrained(
             args.model_path,
             subfolder="unet",
             torch_dtype=dtype
         ).to(device)
         
-        # Enable gradient checkpointing if requested
         if args.gradient_checkpointing:
-            unet.enable_gradient_checkpointing()
-        
-        # Compile model if requested
+            models["unet"].enable_gradient_checkpointing()
+            
         if args.enable_compile:
             logger.info(f"Compiling UNet with mode: {args.compile_mode}")
-            unet = torch.compile(
-                unet,
+            models["unet"] = torch.compile(
+                models["unet"],
                 mode=args.compile_mode,
                 fullgraph=True
             )
-        
-        # Load VAE
-        logger.info("Loading VAE...")
-        vae = AutoencoderKL.from_pretrained(
-            args.model_path,
-            subfolder="vae",
-            torch_dtype=dtype
-        ).to(device)
-        vae.requires_grad_(False)
-        vae.eval()
-        
-        # Load text encoders and tokenizers
-        logger.info("Loading text encoders and tokenizers...")
-        tokenizer = CLIPTokenizer.from_pretrained(
-            args.model_path,
-            subfolder="tokenizer"
-        )
-        tokenizer_2 = CLIPTokenizer.from_pretrained(
-            args.model_path,
-            subfolder="tokenizer_2"
-        )
-        text_encoder = CLIPTextModel.from_pretrained(
-            args.model_path,
-            subfolder="text_encoder",
-            torch_dtype=dtype
-        ).to(device)
-        text_encoder_2 = CLIPTextModel.from_pretrained(
-            args.model_path,
-            subfolder="text_encoder_2",
-            torch_dtype=dtype
-        ).to(device)
-        
-        # Freeze text encoders
-        text_encoder.requires_grad_(False)
-        text_encoder_2.requires_grad_(False)
-        text_encoder.eval()
-        text_encoder_2.eval()
-        
-        # Initialize EMA model if enabled
-        ema_model = None
-        if args.use_ema:
-            logger.info("Initializing EMA model...")
-            ema_model = AveragedModel(
-                unet,
-                avg_fn=lambda averaged_model_parameter, model_parameter, num_averaged: (
-                    args.ema_decay * averaged_model_parameter + 
-                    (1 - args.ema_decay) * model_parameter
-                )
-            )
-        
-        # Initialize model validator
-        logger.info("Initializing model validator...")
-        validator = ModelValidator(
-            unet,
-            vae,
-            tokenizer,
-            tokenizer_2,
-            text_encoder,
-            text_encoder_2,
-            device=device
-        )
-        
-        # Setup composition-aware reward models if enabled
-        if args.use_itercomp:
-            logger.info("Setting up composition-aware reward models...")
-            reward_models = {
-                "attribute_binding": setup_reward_model("attribute_binding", device, dtype),
-                "spatial_relationship": setup_reward_model("spatial_relationship", device, dtype),
-                "nonspatial_relationship": setup_reward_model("nonspatial_relationship", device, dtype)
-            }
-            validator.reward_models = reward_models
             
-        # Return all components
-        models = {
-            "unet": unet,
-            "vae": vae,
-            "tokenizer": tokenizer,
-            "tokenizer_2": tokenizer_2,
-            "text_encoder": text_encoder,
-            "text_encoder_2": text_encoder_2,
-            "validator": validator
-        }
+        # Setup VAE with automatic memory management
+        logger.info("Setting up VAE...")
+        with torch.cuda.amp.autocast(dtype=dtype):
+            models["vae"] = AutoencoderKL.from_pretrained(
+                args.model_path,
+                subfolder="vae",
+                torch_dtype=dtype
+            ).to(device)
+            models["vae"].requires_grad_(False)
+            models["vae"].eval()
+            
+        # Setup text encoders with shared memory allocation
+        logger.info("Setting up text encoders...")
+        models.update(_setup_text_encoders(args, device, dtype))
         
-        logger.info("Model setup completed successfully")
         return models
         
     except Exception as e:
-        logger.error(f"Error during model setup: {str(e)}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
+        logger.error(f"Error in core model setup: {str(e)}")
+        raise
+
+def _setup_text_encoders(args, device, dtype):
+    """Setup text encoders and tokenizers with shared memory"""
+    try:
+        models = {}
+        
+        # Load tokenizers
+        models["tokenizer"] = CLIPTokenizer.from_pretrained(
+            args.model_path,
+            subfolder="tokenizer"
+        )
+        models["tokenizer_2"] = CLIPTokenizer.from_pretrained(
+            args.model_path,
+            subfolder="tokenizer_2"
+        )
+        
+        # Load encoders with memory optimization
+        with torch.cuda.amp.autocast(dtype=dtype):
+            models["text_encoder"] = CLIPTextModel.from_pretrained(
+                args.model_path,
+                subfolder="text_encoder",
+                torch_dtype=dtype
+            ).to(device)
+            models["text_encoder_2"] = CLIPTextModel.from_pretrained(
+                args.model_path,
+                subfolder="text_encoder_2",
+                torch_dtype=dtype
+            ).to(device)
+            
+        # Freeze encoders
+        for encoder in ["text_encoder", "text_encoder_2"]:
+            models[encoder].requires_grad_(False)
+            models[encoder].eval()
+            
+        return models
+        
+    except Exception as e:
+        logger.error(f"Error in text encoder setup: {str(e)}")
+        raise
+
+def _setup_reward_models(device, dtype):
+    """
+    Setup composition-aware reward models with validation
+    
+    Args:
+        device: Target device for models
+        dtype: Model precision
+        
+    Returns:
+        dict: Dictionary of reward models for different compositional aspects
+    """
+    try:
+        logger.info("Setting up reward models...")
+        
+        # Initialize reward models for different aspects
+        reward_models = {
+            "attribute": AttributeBindingRewardModel(
+                clip_feature_dim=768  # CLIP feature dimension
+            ).to(device).to(dtype),
+            
+            "spatial": SpatialRewardModel(
+                detr_feature_dim=256  # DETR feature dimension
+            ).to(device).to(dtype),
+            
+            "non_spatial": NonSpatialRewardModel(
+                clip_dim=768,  # CLIP feature dimension
+                detr_dim=256   # DETR feature dimension
+            ).to(device).to(dtype)
+        }
+        
+        # Set all models to eval mode and disable gradients initially
+        for name, model in reward_models.items():
+            model.eval()
+            model.requires_grad_(False)
+            logger.debug(f"Initialized {name} reward model")
+            
+        # Validate model configurations
+        for name, model in reward_models.items():
+            if not isinstance(model, BaseRewardModel):
+                raise TypeError(f"Invalid reward model type for {name}")
+            if next(model.parameters()).device != device:
+                raise ValueError(f"Reward model {name} on wrong device")
+            if next(model.parameters()).dtype != dtype:
+                raise ValueError(f"Reward model {name} has wrong dtype")
+                
+        logger.info("Successfully set up all reward models")
+        return reward_models
+        
+    except Exception as e:
+        logger.error("Failed to setup reward models")
+        logger.error(traceback.format_exc())
         raise
 
 def verify_models(models):
@@ -176,13 +239,41 @@ def verify_models(models):
         logger.error(f"Model verification failed: {str(e)}")
         return False
 
-def setup_reward_model(reward_type, device, dtype):
-    """Setup individual composition-aware reward model"""
-    # Initialize BLIP feature extractor and MLP head
-    model = RewardModel(
-        feature_extractor=setup_blip_extractor(device, dtype),
-        mlp_head=setup_reward_head(device, dtype)
-    ).to(device)
-    model.requires_grad_(False)
-    model.eval()
-    return model
+def _setup_ema_model(unet, args):
+    """
+    Setup Exponential Moving Average (EMA) model
+    
+    Args:
+        unet: Base UNet model to create EMA from
+        args: Training arguments containing EMA configuration
+        
+    Returns:
+        EMAModel: Configured EMA model wrapper
+    """
+    try:
+        logger.info("Setting up EMA model...")
+        
+        # Validate EMA decay rate
+        if not 0.0 <= args.ema_decay <= 1.0:
+            raise ValueError(f"Invalid EMA decay rate: {args.ema_decay}. Must be between 0 and 1")
+            
+        # Create EMA model
+        ema_model = AveragedModel(
+            unet,
+            avg_fn=lambda averaged_model_parameter, model_parameter, num_averaged: (
+                args.ema_decay * averaged_model_parameter + 
+                (1 - args.ema_decay) * model_parameter
+            )
+        )
+        
+        # Copy current model weights
+        for param in ema_model.parameters():
+            param.requires_grad_(False)
+            
+        logger.info(f"EMA model initialized with decay rate: {args.ema_decay}")
+        return ema_model
+        
+    except Exception as e:
+        logger.error("Failed to setup EMA model")
+        logger.error(traceback.format_exc())
+        raise
