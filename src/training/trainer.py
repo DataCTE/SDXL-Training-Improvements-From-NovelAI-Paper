@@ -81,6 +81,11 @@ def train_one_epoch(
                     added_cond_kwargs=added_cond_kwargs
                 )
                 
+                # Skip batch if loss function returned None
+                if loss is None:
+                    logger.debug("Skipping batch due to invalid aspect ratio")
+                    continue
+                
                 logger.debug(f"Raw loss: {loss.item():.6f}")
                 loss = loss / args.gradient_accumulation_steps
                 logger.debug(f"Loss after accumulation scaling: {loss.item():.6f}")

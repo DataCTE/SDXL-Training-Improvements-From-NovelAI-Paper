@@ -96,13 +96,16 @@ def training_loss_v_prediction(
         # Calculate total pixels in latent space
         total_pixels = height * width
         
-        # Validate aspect ratio is within supported range
+        # Check aspect ratio but don't raise error
         aspect_ratio = width / height
         if aspect_ratio < 0.25 or aspect_ratio > 4.0:  # Values from SDXL paper
-            raise ValueError(
-                f"Aspect ratio ({aspect_ratio:.2f}) outside supported range (0.25 to 4.0)"
+            logger.warning(
+                f"Batch contains latents with aspect ratio ({aspect_ratio:.2f}) "
+                "outside supported range (0.25 to 4.0). Skipping batch."
             )
-            
+            # Return None to indicate batch should be skipped
+            return None, None
+        
         # Validate text embedding context dimension (SDXL requirement)
         if text_embeddings.shape[-1] != 2048:
             raise ValueError(
