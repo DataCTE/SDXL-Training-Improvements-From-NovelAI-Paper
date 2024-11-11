@@ -7,8 +7,12 @@ from pathlib import Path
 import time
 from PIL import Image
 import numpy as np
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).parent.parent))
 from training.loss import get_sigmas, v_prediction_scaling_factors
 import traceback
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -115,8 +119,11 @@ def encode_prompt(prompt, tokenizer, tokenizer_2, text_encoder, text_encoder_2, 
         pooled_text_embeddings_2 = text_embeddings_2[1]
         text_embeddings_2 = text_embeddings_2[0]
     
-    # Concatenate embeddings
+    # Concatenate embeddings - verify dimensions
+    print(f"Text embeddings 1 shape: {text_embeddings.shape}")  # Should be [batch_size, seq_len, 768]
+    print(f"Text embeddings 2 shape: {text_embeddings_2.shape}")  # Should be [batch_size, seq_len, 1280]
     text_embeddings = torch.cat([text_embeddings, text_embeddings_2], dim=-1)
+    print(f"Combined embeddings shape: {text_embeddings.shape}")  # Should be [batch_size, seq_len, 2048]
     
     return text_embeddings, pooled_text_embeddings_2
 
@@ -124,13 +131,15 @@ def load_models(model_path, dtype):
     """Load all required models"""
     logger.info("Loading models...")
     
-    # Load UNet
+    # Load UNet with proper config
     unet = UNet2DConditionModel.from_pretrained(
         f"{model_path}/unet",
         torch_dtype=dtype,
         use_safetensors=True
     ).to("cuda")
-    unet.eval()
+    
+    # Print UNet config for debugging
+    print("UNet config:", unet.config)
     
     # Load VAE
     vae = AutoencoderKL.from_pretrained(
@@ -165,8 +174,48 @@ def load_models(model_path, dtype):
         "tokenizer_2": tokenizer_2
     }
 
+def get_timestep_embedding(timesteps, embedding_dim, max_period=10000):
+    """
+    Create sinusoidal timestep embeddings.
+    """
+    half = embedding_dim // 2
+    freqs = torch.exp(
+        -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=timesteps.device) / half
+    )
+    
+    # Reshape for broadcasting
+    args = timesteps[:, None].float() * freqs[None, :]
+    
+    # Create embeddings
+    embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+    
+    # Handle odd embedding dimensions
+    if embedding_dim % 2:
+        embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+    
+    return embedding
+
+def create_time_ids(args, device, dtype):
+    # Create tensor with correct shape [batch_size, 6]
+    add_time_ids = torch.zeros((1, 6), device=device, dtype=dtype)
+    
+    # Fill in the values according to SDXL's requirements
+    add_time_ids[0] = torch.tensor([
+        args.width,   # Original width
+        args.height,  # Original height
+        args.width,   # Target width
+        args.height,  # Target height
+        0,           # Crop coordinates
+        0,           # Crop coordinates
+    ], device=device, dtype=dtype)
+    
+    # Handle classifier-free guidance
+    if args.guidance_scale > 1.0:
+        add_time_ids = add_time_ids.repeat(2, 1)  # Shape: [2, 6]
+    
+    return add_time_ids
+
 def generate_images(models, args):
-    """Generate images using v-prediction"""
     device = "cuda"
     dtype = torch.float16 if args.use_fp16 else torch.float32
     
@@ -178,12 +227,10 @@ def generate_images(models, args):
     if args.seed is not None:
         torch.manual_seed(args.seed)
     
-    # Get sigmas for inference
-    sigmas = get_sigmas(
-        num_inference_steps=args.num_inference_steps,
-        height=args.height,
-        width=args.width
-    ).to(device)
+    # Get sigmas for sampling
+    sigmas = get_sigmas(args.num_inference_steps)
+    sigmas = sigmas.to(device=device, dtype=dtype)
+    sigmas = sigmas.flip(0)
     
     # Encode prompts
     text_embeddings, pooled_text_embeddings_2 = encode_prompt(
@@ -209,33 +256,31 @@ def generate_images(models, args):
         pooled_text_embeddings_2 = torch.cat([uncond_pooled, pooled_text_embeddings_2])
     
     # Create time embeddings
-    time_ids = torch.tensor(
-        [1024, 1024, 1024, 1024, 0, 0],
-        device=device,
-        dtype=dtype
-    ).repeat(args.num_images * (2 if args.guidance_scale > 1.0 else 1), 1)
+    time_ids = create_time_ids(args, device, dtype)
     
-    # Prepare for generation
-    latents_shape = (args.num_images, 4, args.height // 8, args.width // 8)
-    
-    for i in range(args.num_images):
-        start_time = time.time()
+    # Generate multiple images
+    start_time = time.time()
+    for img_idx in range(args.num_images):
+        # Initialize latents
+        latents = torch.randn(
+            (1, 4, args.height // 8, args.width // 8),
+            device=device,
+            dtype=dtype
+        )
         
-        # Initialize random latents
-        latents = torch.randn(latents_shape, device=device, dtype=dtype)
+        if args.guidance_scale > 1.0:
+            latents = latents.repeat(2, 1, 1, 1)
         
-        # Denoise latents
-        for _, sigma in enumerate(sigmas):
-            # Get scaling factors
-            c_skip, c_out, c_in = v_prediction_scaling_factors(sigma)
+        # Denoising loop
+        for step_idx, sigma in enumerate(sigmas):
+            c_in = 1 / (sigma ** 2 + 1).sqrt()
+            c_out = -sigma / (sigma ** 2 + 1).sqrt()
             
-            # Prepare network input
-            latent_input = c_in * latents
+            latent_model_input = c_in * latents
             
-            # Get model prediction
             with torch.no_grad():
                 noise_pred = models["unet"](
-                    latent_input,
+                    latent_model_input,
                     sigma,
                     encoder_hidden_states=text_embeddings,
                     added_cond_kwargs={
@@ -244,37 +289,39 @@ def generate_images(models, args):
                     }
                 ).sample
             
-            # Handle classifier-free guidance
             if args.guidance_scale > 1.0:
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                 noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_text - noise_pred_uncond)
+                # Take only the text conditional latents, not the unconditional ones
+                latents = latents[:1]
             
-            # Update latents
-            latents = c_skip * latents + c_out * noise_pred
+            latents = c_out * latents - c_in * noise_pred
+            
+            if step_idx % 5 == 0:
+                print(f"Step {step_idx}")
+                print(f"  Sigma: {sigma:.3f}")
+                print(f"  Latents range: {latents.min():.3f} to {latents.max():.3f}")
+                print(f"  Model input range: {latent_model_input.min():.3f} to {latent_model_input.max():.3f}")
+                print(f"  Noise pred range: {noise_pred.min():.3f} to {noise_pred.max():.3f}")
         
-        # Decode latents using VAE
+        # Decode the final latents
         with torch.no_grad():
-            # Scale latents according to VAE scaling factor
-            latents = 1 / 0.18215 * latents
-            
-            # Decode latents to image tensors
-            images = models["vae"].decode(latents).sample
+            latents = 1 / 0.13025 * latents
+            decoded = models["vae"].decode(latents).sample
+            images = (decoded / 2 + 0.5).clamp(0, 1)
+            images = images.cpu().permute(0, 2, 3, 1).float().numpy()
+            images = (images * 255).round().astype("uint8")
+            pil_images = [Image.fromarray(image) for image in images]
         
-        # Convert to PIL images
-        images = (images / 2 + 0.5).clamp(0, 1)
-        images = images.cpu().permute(0, 2, 3, 1).numpy()
-        images = (images * 255).round().astype("uint8")
-        pil_images = [Image.fromarray(image) for image in images]
-        
-        # Save images
+        # Save the images
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         for j, image in enumerate(pil_images):
-            image_path = output_dir / f"generation_{timestamp}_{i}_{j}.png"
+            image_path = output_dir / f"generation_{timestamp}_{img_idx}_{j}.png"
             image.save(image_path)
             logger.info(f"Saved image to {image_path}")
         
         generation_time = time.time() - start_time
-        logger.info(f"Generated image {i+1}/{args.num_images} in {generation_time:.2f}s")
+        logger.info(f"Generated image {img_idx+1}/{args.num_images} in {generation_time:.2f}s")
 
 def main():
     args = parse_args()
