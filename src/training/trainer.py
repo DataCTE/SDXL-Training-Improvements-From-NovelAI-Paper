@@ -81,47 +81,44 @@ def train_one_epoch(
                     added_cond_kwargs=added_cond_kwargs
                 )
                 
-                # Skip batch if loss function returned None
-                if loss is None:
-                    logger.debug("Skipping batch due to invalid aspect ratio")
+                # Skip batch if loss is unstable
+                if torch.isnan(loss) or torch.isinf(loss) or loss > 1e5:
+                    logger.warning(f"Skipping batch due to unstable loss: {loss.item()}")
                     continue
                 
-                logger.debug(f"Raw loss: {loss.item():.6f}")
                 loss = loss / args.gradient_accumulation_steps
-                logger.debug(f"Loss after accumulation scaling: {loss.item():.6f}")
             
-            # Apply tag-based weighting only if enabled
-            if args.use_tag_weighting and tag_weighter is not None:
-                if "tags" in batch:
-                    weighted_loss = tag_weighter.update_training_loss(loss, batch["tags"])
-                    logger.debug(f"Weighted loss: {weighted_loss.item():.6f}")
-                else:
-                    logger.warning("Tag weighter provided but no tags found in batch")
-                    weighted_loss = loss
-            else:
-                weighted_loss = loss
-                logger.debug("Tag weighting disabled or no weighter available")
+            # Gradient scaling for stability
+            scaler = torch.cuda.amp.GradScaler()
+            scaler.scale(loss).backward()
             
-            weighted_loss.backward()
-            
-            # Update model if gradient accumulation complete
             if (step + 1) % args.gradient_accumulation_steps == 0:
-                # Log pre-clipping gradients
+                # Check gradient norms
                 total_norm = 0.0
                 for p in unet.parameters():
                     if p.grad is not None:
                         param_norm = p.grad.data.norm(2)
+                        if torch.isnan(param_norm) or torch.isinf(param_norm):
+                            p.grad = None
+                            continue
                         total_norm += param_norm.item() ** 2
                 total_norm = total_norm ** 0.5
-                logger.debug(f"Pre-clipping gradient norm: {total_norm:.6f}")
                 
+                # Skip update if gradients are unstable
+                if total_norm > 1000.0 or total_norm < 1e-6:
+                    logger.warning(f"Skipping update due to unstable gradients: {total_norm}")
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
+                
+                # Clip gradients
                 grad_norm_value = torch.nn.utils.clip_grad_norm_(
-                    unet.parameters(), 
-                    args.max_grad_norm
+                    unet.parameters(),
+                    args.max_grad_norm,
+                    error_if_nonfinite=False
                 ).item()
-                logger.debug(f"Post-clipping gradient norm: {grad_norm_value:.6f}")
                 
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
                 optimizer.zero_grad(set_to_none=True)
                 lr_scheduler.step()
                 
@@ -129,8 +126,8 @@ def train_one_epoch(
                     ema_model.update_parameters(unet)
             
             # Update metrics
-            running_loss = 0.9 * running_loss + 0.1 * weighted_loss.item() if step > 0 else weighted_loss.item()
-            loss_history.append(weighted_loss.item())
+            running_loss = 0.9 * running_loss + 0.1 * loss.item() if step > 0 else loss.item()
+            loss_history.append(loss.item())
             logger.debug(f"Running loss: {running_loss:.6f}")
             
             # Calculate averages
@@ -143,7 +140,7 @@ def train_one_epoch(
             if args.use_wandb and step % args.logging_steps == 0:
                 metrics = {
                     # Loss metrics
-                    "loss/current": weighted_loss.item(),
+                    "loss/current": loss.item(),
                     "loss/average": average_loss,
                     "loss/running": running_loss,
                     

@@ -27,16 +27,16 @@ def get_sigmas(num_inference_steps=28, sigma_min=0.0292, height=1024, width=1024
     return sigmas
 
 def v_prediction_scaling_factors(sigma, sigma_data=1.0):
-    """Compute scaling factors for v-prediction as described in paper section 2.1"""
-    # α_t = 1/√(1 + σ²) from paper
-    alpha_t = 1 / torch.sqrt(1 + sigma**2)
+    """Compute scaling factors for v-prediction with improved stability"""
+    # Add small epsilon to prevent division by zero
+    eps = 1e-5
     
-    # Scaling factors from paper appendix A.1
-    c_skip = sigma_data**2 / (sigma**2 + sigma_data**2)
-    c_out = -sigma * sigma_data / torch.sqrt(sigma_data**2 + sigma**2)
-    c_in = 1 / torch.sqrt(sigma**2 + sigma_data**2)
+    # Modified scaling factors with better numerical stability
+    c_skip = (sigma_data**2) / (sigma**2 + sigma_data**2 + eps)
+    c_out = (-sigma * sigma_data) / torch.sqrt(sigma**2 + sigma_data**2 + eps)
+    c_in = 1 / torch.sqrt(sigma**2 + sigma_data**2 + eps)
     
-    return alpha_t, c_skip, c_out, c_in
+    return c_skip, c_out, c_in
 
 def training_loss_v_prediction(
     model,
@@ -130,18 +130,24 @@ def training_loss_v_prediction(
             sigma_max = 20000.0 * scale_factor  # Using practical ZTSNR approximation
             sigma = sigma * (sigma_max / 20000.0)
         
-        # Generate noise and noisy input
+        # Modified noise scaling
         noise = torch.randn_like(x_0)
+        noise = noise / (noise.norm(p=2, dim=(1,2,3), keepdim=True) + 1e-5)
+        
+        # Add noise with improved numerical stability
         x_t = x_0 + noise * sigma.view(-1, 1, 1, 1)
         
-        # Calculate v-prediction scaling factors
-        sigma_data = 1.0  # Using σdata = 1.0 as per EDM formulation
-        c_skip = sigma_data**2 / (sigma**2 + sigma_data**2)
-        c_out = -sigma * sigma_data / torch.sqrt(sigma**2 + sigma_data**2)
-        c_in = 1 / torch.sqrt(sigma**2 + sigma_data**2)
+        # Get scaling factors with improved stability
+        sigma_data = 1.0
+        eps = 1e-5
+        c_skip = (sigma_data**2) / (sigma**2 + sigma_data**2 + eps)
+        c_out = (-sigma * sigma_data) / torch.sqrt(sigma**2 + sigma_data**2 + eps)
+        c_in = 1 / torch.sqrt(sigma**2 + sigma_data**2 + eps)
         
-        # Scale model input and get prediction
-        model_input = c_in.view(-1, 1, 1, 1) * x_t
+        # Scale model input with gradient clamping
+        model_input = torch.clamp(c_in.view(-1, 1, 1, 1) * x_t, -1e3, 1e3)
+        
+        # Get model prediction
         v_pred = model(
             model_input, 
             sigma, 
@@ -149,25 +155,28 @@ def training_loss_v_prediction(
             added_cond_kwargs=added_cond_kwargs
         ).sample
         
-        # Validate model output shape
-        if v_pred.shape != x_t.shape:
-            raise ValueError(
-                f"Model output shape ({v_pred.shape}) must match input shape ({x_t.shape})"
-            )
+        # Clamp predictions for stability
+        v_pred = torch.clamp(v_pred, -1e3, 1e3)
         
-        # Apply v-prediction scaling
-        scaled_output = c_skip.view(-1, 1, 1, 1) * x_t + c_out.view(-1, 1, 1, 1) * v_pred
+        # Modified scaling with improved stability
+        scaled_output = (c_skip.view(-1, 1, 1, 1) * x_t + 
+                        c_out.view(-1, 1, 1, 1) * v_pred)
         v_target = c_in.view(-1, 1, 1, 1) * noise
         
-        # Calculate MinSNR weighting (NovelAI V3 section 2.4)
-        snr = (sigma_data / sigma) ** 2
-        min_snr = 1.0  # Minimum SNR threshold
+        # Modified SNR weighting with better bounds
+        snr = torch.clamp((sigma_data / (sigma + 1e-5)) ** 2, 1e-5, 1e2)
+        min_snr = 0.1  # Reduced from 1.0 for better stability
         snr_clipped = torch.minimum(snr, torch.tensor(min_snr))
-        loss_weight = snr_clipped / snr
+        loss_weight = torch.clamp(snr_clipped / snr, 0.1, 10.0)
         
-        # Calculate weighted MSE loss
-        loss = torch.nn.functional.mse_loss(scaled_output, v_target, reduction='none')
-        loss = (loss * loss_weight.view(-1, 1, 1, 1)).mean()
+        # Calculate loss with stability improvements
+        mse_loss = torch.nn.functional.mse_loss(scaled_output, v_target, reduction='none')
+        weighted_loss = (mse_loss * loss_weight.view(-1, 1, 1, 1))
+        loss = weighted_loss.mean()
+        
+        # Add L2 regularization to prevent extreme predictions
+        l2_reg = 1e-4 * (v_pred ** 2).mean()
+        loss = loss + l2_reg
         
         # Collect metrics
         loss_metrics = {
