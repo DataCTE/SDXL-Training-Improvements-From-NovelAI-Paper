@@ -1,7 +1,6 @@
-# SDXL Training with ZTSNR and NovelAI V3 Improvements
+# SDXL Training with ZTSNR, NovelAI V3 Improvements, and IterComp
 
-Most SDXL implementations use a maximum noise deviation (σ_max) of 14.6 [meaning that only 14.6% of the noise is removed at maximum] inherited from SD1.5/1.4, without accounting for SDXL's larger scale. Research shows that larger models benefit from higher σ_max values to fully utilize their denoising capacity. This repository implements an increased σ_max ≈ 20000.0 (as recommended by NovelAI research arXiv:2409.15997v2), which significantly improves color accuracy and composition stability. Combined with Zero Terminal SNR (ZTSNR) and VAE finetuning.
-
+Most SDXL implementations use a maximum noise deviation (σ_max) of 14.6 [meaning that only 14.6% of the noise is removed at maximum] inherited from SD1.5/1.4, without accounting for SDXL's larger scale. Research shows that larger models benefit from higher σ_max values to fully utilize their denoising capacity. This repository implements an increased σ_max ≈ 20000.0 (as recommended by NovelAI research arXiv:2409.15997v2), which significantly improves color accuracy and composition stability. Combined with Zero Terminal SNR (ZTSNR), VAE finetuning, and IterComp for enhanced compositional generation.
 
 ### Current Status
 
@@ -13,8 +12,9 @@ Most SDXL implementations use a maximum noise deviation (σ_max) of 14.6 [meanin
 - [x] VAE improvements
 - [x] Tag-based CLIP weighting
 - [x] functional detailed wandb logging
+- [ ] IterComp composition-aware feedback learning
 
-- [x] 10k dataset proof of concept (completed)[link](https://huggingface.co/dataautogpt3/ProteusSigma)
+- [ ] 10k dataset proof of concept (in testing)
 - [ ] 200k+ dataset finetune (in testing)
 - [ ] 12M million dataset finetune (planned)
 
@@ -47,6 +47,17 @@ Most SDXL implementations use a maximum noise deviation (σ_max) of 14.6 [meanin
   - Latent caching
   - Progressive batching
   - Dynamic normalization
+
+### 4. IterComp Composition-Aware Learning
+- **Model Gallery**: Aggregates preferences from 6 powerful models
+- **Compositional Metrics**:
+  - Attribute binding
+  - Spatial relationships
+  - Non-spatial relationships
+- **Iterative Feedback**:
+  - Progressive self-refinement
+  - Multi-aspect reward models
+  - Closed-loop optimization
 
 ## Quick Start
 
@@ -85,7 +96,10 @@ python src/main.py \
   --vae_learning_rate 1e-6 \
   --use_wandb \
   --wandb_project "sdxl-training" \
-  --wandb_run_name "ztsnr-training"
+  --wandb_run_name "ztsnr-itercomp-training" \
+  --use_itercomp \
+  --reward_weight 1e-3 \
+  --num_iterations 3
 ```
 
 ## Tag-Based CLIP Weighting
