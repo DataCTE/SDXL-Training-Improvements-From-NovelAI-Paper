@@ -39,112 +39,89 @@ def v_prediction_scaling_factors(sigma, sigma_data=1.0):
     return c_skip, c_out, c_in
 
 def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kwargs=None, sigma_data=1.0):
-    """Training loss using v-prediction with MinSNR weighting as described in NovelAI V3 paper"""
     try:
-        # Get model's dtype for consistency
+        # Get model dtype
         dtype = next(model.parameters()).dtype
+        device = next(model.parameters()).device
         
-        # Convert inputs to model's dtype
+        # Convert inputs to model dtype
         x_0 = x_0.to(dtype=dtype)
         sigma = sigma.to(dtype=dtype)
         text_embeddings = text_embeddings.to(dtype=dtype)
         
-        # Convert added_cond_kwargs to model's dtype
         if added_cond_kwargs is not None:
             added_cond_kwargs = {
                 k: v.to(dtype=dtype) if torch.is_tensor(v) else v
                 for k, v in added_cond_kwargs.items()
             }
+
+        # Scale sigma based on resolution as per Section 2.3
+        _, _, height, width = x_0.shape
+        total_pixels = height * width
+        base_res = 1024 * 1024
         
-        # Generate noise with matching dtype
+        # Paper's resolution scaling with stability cap
+        scale_factor = min((total_pixels / base_res) ** 0.5, 4.0)
+        
+        # Set sigma range as per Section 2.2 with practical upper bound
+        sigma_min = 0.002
+        sigma_max = 20000.0  # Practical approximation of inf for ZTSNR
+        sigma = torch.clamp(sigma * scale_factor, sigma_min, sigma_max)
+        
+        # Generate noise with explicit dtype
         noise = torch.randn_like(x_0, dtype=dtype)
-        
-        # Add gradient scaling for numerical stability
-        scale_factor = min((x_0.shape[-1] * x_0.shape[-2] / (1024 * 1024)) ** 0.5, 4.0)  # Cap scaling
-        sigma = sigma * scale_factor
         
         # Create noisy input
         x_t = x_0 + noise * sigma.view(-1, 1, 1, 1)
         
-        # Get model prediction
-        v_pred = model(
-            x_t,
-            sigma,
-            text_embeddings,
-            added_cond_kwargs=added_cond_kwargs
-        ).sample
+        # Get v-prediction
+        v_pred = model(x_t, sigma, text_embeddings, added_cond_kwargs=added_cond_kwargs).sample
         
-        # Channel-wise normalization for stability (as per paper)
-        B, C, H, W = v_pred.shape
-        v_pred = v_pred.view(B, C, -1)
-        v_pred = v_pred / (v_pred.norm(dim=-1, keepdim=True) + 1e-8)
-        v_pred = v_pred.view(B, C, H, W)
-        
-        # Conservative clamping (as per paper's practical implementation)
-        v_pred = torch.clamp(v_pred, -0.5, 0.5)  # Reduced range for stability
-        
-        # Improved v-prediction scaling factors
-        c_skip, c_out, c_in = v_prediction_scaling_factors(sigma, sigma_data)
+        # v-prediction scaling factors with numerical stability
+        eps = 1e-8  # Small epsilon to prevent division by zero
+        c_skip = (sigma_data**2) / (sigma**2 + sigma_data**2 + eps)
+        c_out = (-sigma * sigma_data) / torch.sqrt(sigma**2 + sigma_data**2 + eps)
+        c_in = 1 / torch.sqrt(sigma**2 + sigma_data**2 + eps)
         
         # Scale prediction and target
         scaled_output = c_out.view(-1, 1, 1, 1) * v_pred
         v_target = c_in.view(-1, 1, 1, 1) * noise
         
-        # Improved MinSNR weighting with better numerical stability
-        snr = (sigma_data / (sigma + 1e-8)) ** 2
-        snr = torch.clamp(snr, min=1e-5, max=1e2)  # Tighter bounds
-        min_snr = 1.0
-        snr_clipped = torch.minimum(snr, torch.tensor(min_snr, device=snr.device, dtype=snr.dtype))
-        loss_weight = torch.clamp(snr_clipped / snr, min=0.1, max=10.0)
+        # MinSNR loss weighting with stability bounds
+        snr = (sigma_data / (sigma + eps)) ** 2
+        snr = torch.clamp(snr, min=1e-5, max=1e5)  # Prevent extreme values
+        min_snr_gamma = 1.0  # As per paper
+        loss_weight = torch.minimum(snr, torch.tensor(min_snr_gamma, device=snr.device, dtype=snr.dtype))
         
-        # Calculate loss with improved stability
+        # Calculate weighted MSE loss
         mse_loss = F.mse_loss(scaled_output, v_target, reduction='none')
         weighted_loss = mse_loss * loss_weight.view(-1, 1, 1, 1)
         loss = weighted_loss.mean()
         
-        # Add gradient norm clipping threshold
-        max_grad_norm = 1.0
-        if loss.requires_grad:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-        
-        # Skip if loss is too small
-        if loss.item() < 1e-8:
-            logger.warning(f"Skipping batch due to very small loss: {loss.item()}")
+        # More aggressive stability checks
+        if (not torch.isfinite(loss) or 
+            loss < 1e-6 or  # Increased threshold
+            torch.abs(v_pred).max() > 1e3 or  # Check for extreme predictions
+            torch.abs(weighted_loss).max() > 1e3):  # Check for extreme loss values
+            logger.warning(f"Skipping batch - Loss: {loss.item()}, Max v_pred: {torch.abs(v_pred).max().item()}, Max weighted_loss: {torch.abs(weighted_loss).max().item()}")
             return None, None
             
-        # Add L2 regularization to prevent extreme predictions
-        l2_reg = 1e-4 * (v_pred ** 2).mean()
-        loss = loss + l2_reg
-        
-        # Collect detailed metrics for monitoring
+        # Collect metrics
         loss_metrics = {
-            'loss/mse_mean': loss.item(),
-            'loss/mse_std': torch.nn.functional.mse_loss(scaled_output, v_target).std().item(),
-            'loss/snr_mean': snr.mean().item(),
-            'loss/min_snr_gamma_mean': loss_weight.mean().item(),
-            'model/v_pred_std': v_pred.std().item(),
-            'model/v_target_std': v_target.std().item(),
-            'model/alpha_t_mean': (1 / torch.sqrt(1 + sigma**2)).mean().item(),
-            'noise/sigma_mean': sigma.mean().item(),
-            'noise/x_t_std': x_t.std().item(),
+            'loss/total': loss.item(),
+            'loss/mse_raw': mse_loss.mean().item(),
+            'loss/weight_mean': loss_weight.mean().item(),
+            'model/sigma_mean': sigma.mean().item(),
+            'model/sigma_std': sigma.std().item(),
+            'model/v_pred_norm': v_pred.norm().item(),
         }
         
-        # Skip batch if loss is unstable
-        if torch.isnan(loss) or torch.isinf(loss) or loss > 1e5:
-            logger.warning(f"Skipping batch due to unstable loss: {loss.item()}")
-            return None, None  # Return None to indicate batch should be skipped
-            
         return loss, loss_metrics
 
     except Exception as e:
-        logger.error("\n=== Error in v-prediction training ===")
-        logger.error(f"Error message: {str(e)}")
-        logger.error(traceback.format_exc())
-        logger.error(f"Input shapes and dtypes:")
-        logger.error(f"x_0: {x_0.shape}, {x_0.dtype}")
-        logger.error(f"sigma: {sigma.shape}, {sigma.dtype}")
-        logger.error(f"text_embeddings: {text_embeddings.shape}, {text_embeddings.dtype}")
-        logger.error(f"added_cond_kwargs: {added_cond_kwargs}")
+        logger.error(f"Error in loss calculation: {str(e)}")
+        logger.error(f"Shapes: x_0={x_0.shape}, sigma={sigma.shape}")
+        logger.error(f"Values: sigma={sigma}, loss_weight={loss_weight}")
         raise
 
 def get_resolution_dependent_sigma_max(height, width):
