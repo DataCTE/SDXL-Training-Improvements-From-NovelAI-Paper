@@ -401,6 +401,10 @@ class CustomDataset(Dataset):
 
                         # Save individual files from batch
                         for idx, (img_path, _) in enumerate(batch_files):
+                            if idx >= len(text_embeddings):  # Add this check
+                                logger.warning(f"Skipping index {idx} as it exceeds embedding tensor size {len(text_embeddings)}")
+                                continue
+                            
                             cache_latents_path = self.cache_dir / f"{Path(img_path).stem}_latents.pt"
                             cache_embeddings_path = self.cache_dir / f"{Path(img_path).stem}_embeddings.pt"
                             
