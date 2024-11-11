@@ -71,8 +71,9 @@ def train_one_epoch(
                 "time_ids": batch["added_cond_kwargs"]["time_ids"].to(device, dtype=dtype)
             }
             
-            # Training step
-            with torch.amp.autocast('cuda', dtype=dtype):
+            # Modified training step for BFloat16
+            if dtype == torch.bfloat16:
+                # Direct BFloat16 training without AMP
                 loss, step_metrics = training_loss_v_prediction(
                     model=unet,
                     x_0=latents,
@@ -87,10 +88,26 @@ def train_one_epoch(
                     continue
                 
                 loss = loss / args.gradient_accumulation_steps
-            
-            # Gradient scaling for stability
-            scaler = torch.cuda.amp.GradScaler()
-            scaler.scale(loss).backward()
+                loss.backward()
+            else:
+                # Use AMP for float16/float32
+                with torch.amp.autocast('cuda', dtype=dtype):
+                    loss, step_metrics = training_loss_v_prediction(
+                        model=unet,
+                        x_0=latents,
+                        sigma=sigma,
+                        text_embeddings=text_embeddings,
+                        added_cond_kwargs=added_cond_kwargs
+                    )
+                    
+                    if torch.isnan(loss) or torch.isinf(loss) or loss > 1e5:
+                        logger.warning(f"Skipping batch due to unstable loss: {loss.item()}")
+                        continue
+                    
+                    loss = loss / args.gradient_accumulation_steps
+                
+                scaler = torch.cuda.amp.GradScaler()
+                scaler.scale(loss).backward()
             
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 # Check gradient norms
@@ -117,8 +134,14 @@ def train_one_epoch(
                     error_if_nonfinite=False
                 ).item()
                 
-                scaler.step(optimizer)
-                scaler.update()
+                if dtype == torch.bfloat16:
+                    # Direct optimizer step for BFloat16
+                    optimizer.step()
+                else:
+                    # Use scaler for float16/float32
+                    scaler.step(optimizer)
+                    scaler.update()
+                
                 optimizer.zero_grad(set_to_none=True)
                 lr_scheduler.step()
                 

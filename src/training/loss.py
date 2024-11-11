@@ -163,9 +163,9 @@ def training_loss_v_prediction(
                         c_out.view(-1, 1, 1, 1) * v_pred)
         v_target = c_in.view(-1, 1, 1, 1) * noise
         
-        # Modified SNR weighting with better bounds
+        # Modified SNR weighting with paper-specified values
         snr = torch.clamp((sigma_data / (sigma + 1e-5)) ** 2, 1e-5, 1e2)
-        min_snr = 0.1  # Reduced from 1.0 for better stability
+        min_snr = 1.0  # Changed from 0.1 to 1.0 as per NovelAI V3 paper
         snr_clipped = torch.minimum(snr, torch.tensor(min_snr))
         loss_weight = torch.clamp(snr_clipped / snr, 0.1, 10.0)
         
