@@ -59,21 +59,22 @@ def train_one_epoch(
             
             # Move batch to device and handle tensor conversion
             latents = batch["latents"].to(device, dtype=dtype)
-            text_embeddings = batch["text_embeddings"].to(device, dtype=dtype)
+            text_embeddings = batch["text_embeddings"].to(device, dtype=torch.float32)
+            
+            # Properly format added conditioning
+            added_cond_kwargs = {
+                "text_embeds": batch["added_cond_kwargs"]["text_embeds"].to(device, dtype=torch.float32),
+                "time_ids": batch["added_cond_kwargs"]["time_ids"].to(device, dtype=torch.float32)
+            }
             
             # Get noise schedule
             sigmas = get_sigmas(args.num_inference_steps).to(device)
             sigma = sigmas[step % args.num_inference_steps].expand(latents.size(0))
             
-            # Properly format added conditioning
-            added_cond_kwargs = {
-                "text_embeds": batch["added_cond_kwargs"]["text_embeds"].to(device, dtype=dtype),
-                "time_ids": batch["added_cond_kwargs"]["time_ids"].to(device, dtype=dtype)
-            }
-            
             # Modified training step for BFloat16
             if dtype == torch.bfloat16:
-                # Direct BFloat16 training without AMP
+                # Convert UNet to bfloat16 but keep embeddings in float32
+                unet = unet.to(dtype=torch.bfloat16)
                 loss, step_metrics = training_loss_v_prediction(
                     model=unet,
                     x_0=latents,
