@@ -123,6 +123,9 @@ def training_loss_v_prediction(
                 f"Text embedding batch size ({text_embeddings.shape[0]}) must match image batch size ({batch_size})"
             )
         
+        # Ensure sigma is in same dtype as model
+        sigma = sigma.to(dtype=x_0.dtype)
+        
         # Scale sigma based on resolution as per paper section 2.3
         if sigma.ndim == 1:
             base_res = 1024 * 1024  # Base resolution from paper
