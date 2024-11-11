@@ -599,60 +599,41 @@ def update_reward_models(reward_models, train_dataloader, args, metrics):
 def training_step(unet, batch, args, reward_models=None):
     """
     Single training step combining NAI V3 improvements with IterComp reward guidance
-    
-    Implements:
-    - v-prediction parameterization (NAI V3)
-    - Zero Terminal SNR (NAI V3)
-    - Resolution-dependent sigma scaling (NAI V3)
-    - MinSNR weighting (NAI V3)
-    - Compositional reward guidance (IterComp)
     """
     try:
+        # Validate batch contents
+        required_keys = ["latents", "text_embeddings"]
+        for key in required_keys:
+            if key not in batch:
+                raise KeyError(f"Missing required key '{key}' in batch. Available keys: {batch.keys()}")
+
         # Get base diffusion loss with NAI V3 improvements
         base_loss, base_metrics = training_loss_v_prediction(
-            unet, 
-            batch["images"].to(args.device),
-            batch["sigma"].to(args.device),
-            batch["text_embeddings"].to(args.device),
+            model=unet,
+            x_0=batch["latents"],
+            sigma=batch.get("sigma", None),  # Handle missing sigma
+            text_embeddings=batch["text_embeddings"],
             added_cond_kwargs=batch.get("added_cond_kwargs")
         )
         
+        if base_loss is None:  # Skip batch if loss calculation failed
+            logger.warning("Skipping batch due to invalid dimensions or aspect ratio")
+            return None, {}
+
         total_loss = base_loss
         metrics = {"base_loss": base_loss.item()}
         metrics.update(base_metrics)
         
-        # Add IterComp reward guidance if enabled
+        # Add reward guidance if enabled
         if reward_models is not None:
-            logger.debug("Computing reward-guided loss")
-            
-            # Extract features once for all reward models
-            clip_features = model_manager.clip.extract_features(
-                batch["images"], 
-                text=batch["prompts"]
-            )["image_features"]
-            
-            object_detections = model_manager.detr.detect_objects(batch["images"])
-            text_embeddings = batch["text_embeddings"].to(args.device)
-            
-            # Calculate rewards for each aspect
-            reward_losses = {}
-            for reward_type, reward_model in reward_models.items():
-                if isinstance(reward_model, AttributeBindingRewardModel):
-                    reward = reward_model(clip_features, text_embeddings)
-                elif isinstance(reward_model, SpatialRewardModel):
-                    reward = reward_model(object_detections, text_embeddings)
-                else:  # NonSpatialRewardModel
-                    reward = reward_model(clip_features, object_detections, text_embeddings)
-                
-                reward_losses[reward_type] = reward
-                metrics[f"{reward_type}_reward"] = reward.item()
-            
-            # Combine rewards
-            reward_loss = sum(reward_losses.values()) / len(reward_losses)
-            total_loss = total_loss + args.reward_weight * reward_loss
-            metrics["reward_loss"] = reward_loss.item()
-            
-            logger.debug(f"Reward loss: {reward_loss.item():.6f}")
+            reward_loss, reward_metrics = compute_reward_guidance(
+                reward_models=reward_models,
+                batch=batch,
+                args=args
+            )
+            if reward_loss is not None:
+                total_loss = total_loss + args.reward_weight * reward_loss
+                metrics.update(reward_metrics)
             
         return total_loss, metrics
         
@@ -661,6 +642,46 @@ def training_step(unet, batch, args, reward_models=None):
         logger.error(f"Batch keys: {batch.keys()}")
         logger.error(traceback.format_exc())
         raise
+
+def compute_reward_guidance(reward_models, batch, args):
+    """Compute reward guidance loss if possible"""
+    try:
+        if "images" not in batch or "prompts" not in batch:
+            return None, {}
+
+        # Extract features once for all reward models
+        clip_features = model_manager.clip.extract_features(
+            batch["images"], 
+            text=batch["prompts"]
+        )["image_features"]
+        
+        object_detections = model_manager.detr.detect_objects(batch["images"])
+        text_embeddings = batch["text_embeddings"]
+        
+        # Calculate rewards for each aspect
+        reward_losses = {}
+        reward_metrics = {}
+        
+        for reward_type, reward_model in reward_models.items():
+            if isinstance(reward_model, AttributeBindingRewardModel):
+                reward = reward_model(clip_features, text_embeddings)
+            elif isinstance(reward_model, SpatialRewardModel):
+                reward = reward_model(object_detections, text_embeddings)
+            else:  # NonSpatialRewardModel
+                reward = reward_model(clip_features, object_detections, text_embeddings)
+            
+            reward_losses[reward_type] = reward
+            reward_metrics[f"{reward_type}_reward"] = reward.item()
+        
+        # Combine rewards
+        total_reward_loss = sum(reward_losses.values()) / len(reward_losses)
+        reward_metrics["reward_loss"] = total_reward_loss.item()
+        
+        return total_reward_loss, reward_metrics
+        
+    except Exception as e:
+        logger.warning(f"Failed to compute reward guidance: {str(e)}")
+        return None, {}
 
 def compute_base_loss(unet, batch, args):
     """
