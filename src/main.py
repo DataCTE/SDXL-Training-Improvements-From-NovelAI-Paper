@@ -107,6 +107,15 @@ def parse_args():
     parser.add_argument("--hub_model_id", type=str)
     parser.add_argument("--hub_private", action="store_true")
     
+    # IterComp arguments (optional)
+    itercomp_group = parser.add_argument_group("IterComp")
+    itercomp_group.add_argument("--use_itercomp", action="store_true",
+                               help="Enable IterComp training")
+    itercomp_group.add_argument("--reward_weight", type=float, default=1e-3,
+                               help="Weight for reward loss")
+    itercomp_group.add_argument("--num_iterations", type=int, default=3,
+                               help="Number of IterComp iterations")
+    
     return parser.parse_args()
 
 def main(args):

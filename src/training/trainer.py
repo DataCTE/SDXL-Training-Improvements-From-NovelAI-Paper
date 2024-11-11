@@ -9,6 +9,8 @@ from safetensors.torch import load_file
 from training.loss import get_sigmas, training_loss_v_prediction
 from training.ema import EMAModel
 from training.utils import save_checkpoint, load_checkpoint
+from models.reward_model import RewardModel
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +103,17 @@ def train_one_epoch(
             else:
                 weighted_loss = loss
                 logger.debug("Tag weighting disabled or no weighter available")
+            
+            if args.use_itercomp and models["reward_models"] is not None:
+                # Calculate composition-aware rewards
+                rewards = []
+                for reward_model in models["reward_models"].values():
+                    reward = reward_model(text_embeddings, latents)
+                    rewards.append(reward)
+                    
+                # Combine with existing loss
+                reward_loss = sum(rewards) / len(rewards)
+                weighted_loss = weighted_loss + args.reward_weight * reward_loss
             
             weighted_loss.backward()
             
@@ -319,3 +332,237 @@ def train(args, models, train_components, device, dtype):
             logger.error(f"Failed to save checkpoint after training error: {str(save_error)}")
         
         raise  # Re-raise the original training error
+
+def train_reward_models(reward_models, train_dataloader, args):
+    """Train composition-aware reward models on model gallery preferences"""
+    logger.info("Training composition-aware reward models...")
+    
+    for reward_type, reward_model in reward_models.items():
+        logger.info(f"Training {reward_type} reward model")
+        reward_model.train()
+        
+        optimizer = torch.optim.AdamW(
+            reward_model.parameters(),
+            lr=args.learning_rate,
+            weight_decay=args.weight_decay
+        )
+        
+        for batch in train_dataloader:
+            # Get winning and losing images from model gallery preferences
+            winning_images = batch["winning_images"].to(args.device) 
+            losing_images = batch["losing_images"].to(args.device)
+            prompts = batch["prompts"]
+            
+            # Calculate reward scores
+            winning_scores = reward_model(prompts, winning_images)
+            losing_scores = reward_model(prompts, losing_images)
+            
+            # Compute preference loss
+            loss = -torch.log(torch.sigmoid(winning_scores - losing_scores)).mean()
+            
+            # Optimize
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            if args.use_wandb:
+                wandb.log({
+                    f"reward_model/{reward_type}_loss": loss.item()
+                })
+                
+        reward_model.eval()
+    
+    logger.info("Finished training reward models")
+
+def expand_model_gallery(models, train_dataloader, args):
+    """Expand model gallery with samples from current model"""
+    logger.info("Expanding model gallery with new samples...")
+    
+    base_model = models["unet"]
+    base_model.eval()
+    
+    gallery_samples = []
+    with torch.no_grad():
+        for batch in train_dataloader:
+            # Generate images with current model
+            prompts = batch["prompts"]
+            generated = generate_images(
+                models,
+                prompts,
+                num_inference_steps=args.num_inference_steps,
+                guidance_scale=args.guidance_scale
+            )
+            
+            # Get reward scores
+            reward_scores = {}
+            for reward_type, reward_model in models["reward_models"].items():
+                scores = reward_model(prompts, generated).cpu()
+                reward_scores[reward_type] = scores
+                
+            # Store samples and scores
+            gallery_samples.append({
+                "images": generated.cpu(),
+                "prompts": prompts,
+                "reward_scores": reward_scores
+            })
+            
+            if args.use_wandb:
+                wandb.log({
+                    f"gallery/reward_{reward_type}": scores.mean()
+                    for reward_type, scores in reward_scores.items()
+                })
+    
+    # Update gallery dataset
+    update_gallery_dataset(gallery_samples, args)
+    logger.info("Finished expanding model gallery")
+
+def update_gallery_dataset(new_samples, args):
+    """Update the gallery dataset with new samples"""
+    gallery_path = Path(args.output_dir) / "model_gallery"
+    gallery_path.mkdir(exist_ok=True)
+    
+    # Load existing gallery if any
+    existing_samples = []
+    if (gallery_path / "samples.pt").exists():
+        existing_samples = torch.load(gallery_path / "samples.pt")
+        
+    # Combine with new samples
+    all_samples = existing_samples + new_samples
+    
+    # Save updated gallery
+    torch.save(all_samples, gallery_path / "samples.pt")
+    
+    logger.info(f"Updated gallery dataset with {len(new_samples)} new samples")
+
+def generate_images(models, prompts, num_inference_steps=50, guidance_scale=7.5):
+    """Generate images using the current model"""
+    # Set up pipeline components
+    unet = models["unet"]
+    vae = models["vae"]
+    tokenizer = models["tokenizer"]
+    text_encoder = models["text_encoder"]
+    
+    # Encode text
+    text_inputs = tokenizer(
+        prompts,
+        padding="max_length",
+        max_length=tokenizer.model_max_length,
+        truncation=True,
+        return_tensors="pt"
+    )
+    text_embeddings = text_encoder(text_inputs.input_ids.to(unet.device))[0]
+    
+    # Generate latents
+    latents = torch.randn(
+        (len(prompts), unet.config.in_channels, 64, 64),
+        device=unet.device
+    )
+    
+    # Denoise latents
+    for t in range(num_inference_steps):
+        with torch.no_grad():
+            noise_pred = unet(latents, t, text_embeddings).sample
+            latents = diffusion_step(latents, noise_pred, t, guidance_scale)
+    
+    # Decode latents
+    with torch.no_grad():
+        images = vae.decode(latents).sample
+        
+    return images
+
+def iterative_feedback_learning(models, train_dataloader, args):
+    """Implement iterative feedback learning loop"""
+    for iteration in range(args.num_iterations):
+        logger.info(f"Starting iteration {iteration+1}/{args.num_iterations}")
+        
+        # Train reward models
+        if iteration > 0:  # Skip first iteration
+            train_reward_models(models["reward_models"], train_dataloader)
+            
+        # Train base diffusion model
+        train(models, train_dataloader, args)
+        
+        # Expand model gallery
+        if iteration < args.num_iterations - 1:
+            expand_model_gallery(models, train_dataloader)
+            
+    return models
+
+def diffusion_step(latents, noise_pred, timestep, guidance_scale=7.5):
+    """
+    Perform a single diffusion step with classifier-free guidance
+    
+    Args:
+        latents: Current latent state
+        noise_pred: Predicted noise from UNet
+        timestep: Current timestep
+        guidance_scale: Scale factor for classifier-free guidance (default: 7.5)
+    
+    Returns:
+        Updated latents after denoising step
+    """
+    # Get alphas for current timestep
+    alpha_t = get_alpha_schedule()[timestep]
+    alpha_prev = get_alpha_schedule()[timestep - 1] if timestep > 0 else 1.0
+    
+    # Calculate coefficients
+    c0 = 1 / torch.sqrt(alpha_t)
+    c1 = (1 - alpha_t) / torch.sqrt(1 - alpha_prev)
+    
+    # Apply classifier-free guidance
+    if guidance_scale > 1.0:
+        # Split noise prediction into unconditional and conditional parts
+        noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
+        # Combine using guidance scale
+        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+    
+    # Update latents using predicted noise
+    latents = c0 * latents - c1 * noise_pred
+    
+    return latents
+
+def get_alpha_schedule(num_train_timesteps=1000):
+    """
+    Get the alpha (noise level) schedule for the diffusion process
+    
+    Args:
+        num_train_timesteps: Number of diffusion timesteps
+    
+    Returns:
+        Tensor containing alpha values for each timestep
+    """
+    # Linear schedule from β1 to β2
+    beta_start = 0.00085
+    beta_end = 0.012
+    betas = torch.linspace(beta_start, beta_end, num_train_timesteps)
+    
+    # Calculate alphas
+    alphas = 1.0 - betas
+    alphas_cumprod = torch.cumprod(alphas, dim=0)
+    
+    return alphas_cumprod
+
+def train_with_itercomp(models, train_dataloader, args):
+    """
+    Train using IterComp approach while preserving existing functionality
+    """
+    if args.use_itercomp:
+        logger.info("Starting IterComp training...")
+        return iterative_feedback_learning(models, train_dataloader, args)
+    else:
+        logger.info("Starting standard training...")
+        return train(models, train_dataloader, args)
+
+def training_step(unet, batch, reward_models=None):
+    """
+    Single training step with optional IterComp reward guidance
+    """
+    # Existing training logic
+    loss = compute_base_loss(unet, batch)
+    
+    # Add IterComp reward guidance if enabled
+    if reward_models is not None:
+        reward_loss = compute_reward_loss(reward_models, batch)
+        loss = loss + args.reward_weight * reward_loss
+        
+    return loss

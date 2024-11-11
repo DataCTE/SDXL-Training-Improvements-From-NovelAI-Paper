@@ -5,6 +5,7 @@ from diffusers import UNet2DConditionModel, AutoencoderKL
 from transformers import CLIPTokenizer, CLIPTextModel, CLIPModel
 from torch.optim.swa_utils import AveragedModel
 from models.model_validator import ModelValidator
+from models.reward_model import RewardModel
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +106,16 @@ def setup_models(args, device, dtype):
             device=device
         )
         
+        # Setup composition-aware reward models if enabled
+        if args.use_itercomp:
+            logger.info("Setting up composition-aware reward models...")
+            reward_models = {
+                "attribute_binding": setup_reward_model("attribute_binding", device, dtype),
+                "spatial_relationship": setup_reward_model("spatial_relationship", device, dtype),
+                "nonspatial_relationship": setup_reward_model("nonspatial_relationship", device, dtype)
+            }
+            validator.reward_models = reward_models
+            
         # Return all components
         models = {
             "unet": unet,
@@ -164,3 +175,14 @@ def verify_models(models):
     except Exception as e:
         logger.error(f"Model verification failed: {str(e)}")
         return False
+
+def setup_reward_model(reward_type, device, dtype):
+    """Setup individual composition-aware reward model"""
+    # Initialize BLIP feature extractor and MLP head
+    model = RewardModel(
+        feature_extractor=setup_blip_extractor(device, dtype),
+        mlp_head=setup_reward_head(device, dtype)
+    ).to(device)
+    model.requires_grad_(False)
+    model.eval()
+    return model
