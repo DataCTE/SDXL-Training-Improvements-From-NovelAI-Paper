@@ -224,14 +224,14 @@ def verify_models(models):
                 raise ValueError(f"Missing required model: {model_name}")
             
         # Verify model states
-        assert not models["text_encoder"].training, "Text encoder should be in eval mode"
-        assert not models["text_encoder_2"].training, "Text encoder 2 should be in eval mode"
-        assert not models["vae"].training, "VAE should be in eval mode"
-        
+        for name in ["text_encoder", "text_encoder_2", "vae"]:
+            if hasattr(models[name], 'training') and models[name].training:
+                raise ValueError(f"{name} should be in eval mode")
+            
         # Verify gradient states
-        assert not models["text_encoder"].requires_grad, "Text encoder should not require gradients"
-        assert not models["text_encoder_2"].requires_grad, "Text encoder 2 should not require gradients"
-        assert not models["vae"].requires_grad, "VAE should not require gradients"
+        for name in ["text_encoder", "text_encoder_2", "vae"]:
+            if any(param.requires_grad for param in models[name].parameters()):
+                raise ValueError(f"{name} parameters should not require gradients")
         
         return True
         
