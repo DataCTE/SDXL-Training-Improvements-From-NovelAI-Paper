@@ -14,7 +14,7 @@ Most SDXL implementations use a maximum noise deviation (σ_max) of 14.6 [meanin
 - [x] Tag-based CLIP weighting
 - [x] functional detailed wandb logging
 
-- [x] 10k dataset proof of concept (completed)[link](https://huggingface.co/dataautogpt3/sdxl-ztsnr-sigma-10k)
+- [x] 10k dataset proof of concept (completed)[link](https://huggingface.co/dataautogpt3/ProteusSigma)
 - [ ] 200k+ dataset finetune (in testing)
 - [ ] 12M million dataset finetune (planned)
 
