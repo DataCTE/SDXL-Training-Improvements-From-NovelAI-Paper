@@ -146,49 +146,49 @@ def _setup_text_encoders(args, device, dtype):
         raise
 
 def _setup_reward_models(device, dtype):
-    """
-    Setup composition-aware reward models with validation
-    
-    Args:
-        device: Target device for models
-        dtype: Model precision
-        
-    Returns:
-        dict: Dictionary of reward models for different compositional aspects
-    """
+    """Setup composition-aware reward models with validation"""
     try:
         logger.info("Setting up reward models...")
         
         # Initialize reward models for different aspects
         reward_models = {
             "attribute": AttributeBindingRewardModel(
-                clip_feature_dim=768  # CLIP feature dimension
-            ).to(device).to(dtype),
-            
+                clip_feature_dim=768
+            ),
             "spatial": SpatialRewardModel(
-                detr_feature_dim=256  # DETR feature dimension
-            ).to(device).to(dtype),
-            
+                detr_feature_dim=256
+            ),
             "non_spatial": NonSpatialRewardModel(
-                clip_dim=768,  # CLIP feature dimension
-                detr_dim=256   # DETR feature dimension
-            ).to(device).to(dtype)
+                clip_dim=768,
+                detr_dim=256
+            )
         }
         
-        # Set all models to eval mode and disable gradients initially
+        # Move models to device and dtype
         for name, model in reward_models.items():
+            # First move to device, then cast to dtype
+            reward_models[name] = model.to(device)
+            if dtype in [torch.float16, torch.bfloat16]:
+                reward_models[name] = reward_models[name].to(dtype)
             model.eval()
             model.requires_grad_(False)
-            logger.debug(f"Initialized {name} reward model")
+            logger.debug(f"Initialized {name} reward model on {device} with dtype {dtype}")
             
         # Validate model configurations
         for name, model in reward_models.items():
             if not isinstance(model, BaseRewardModel):
                 raise TypeError(f"Invalid reward model type for {name}")
-            if next(model.parameters()).device != device:
-                raise ValueError(f"Reward model {name} on wrong device")
-            if next(model.parameters()).dtype != dtype:
-                raise ValueError(f"Reward model {name} has wrong dtype")
+                
+            # Check device
+            model_device = next(model.parameters()).device
+            if model_device != device:
+                raise ValueError(f"Reward model {name} on wrong device: {model_device} vs {device}")
+                
+            # Check dtype if specified
+            if dtype in [torch.float16, torch.bfloat16]:
+                model_dtype = next(model.parameters()).dtype
+                if model_dtype != dtype:
+                    raise ValueError(f"Reward model {name} has wrong dtype: {model_dtype} vs {dtype}")
                 
         logger.info("Successfully set up all reward models")
         return reward_models
