@@ -41,91 +41,23 @@ def v_prediction_scaling_factors(sigma, sigma_data=1.0):
 def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kwargs=None, sigma_data=1.0):
     """Training loss using v-prediction with MinSNR weighting as described in NovelAI V3 paper"""
     try:
-        # Validate input dimensions
-        batch_size, channels, height, width = x_0.shape
-        embed_dim = text_embeddings.shape[-1]  # Get just the embedding dimension
+        # Get model's dtype for consistency
+        dtype = next(model.parameters()).dtype
         
-        # Validate text embedding dimensions
-        if embed_dim != 2048:
-            # Check if we need to concatenate embeddings
-            if embed_dim == 768:
-                logger.warning("Got 768-dim embeddings, expecting concatenated SDXL embeddings (2048-dim)")
-                logger.warning("Please ensure both text encoders' outputs are being concatenated")
-                raise ValueError(
-                    f"Text embedding context dimension ({embed_dim}) must be 2048 for SDXL. "
-                    "Make sure to concatenate both text encoders' outputs."
-                )
-            else:
-                raise ValueError(
-                    f"Unexpected embedding dimension: {embed_dim}. "
-                    "SDXL requires 2048-dim embeddings (768 from encoder 1 + 1280 from encoder 2)"
-                )
+        # Convert inputs to model's dtype
+        x_0 = x_0.to(dtype=dtype)
+        sigma = sigma.to(dtype=dtype)
+        text_embeddings = text_embeddings.to(dtype=dtype)
         
-        # Get latent dimensions and validate
-        batch_size, channels, height, width = x_0.shape
+        # Convert added_cond_kwargs to model's dtype
+        if added_cond_kwargs is not None:
+            added_cond_kwargs = {
+                k: v.to(dtype=dtype) if torch.is_tensor(v) else v
+                for k, v in added_cond_kwargs.items()
+            }
         
-        # Validate channel dimension (SDXL uses 4 channels in latent space)
-        if channels != 4:
-            raise ValueError(
-                f"Input must have 4 channels for SDXL latent space. "
-                f"Got {channels} channels. Shape: {x_0.shape}"
-            )
-            
-        # Validate UNet architecture requirements (in latent space)
-        min_size = 32  # 256 pixels / 8 (VAE scaling)
-        max_size = 256  # 2048 pixels / 8 (VAE scaling)
-        
-        if height < min_size or width < min_size:
-            raise ValueError(
-                f"Latent dimensions too small. Minimum size is {min_size}x{min_size} "
-                f"(256x256 in pixel space). Got {height}x{width}"
-            )
-            
-        if height > max_size or width > max_size:
-            raise ValueError(
-                f"Latent dimensions too large. Maximum size is {max_size}x{max_size} "
-                f"(2048x2048 in pixel space). Got {height}x{width}"
-            )
-        
-        # Calculate total pixels in latent space
-        total_pixels = height * width
-        
-        # Check aspect ratio but don't raise error
-        aspect_ratio = width / height
-        if aspect_ratio < 0.25 or aspect_ratio > 4.0:  # Values from SDXL paper
-            logger.warning(
-                f"Batch contains latents with aspect ratio ({aspect_ratio:.2f}) "
-                "outside supported range (0.25 to 4.0). Skipping batch."
-            )
-            # Return None to indicate batch should be skipped
-            return None, None
-        
-        # Validate text embedding context dimension (SDXL requirement)
-        if text_embeddings.shape[-1] != 2048:
-            raise ValueError(
-                f"Text embedding context dimension ({text_embeddings.shape[-1]}) must be 2048 for SDXL"
-            )
-            
-        # Validate batch dimensions match
-        if sigma.ndim == 1 and len(sigma) != batch_size:
-            raise ValueError(
-                f"Sigma length ({len(sigma)}) must match batch size ({batch_size})"
-            )
-            
-        if text_embeddings.shape[0] != batch_size:
-            raise ValueError(
-                f"Text embedding batch size ({text_embeddings.shape[0]}) must match image batch size ({batch_size})"
-            )
-        
-        # Scale sigma based on resolution as per paper section 2.3
-        batch_size, channels, height, width = x_0.shape
-        total_pixels = height * width
-        base_res = 1024 * 1024  # Base resolution from paper
-        scale_factor = (total_pixels / base_res) ** 0.5
-        sigma = sigma * scale_factor
-        
-        # Generate noise (keep unnormalized as per paper)
-        noise = torch.randn_like(x_0)
+        # Generate noise with matching dtype
+        noise = torch.randn_like(x_0, dtype=dtype)
         
         # Create noisy input
         x_t = x_0 + noise * sigma.view(-1, 1, 1, 1)
@@ -191,10 +123,10 @@ def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kw
         logger.error("\n=== Error in v-prediction training ===")
         logger.error(f"Error message: {str(e)}")
         logger.error(traceback.format_exc())
-        logger.error(f"Input shapes:")
-        logger.error(f"x_0: {x_0.shape}")
-        logger.error(f"sigma: {sigma.shape}")
-        logger.error(f"text_embeddings: {text_embeddings.shape}")
+        logger.error(f"Input shapes and dtypes:")
+        logger.error(f"x_0: {x_0.shape}, {x_0.dtype}")
+        logger.error(f"sigma: {sigma.shape}, {sigma.dtype}")
+        logger.error(f"text_embeddings: {text_embeddings.shape}, {text_embeddings.dtype}")
         logger.error(f"added_cond_kwargs: {added_cond_kwargs}")
         raise
 
