@@ -134,20 +134,25 @@ def training_loss_v_prediction(
         noise = torch.randn_like(x_0)
         x_t = x_0 + noise * sigma.view(-1, 1, 1, 1)
         
-        # Calculate v-prediction scaling factors
-        sigma_data = 1.0  # Using σdata = 1.0 as per EDM formulation
-        c_skip = sigma_data**2 / (sigma**2 + sigma_data**2)
-        c_out = -sigma * sigma_data / torch.sqrt(sigma**2 + sigma_data**2)
-        c_in = 1 / torch.sqrt(sigma**2 + sigma_data**2)
+        # Calculate v-prediction scaling factors with stability improvements
+        sigma_data = 1.0
+        # Add epsilon to prevent division by zero
+        eps = 1e-8
+        c_skip = (sigma_data**2) / (sigma**2 + sigma_data**2 + eps)
+        c_out = (-sigma * sigma_data) / torch.sqrt(sigma_data**2 + sigma**2 + eps)
+        c_in = 1 / torch.sqrt(sigma**2 + sigma_data**2 + eps)
+        
+        # Clip scaling factors for stability
+        c_skip = torch.clamp(c_skip, -5.0, 5.0)
+        c_out = torch.clamp(c_out, -5.0, 5.0)
+        c_in = torch.clamp(c_in, -5.0, 5.0)
         
         # Scale model input and get prediction
         model_input = c_in.view(-1, 1, 1, 1) * x_t
-        v_pred = model(
-            model_input, 
-            sigma, 
-            text_embeddings, 
-            added_cond_kwargs=added_cond_kwargs
-        ).sample
+        v_pred = model(model_input, sigma, text_embeddings, added_cond_kwargs=added_cond_kwargs).sample
+        
+        # Apply gradient clipping to v_pred
+        v_pred = torch.clamp(v_pred, -10.0, 10.0)
         
         # Validate model output shape
         if v_pred.shape != x_t.shape:

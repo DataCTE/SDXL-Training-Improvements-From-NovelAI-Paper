@@ -55,6 +55,10 @@ def train_one_epoch(
         window_size = 100
         epoch_metrics = defaultdict(float)
         
+        # Add gradient norm tracking
+        max_grad_norm = 1.0
+        grad_norms = []
+        
         progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}")
         
         for step, batch in enumerate(progress_bar):
@@ -70,22 +74,34 @@ def train_one_epoch(
                 reward_models=models.get("reward_models")
             )
             
+            # Skip bad batches
+            if loss is None:
+                continue
+                
             # Scale loss for gradient accumulation
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
+                
+            if torch.isnan(loss).any() or torch.isinf(loss).any():
+                logger.warning(f"Skipping step {step} due to invalid loss value")
+                continue
             
-            # Backward pass
+            # Backward pass with gradient clipping
             loss.backward()
             
-            # Update model if gradient accumulation complete
             if (step + 1) % args.gradient_accumulation_steps == 0:
-                # Log gradients
-                if args.log_gradients:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        unet.parameters(), 
-                        args.max_grad_norm
-                    )
-                    logger.debug(f"Gradient norm: {grad_norm:.6f}")
+                # Clip gradients
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    unet.parameters(), 
+                    max_grad_norm
+                )
+                grad_norms.append(grad_norm.item())
+                
+                # Skip step if gradients are invalid
+                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                    logger.warning(f"Skipping step {step} due to invalid gradients")
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
                 
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
