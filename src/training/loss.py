@@ -29,7 +29,7 @@ def get_sigmas(num_inference_steps=28, sigma_min=0.0292, height=1024, width=1024
 def v_prediction_scaling_factors(sigma, sigma_data=1.0):
     """Compute scaling factors for v-prediction with improved stability"""
     # Add small epsilon to prevent division by zero
-    eps = 1e-5
+    eps = 1e-8
     
     # Modified scaling factors with better numerical stability
     c_skip = (sigma_data**2) / (sigma**2 + sigma_data**2 + eps)
@@ -127,10 +127,11 @@ def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kw
             sigma_max = 20000.0 * scale_factor  # Using practical ZTSNR approximation
             sigma = sigma * (sigma_max / 20000.0)
         
-        # Generate noise without normalization
+        # Generate noise and normalize it
         noise = torch.randn_like(x_0)
+        noise = noise / (noise.norm(p=2, dim=(1,2,3), keepdim=True) + 1e-8)
         
-        # Add noise to input (using unnormalized noise)
+        # Create noisy input with normalized noise
         x_t = x_0 + noise * sigma.view(-1, 1, 1, 1)
         
         # Get scaling factors (we'll only use c_out and c_in)
@@ -144,21 +145,22 @@ def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kw
             added_cond_kwargs=added_cond_kwargs
         ).sample
         
-        # Clamp predictions to prevent extreme values
-        v_pred = torch.clamp(v_pred, -10.0, 10.0)
+        # Normalize prediction before clamping
+        v_pred = v_pred / (v_pred.norm(p=2, dim=(1,2,3), keepdim=True) + 1e-8)
+        v_pred = torch.clamp(v_pred, -1.0, 1.0)  # Clamp to [-1,1] after normalization
         
         # Scale output and compute target (using unnormalized noise)
         scaled_output = c_out.view(-1, 1, 1, 1) * v_pred 
         v_target = c_in.view(-1, 1, 1, 1) * noise
 
         # Modified SNR weighting with paper-specified values
-        snr = torch.clamp((sigma_data / (sigma + 1e-5)) ** 2, 1e-5, 1e2)
+        snr = torch.clamp((sigma_data / (sigma + 1e-8)) ** 2, 1e-5, 1e2)
         min_snr = 1.0  # As per NovelAI V3 paper
         snr_clipped = torch.minimum(snr, torch.tensor(min_snr))
         loss_weight = torch.clamp(snr_clipped / snr, 0.1, 10.0)
 
         # Calculate loss with stability improvements
-        mse_loss = torch.nn.functional.mse_loss(scaled_output, v_target, reduction='none')
+        mse_loss = F.mse_loss(scaled_output, v_target, reduction='none')
         weighted_loss = (mse_loss * loss_weight.view(-1, 1, 1, 1))
         loss = weighted_loss.mean()
 
