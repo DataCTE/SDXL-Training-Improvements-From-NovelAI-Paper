@@ -21,8 +21,8 @@ from models.reward_model import (
 )
 from pathlib import Path
 import torch.nn.functional as F
-from ..utils.image_utils import encode_images, add_noise
-from ..utils.text_utils import encode_prompts
+from utils.image_utils import encode_images, add_noise
+from utils.text_utils import encode_prompts
 
 logger = logging.getLogger(__name__)
 
