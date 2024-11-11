@@ -237,7 +237,13 @@ def train(args, models, train_components, device, dtype):
     # Unpack components
     unet = models["unet"]
     train_dataloader = train_components["train_dataloader"]
-    optimizer = train_components["optimizer"]
+    optimizer = torch.optim.AdamW(
+        unet.parameters(),
+        lr=train_components["lr_scheduler"].get_last_lr()[0],
+        betas=(0.9, 0.999),
+        eps=1e-8,  # Increase epsilon for better stability
+        weight_decay=0.01
+    )
     lr_scheduler = train_components["lr_scheduler"]
     ema_model = train_components["ema_model"]
     validator = train_components["validator"]

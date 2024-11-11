@@ -59,6 +59,10 @@ def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kw
         # Generate noise with matching dtype
         noise = torch.randn_like(x_0, dtype=dtype)
         
+        # Add gradient scaling for numerical stability
+        scale_factor = min((x_0.shape[-1] * x_0.shape[-2] / (1024 * 1024)) ** 0.5, 4.0)  # Cap scaling
+        sigma = sigma * scale_factor
+        
         # Create noisy input
         x_t = x_0 + noise * sigma.view(-1, 1, 1, 1)
         
@@ -79,22 +83,35 @@ def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kw
         # Conservative clamping (as per paper's practical implementation)
         v_pred = torch.clamp(v_pred, -0.5, 0.5)  # Reduced range for stability
         
-        # Scale prediction and target using v-prediction scaling factors
-        _, c_out, c_in = v_prediction_scaling_factors(sigma, sigma_data)
+        # Improved v-prediction scaling factors
+        c_skip, c_out, c_in = v_prediction_scaling_factors(sigma, sigma_data)
+        
+        # Scale prediction and target
         scaled_output = c_out.view(-1, 1, 1, 1) * v_pred
         v_target = c_in.view(-1, 1, 1, 1) * noise
         
-        # MinSNR weighting as described in paper
-        snr = torch.clamp((sigma_data / (sigma + 1e-8)) ** 2, 1e-5, 1e2)
-        min_snr = 1.0  # As per paper
-        snr_clipped = torch.minimum(snr, torch.tensor(min_snr))
-        loss_weight = torch.clamp(snr_clipped / snr, 0.1, 10.0)
+        # Improved MinSNR weighting with better numerical stability
+        snr = (sigma_data / (sigma + 1e-8)) ** 2
+        snr = torch.clamp(snr, min=1e-5, max=1e2)  # Tighter bounds
+        min_snr = 1.0
+        snr_clipped = torch.minimum(snr, torch.tensor(min_snr, device=snr.device, dtype=snr.dtype))
+        loss_weight = torch.clamp(snr_clipped / snr, min=0.1, max=10.0)
         
-        # Calculate loss with stability improvements
+        # Calculate loss with improved stability
         mse_loss = F.mse_loss(scaled_output, v_target, reduction='none')
-        weighted_loss = (mse_loss * loss_weight.view(-1, 1, 1, 1))
+        weighted_loss = mse_loss * loss_weight.view(-1, 1, 1, 1)
         loss = weighted_loss.mean()
         
+        # Add gradient norm clipping threshold
+        max_grad_norm = 1.0
+        if loss.requires_grad:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+        
+        # Skip if loss is too small
+        if loss.item() < 1e-8:
+            logger.warning(f"Skipping batch due to very small loss: {loss.item()}")
+            return None, None
+            
         # Add L2 regularization to prevent extreme predictions
         l2_reg = 1e-4 * (v_pred ** 2).mean()
         loss = loss + l2_reg
