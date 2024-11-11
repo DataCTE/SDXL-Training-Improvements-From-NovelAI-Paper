@@ -11,6 +11,9 @@ from training.ema import EMAModel
 from training.utils import save_checkpoint, load_checkpoint
 from models.reward_model import RewardModel
 from pathlib import Path
+import torch.nn.functional as F
+from ..utils.image_utils import encode_images, add_noise
+from ..utils.text_utils import encode_prompts
 
 logger = logging.getLogger(__name__)
 
@@ -553,12 +556,21 @@ def train_with_itercomp(models, train_dataloader, args):
         logger.info("Starting standard training...")
         return train(models, train_dataloader, args)
 
-def training_step(unet, batch, reward_models=None):
+def training_step(unet, batch, args, reward_models=None):
     """
     Single training step with optional IterComp reward guidance
+    
+    Args:
+        unet: UNet model
+        batch: Training batch containing images and prompts
+        args: Training arguments
+        reward_models: Optional dict of reward models for IterComp
+    
+    Returns:
+        Total loss combining base loss and optional reward loss
     """
-    # Existing training logic
-    loss = compute_base_loss(unet, batch)
+    # Compute base diffusion loss
+    loss = compute_base_loss(unet, batch, args)
     
     # Add IterComp reward guidance if enabled
     if reward_models is not None:
@@ -566,3 +578,73 @@ def training_step(unet, batch, reward_models=None):
         loss = loss + args.reward_weight * reward_loss
         
     return loss
+
+def compute_base_loss(unet, batch, args):
+    """
+    Compute standard diffusion training loss
+    
+    Args:
+        unet: UNet model
+        batch: Training batch
+        args: Training arguments
+    
+    Returns:
+        Base diffusion loss
+    """
+    # Get images and prompts from batch
+    images = batch["images"].to(args.device)
+    prompts = batch["prompts"]
+    
+    # Encode images to latent space
+    latents = encode_images(images)
+    
+    # Add noise to latents
+    noise = torch.randn_like(latents)
+    timesteps = torch.randint(0, args.num_train_timesteps, (latents.shape[0],), device=latents.device)
+    noisy_latents = add_noise(latents, noise, timesteps)
+    
+    # Get text embeddings
+    text_embeddings = encode_prompts(prompts)
+    
+    # Predict noise
+    noise_pred = unet(noisy_latents, timesteps, text_embeddings).sample
+    
+    # Calculate loss
+    if args.loss_fn == "l2":
+        loss = F.mse_loss(noise_pred, noise)
+    elif args.loss_fn == "l1":
+        loss = F.l1_loss(noise_pred, noise)
+    else:
+        raise ValueError(f"Unknown loss function: {args.loss_fn}")
+        
+    return loss
+
+def compute_reward_loss(reward_models, batch):
+    """
+    Compute composition-aware reward loss from multiple reward models
+    
+    Args:
+        reward_models: Dict of reward models for different aspects
+        batch: Training batch
+    
+    Returns:
+        Combined reward loss
+    """
+    total_reward_loss = 0
+    
+    # Get generated and reference images
+    generated_images = batch["generated_images"] 
+    reference_images = batch["reference_images"]
+    prompts = batch["prompts"]
+    
+    # Calculate reward loss for each type of reward model
+    for reward_type, reward_model in reward_models.items():
+        # Get reward scores
+        generated_score = reward_model(prompts, generated_images)
+        reference_score = reward_model(prompts, reference_images)
+        
+        # Calculate loss based on reward difference
+        reward_loss = torch.mean(reference_score - generated_score)
+        total_reward_loss += reward_loss
+        
+    return total_reward_loss
