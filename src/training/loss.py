@@ -8,21 +8,22 @@ logger = logging.getLogger(__name__)
 
 def get_sigmas(num_inference_steps=28, sigma_min=0.0292, height=1024, width=1024):
     """
-    Generate sigmas for ZTSNR with resolution-dependent scaling using 28-step native schedule
+    Generate sigmas with resolution-dependent scaling using 28-step native schedule
+    Using sigma_max=29.0 for better coherence at high resolutions
     """
-    # Calculate resolution-dependent sigma_max
+    # Calculate resolution-dependent sigma_max with conservative scaling
     base_res = 1024 * 1024
     current_res = height * width
-    scale_factor = (current_res / base_res) ** 0.5
+    scale_factor = (current_res / base_res) ** 0.25  # Conservative scaling
     
-    # Use 20000 as infinity approximation for ZTSNR
-    sigma_max = 20000.0 * scale_factor
+    # Use 29.0 as base sigma_max (2x SDXL's default 14.6)
+    sigma_max = 29.0 * scale_factor
     
-    # Uniform linear spacing over 1000-step ZTSNR schedule
-    # but sampled at 28 points for efficiency
+    # Use non-linear spacing for better detail preservation
     t = torch.linspace(0, 1, num_inference_steps)
+    t = torch.sqrt(t)  # Non-linear spacing
     
-    # Linear interpolation in log-space
+    # Log-space interpolation with smoothing
     sigmas = torch.exp(t * torch.log(torch.tensor(sigma_min)) + 
                       (1-t) * torch.log(torch.tensor(sigma_max)))
     
@@ -160,10 +161,10 @@ class PerceptualLoss:
         return loss
 
 def get_resolution_dependent_sigma_max(height, width):
-    """Calculate resolution-dependent maximum sigma value"""
+    """Calculate resolution-dependent maximum sigma value with conservative scaling"""
     base_res = 1024 * 1024
     current_res = height * width
-    # Scale based on total pixels with EDM-style adjustment
-    scale_factor = (current_res / base_res) ** 0.5
-    base_sigma_max = 20000.0  # Approximate infinity for ZTSNR
+    # More conservative scaling for higher resolutions
+    scale_factor = (current_res / base_res) ** 0.25
+    base_sigma_max = 29.0  # Double SDXL's default of 14.6
     return base_sigma_max * scale_factor
