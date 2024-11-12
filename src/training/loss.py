@@ -37,6 +37,15 @@ def v_prediction_scaling_factors(sigma, sigma_data=1.0):
     
     return c_out, c_in
 
+def v_prediction_scaling_factors(sigma, sigma_data=1.0):
+    """
+    Compute v-prediction scaling factors according to paper equations (12), (13)
+    """
+    c_out = (-sigma * sigma_data) / torch.sqrt(sigma**2 + sigma_data**2)
+    c_in = 1 / torch.sqrt(sigma**2 + sigma_data**2)
+    
+    return c_out, c_in
+
 def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kwargs=None, sigma_data=1.0):
     """
     Calculate v-prediction loss with MinSNR weighting
@@ -67,11 +76,10 @@ def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kw
         # Get model prediction
         v_pred = model(x_t, sigma, text_embeddings, added_cond_kwargs=added_cond_kwargs).sample
         
-        # Calculate scaling factors
-        c_skip, c_out, c_in = v_prediction_scaling_factors(sigma, sigma_data)
-
-
-        # Keep these for the loss calculation:
+        # Calculate scaling factors - note we only need c_out and c_in
+        c_out, c_in = v_prediction_scaling_factors(sigma, sigma_data)
+        
+        # Scale prediction and target 
         scaled_output = c_out.view(-1, 1, 1, 1) * v_pred
         v_target = c_in.view(-1, 1, 1, 1) * noise
         
