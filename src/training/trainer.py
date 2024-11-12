@@ -239,10 +239,10 @@ def train(args, models, train_components, device, dtype):
     train_dataloader = train_components["train_dataloader"]
     optimizer = torch.optim.AdamW(
         unet.parameters(),
-        lr=train_components["lr_scheduler"].get_last_lr()[0],
-        betas=(0.9, 0.999),
-        eps=1e-8,  # Increase epsilon for better stability
-        weight_decay=0.01
+        lr=args.learning_rate,
+        betas=(args.adam_beta1, args.adam_beta2),
+        eps=args.adam_epsilon,
+        weight_decay=args.weight_decay
     )
     lr_scheduler = train_components["lr_scheduler"]
     ema_model = train_components["ema_model"]
