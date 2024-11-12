@@ -14,7 +14,7 @@ def get_sigmas(num_inference_steps=28, sigma_min=0.0292, height=1024, width=1024
     # Calculate resolution-dependent sigma_max with more conservative scaling
     base_res = 1024 * 1024
     current_res = height * width
-    scale_factor = (current_res / base_res) ** 0.5  # Reduced from 0.5 to 0.25
+    scale_factor = (current_res / base_res) ** 0.5  
     
     # Use 20000 as practical infinity approximation for ZTSNR
     sigma_max = 20000.0 * scale_factor
