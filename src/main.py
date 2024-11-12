@@ -49,8 +49,8 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
-    parser.add_argument("--warmup_steps", type=int, default=0,
-                       help="Number of steps for scheduler warm up")
+    parser.add_argument("--warmup_steps", type=int, default=1000,
+                       help="Number of warmup steps for learning rate scheduler")
     
     # AdamW optimizer arguments
     parser.add_argument("--adam_beta1", type=float, default=0.9,
@@ -65,7 +65,8 @@ def parse_args():
     # Data arguments
     parser.add_argument("--data_dir", type=str, required=True)
     parser.add_argument("--cache_dir", type=str, default="latents_cache")
-    parser.add_argument("--num_inference_steps", type=int, default=28)
+    parser.add_argument("--num_inference_steps", type=int, default=28,
+                       help="Number of inference steps (default: 28 as per paper)")
     
     # Model optimization
     parser.add_argument("--use_adafactor", action="store_true")

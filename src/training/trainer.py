@@ -9,6 +9,7 @@ from safetensors.torch import load_file
 from training.loss import get_sigmas, training_loss_v_prediction
 from training.ema import EMAModel
 from training.utils import save_checkpoint, load_checkpoint
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -234,6 +235,28 @@ def train_one_epoch(
         
         raise  # Re-raise the original training error
 
+def get_cosine_schedule_with_warmup(
+    optimizer: torch.optim.Optimizer,
+    num_warmup_steps: int,
+    num_training_steps: int,
+    num_cycles: float = 0.5,
+    last_epoch: int = -1
+):
+    """
+    Create a schedule with a learning rate that decreases following the values of the cosine function between the
+    initial lr set in the optimizer to 0, after a warmup period during which it increases linearly between 0 and the
+    initial lr set in the optimizer.
+    """
+    def lr_lambda(current_step):
+        # Warmup
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        # Cosine decay
+        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda, last_epoch)
+
 def train(args, models, train_components, device, dtype):
     """
     Main training loop
@@ -251,14 +274,29 @@ def train(args, models, train_components, device, dtype):
     # Unpack components
     unet = models["unet"]
     train_dataloader = train_components["train_dataloader"]
+    
+    # Initialize optimizer with paper's recommendations
     optimizer = torch.optim.AdamW(
         unet.parameters(),
-        lr=args.learning_rate,
-        betas=(args.adam_beta1, args.adam_beta2),
+        lr=args.learning_rate,  # Default should be 1e-5
+        betas=(args.adam_beta1, args.adam_beta2),  # (0.9, 0.999)
         eps=args.adam_epsilon,
-        weight_decay=args.weight_decay
+        weight_decay=args.weight_decay  # 0.01
     )
-    lr_scheduler = train_components["lr_scheduler"]
+    
+    # Calculate total number of training steps
+    num_training_steps = len(train_dataloader) * args.num_epochs
+    
+    # Create scheduler with warmup and cosine decay
+    lr_scheduler = get_cosine_schedule_with_warmup(
+        optimizer=optimizer,
+        num_warmup_steps=args.warmup_steps,
+        num_training_steps=num_training_steps
+    )
+    
+    # Update train_components with new scheduler
+    train_components["lr_scheduler"] = lr_scheduler
+    
     ema_model = train_components["ema_model"]
     validator = train_components["validator"]
     tag_weighter = train_components["tag_weighter"]

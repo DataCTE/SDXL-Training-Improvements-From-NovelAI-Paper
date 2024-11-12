@@ -8,37 +8,34 @@ logger = logging.getLogger(__name__)
 
 def get_sigmas(num_inference_steps=28, sigma_min=0.0292, height=1024, width=1024):
     """
-    Generate sigmas using EDM-style schedule with proper ZTSNR support
+    Generate sigmas for ZTSNR with resolution-dependent scaling using 28-step native schedule
     """
-    # Calculate base sigma max based on resolution
+    # Calculate resolution-dependent sigma_max
     base_res = 1024 * 1024
     current_res = height * width
-    res_scale = (current_res / base_res) ** 0.5
+    scale_factor = (current_res / base_res) ** 0.5
     
-    # Use EDM-style schedule
-    sigma_max = 20000.0 * res_scale  # Approximate infinity for ZTSNR
-    rho = 7.0  # EDM default
+    # Use 20000 as infinity approximation for ZTSNR
+    sigma_max = 20000.0 * scale_factor
     
-    # Generate timesteps with better distribution
+    # Uniform linear spacing over 1000-step ZTSNR schedule
+    # but sampled at 28 points for efficiency
     t = torch.linspace(0, 1, num_inference_steps)
-    sigmas = sigma_max ** (1/rho) * (1 - t) + sigma_min ** (1/rho) * t
-    sigmas = sigmas ** rho
+    
+    # Linear interpolation in log-space
+    sigmas = torch.exp(t * torch.log(torch.tensor(sigma_min)) + 
+                      (1-t) * torch.log(torch.tensor(sigma_max)))
     
     return sigmas
 
 def v_prediction_scaling_factors(sigma, sigma_data=1.0):
     """
-    Compute v-prediction scaling factors with proper SNR handling
+    Compute v-prediction scaling factors according to paper equations (12), (13)
     """
-    # Calculate signal-to-noise ratio
-    snr = (sigma_data / sigma) ** 2
-    
-    # Compute EDM-based scaling factors
-    c_skip = sigma_data**2 / (sigma**2 + sigma_data**2)
-    c_out = -sigma * sigma_data / torch.sqrt(sigma**2 + sigma_data**2)
+    c_out = (-sigma * sigma_data) / torch.sqrt(sigma**2 + sigma_data**2)
     c_in = 1 / torch.sqrt(sigma**2 + sigma_data**2)
     
-    return c_skip, c_out, c_in
+    return c_out, c_in
 
 def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kwargs=None, sigma_data=1.0):
     """
@@ -72,8 +69,9 @@ def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kw
         
         # Calculate scaling factors
         c_skip, c_out, c_in = v_prediction_scaling_factors(sigma, sigma_data)
-        
-        # Scale prediction and target
+
+
+        # Keep these for the loss calculation:
         scaled_output = c_out.view(-1, 1, 1, 1) * v_pred
         v_target = c_in.view(-1, 1, 1, 1) * noise
         
