@@ -67,11 +67,25 @@ def train_one_epoch(
                 "time_ids": batch["added_cond_kwargs"]["time_ids"].to(device, dtype=dtype)
             }
             
-            # Get noise schedule
-            sigmas = get_sigmas(args.num_inference_steps).to(device)
+            # Get noise schedule with resolution-aware sigma scaling
+            _, _, height, width = latents.shape
+            sigmas = get_sigmas(
+                num_inference_steps=args.num_inference_steps,
+                sigma_min=0.0292,
+                height=height,
+                width=width
+            ).to(device)
             sigma = sigmas[step % args.num_inference_steps].expand(latents.size(0))
-
-             
+            
+            # Log sigma distribution periodically
+            if args.use_wandb and step % args.logging_steps == 0:
+                timestep_histogram = torch.histc(sigma, bins=20)
+                wandb.log({
+                    "training/sigma_histogram": wandb.Histogram(timestep_histogram.cpu().numpy()),
+                    "training/sigma_mean": sigma.mean().item(),
+                    "training/sigma_std": sigma.std().item(),
+                    "training/step": step,
+                }, step=global_step)
             
             # Modified training step for BFloat16
             if dtype == torch.bfloat16:

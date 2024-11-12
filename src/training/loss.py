@@ -61,17 +61,10 @@ def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kw
                 for k, v in added_cond_kwargs.items()
             }
 
-        # Scale sigma based on resolution
-        _, _, height, width = x_0.shape
-        total_pixels = height * width
-        base_res = 1024 * 1024
-        res_scale = (total_pixels / base_res) ** 0.5
-        sigma = sigma * res_scale
-        
         # Generate noise
         noise = torch.randn_like(x_0, dtype=dtype)
         
-        # Create noisy input with proper scaling
+        # Create noisy input
         x_t = x_0 + noise * sigma.view(-1, 1, 1, 1)
         
         # Get model prediction
