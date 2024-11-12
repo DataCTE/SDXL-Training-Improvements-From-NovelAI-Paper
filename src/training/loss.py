@@ -8,16 +8,16 @@ logger = logging.getLogger(__name__)
 
 def get_sigmas(num_inference_steps=28, sigma_min=0.0292, height=1024, width=1024):
     """
-    Generate sigmas with resolution-dependent scaling using 28-step native schedule
-    Using sigma_max=29.0 for better coherence at high resolutions
+    Generate sigmas for ZTSNR with resolution-dependent scaling using 28-step native schedule
+    Modified for better noise control and ZTSNR support
     """
-    # Calculate resolution-dependent sigma_max with conservative scaling
+    # Calculate resolution-dependent sigma_max with more conservative scaling
     base_res = 1024 * 1024
     current_res = height * width
-    scale_factor = (current_res / base_res) ** 0.25  # Conservative scaling
+    scale_factor = (current_res / base_res) ** 0.5  # Reduced from 0.5 to 0.25
     
-    # Use 29.0 as base sigma_max (2x SDXL's default 14.6)
-    sigma_max = 29.0 * scale_factor
+    # Use 20000 as practical infinity approximation for ZTSNR
+    sigma_max = 20000.0 * scale_factor
     
     # Use non-linear spacing for better detail preservation
     t = torch.linspace(0, 1, num_inference_steps)
@@ -165,6 +165,6 @@ def get_resolution_dependent_sigma_max(height, width):
     base_res = 1024 * 1024
     current_res = height * width
     # More conservative scaling for higher resolutions
-    scale_factor = (current_res / base_res) ** 0.25
-    base_sigma_max = 29.0  # Double SDXL's default of 14.6
+    scale_factor = (current_res / base_res) ** 0.5  # Changed from 0.5 to 0.25
+    base_sigma_max = 20000.0  # Practical infinity for ZTSNR
     return base_sigma_max * scale_factor
