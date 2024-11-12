@@ -52,6 +52,16 @@ def parse_args():
     parser.add_argument("--warmup_steps", type=int, default=0,
                        help="Number of steps for scheduler warm up")
     
+    # AdamW optimizer arguments
+    parser.add_argument("--adam_beta1", type=float, default=0.9,
+                       help="The beta1 parameter for the Adam optimizer")
+    parser.add_argument("--adam_beta2", type=float, default=0.999,
+                       help="The beta2 parameter for the Adam optimizer")
+    parser.add_argument("--adam_epsilon", type=float, default=1e-8,
+                       help="Epsilon value for the Adam optimizer")
+    parser.add_argument("--weight_decay", type=float, default=1e-2,
+                       help="Weight decay for the Adam optimizer")
+    
     # Data arguments
     parser.add_argument("--data_dir", type=str, required=True)
     parser.add_argument("--cache_dir", type=str, default="latents_cache")
