@@ -4,9 +4,7 @@ import os
 import traceback
 from diffusers import UNet2DConditionModel, AutoencoderKL
 from transformers import CLIPTextModel
-
-
-
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -248,4 +246,33 @@ def save_checkpoint(checkpoint_dir, models, train_components, training_state):
         logger.error(f"Failed to save checkpoint: {str(e)}")
         logger.error(f"Checkpoint directory: {checkpoint_dir}")
         logger.error(f"Traceback: {traceback.format_exc()}")
+        raise
+
+def save_final_outputs(args, models, training_history, train_components):
+    """Save final model outputs using safetensors"""
+    try:
+        logger.info("Saving final model outputs...")
+        
+        # Save final UNet
+        final_model_path = os.path.join(args.output_dir, "final_model")
+        os.makedirs(final_model_path, exist_ok=True)
+        models["unet"].save_pretrained(final_model_path, safe_serialization=True)
+        
+        # Save final EMA model if it exists
+        if models.get("ema_model") is not None:
+            logger.info("Saving final EMA model...")
+            ema_path = os.path.join(args.output_dir, "final_ema")
+            os.makedirs(ema_path, exist_ok=True)
+            
+            ema_model = models["ema_model"].get_model()
+            ema_model.save_pretrained(ema_path, safe_serialization=True)
+        
+        # Save final training metrics
+        with open(os.path.join(args.output_dir, "training_history.json"), "w") as f:
+            json.dump(training_history, f, indent=2)
+            
+        logger.info("Final outputs saved successfully")
+        
+    except Exception as e:
+        logger.error(f"Error saving final outputs: {str(e)}")
         raise

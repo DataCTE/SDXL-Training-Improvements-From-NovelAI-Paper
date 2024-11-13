@@ -8,15 +8,13 @@ from diffusers.optimization import get_scheduler
 from data.dataset import CustomDataset
 from models.tag_weighter import TagBasedLossWeighter
 from models.vae_finetuner import VAEFineTuner
-from models.model_validator import ModelValidator
+from ..infer.text_to_image import ModelValidator
 from training.ema import EMAModel
 import wandb
 import numpy as np
 from diffusers import UNet2DConditionModel, AutoencoderKL
 from transformers import CLIPTokenizer, CLIPTextModel
-from torchvision import transforms
-import json
-import os
+
 
 
 logger = logging.getLogger(__name__)
@@ -40,48 +38,6 @@ def setup_torch_backends():
     torch.backends.cuda.enable_math_sdp(True)
     torch.backends.cuda.enable_mem_efficient_sdp(True)
 
-def custom_collate(batch):
-    """Custom collate function that validates dimensions and handles varying tensor sizes"""
-    def validate_latents(latents):
-        h, w = latents.shape[-2:]
-        min_size = 256 // 8  # Minimum 256 pixels in image space
-        max_size = 2048 // 8  # Maximum 2048 pixels in image space
-        return (h >= min_size and w >= min_size and
-                h <= max_size and w <= max_size)
-
-    def resize_latents(latents, target_height, target_width):
-        return transforms.functional.interpolate(
-            latents,
-            size=(target_height, target_width),
-            mode='nearest'
-        )
-
-    # Filter out invalid samples
-    valid_batch = [item for item in batch if validate_latents(item['latents'])]
-    
-    if not valid_batch:
-        raise ValueError("No valid samples in batch (all below minimum size)")
-
-    # Find the largest dimensions to pad to
-    max_height = max(latent.shape[-2] for latent in [x["latents"] for x in valid_batch])
-    max_width = max(latent.shape[-1] for latent in [x["latents"] for x in valid_batch])
-
-    # Resize or pad latents to the largest dimensions
-    resized_latents = [
-        resize_latents(x["latents"], max_height, max_width)
-        for x in valid_batch
-    ]
-
-    # Stack resized tensors
-    batch_dict = {
-        "latents": torch.stack(resized_latents),
-        "text_embeddings": torch.stack([x["text_embeddings"] for x in valid_batch]),
-        "text_embeddings_2": torch.stack([x["text_embeddings_2"] for x in valid_batch]),
-        "pooled_text_embeddings_2": torch.stack([x["pooled_text_embeddings_2"] for x in valid_batch]),
-        "tags": [x["tags"] for x in valid_batch]
-    }
-
-    return batch_dict
 
 def enable_gradient_checkpointing(model):
     """Enable gradient checkpointing for a model"""
@@ -412,90 +368,3 @@ def setup_training(args, models, device, dtype):
         logger.error(f"Traceback: {traceback.format_exc()}")
         raise
 
-def verify_training_components(train_components):
-    """
-    Verify that all required training components are present and properly configured
-    
-    Args:
-        train_components (dict): Dictionary of training components
-        
-    Returns:
-        bool: True if verification passes
-    """
-    required_components = [
-        "dataset",
-        "train_dataloader",
-        "optimizer",
-        "lr_scheduler",
-        "tag_weighter",
-        "num_update_steps_per_epoch",
-        "num_training_steps"
-    ]
-    
-    try:
-        # Check for required components
-        for component_name in required_components:
-            if component_name not in train_components:
-                raise ValueError(f"Missing required component: {component_name}")
-            
-        # Verify dataloader
-        if len(train_components["train_dataloader"]) == 0:
-            raise ValueError("Empty training dataloader")
-            
-        # Verify optimizer
-        if len(list(train_components["optimizer"].param_groups)) == 0:
-            raise ValueError("Optimizer has no parameter groups")
-            
-        return True
-        
-    except Exception as e:
-        logger.error(f"Training component verification failed: {str(e)}")
-        return False
-
-def cleanup(models, train_components, args):
-    """Cleanup after training"""
-    try:
-        # Clean up CUDA memory
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            if hasattr(torch.cuda, 'memory_stats'):
-                logger.info(f"Final CUDA memory: {torch.cuda.memory_allocated()/1e9:.2f}GB")
-        
-        # Disable gradient checkpointing for cleanup
-        for model_name, model in models.items():
-            if hasattr(model, "gradient_checkpointing_disable"):
-                model.gradient_checkpointing_disable()
-            elif hasattr(model, "disable_gradient_checkpointing"):
-                model.disable_gradient_checkpointing()
-        
-    except Exception as cleanup_error:
-        logger.error(f"Error during cleanup: {cleanup_error}")
-
-def save_final_outputs(args, models, training_history, train_components):
-    """Save final model outputs using safetensors"""
-    try:
-        logger.info("Saving final model outputs...")
-        
-        # Save final UNet
-        final_model_path = os.path.join(args.output_dir, "final_model")
-        os.makedirs(final_model_path, exist_ok=True)
-        models["unet"].save_pretrained(final_model_path, safe_serialization=True)
-        
-        # Save final EMA model if it exists
-        if models.get("ema_model") is not None:
-            logger.info("Saving final EMA model...")
-            ema_path = os.path.join(args.output_dir, "final_ema")
-            os.makedirs(ema_path, exist_ok=True)
-            
-            ema_model = models["ema_model"].get_model()
-            ema_model.save_pretrained(ema_path, safe_serialization=True)
-        
-        # Save final training metrics
-        with open(os.path.join(args.output_dir, "training_history.json"), "w") as f:
-            json.dump(training_history, f, indent=2)
-            
-        logger.info("Final outputs saved successfully")
-        
-    except Exception as e:
-        logger.error(f"Error saving final outputs: {str(e)}")
-        raise

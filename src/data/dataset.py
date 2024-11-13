@@ -6,14 +6,10 @@ from torch.utils.data import Dataset
 import math
 from tqdm import tqdm
 import logging
-from transformers import CLIPModel, CLIPProcessor
-from utils.device import to_device
 import traceback
-import os
-import time
-import glob
 import random
 import re
+from ..utils.validation import validate_dataset
 
 logger = logging.getLogger(__name__)
 
@@ -392,72 +388,46 @@ class CustomDataset(Dataset):
         random.shuffle(combined)
         self.image_paths, self.latent_paths = zip(*combined)
 
-def validate_dataset(data_dir):
-    """Pre-process validation of all images in dataset"""
-    logger.info("Starting dataset validation...")
-    stats = {'valid': 0, 'invalid': 0, 'errors': {}}
-    
-    for path in glob.glob(os.path.join(data_dir, "*.png")):
-        try:
-            # Try to open and verify the image
-            with Image.open(path) as img:
-                # Check if image can be loaded
-                img.verify()
-                
-                # Additional checks
-                if img.mode != 'RGB':
-                    raise ValueError(f"Invalid mode: {img.mode}")
-                
-                # Get image size
-                width, height = img.size
-                if width < 512 or height < 512:
-                    raise ValueError(f"Image too small: {width}x{height}")
-                
-                stats['valid'] += 1
-                
-        except Exception as e:
-            stats['invalid'] += 1
-            error_type = type(e).__name__
-            error_msg = str(e)
-            
-            if error_type not in stats['errors']:
-                stats['errors'][error_type] = []
-            stats['errors'][error_type].append((path, error_msg))
-            
-            logger.warning(f"- {path}: {error_type}: {error_msg}")
 
-    # Log error statistics
-    if stats['errors']:
-        logger.warning("\nError Summary:")
-        for error_type, errors in stats['errors'].items():
-            logger.warning(f"\n{error_type} ({len(errors)} occurrences):")
-            # Show first 5 examples of each error type
-            for path, msg in errors[:5]:
-                logger.warning(f"  - {os.path.basename(path)}: {msg}")
-            if len(errors) > 5:
-                logger.warning(f"  ... and {len(errors)-5} more")
+def custom_collate(batch):
+    """Custom collate function that validates dimensions and handles varying tensor sizes"""
+    def validate_latents(latents):
+        h, w = latents.shape[-2:]
+        min_size = 256 // 8  # Minimum 256 pixels in image space
+        max_size = 2048 // 8  # Maximum 2048 pixels in image space
+        return (h >= min_size and w >= min_size and
+                h <= max_size and w <= max_size)
 
-    logger.info(f"\nValidation complete: {stats['valid']} valid, {stats['invalid']} invalid images")
-    
-    return stats['valid'] > 0, stats
+    def resize_latents(latents, target_height, target_width):
+        return transforms.functional.interpolate(
+            latents,
+            size=(target_height, target_width),
+            mode='nearest'
+        )
 
-def validate_image_dimensions(width, height):
-    """Validate image dimensions for SDXL training"""
-    # Convert to latent dimensions
-    latent_width = width // 8
-    latent_height = height // 8
+    # Filter out invalid samples
+    valid_batch = [item for item in batch if validate_latents(item['latents'])]
     
-    # Check minimum dimensions
-    if latent_width < 32 or latent_height < 32:  # 256 pixels in image space
-        return False, f"Latent dimensions too small: {latent_width}x{latent_height}"
-        
-    # Check maximum dimensions
-    if latent_width > 256 or latent_height > 256:  # 2048 pixels in image space
-        return False, f"Latent dimensions too large: {latent_width}x{latent_height}"
-        
-    # Check aspect ratio
-    aspect_ratio = width / height
-    if aspect_ratio < 0.25 or aspect_ratio > 4.0:
-        return False, f"Aspect ratio ({aspect_ratio:.2f}) outside supported range"
-        
-    return True, None
+    if not valid_batch:
+        raise ValueError("No valid samples in batch (all below minimum size)")
+
+    # Find the largest dimensions to pad to
+    max_height = max(latent.shape[-2] for latent in [x["latents"] for x in valid_batch])
+    max_width = max(latent.shape[-1] for latent in [x["latents"] for x in valid_batch])
+
+    # Resize or pad latents to the largest dimensions
+    resized_latents = [
+        resize_latents(x["latents"], max_height, max_width)
+        for x in valid_batch
+    ]
+
+    # Stack resized tensors
+    batch_dict = {
+        "latents": torch.stack(resized_latents),
+        "text_embeddings": torch.stack([x["text_embeddings"] for x in valid_batch]),
+        "text_embeddings_2": torch.stack([x["text_embeddings_2"] for x in valid_batch]),
+        "pooled_text_embeddings_2": torch.stack([x["pooled_text_embeddings_2"] for x in valid_batch]),
+        "tags": [x["tags"] for x in valid_batch]
+    }
+
+    return batch_dict

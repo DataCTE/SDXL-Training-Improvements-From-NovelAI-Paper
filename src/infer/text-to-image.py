@@ -1,351 +1,239 @@
 import torch
-from diffusers import UNet2DConditionModel, AutoencoderKL
-from transformers import CLIPTokenizer, CLIPTextModel
-import argparse
+from diffusers import StableDiffusionXLPipeline
 import logging
 from pathlib import Path
 import time
-from PIL import Image
-import numpy as np
-import sys
-from pathlib import Path
-sys.path.append(str(Path(__file__).parent.parent))
-from training.loss import get_sigmas, v_prediction_scaling_factors
-import traceback
-import math
+import wandb
+
 
 logger = logging.getLogger(__name__)
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Generate images using trained SDXL model")
-    
-    parser.add_argument(
-        "--model_path",
-        type=str,
-        required=True,
-        help="Path to the trained model directory"
-    )
-    parser.add_argument(
-        "--prompt",
-        type=str,
-        required=True,
-        help="Text prompt for image generation"
-    )
-    parser.add_argument(
-        "--negative_prompt",
-        type=str,
-        default="",
-        help="Negative prompt for image generation"
-    )
-    parser.add_argument(
-        "--num_images",
-        type=int,
-        default=1,
-        help="Number of images to generate"
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="outputs",
-        help="Directory to save generated images"
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-        help="Random seed for generation"
-    )
-    parser.add_argument(
-        "--height",
-        type=int,
-        default=1024,
-        help="Height of generated images"
-    )
-    parser.add_argument(
-        "--width",
-        type=int,
-        default=1024,
-        help="Width of generated images"
-    )
-    parser.add_argument(
-        "--num_inference_steps",
-        type=int,
-        default=28,
-        help="Number of denoising steps"
-    )
-    parser.add_argument(
-        "--guidance_scale",
-        type=float,
-        default=7.5,
-        help="Classifier-free guidance scale"
-    )
-    parser.add_argument(
-        "--use_fp16",
-        action="store_true",
-        help="Use float16 precision"
-    )
+class ModelValidator:
+    def __init__(self, model_path, device="cuda", dtype=torch.float16,
+                 zsnr=True, sigma_min=0.0292, sigma_data=1.0, min_snr_gamma=5.0,
+                 variant="fp16"):
+        """
+        Initialize the ModelValidator with specified parameters.
 
-    return parser.parse_args()
-
-def encode_prompt(prompt, tokenizer, tokenizer_2, text_encoder, text_encoder_2, device):
-    """Encode the prompt using both text encoders"""
-    # Tokenize prompts
-    text_inputs = tokenizer(
-        prompt,
-        padding="max_length",
-        max_length=tokenizer.model_max_length,
-        truncation=True,
-        return_tensors="pt",
-    )
-    
-    text_inputs_2 = tokenizer_2(
-        prompt,
-        padding="max_length",
-        max_length=tokenizer_2.model_max_length,
-        truncation=True,
-        return_tensors="pt",
-    )
-    
-    # Get text embeddings
-    text_encoder.eval()
-    text_encoder_2.eval()
-    with torch.no_grad():
-        text_embeddings = text_encoder(
-            text_inputs.input_ids.to(device)
-        )[0]
-        text_embeddings_2 = text_encoder_2(
-            text_inputs_2.input_ids.to(device)
-        )
-        pooled_text_embeddings_2 = text_embeddings_2[1]
-        text_embeddings_2 = text_embeddings_2[0]
-    
-    # Concatenate embeddings - verify dimensions
-    print(f"Text embeddings 1 shape: {text_embeddings.shape}")  # Should be [batch_size, seq_len, 768]
-    print(f"Text embeddings 2 shape: {text_embeddings_2.shape}")  # Should be [batch_size, seq_len, 1280]
-    text_embeddings = torch.cat([text_embeddings, text_embeddings_2], dim=-1)
-    print(f"Combined embeddings shape: {text_embeddings.shape}")  # Should be [batch_size, seq_len, 2048]
-    
-    return text_embeddings, pooled_text_embeddings_2
-
-def load_models(model_path, dtype):
-    """Load all required models"""
-    logger.info("Loading models...")
-    
-    # Load UNet with proper config
-    unet = UNet2DConditionModel.from_pretrained(
-        f"{model_path}/unet",
-        torch_dtype=dtype,
-        use_safetensors=True
-    ).to("cuda")
-    
-    # Print UNet config for debugging
-    print("UNet config:", unet.config)
-    
-    # Load VAE
-    vae = AutoencoderKL.from_pretrained(
-        f"{model_path}/vae",
-        torch_dtype=dtype,
-        use_safetensors=True
-    ).to("cuda")
-    vae.eval()
-    
-    # Load text encoders and tokenizers
-    text_encoder = CLIPTextModel.from_pretrained(
-        f"{model_path}/text_encoder",
-        torch_dtype=dtype,
-        use_safetensors=True
-    ).to("cuda")
-    
-    text_encoder_2 = CLIPTextModel.from_pretrained(
-        f"{model_path}/text_encoder_2",
-        torch_dtype=dtype,
-        use_safetensors=True
-    ).to("cuda")
-    
-    tokenizer = CLIPTokenizer.from_pretrained(f"{model_path}/tokenizer")
-    tokenizer_2 = CLIPTokenizer.from_pretrained(f"{model_path}/tokenizer_2")
-    
-    return {
-        "unet": unet,
-        "vae": vae,
-        "text_encoder": text_encoder,
-        "text_encoder_2": text_encoder_2,
-        "tokenizer": tokenizer,
-        "tokenizer_2": tokenizer_2
-    }
-
-def get_timestep_embedding(timesteps, embedding_dim, max_period=10000):
-    """
-    Create sinusoidal timestep embeddings.
-    """
-    half = embedding_dim // 2
-    freqs = torch.exp(
-        -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=timesteps.device) / half
-    )
-    
-    # Reshape for broadcasting
-    args = timesteps[:, None].float() * freqs[None, :]
-    
-    # Create embeddings
-    embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-    
-    # Handle odd embedding dimensions
-    if embedding_dim % 2:
-        embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-    
-    return embedding
-
-def create_time_ids(args, device, dtype):
-    # Create tensor with correct shape [batch_size, 6]
-    add_time_ids = torch.zeros((1, 6), device=device, dtype=dtype)
-    
-    # Fill in the values according to SDXL's requirements
-    add_time_ids[0] = torch.tensor([
-        args.width,   # Original width
-        args.height,  # Original height
-        args.width,   # Target width
-        args.height,  # Target height
-        0,           # Crop coordinates
-        0,           # Crop coordinates
-    ], device=device, dtype=dtype)
-    
-    # Handle classifier-free guidance
-    if args.guidance_scale > 1.0:
-        add_time_ids = add_time_ids.repeat(2, 1)  # Shape: [2, 6]
-    
-    return add_time_ids
-
-def generate_images(models, args):
-    device = "cuda"
-    dtype = torch.float16 if args.use_fp16 else torch.float32
-    
-    # Create output directory
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Set seed if provided
-    if args.seed is not None:
-        torch.manual_seed(args.seed)
-    
-    # Get sigmas for sampling
-    sigmas = get_sigmas(args.num_inference_steps)
-    sigmas = sigmas.to(device=device, dtype=dtype)
-    sigmas = sigmas.flip(0)
-    
-    # Encode prompts
-    text_embeddings, pooled_text_embeddings_2 = encode_prompt(
-        args.prompt,
-        models["tokenizer"],
-        models["tokenizer_2"],
-        models["text_encoder"],
-        models["text_encoder_2"],
-        device
-    )
-    
-    # Handle classifier-free guidance
-    if args.guidance_scale > 1.0:
-        uncond_embeddings, uncond_pooled = encode_prompt(
-            args.negative_prompt,
-            models["tokenizer"],
-            models["tokenizer_2"],
-            models["text_encoder"],
-            models["text_encoder_2"],
-            device
-        )
-        text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
-        pooled_text_embeddings_2 = torch.cat([uncond_pooled, pooled_text_embeddings_2])
-    
-    # Create time embeddings
-    time_ids = create_time_ids(args, device, dtype)
-    
-    # Generate multiple images
-    start_time = time.time()
-    for img_idx in range(args.num_images):
-        # Initialize latents
-        latents = torch.randn(
-            (1, 4, args.height // 8, args.width // 8),
-            device=device,
-            dtype=dtype
-        )
+        Args:
+            model_path (str): Path to the pre-trained model.
+            device (str): Device to run on, e.g., "cuda" or "cpu".
+            dtype (torch.dtype): Data type for the model.
+            zsnr (bool): Whether to use ZSNR.
+            sigma_min (float): Minimum value for sigma.
+            sigma_data (float): Maximum value for sigma.
+            min_snr_gamma (float): Minimum SNR gamma value.
+            variant (str): Variant to load, e.g., "fp16".
+        """
+        logger.info(f"Initializing ModelValidator with model path: {model_path}")
         
-        if args.guidance_scale > 1.0:
-            latents = latents.repeat(2, 1, 1, 1)
+        self.model_path = model_path
+        self.device = device
+        self.dtype = dtype
+        self.zsnr = zsnr
+        self.sigma_min = sigma_min
+        self.sigma_data = sigma_data
+        self.min_snr_gamma = min_snr_gamma
+        self.variant = variant
         
-        # Denoising loop
-        for step_idx, sigma in enumerate(sigmas):
-            c_in = 1 / (sigma ** 2 + 1).sqrt()
-            c_out = -sigma / (sigma ** 2 + 1).sqrt()
+        try:
+            self.pipeline = StableDiffusionXLPipeline.from_pretrained(
+                model_path,
+                torch_dtype=self.dtype,
+                use_safetensors=True,
+                variant=self.variant
+            ).to(self.device)
             
-            latent_model_input = c_in * latents
-            
-            with torch.no_grad():
-                noise_pred = models["unet"](
-                    latent_model_input,
-                    sigma,
-                    encoder_hidden_states=text_embeddings,
-                    added_cond_kwargs={
-                        "text_embeds": pooled_text_embeddings_2,
-                        "time_ids": time_ids
-                    }
-                ).sample
-            
-            if args.guidance_scale > 1.0:
-                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_text - noise_pred_uncond)
-                # Take only the text conditional latents, not the unconditional ones
-                latents = latents[:1]
-            
-            latents = c_out * latents - c_in * noise_pred
-            
-            if step_idx % 5 == 0:
-                print(f"Step {step_idx}")
-                print(f"  Sigma: {sigma:.3f}")
-                print(f"  Latents range: {latents.min():.3f} to {latents.max():.3f}")
-                print(f"  Model input range: {latent_model_input.min():.3f} to {latent_model_input.max():.3f}")
-                print(f"  Noise pred range: {noise_pred.min():.3f} to {noise_pred.max():.3f}")
-        
-        # Decode the final latents
-        with torch.no_grad():
-            latents = 1 / 0.13025 * latents
-            decoded = models["vae"].decode(latents).sample
-            images = (decoded / 2 + 0.5).clamp(0, 1)
-            images = images.cpu().permute(0, 2, 3, 1).float().numpy()
-            images = (images * 255).round().astype("uint8")
-            pil_images = [Image.fromarray(image) for image in images]
-        
-        # Save the images
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        for j, image in enumerate(pil_images):
-            image_path = output_dir / f"generation_{timestamp}_{img_idx}_{j}.png"
-            image.save(image_path)
-            logger.info(f"Saved image to {image_path}")
-        
-        generation_time = time.time() - start_time
-        logger.info(f"Generated image {img_idx+1}/{args.num_images} in {generation_time:.2f}s")
-
-def main():
-    args = parse_args()
+            logger.info("Model successfully loaded to device.")
+        except Exception as e:
+            logger.error(f"Error loading model: {str(e)}")
+            raise
     
-    # Setup logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s'
-    )
-    
-    try:
-        # Load models
-        dtype = torch.float16 if args.use_fp16 else torch.float32
-        models = load_models(args.model_path, dtype)
-        
-        # Generate images
-        generate_images(models, args)
-        
-        logger.info("Generation complete!")
-        
-    except Exception as e:
-        logger.error(f"Generation failed: {str(e)}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        raise
+    def generate_images(self, prompts, **generation_kwargs):
+        """
+        Generate images based on the provided prompts.
 
-if __name__ == "__main__":
-    main()
+        Args:
+            prompts (list): List of prompts to validate with.
+            **generation_kwargs: Additional arguments for image generation.
+
+        Returns:
+            list: Generated images.
+        """
+        logger.info("Starting image generation.")
+        
+        generated_images = []
+        generation_times = []
+        
+        try:
+            for idx, prompt in enumerate(prompts):
+                logger.debug(f"Generating image for prompt: {prompt}")
+                
+                start_time = time.time()
+                
+                # Generate image
+                output = self.pipeline(prompt=prompt, **generation_kwargs)
+                gen_time = time.time() - start_time
+                
+                generation_times.append(gen_time)
+                
+                logger.debug(f"Generated image for prompt: {prompt} in {gen_time:.2f}s")
+                
+                generated_image = {
+                    "prompt": prompt,
+                    "image": output.images[0],
+                    "generation_time": gen_time,
+                    "image_index": idx
+                }
+                
+                generated_images.append(generated_image)
+                
+            logger.info("All images successfully generated.")
+            
+        except Exception as e:
+            logger.error(f"Error during image generation: {str(e)}")
+            raise
+        
+        finally:
+            torch.cuda.empty_cache()
+        
+        return generated_images, generation_times
+    
+    def run_validation(self, prompts, output_dir=None, log_to_wandb=True, **generation_kwargs):
+        """
+        Run full validation suite.
+
+        Args:
+            prompts (list): List of prompts to validate with.
+            output_dir (str): Directory to save validation images.
+            log_to_wandb (bool): Whether to log results to W&B.
+            **generation_kwargs: Additional arguments for image generation.
+
+        Returns:
+            dict: Validation metrics.
+        """
+        logger.info("Starting validation run.")
+        
+        if output_dir:
+            output_dir = Path(output_dir)
+            output_dir.mkdir(exist_ok=True)
+        
+        validation_metrics = {
+            "generation_times": [],
+            "images_generated": 0,
+            "successful_generations": 0,
+            "failed_generations": 0
+        }
+        
+        try:
+            # Generate validation images
+            generated_images, generation_times = self.generate_images(prompts, **generation_kwargs)
+            
+            validation_metrics["images_generated"] = len(generated_images)
+            validation_metrics["successful_generations"] = len(generated_images)
+            
+            # Calculate average generation time
+            avg_gen_time = sum(gen_time for gen_time in generation_times) / len(generation_times)
+            validation_metrics["avg_generation_time"] = avg_gen_time
+            
+            logger.info(f"Average generation time: {avg_gen_time:.2f}s")
+            
+            # Save images if output directory provided
+            if output_dir:
+                for idx, gen in enumerate(generated_images):
+                    image_path = output_dir / f"validation_{idx}.png"
+                    gen["image"].save(image_path)
+                    logger.debug(f"Saved validation image to {image_path}")
+                    
+            # Log to W&B if enabled
+            if log_to_wandb and wandb.run is not None:
+                wandb_images = []
+                for idx, gen in enumerate(generated_images):
+                    wandb_images.append(
+                        wandb.Image(
+                            gen["image"],
+                            caption=f"Prompt: {gen['prompt']}\nGeneration time: {gen['generation_time']:.2f}s"
+                        )
+                    )
+                wandb.log({
+                    "validation/images": wandb_images,
+                    "validation/avg_generation_time": avg_gen_time
+                })
+                
+            logger.info("Validation metrics successfully logged to W&B.")
+            
+        except Exception as e:
+            logger.error(f"Error during validation run: {str(e)}")
+            raise
+        
+        finally:
+            torch.cuda.empty_cache()
+        
+        return validation_metrics
+    
+    def generate_images(self, prompts, **generation_kwargs):
+        """
+        Generate images based on the provided prompts.
+
+        Args:
+            prompts (list): List of prompts to validate with.
+            **generation_kwargs: Additional arguments for image generation.
+
+        Returns:
+            list: Generated images and their generation times.
+        """
+        logger.info("Starting image generation.")
+        
+        generated_images = []
+        generation_times = []
+        
+        try:
+            # Generate images
+            outputs = self.pipeline(prompts=prompts, **generation_kwargs)
+            
+            for output in outputs:
+                gen_time = time.time()
+                
+                generated_image = {
+                    "prompt": output.prompt,
+                    "image": output.images[0],
+                    "generation_time": gen_time
+                }
+                
+                generated_images.append(generated_image)
+                generation_times.append(gen_time)
+            
+        except Exception as e:
+            logger.error(f"Error during image generation: {str(e)}")
+            raise
+        
+        finally:
+            torch.cuda.empty_cache()
+        
+        return generated_images, generation_times
+    
+    def log_validation_metrics(self, validation_metrics):
+        """
+        Log the validation metrics.
+
+        Args:
+            validation_metrics (dict): Validation metrics to log.
+        """
+        logger.info("Logging validation metrics.")
+        
+        try:
+            if wandb.run is not None:
+                wandb.log(validation_metrics)
+            
+            logger.info(f"Validation metrics successfully logged to W&B.")
+            
+        except Exception as e:
+            logger.error(f"Error logging validation metrics: {str(e)}")
+            raise
+        
+    def cleanup(self):
+        """
+        Clean up resources.
+        """
+        torch.cuda.empty_cache()
+        logger.info("Resources cleaned up.")
