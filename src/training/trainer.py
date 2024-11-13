@@ -5,15 +5,11 @@ from tqdm import tqdm
 import wandb
 import logging
 import traceback
-from safetensors.torch import load_file
 from training.loss import get_sigmas, training_loss_v_prediction
-from training.ema import EMAModel
-from training.utils import save_checkpoint, load_checkpoint
+from utils.setup import save_checkpoint, load_checkpoint
 import math
 import os
 import numpy as np
-from data.dataset import CustomDataset
-
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +19,6 @@ def train_one_epoch(
     optimizer,
     lr_scheduler,
     ema_model,
-    validator,
     tag_weighter,
     vae_finetuner,
     args,
@@ -32,7 +27,6 @@ def train_one_epoch(
     epoch,
     global_step,
     models,
-    training_history
 ):
     """Single epoch training loop with detailed logging"""
     try:

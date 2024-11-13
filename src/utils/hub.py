@@ -8,7 +8,7 @@ from diffusers.optimization import get_scheduler
 from data.dataset import CustomDataset
 from models.tag_weighter import TagBasedLossWeighter
 from models.vae_finetuner import VAEFineTuner
-from training.utils import custom_collate
+from setup import custom_collate
 
 logger = logging.getLogger(__name__)
 
