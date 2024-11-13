@@ -21,19 +21,7 @@ logger = logging.getLogger(__name__)
 class CustomDataset(Dataset):
     def __init__(self, data_dir, vae, tokenizer, tokenizer_2, text_encoder, text_encoder_2,
                  cache_dir="latents_cache", no_caching_latents=False, all_ar=False):
-        """Initialize dataset with image preprocessing
-        
-        Args:
-            data_dir (str): Directory containing images and captions
-            vae (AutoencoderKL): VAE model
-            tokenizer (CLIPTokenizer): Primary tokenizer
-            tokenizer_2 (CLIPTokenizer): Secondary tokenizer
-            text_encoder (CLIPTextModel): Primary text encoder
-            text_encoder_2 (CLIPTextModel): Secondary text encoder
-            cache_dir (str): Directory for caching latents
-            no_caching_latents (bool): Skip latent caching if True
-            all_ar (bool): Accept all aspect ratios without resizing if True
-        """
+        """Initialize dataset with image preprocessing"""
         super().__init__()
         self.data_dir = Path(data_dir)
         self.cache_dir = Path(cache_dir)
@@ -43,11 +31,6 @@ class CustomDataset(Dataset):
         if not no_caching_latents:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
         
-        # Validate dataset first
-        valid, stats = validate_dataset(data_dir)
-        if not valid:
-            raise ValueError("Dataset validation failed")
-            
         # Get all valid image paths (support multiple formats)
         self.image_paths = []
         for ext in ['*.png', '*.jpg', '*.jpeg', '*.webp']:
@@ -66,15 +49,13 @@ class CustomDataset(Dataset):
         self.text_encoder = text_encoder
         self.text_encoder_2 = text_encoder_2
         
-        # Initialize upscaler
-        logger.info("Initializing image processors...")
-        self.upscaler = UltimateUpscaler()
+        # Initialize processors only if needed
+        if not all_ar:
+            logger.info("Initializing image processors...")
+            self.upscaler = UltimateUpscaler()
         
-        # Preprocess all images to correct SDXL sizes
-        logger.info("Starting image preprocessing...")
+        # Process images and captions
         self._preprocess_images()
-        
-        # Process captions and build statistics
         self.tag_stats = self._build_tag_statistics()
         logger.info(f"Processed {len(self.image_paths)} images with tag statistics")
 
