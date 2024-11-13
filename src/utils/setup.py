@@ -6,8 +6,8 @@ from bitsandbytes.optim import AdamW8bit
 from transformers.optimization import Adafactor
 from diffusers.optimization import get_scheduler
 from data.dataset import CustomDataset
-from models.tag_weighter import TagBasedLossWeighter
-from models.vae_finetuner import VAEFineTuner
+from data.tag_weighter import TagBasedLossWeighter
+from training.vae_finetuner import VAEFineTuner
 from inference.text_to_image import ModelValidator
 from training.ema import EMAModel
 import wandb
@@ -18,8 +18,8 @@ from data.dataset import custom_collate
 from data.dataset import CustomDataset
 from inference.text_to_image import ModelValidator
 from training.ema import EMAModel
-from models.tag_weighter import TagBasedLossWeighter
-from models.vae_finetuner import VAEFineTuner
+from data.tag_weighter import TagBasedLossWeighter
+from training.vae_finetuner import VAEFineTuner
 from utils.device import cleanup
 
 
