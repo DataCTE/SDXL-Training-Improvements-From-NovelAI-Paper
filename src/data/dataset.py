@@ -80,8 +80,8 @@ class CustomDataset(Dataset):
         logger.info(f"Caching latents for {len(uncached_images)} images in batches")
         
         # Calculate optimal number of workers
-        num_cpu_workers = min(32, os.cpu_count() * 2)  # CPU-bound tasks
-        num_gpu_workers = 2  # GPU-bound tasks (keep low to avoid OOM)
+        num_cpu_workers = min(8, os.cpu_count())  # Reduced CPU workers
+        chunk_size = batch_size * 4  # Process images in chunks
         
         # Group images by size using parallel processing
         def group_image_by_size(img_path):
@@ -207,7 +207,7 @@ class CustomDataset(Dataset):
             
             return batch_results
 
-        # Process each size group with parallel preprocessing and batch VAE processing
+        # Process each size group with chunked parallel preprocessing
         processed_paths = []
         total_images = sum(len(group) for group in size_groups.values())
         
@@ -215,26 +215,34 @@ class CustomDataset(Dataset):
             for size, group_paths in size_groups.items():
                 logger.info(f"Processing size group {size} ({len(group_paths)} images)")
                 
-                # Preprocess images in parallel
-                preprocessed_batch = []
-                with ThreadPoolExecutor(max_workers=num_cpu_workers) as executor:
-                    for result in executor.map(preprocess_image, group_paths):
-                        if result:
-                            preprocessed_batch.append(result)
-                            if len(preprocessed_batch) >= batch_size:
-                                # Process batch through VAE
-                                results = process_batch_with_vae(preprocessed_batch)
-                                processed_paths.extend(results)
-                                pbar.update(len(preprocessed_batch))
-                                preprocessed_batch = []
-                                gc.collect()
-                
-                # Process remaining images in the last batch
-                if preprocessed_batch:
-                    results = process_batch_with_vae(preprocessed_batch)
-                    processed_paths.extend(results)
-                    pbar.update(len(preprocessed_batch))
+                # Process images in chunks
+                for chunk_start in range(0, len(group_paths), chunk_size):
+                    chunk_end = min(chunk_start + chunk_size, len(group_paths))
+                    chunk_paths = group_paths[chunk_start:chunk_end]
+                    
+                    # Preprocess chunk in parallel
+                    preprocessed_batch = []
+                    with ThreadPoolExecutor(max_workers=num_cpu_workers) as executor:
+                        for result in executor.map(preprocess_image, chunk_paths):
+                            if result:
+                                preprocessed_batch.append(result)
+                                if len(preprocessed_batch) >= batch_size:
+                                    # Process batch through VAE
+                                    results = process_batch_with_vae(preprocessed_batch)
+                                    processed_paths.extend(results)
+                                    pbar.update(len(preprocessed_batch))
+                                    preprocessed_batch = []
+                    
+                    # Process remaining images in the chunk
+                    if preprocessed_batch:
+                        results = process_batch_with_vae(preprocessed_batch)
+                        processed_paths.extend(results)
+                        pbar.update(len(preprocessed_batch))
+                    
+                    # Cleanup after each chunk
                     gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
         
         logger.info(f"Successfully cached {len(processed_paths)} latents")
 
