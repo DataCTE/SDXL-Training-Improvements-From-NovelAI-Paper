@@ -349,6 +349,9 @@ def setup_training(args, models, device, dtype):
             sigma_data=1.0
         )
         
+        # Update UNet in validator to use training UNet
+        validator.pipeline.unet = models["unet"]  # Explicitly set to training UNet
+        
         # Return all components
         train_components = {
             "dataset": dataset,

@@ -232,9 +232,9 @@ def train(args, models, train_components, device, dtype):
     training_history = {
         'loss_history': [],
         'validation_scores': [],
-        'ema_validation_scores': [],  # Add EMA validation tracking
+        'ema_validation_scores': [],
         'best_score': float('inf'),
-        'best_ema_score': float('inf')  # Add EMA best score tracking
+        'best_ema_score': float('inf')
     }
     
     global_step = 0
@@ -263,7 +263,9 @@ def train(args, models, train_components, device, dtype):
     
     logger.info(f"Starting training from epoch {start_epoch}")
     
-    train_components["validator"] = SDXLInference(
+    # Create validator using the training pipeline
+    logger.info("Initializing validation pipeline...")
+    validator = SDXLInference(
         model_path=args.model_path,
         device=device,
         dtype=dtype,
@@ -272,6 +274,10 @@ def train(args, models, train_components, device, dtype):
         sigma_data=args.sigma_data
     )
     
+    # Update UNet in validator to use training UNet
+    validator.pipeline.unet = models["unet"]
+    train_components["validator"] = validator
+
     for epoch in range(start_epoch, args.num_epochs):
         # Log epoch start
         logger.info(f"\nStarting epoch {epoch+1}/{args.num_epochs}")
@@ -294,43 +300,59 @@ def train(args, models, train_components, device, dtype):
                 models=models
             )
         
-        # Run end-of-epoch validation for both regular and EMA models
+        # Run end-of-epoch validation
         if not args.skip_validation and (epoch + 1) % args.validation_frequency == 0:
             logger.info("\nRunning end-of-epoch validation...")
             
-            # Regular model validation
+            # Regular model validation (using training model)
             validation_metrics = train_components["validator"].run_validation(
-                model=models["unet"],
                 prompts=args.validation_prompts,
                 output_dir=os.path.join(args.output_dir, f"validation_epoch_{epoch+1}"),
+                log_to_wandb=args.use_wandb,
                 num_images_per_prompt=1,
                 guidance_scale=5.0,
                 num_inference_steps=28,
                 height=1024,
-                width=1024,
-                log_to_wandb=args.use_wandb
+                width=1024
             )
             
-            # EMA model validation if enabled
+            # EMA validation if enabled
             if train_components["ema_model"] is not None:
+                # Temporarily swap UNet with EMA model
+                original_unet = train_components["validator"].pipeline.unet
+                train_components["validator"].pipeline.unet = train_components["ema_model"].averaged_model
+                
                 ema_validation_metrics = train_components["validator"].run_validation(
-                    model=train_components["ema_model"].get_model(),
                     prompts=args.validation_prompts,
                     output_dir=os.path.join(args.output_dir, f"ema_validation_epoch_{epoch+1}"),
+                    log_to_wandb=args.use_wandb,
                     num_images_per_prompt=1,
                     guidance_scale=5.0,
                     num_inference_steps=28,
                     height=1024,
-                    width=1024,
-                    log_to_wandb=args.use_wandb
+                    width=1024
                 )
+                
+                # Restore original UNet
+                train_components["validator"].pipeline.unet = original_unet
                 
                 if args.use_wandb:
                     wandb.log({
                         "validation/epoch": epoch + 1,
-                        "validation/regular": validation_metrics,
-                        "validation/ema": ema_validation_metrics
+                        "validation/regular_metrics": validation_metrics,
+                        "validation/ema_metrics": ema_validation_metrics
                     }, step=global_step)
+            else:
+                if args.use_wandb:
+                    wandb.log({
+                        "validation/epoch": epoch + 1,
+                        "validation/metrics": validation_metrics
+                    }, step=global_step)
+            
+            # Update training history
+            training_history['validation_scores'].append(validation_metrics)
+            if train_components["ema_model"] is not None:
+                training_history['ema_validation_scores'].append(ema_validation_metrics)
         
         # Save checkpoint at epoch end if requested
         if args.save_checkpoints and (epoch + 1) % args.save_epochs == 0:
