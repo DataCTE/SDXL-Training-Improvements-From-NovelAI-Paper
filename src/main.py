@@ -242,6 +242,12 @@ def setup_wandb(args):
         wandb.define_metric("lr/textencoder", step_metric="step")
         wandb.define_metric("lr/unet", step_metric="step")
         
+        # Add epoch-specific metric groupings
+        wandb.define_metric("epoch", summary="max")
+        wandb.define_metric("epoch/*", step_metric="epoch")
+        wandb.define_metric("epoch/progress", summary="last")
+        wandb.define_metric("epoch/average_loss", summary="min")
+        
         return wandb.run
     return None
 

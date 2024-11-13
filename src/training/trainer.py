@@ -33,7 +33,14 @@ def train_one_epoch(
 ):
     """Single epoch training loop"""
     try:
-        logger.debug("\n=== Starting new epoch ===")
+        logger.debug(f"\n=== Starting epoch {epoch+1} ===")
+        
+        # Add epoch to wandb at start of epoch
+        if args.use_wandb:
+            wandb.log({
+                "epoch": epoch,
+                "epoch/learning_rate": lr_scheduler.get_last_lr()[0]
+            }, step=global_step)
         
         # Initialize metrics
         window_size = 100
@@ -235,6 +242,11 @@ def train_one_epoch(
             # Log metrics to wandb
             if args.use_wandb and step % args.logging_steps == 0:
                 metrics = {
+                    # Add epoch metrics
+                    "epoch": epoch,
+                    "epoch/step": step,
+                    "epoch/progress": step / len(train_dataloader),
+                    
                     # Loss metrics
                     "loss/current": loss.item(),
                     "loss/average": average_loss,
@@ -267,10 +279,19 @@ def train_one_epoch(
             step_metrics['step_time'] = time.time() - step_start
             
         progress_bar.close()
+        
+        # Log epoch completion metrics
+        if args.use_wandb:
+            wandb.log({
+                "epoch/completed": epoch + 1,
+                "epoch/average_loss": sum(loss_history) / len(loss_history),
+                "epoch/final_lr": lr_scheduler.get_last_lr()[0]
+            }, step=global_step)
+        
         return global_step
         
     except Exception as e:
-        logger.error(f"Error in training loop: {str(e)}")
+        logger.error(f"Error in epoch {epoch+1}: {str(e)}")
         raise
 
 def get_cosine_schedule_with_warmup(
