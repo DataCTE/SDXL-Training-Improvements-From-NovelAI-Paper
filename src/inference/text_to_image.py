@@ -4,236 +4,215 @@ import logging
 from pathlib import Path
 import time
 import wandb
-
+from training.loss import get_sigmas  # Import our custom sigma scheduler
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
-class ModelValidator:
-    def __init__(self, model_path, device="cuda", dtype=torch.float16,
-                 zsnr=True, sigma_min=0.0292, sigma_data=1.0, min_snr_gamma=5.0,
-                 variant="fp16"):
+class SDXLInference:
+    def __init__(
+        self,
+        model_path,
+        device="cuda",
+        dtype=torch.float16,
+        variant="fp16",
+        use_resolution_binning=True,
+        sigma_min=0.0292,
+        sigma_data=1.0,
+    ):
         """
-        Initialize the ModelValidator with specified parameters.
+        Initialize SDXL inference with custom training parameters.
 
         Args:
-            model_path (str): Path to the pre-trained model.
-            device (str): Device to run on, e.g., "cuda" or "cpu".
-            dtype (torch.dtype): Data type for the model.
-            zsnr (bool): Whether to use ZSNR.
-            sigma_min (float): Minimum value for sigma.
-            sigma_data (float): Maximum value for sigma.
-            min_snr_gamma (float): Minimum SNR gamma value.
-            variant (str): Variant to load, e.g., "fp16".
+            model_path (str): Path to the model
+            device (str): Device to run inference on
+            dtype (torch.dtype): Model dtype
+            variant (str): Model variant (e.g., 'fp16')
+            use_resolution_binning (bool): Whether to use resolution-dependent sigma scaling
+            sigma_min (float): Minimum sigma value for noise schedule
+            sigma_data (float): Sigma data value for noise schedule
         """
-        logger.info(f"Initializing ModelValidator with model path: {model_path}")
+        logger.info(f"Initializing SDXL inference with model: {model_path}")
         
         self.model_path = model_path
         self.device = device
         self.dtype = dtype
-        self.zsnr = zsnr
+        self.use_resolution_binning = use_resolution_binning
         self.sigma_min = sigma_min
         self.sigma_data = sigma_data
-        self.min_snr_gamma = min_snr_gamma
-        self.variant = variant
         
+        # Load pipeline
         try:
             self.pipeline = StableDiffusionXLPipeline.from_pretrained(
                 model_path,
-                torch_dtype=self.dtype,
+                torch_dtype=dtype,
                 use_safetensors=True,
-                variant=self.variant
-            ).to(self.device)
+                variant=variant
+            ).to(device)
             
-            logger.info("Model successfully loaded to device.")
+            # Use our custom scheduler settings
+            self.pipeline.scheduler.register_to_config(
+                use_resolution_binning=use_resolution_binning,
+                sigma_min=sigma_min,
+                sigma_data=sigma_data
+            )
+            
+            logger.info("Model loaded successfully")
+            
         except Exception as e:
-            logger.error(f"Error loading model: {str(e)}")
+            logger.error(f"Failed to load model: {str(e)}")
             raise
-    
-    def generate_images(self, prompts, **generation_kwargs):
+
+    def generate_images(
+        self,
+        prompts,
+        negative_prompt=None,
+        num_images_per_prompt=1,
+        guidance_scale=5.0,
+        num_inference_steps=28,
+        height=1024,
+        width=1024,
+        output_dir=None,
+        **additional_kwargs
+    ):
         """
-        Generate images based on the provided prompts.
+        Generate images using the SDXL model.
 
         Args:
-            prompts (list): List of prompts to validate with.
-            **generation_kwargs: Additional arguments for image generation.
-
-        Returns:
-            list: Generated images.
-        """
-        logger.info("Starting image generation.")
+            prompts (str or list): Prompt(s) to generate images from
+            negative_prompt (str, optional): Negative prompt for generation
+            num_images_per_prompt (int): Number of images per prompt
+            guidance_scale (float): CFG scale
+            num_inference_steps (int): Number of denoising steps
+            height (int): Image height
+            width (int): Image width
+            output_dir (str, optional): Directory to save generated images
+            **additional_kwargs: Additional arguments for pipeline
         
-        generated_images = []
-        generation_times = []
+        Returns:
+            dict: Generation results including images and metadata
+        """
+        if isinstance(prompts, str):
+            prompts = [prompts]
+            
+        results = []
         
         try:
-            for idx, prompt in enumerate(prompts):
-                logger.debug(f"Generating image for prompt: {prompt}")
-                
+            # Update noise schedule based on resolution if enabled
+            if self.use_resolution_binning:
+                sigmas = get_sigmas(
+                    num_inference_steps=num_inference_steps,
+                    sigma_min=self.sigma_min,
+                    height=height,
+                    width=width
+                ).to(self.device)
+                self.pipeline.scheduler.sigmas = sigmas
+            
+            # Generate images
+            for prompt in prompts:
                 start_time = time.time()
                 
-                # Generate image
-                output = self.pipeline(prompt=prompt, **generation_kwargs)
-                gen_time = time.time() - start_time
+                output = self.pipeline(
+                    prompt=prompt,
+                    negative_prompt=negative_prompt,
+                    num_images_per_prompt=num_images_per_prompt,
+                    guidance_scale=guidance_scale,
+                    num_inference_steps=num_inference_steps,
+                    height=height,
+                    width=width,
+                    **additional_kwargs
+                )
                 
-                generation_times.append(gen_time)
+                generation_time = time.time() - start_time
                 
-                logger.debug(f"Generated image for prompt: {prompt} in {gen_time:.2f}s")
+                # Save images if output directory provided
+                if output_dir:
+                    output_dir = Path(output_dir)
+                    output_dir.mkdir(exist_ok=True, parents=True)
+                    
+                    for idx, image in enumerate(output.images):
+                        image_path = output_dir / f"{len(results)}_{idx}.png"
+                        image.save(image_path)
                 
-                generated_image = {
+                # Collect results
+                result = {
                     "prompt": prompt,
-                    "image": output.images[0],
-                    "generation_time": gen_time,
-                    "image_index": idx
+                    "images": output.images,
+                    "generation_time": generation_time,
+                    "metadata": {
+                        "guidance_scale": guidance_scale,
+                        "num_inference_steps": num_inference_steps,
+                        "height": height,
+                        "width": width
+                    }
                 }
+                results.append(result)
                 
-                generated_images.append(generated_image)
-                
-            logger.info("All images successfully generated.")
+            return results
             
         except Exception as e:
             logger.error(f"Error during image generation: {str(e)}")
             raise
-        
+            
         finally:
             torch.cuda.empty_cache()
-        
-        return generated_images, generation_times
-    
-    def run_validation(self, prompts, output_dir=None, log_to_wandb=True, **generation_kwargs):
+
+    def run_validation(
+        self,
+        prompts,
+        output_dir=None,
+        log_to_wandb=False,
+        **generation_kwargs
+    ):
         """
-        Run full validation suite.
+        Run validation using the model.
 
         Args:
-            prompts (list): List of prompts to validate with.
-            output_dir (str): Directory to save validation images.
-            log_to_wandb (bool): Whether to log results to W&B.
-            **generation_kwargs: Additional arguments for image generation.
-
+            prompts (list): Validation prompts
+            output_dir (str, optional): Directory to save validation images
+            log_to_wandb (bool): Whether to log results to W&B
+            **generation_kwargs: Arguments for image generation
+        
         Returns:
-            dict: Validation metrics.
+            dict: Validation metrics
         """
-        logger.info("Starting validation run.")
-        
-        if output_dir:
-            output_dir = Path(output_dir)
-            output_dir.mkdir(exist_ok=True)
-        
-        validation_metrics = {
-            "generation_times": [],
-            "images_generated": 0,
-            "successful_generations": 0,
-            "failed_generations": 0
-        }
+        logger.info("Starting validation run")
         
         try:
             # Generate validation images
-            generated_images, generation_times = self.generate_images(prompts, **generation_kwargs)
+            results = self.generate_images(
+                prompts=prompts,
+                output_dir=output_dir,
+                **generation_kwargs
+            )
             
-            validation_metrics["images_generated"] = len(generated_images)
-            validation_metrics["successful_generations"] = len(generated_images)
+            # Calculate metrics
+            metrics = {
+                "validation/avg_generation_time": np.mean([r["generation_time"] for r in results]),
+                "validation/total_images": sum(len(r["images"]) for r in results),
+                "validation/num_prompts": len(prompts)
+            }
             
-            # Calculate average generation time
-            avg_gen_time = sum(gen_time for gen_time in generation_times) / len(generation_times)
-            validation_metrics["avg_generation_time"] = avg_gen_time
-            
-            logger.info(f"Average generation time: {avg_gen_time:.2f}s")
-            
-            # Save images if output directory provided
-            if output_dir:
-                for idx, gen in enumerate(generated_images):
-                    image_path = output_dir / f"validation_{idx}.png"
-                    gen["image"].save(image_path)
-                    logger.debug(f"Saved validation image to {image_path}")
-                    
             # Log to W&B if enabled
             if log_to_wandb and wandb.run is not None:
                 wandb_images = []
-                for idx, gen in enumerate(generated_images):
-                    wandb_images.append(
-                        wandb.Image(
-                            gen["image"],
-                            caption=f"Prompt: {gen['prompt']}\nGeneration time: {gen['generation_time']:.2f}s"
+                for result in results:
+                    for img in result["images"]:
+                        wandb_images.append(
+                            wandb.Image(
+                                img,
+                                caption=f"Prompt: {result['prompt']}\n"
+                                f"Time: {result['generation_time']:.2f}s"
+                            )
                         )
-                    )
+                
                 wandb.log({
                     "validation/images": wandb_images,
-                    "validation/avg_generation_time": avg_gen_time
+                    **metrics
                 })
-                
-            logger.info("Validation metrics successfully logged to W&B.")
+            
+            return metrics
             
         except Exception as e:
-            logger.error(f"Error during validation run: {str(e)}")
+            logger.error(f"Validation failed: {str(e)}")
             raise
-        
-        finally:
-            torch.cuda.empty_cache()
-        
-        return validation_metrics
-    
-    def generate_images(self, prompts, **generation_kwargs):
-        """
-        Generate images based on the provided prompts.
-
-        Args:
-            prompts (list): List of prompts to validate with.
-            **generation_kwargs: Additional arguments for image generation.
-
-        Returns:
-            list: Generated images and their generation times.
-        """
-        logger.info("Starting image generation.")
-        
-        generated_images = []
-        generation_times = []
-        
-        try:
-            # Generate images
-            outputs = self.pipeline(prompts=prompts, **generation_kwargs)
-            
-            for output in outputs:
-                gen_time = time.time()
-                
-                generated_image = {
-                    "prompt": output.prompt,
-                    "image": output.images[0],
-                    "generation_time": gen_time
-                }
-                
-                generated_images.append(generated_image)
-                generation_times.append(gen_time)
-            
-        except Exception as e:
-            logger.error(f"Error during image generation: {str(e)}")
-            raise
-        
-        finally:
-            torch.cuda.empty_cache()
-        
-        return generated_images, generation_times
-    
-    def log_validation_metrics(self, validation_metrics):
-        """
-        Log the validation metrics.
-
-        Args:
-            validation_metrics (dict): Validation metrics to log.
-        """
-        logger.info("Logging validation metrics.")
-        
-        try:
-            if wandb.run is not None:
-                wandb.log(validation_metrics)
-            
-            logger.info(f"Validation metrics successfully logged to W&B.")
-            
-        except Exception as e:
-            logger.error(f"Error logging validation metrics: {str(e)}")
-            raise
-        
-    def cleanup(self):
-        """
-        Clean up resources.
-        """
-        torch.cuda.empty_cache()
-        logger.info("Resources cleaned up.")

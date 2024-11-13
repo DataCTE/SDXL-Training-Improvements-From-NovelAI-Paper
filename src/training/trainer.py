@@ -10,6 +10,7 @@ from utils.checkpoint import save_checkpoint, load_checkpoint
 import math
 import os
 import numpy as np
+from inference.text_to_image import SDXLInference
 
 logger = logging.getLogger(__name__)
 
@@ -262,29 +263,36 @@ def train(args, models, train_components, device, dtype):
     
     logger.info(f"Starting training from epoch {start_epoch}")
     
+    train_components["validator"] = SDXLInference(
+        model_path=args.model_path,
+        device=device,
+        dtype=dtype,
+        use_resolution_binning=True,
+        sigma_min=args.sigma_min,
+        sigma_data=args.sigma_data
+    )
+    
     for epoch in range(start_epoch, args.num_epochs):
         # Log epoch start
         logger.info(f"\nStarting epoch {epoch+1}/{args.num_epochs}")
         if args.use_wandb:
             wandb.log({"train/epoch": epoch}, step=global_step)
         
-        global_step = train_one_epoch(
-            unet=models["unet"],
-            train_dataloader=train_components["train_dataloader"],
-            optimizer=train_components["optimizer"],
-            lr_scheduler=train_components["lr_scheduler"],
-            ema_model=train_components["ema_model"],
-            validator=train_components["validator"],
-            tag_weighter=train_components["tag_weighter"],
-            vae_finetuner=train_components["vae_finetuner"],
-            args=args,
-            device=device,
-            dtype=dtype,
-            epoch=epoch,
-            global_step=global_step,
-            models=models,
-            training_history=training_history
-        )
+            global_step = train_one_epoch(
+                unet=models["unet"],
+                train_dataloader=train_components["train_dataloader"],
+                optimizer=train_components["optimizer"],
+                lr_scheduler=train_components["lr_scheduler"],
+                ema_model=train_components["ema_model"],
+                tag_weighter=train_components["tag_weighter"],
+                vae_finetuner=train_components["vae_finetuner"],
+                args=args,
+                device=device,
+                dtype=dtype,
+                epoch=epoch,
+                global_step=global_step,
+                models=models
+            )
         
         # Run end-of-epoch validation for both regular and EMA models
         if not args.skip_validation and (epoch + 1) % args.validation_frequency == 0:

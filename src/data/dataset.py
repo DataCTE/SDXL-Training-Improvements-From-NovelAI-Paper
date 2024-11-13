@@ -19,6 +19,18 @@ logger = logging.getLogger(__name__)
 class CustomDataset(Dataset):
     def __init__(self, data_dir, vae, tokenizer, tokenizer_2, text_encoder, text_encoder_2,
                  cache_dir="latents_cache", no_caching_latents=False):
+        """Initialize dataset with image preprocessing
+        
+        Args:
+            data_dir (str): Directory containing images and captions
+            vae (AutoencoderKL): VAE model
+            tokenizer (CLIPTokenizer): Primary tokenizer
+            tokenizer_2 (CLIPTokenizer): Secondary tokenizer
+            text_encoder (CLIPTextModel): Primary text encoder
+            text_encoder_2 (CLIPTextModel): Secondary text encoder
+            cache_dir (str): Directory for caching latents
+            no_caching_latents (bool): Skip latent caching if True
+        """
         super().__init__()
         self.data_dir = Path(data_dir)
         self.cache_dir = Path(cache_dir)
@@ -28,7 +40,7 @@ class CustomDataset(Dataset):
             self.cache_dir.mkdir(parents=True, exist_ok=True)
         
         # Validate dataset first
-        valid = validate_dataset(data_dir)[0]
+        valid, stats = validate_dataset(data_dir)
         if not valid:
             raise ValueError("Dataset validation failed")
             
@@ -43,12 +55,43 @@ class CustomDataset(Dataset):
         self.text_encoder = text_encoder
         self.text_encoder_2 = text_encoder_2
         
+        # Initialize upscaler
+        logger.info("Initializing image processors...")
+        self.upscaler = UltimateUpscaler()
+        
+        # Preprocess all images to correct SDXL sizes
+        logger.info("Starting image preprocessing...")
+        self._preprocess_images()
+        
         # Process captions and build statistics
         self.tag_stats = self._build_tag_statistics()
         logger.info(f"Processed {len(self.image_paths)} images with tag statistics")
-        
-        # Initialize upscaler with DreamShaper model
-        self.upscaler = UltimateUpscaler()
+
+    def _preprocess_images(self):
+        """Preprocess all images to correct SDXL sizes"""
+        for img_path in tqdm(self.image_paths, desc="Preprocessing images"):
+            try:
+                # Load image
+                image = Image.open(img_path).convert('RGB')
+                width, height = image.size
+                
+                # Get target size from SDXL buckets
+                target_width, target_height = self._get_target_size(width, height)
+                
+                # Skip if already correct size
+                if width == target_width and height == target_height:
+                    continue
+                    
+                # Process image size with advanced scaling
+                processed = self.process_image_size(image, target_width, target_height)
+                
+                # Save processed image
+                processed.save(img_path, quality=95)
+                logger.info(f"Processed {img_path}: {width}x{height} -> {target_width}x{target_height}")
+                
+            except Exception as e:
+                logger.error(f"Error preprocessing {img_path}: {str(e)}")
+                continue
 
     def _parse_tags(self, caption):
         """Parse Midjourney-specific tags and general tags"""
