@@ -15,6 +15,8 @@ import numpy as np
 from .ultimate_upscaler import UltimateUpscaler, USDUMode, USDUSFMode
 from utils.validation import validate_image_dimensions
 import os
+from concurrent.futures import ThreadPoolExecutor
+import functools
 
 logger = logging.getLogger(__name__)
 
@@ -64,53 +66,64 @@ class CustomDataset(Dataset):
         valid_images = []
         corrupted_images = []
         
-        for img_path in tqdm(self.image_paths, desc="Preprocessing images"):
+        # Use ThreadPoolExecutor for parallel processing
+        def process_single_image(img_path):
             try:
-                # Verify image can be opened and is valid
+                # Quick validation without full load
                 with Image.open(img_path) as image:
-                    # Force load image data to check for corruption
-                    image.load()
-                    if image.mode != 'RGB':
-                        image = image.convert('RGB')
+                    # Only load header initially
+                    width, height = image.size
                     
                     # If all_ar is True, accept image as-is
                     if self.all_ar:
-                        valid_images.append(img_path)
-                        continue
+                        return (img_path, None, True)
                     
-                    # Original resizing logic for when all_ar is False
-                    width, height = image.size
+                    # Get target size
                     target_width, target_height = self._get_target_size(width, height)
                     
                     # Skip if already correct size
                     if width == target_width and height == target_height:
-                        valid_images.append(img_path)
-                        continue
-                        
-                    # Process image size with advanced scaling
+                        return (img_path, None, True)
+                    
+                    # Only fully load and process if resize needed
+                    image.load()
+                    if image.mode != 'RGB':
+                        image = image.convert('RGB')
+                    
+                    # Process image size
                     processed = self.process_image_size(image, target_width, target_height)
                     
-                    # Save processed image as PNG for consistency
+                    # Save processed image
                     output_path = img_path.with_suffix('.png')
                     processed.save(output_path, format='PNG', quality=95)
                     
                     if output_path != img_path:
-                        os.remove(img_path)  # Remove original if format changed
-                        
-                    logger.info(f"Processed {img_path}: {width}x{height} -> {target_width}x{target_height}")
-                    valid_images.append(output_path)
+                        os.remove(img_path)
                     
-            except (IOError, SyntaxError, OSError) as e:
-                logger.error(f"Error preprocessing {img_path}: {str(e)}")
-                corrupted_images.append(img_path)
-                continue
-                
+                    return (output_path, None, True)
+                    
             except Exception as e:
-                logger.error(f"Unexpected error processing {img_path}: {str(e)}")
-                corrupted_images.append(img_path)
-                continue
+                return (img_path, str(e), False)
 
-        # Update image paths to only include valid images
+        # Use multiple threads for IO-bound operations
+        max_workers = min(32, os.cpu_count() * 4)  # Limit max threads
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            results = list(tqdm(
+                executor.map(process_single_image, self.image_paths),
+                total=len(self.image_paths),
+                desc="Preprocessing images"
+            ))
+        
+        # Process results
+        for img_path, error, is_valid in results:
+            if is_valid:
+                valid_images.append(img_path)
+            else:
+                corrupted_images.append(img_path)
+                if error:
+                    logger.error(f"Error preprocessing {img_path}: {error}")
+
+        # Update image paths
         self.image_paths = valid_images
         
         # Log statistics

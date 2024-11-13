@@ -23,6 +23,7 @@ from training.vae_finetuner import VAEFineTuner
 from utils.device import cleanup
 from diffusers import StableDiffusionXLPipeline
 from utils.validation import validate_dataset
+import os
 
 
 logger = logging.getLogger(__name__)
@@ -185,6 +186,11 @@ def setup_training(args, models, device, dtype):
     logger.info("Setting up training components...")
     
     try:
+        # Add default num_workers if not specified
+        if not hasattr(args, 'num_workers'):
+            args.num_workers = min(8, os.cpu_count() or 1)  # Default to min(8, CPU cores)
+            logger.info(f"Using default num_workers: {args.num_workers}")
+
         # Initialize dataset without validation if all_ar is True
         if args.all_ar:
             dataset = CustomDataset(

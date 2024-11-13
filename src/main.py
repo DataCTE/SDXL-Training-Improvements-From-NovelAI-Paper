@@ -143,6 +143,14 @@ def parse_args():
     parser.add_argument('--all_ar', action='store_true',
                        help='Accept all aspect ratios without resizing')
     
+    # Add num_workers argument
+    parser.add_argument(
+        '--num_workers',
+        type=int,
+        default=min(8, os.cpu_count() or 1),
+        help='Number of workers for data loading'
+    )
+    
     return parser.parse_args()
 
 def main(args):
