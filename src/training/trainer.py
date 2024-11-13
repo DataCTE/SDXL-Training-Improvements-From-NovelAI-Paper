@@ -33,7 +33,8 @@ def train_one_epoch(
     try:
         logger.debug(f"\n=== Starting epoch {epoch+1} ===")
         
-        # Add epoch to wandb at start of epoch
+        # Move wandb logging after ensuring global_step is at least 1
+        global_step = max(1, global_step)
         if args.use_wandb:
             wandb.log({
                 "epoch": epoch,
@@ -263,20 +264,11 @@ def train(args, models, train_components, device, dtype):
     
     logger.info(f"Starting training from epoch {start_epoch}")
     
-    # Create validator using the training pipeline
-    logger.info("Initializing validation pipeline...")
-    validator = SDXLInference(
-        model_path=args.model_path,
-        device=device,
-        dtype=dtype,
-        use_resolution_binning=True,
-        sigma_min=args.sigma_min,
-        sigma_data=args.sigma_data
-    )
+    # Use the validator that was already initialized in train_components
+    validator = train_components["validator"]
     
     # Update UNet in validator to use training UNet
     validator.pipeline.unet = models["unet"]
-    train_components["validator"] = validator
 
     for epoch in range(start_epoch, args.num_epochs):
         # Log epoch start
