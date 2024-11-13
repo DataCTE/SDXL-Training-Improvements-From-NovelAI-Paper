@@ -14,6 +14,7 @@ import cv2
 import numpy as np
 from .ultimate_upscaler import UltimateUpscaler, USDUMode, USDUSFMode
 from utils.validation import validate_image_dimensions
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -69,30 +70,63 @@ class CustomDataset(Dataset):
         logger.info(f"Processed {len(self.image_paths)} images with tag statistics")
 
     def _preprocess_images(self):
-        """Preprocess all images to correct SDXL sizes"""
+        """Preprocess all images to correct SDXL sizes and remove corrupted images"""
+        valid_images = []
+        corrupted_images = []
+        
         for img_path in tqdm(self.image_paths, desc="Preprocessing images"):
             try:
-                # Load image
-                image = Image.open(img_path).convert('RGB')
-                width, height = image.size
-                
-                # Get target size from SDXL buckets
-                target_width, target_height = self._get_target_size(width, height)
-                
-                # Skip if already correct size
-                if width == target_width and height == target_height:
-                    continue
+                # Verify image can be opened and is valid
+                with Image.open(img_path) as image:
+                    # Force load image data to check for corruption
+                    image.load()
+                    if image.mode != 'RGB':
+                        image = image.convert('RGB')
                     
-                # Process image size with advanced scaling
-                processed = self.process_image_size(image, target_width, target_height)
-                
-                # Save processed image
-                processed.save(img_path, quality=95)
-                logger.info(f"Processed {img_path}: {width}x{height} -> {target_width}x{target_height}")
+                    # Get current and target dimensions
+                    width, height = image.size
+                    target_width, target_height = self._get_target_size(width, height)
+                    
+                    # Skip if already correct size
+                    if width == target_width and height == target_height:
+                        valid_images.append(img_path)
+                        continue
+                        
+                    # Process image size with advanced scaling
+                    processed = self.process_image_size(image, target_width, target_height)
+                    
+                    # Save processed image
+                    processed.save(img_path, quality=95)
+                    logger.info(f"Processed {img_path}: {width}x{height} -> {target_width}x{target_height}")
+                    valid_images.append(img_path)
+                    
+            except (IOError, SyntaxError, OSError) as e:
+                logger.error(f"Error preprocessing {img_path}: {str(e)}")
+                corrupted_images.append(img_path)
+                # Remove corrupted image and its caption if exists
+                try:
+                    os.remove(img_path)
+                    caption_path = img_path.with_suffix('.txt')
+                    if caption_path.exists():
+                        os.remove(caption_path)
+                except Exception as del_e:
+                    logger.error(f"Error removing corrupted file {img_path}: {str(del_e)}")
+                continue
                 
             except Exception as e:
-                logger.error(f"Error preprocessing {img_path}: {str(e)}")
+                logger.error(f"Unexpected error processing {img_path}: {str(e)}")
+                corrupted_images.append(img_path)
                 continue
+
+        # Update image paths to only include valid images
+        self.image_paths = valid_images
+        
+        # Log statistics
+        total = len(valid_images) + len(corrupted_images)
+        logger.info(f"Preprocessing complete:")
+        logger.info(f"Total images processed: {total}")
+        logger.info(f"Valid images: {len(valid_images)}")
+        logger.info(f"Corrupted/removed images: {len(corrupted_images)}")
 
     def _parse_tags(self, caption):
         """Parse Midjourney-specific tags and general tags"""
