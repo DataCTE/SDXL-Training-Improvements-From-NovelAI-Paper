@@ -58,6 +58,12 @@ class CustomDataset(Dataset):
             special_tags['niji'] = True
             raw_tags = raw_tags[1:]
         
+        # Handle version number - normalize all versions to 6
+        if raw_tags and raw_tags[-1].strip() in ['4', '5', '6']:
+            special_tags['version'] = 6  # Always set to 6 regardless of input version
+            raw_tags = raw_tags[:-1]
+            tags.append('6')  # Add version 6 to regular tags
+        
         for tag in raw_tags:
             tag = tag.lower().strip()
             
@@ -76,8 +82,8 @@ class CustomDataset(Dataset):
                 if refs:
                     special_tags['sref'] = refs
 
-            # Handle numeric parameters
-            for param in ['stylize', 'chaos', 'quality', 'sw', 'sv']:
+            # Handle style parameters
+            for param in ['stylize', 'chaos', 'sw', 'sv']:
                 if param in tag:
                     try:
                         value = float(re.search(r'[\d.]+', tag).group())
