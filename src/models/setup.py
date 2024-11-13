@@ -107,7 +107,8 @@ def setup_models(args, device, dtype):
             "tokenizer_2": tokenizer_2,
             "text_encoder": text_encoder,
             "text_encoder_2": text_encoder_2,
-            "validator": validator
+            "validator": validator,
+            "ema_model": ema_model
         }
         
         logger.info("Model setup completed successfully")

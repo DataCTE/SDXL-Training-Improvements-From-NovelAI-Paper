@@ -3,7 +3,7 @@ import logging
 import os
 import shutil
 import traceback
-from safetensors.torch import load_file
+from safetensors.torch import load_file, save_file
 from pathlib import Path
 from torch.utils.data import DataLoader
 import json
@@ -140,146 +140,111 @@ def verify_checkpoint_directory(checkpoint_dir):
     
     return True, optional_status
 
-def save_checkpoint(checkpoint_dir, models, train_components, training_state, use_safetensors=True):
-    """
-    Save training checkpoint in diffusers format with safetensors support
+def save_checkpoint(models, train_components, args, epoch, global_step, training_history, output_dir):
+    """Save training checkpoint using safetensors format"""
+    os.makedirs(output_dir, exist_ok=True)
     
-    Args:
-        checkpoint_dir: Directory to save the checkpoint
-        models: Dictionary containing models to save
-        train_components: Dictionary containing training components
-        training_state: Dictionary containing training state
-        use_safetensors: Whether to use safetensors format for model weights
-    """
     try:
-        logger.info(f"Saving checkpoint to {checkpoint_dir}")
-        os.makedirs(checkpoint_dir, exist_ok=True)
+        # Save UNet
+        unet_path = os.path.join(output_dir, "unet")
+        os.makedirs(unet_path, exist_ok=True)
+        models["unet"].save_pretrained(unet_path, safe_serialization=True)
         
-        # Temporarily put models in eval mode for saving
-        training_mode = models["unet"].training
-        if training_mode:
-            models["unet"].eval()
-        
-        # Save training state
-        if training_state is not None:
-            logger.info("Saving training state")
-            torch.save(
-                training_state,
-                os.path.join(checkpoint_dir, "training_state.pt")
-            )
-        
-        # Save optimizer state
-        if "optimizer" in train_components:
-            logger.info("Saving optimizer state")
-            torch.save(
-                train_components["optimizer"].state_dict(),
-                os.path.join(checkpoint_dir, "optimizer.pt")
-            )
-        
-        # Save scheduler state
-        if "lr_scheduler" in train_components:
-            logger.info("Saving scheduler state")
-            torch.save(
-                train_components["lr_scheduler"].state_dict(),
-                os.path.join(checkpoint_dir, "scheduler.pt")
-            )
-        
-        # Save EMA state
-        if "ema_model" in train_components and train_components["ema_model"] is not None:
-            logger.info("Saving EMA state")
-            if use_safetensors:
-                from safetensors.torch import save_file
-                save_file(
-                    train_components["ema_model"].state_dict(),
-                    os.path.join(checkpoint_dir, "ema.safetensors")
-                )
-            else:
-                torch.save(
-                    train_components["ema_model"].state_dict(),
-                    os.path.join(checkpoint_dir, "ema.pt")
-                )
-        
-        # Restore UNet training mode if it was training
-        if training_mode:
-            models["unet"].train()
+        # Save EMA model if it exists
+        if models.get("ema_model") is not None:
+            logger.info("Saving EMA model state...")
+            ema_state = models["ema_model"].state_dict()
             
+            # Convert model state dict to safetensors format
+            ema_tensors = {
+                f"ema_model.{key}": tensor
+                for key, tensor in ema_state["ema_model"].items()
+            }
+            
+            # Add metadata
+            ema_metadata = {
+                "num_updates": str(ema_state["num_updates"]),
+                "cur_decay_value": str(ema_state["cur_decay_value"])
+            }
+            
+            # Save EMA state using safetensors
+            save_file(
+                ema_tensors,
+                os.path.join(output_dir, "ema.safetensors"),
+                metadata=ema_metadata
+            )
+        
+        # Save optimizer and training state
+        training_state = {
+            "epoch": epoch,
+            "global_step": global_step,
+            "training_history": training_history,
+            "args": vars(args)
+        }
+        
+        # Save training state as JSON
+        with open(os.path.join(output_dir, "training_state.json"), "w") as f:
+            json.dump(training_state, f, indent=2)
+        
+        # Save optimizer state using PyTorch (as it contains non-tensor data)
+        torch.save({
+            "optimizer": train_components["optimizer"].state_dict(),
+            "lr_scheduler": train_components["lr_scheduler"].state_dict(),
+        }, os.path.join(output_dir, "optimizer.pt"))
+        
+        logger.info(f"Checkpoint saved successfully to {output_dir}")
+        
     except Exception as e:
-        logger.error(f"Failed to save checkpoint: {str(e)}")
-        logger.error(f"Checkpoint directory: {checkpoint_dir}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
+        logger.error(f"Error saving checkpoint: {str(e)}")
         raise
 
 def load_checkpoint(checkpoint_dir, models, train_components):
-    """
-    Load a saved checkpoint in diffusers format with safetensors support
-    
-    Args:
-        checkpoint_dir: Directory containing the checkpoint
-        models: Dictionary containing models to load
-        train_components: Dictionary containing training components
-            
-    Returns:
-        dict: Training state (if available) or None
-    """
+    """Load checkpoint from safetensors format"""
     try:
         logger.info(f"Loading checkpoint from {checkpoint_dir}")
         
-        is_valid, optional_status = verify_checkpoint_directory(checkpoint_dir)
-        if not is_valid:
-            raise ValueError("Invalid checkpoint directory structure")
-        
-        # Load training state if available
-        training_state = None
-        if optional_status["training_state.pt"]:
-            logger.info("Loading training state")
-            training_state = torch.load(
-                os.path.join(checkpoint_dir, "training_state.pt"),
-                map_location='cpu'
+        # Load UNet
+        unet_path = os.path.join(checkpoint_dir, "unet")
+        if os.path.exists(unet_path):
+            models["unet"].load_state_dict(
+                load_file(os.path.join(unet_path, "diffusion_pytorch_model.safetensors"))
             )
-            
-            # Load optimizer state
-            if optional_status["optimizer.pt"] and "optimizer" in train_components:
-                logger.info("Loading optimizer state")
-                train_components["optimizer"].load_state_dict(
-                    torch.load(
-                        os.path.join(checkpoint_dir, "optimizer.pt"),
-                        map_location='cpu'
-                    )
-                )
-            
-            # Load scheduler state
-            if optional_status["scheduler.pt"] and "lr_scheduler" in train_components:
-                logger.info("Loading scheduler state")
-                train_components["lr_scheduler"].load_state_dict(
-                    torch.load(
-                        os.path.join(checkpoint_dir, "scheduler.pt"),
-                        map_location='cpu'
-                    )
-                )
-            
-            # Load EMA state
-            if "ema_model" in train_components and train_components["ema_model"] is not None:
-                if optional_status["ema.safetensors"]:
-                    logger.info("Loading EMA state from safetensors")
-                    ema_state = load_file(
-                        os.path.join(checkpoint_dir, "ema.safetensors")
-                    )
-                    train_components["ema_model"].load_state_dict(ema_state)
-                elif optional_status["ema.pt"]:
-                    logger.info("Loading EMA state from pytorch")
-                    train_components["ema_model"].load_state_dict(
-                        torch.load(
-                            os.path.join(checkpoint_dir, "ema.pt"),
-                            map_location='cpu'
-                        )
-                    )
         
+        # Load EMA if it exists
+        ema_path = os.path.join(checkpoint_dir, "ema.safetensors")
+        if os.path.exists(ema_path) and models.get("ema_model") is not None:
+            logger.info("Loading EMA model state...")
+            
+            # Load tensors and metadata
+            ema_tensors = load_file(ema_path)
+            ema_metadata = load_file(ema_path, metadata_only=True)
+            
+            # Reconstruct EMA state dict
+            ema_state = {
+                "ema_model": {
+                    key.replace("ema_model.", ""): tensor
+                    for key, tensor in ema_tensors.items()
+                },
+                "num_updates": int(ema_metadata["num_updates"]),
+                "cur_decay_value": float(ema_metadata["cur_decay_value"])
+            }
+            
+            models["ema_model"].load_state_dict(ema_state)
+        
+        # Load training state from JSON
+        with open(os.path.join(checkpoint_dir, "training_state.json"), "r") as f:
+            training_state = json.load(f)
+        
+        # Load optimizer state (using PyTorch)
+        optimizer_state = torch.load(os.path.join(checkpoint_dir, "optimizer.pt"))
+        train_components["optimizer"].load_state_dict(optimizer_state["optimizer"])
+        train_components["lr_scheduler"].load_state_dict(optimizer_state["lr_scheduler"])
+        
+        logger.info("Checkpoint loaded successfully")
         return training_state
         
     except Exception as e:
-        logger.error(f"Failed to load checkpoint: {str(e)}")
-        logger.error(f"Checkpoint directory: {checkpoint_dir}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
+        logger.error(f"Error loading checkpoint: {str(e)}")
         raise
 
 def cleanup(args, wandb_run=None):
@@ -304,142 +269,30 @@ def cleanup(args, wandb_run=None):
         logger.error(f"Error during cleanup: {cleanup_error}")
 
 def save_final_outputs(args, models, training_history, train_components):
-    """Save all final training outputs in proper diffusers format"""
-    logger.info(f"Saving final outputs to {args.output_dir}")
-    final_output_dir = os.path.join(args.output_dir, "final")
-    
+    """Save final model outputs using safetensors"""
     try:
-        logger.info("Saving models in diffusers format")
+        logger.info("Saving final model outputs...")
         
-        # Handle pooled embeddings
-        if "pooled_text_embeddings_2" in train_components:
-            pooled_embeds = train_components["pooled_text_embeddings_2"]
-            if pooled_embeds.ndim == 1:
-                batch_size = models["unet"].config.sample_size
-                pooled_embeds = pooled_embeds.view(batch_size, -1)
-                train_components["pooled_text_embeddings_2"] = pooled_embeds
-
-        # Create scheduler config
-        scheduler_config = {
-            "_class_name": "EulerDiscreteScheduler",
-            "_diffusers_version": "0.25.0",
-            "beta_end": 0.012,
-            "beta_schedule": "scaled_linear",
-            "beta_start": 0.00085,
-            "clip_sample": True,
-            "num_train_timesteps": 1000,
-            "prediction_type": "v_prediction" if args.v_prediction else "epsilon",
-            "steps_offset": 1,
-            "timestep_spacing": "leading",
-            "trained_betas": None,
-            
-            # ZTSNR specific settings
-            "use_karras_sigmas": True,
-            "sigma_min": args.sigma_min,
-            "sigma_max": 20000.0,  # Practical infinity for ZTSNR
-            "sigma_data": args.sigma_data,
-            "min_snr_gamma": args.min_snr_gamma,
-        }
-
-        # Create pipeline config
-        pipeline_config = {
-            "_class_name": "StableDiffusionXLPipeline",
-            "_diffusers_version": "0.25.0",
-            "force_zeros_for_empty_prompt": True,
-            "add_watermarker": False,
-            
-            # Components
-            "text_encoder": ["text_encoder", "text_encoder_2"],
-            "tokenizer": ["tokenizer", "tokenizer_2"],
-            "scheduler": "scheduler",
-            "unet": "unet",
-            "vae": "vae",
-            
-            # SDXL specific
-            "requires_aesthetics_score": True,
-            "force_zeros_for_empty_prompt": True,
-            
-            # Custom inference settings
-            "custom_inference_config": {
-                "guidance_scale": 7.5,
-                "num_inference_steps": 28,
-                "height": 1024,
-                "width": 1024,
-                
-                # CFG Rescale settings
-                "rescale_cfg": args.rescale_cfg,
-                "scale_method": args.scale_method,
-                "rescale_multiplier": args.rescale_multiplier,
-                
-                # Resolution scaling
-                "resolution_scaling": args.resolution_scaling
-            }
-        }
-
-        # Save model components
-        models["unet"].save_pretrained(
-            os.path.join(final_output_dir, "unet"),
-            safe_serialization=True
-        )
-        models["vae"].save_pretrained(
-            os.path.join(final_output_dir, "vae"),
-            safe_serialization=True
-        )
-        models["text_encoder"].save_pretrained(
-            os.path.join(final_output_dir, "text_encoder"),
-            safe_serialization=True
-        )
-        models["text_encoder_2"].save_pretrained(
-            os.path.join(final_output_dir, "text_encoder_2"),
-            safe_serialization=True
-        )
-        models["tokenizer"].save_pretrained(os.path.join(final_output_dir, "tokenizer"))
-        models["tokenizer_2"].save_pretrained(os.path.join(final_output_dir, "tokenizer_2"))
+        # Save final UNet
+        final_model_path = os.path.join(args.output_dir, "final_model")
+        os.makedirs(final_model_path, exist_ok=True)
+        models["unet"].save_pretrained(final_model_path, safe_serialization=True)
         
-        # Save scheduler config
-        scheduler_path = os.path.join(final_output_dir, "scheduler/scheduler_config.json")
-        os.makedirs(os.path.dirname(scheduler_path), exist_ok=True)
-        with open(scheduler_path, "w") as f:
-            json.dump(scheduler_config, f, indent=2)
-
-        # Save pipeline config
-        pipeline_path = os.path.join(final_output_dir, "model_index.json")
-        with open(pipeline_path, "w") as f:
-            json.dump(pipeline_config, f, indent=2)
-
-        # Save EMA if available
-        if train_components.get("ema_model") is not None:
-            logger.info("Saving EMA weights")
-            ema_path = os.path.join(final_output_dir, "ema_unet")
-            train_components["ema_model"].save_pretrained(ema_path, safe_serialization=True)
-
-        # Save training history
-        logger.info("Saving training history")
-        history_path = os.path.join(final_output_dir, "training_history.pt")
-        torch.save(training_history, history_path)
-
-        # Save full training config
-        logger.info("Saving training configuration")
-        training_config = {
-            **vars(args),
-            "scheduler_config": scheduler_config,
-            "pipeline_config": pipeline_config,
-            "training_history": {
-                "num_epochs": args.num_epochs,
-                "batch_size": args.batch_size,
-                "learning_rate": args.learning_rate,
-                "gradient_accumulation_steps": args.gradient_accumulation_steps,
-            }
-        }
+        # Save final EMA model if it exists
+        if models.get("ema_model") is not None:
+            logger.info("Saving final EMA model...")
+            ema_path = os.path.join(args.output_dir, "final_ema")
+            os.makedirs(ema_path, exist_ok=True)
+            
+            ema_model = models["ema_model"].get_model()
+            ema_model.save_pretrained(ema_path, safe_serialization=True)
         
-        config_path = os.path.join(final_output_dir, "training_config.json")
-        with open(config_path, "w") as f:
-            json.dump(training_config, f, indent=2)
-
-        logger.info("Successfully saved all final outputs")
-
+        # Save final training metrics
+        with open(os.path.join(args.output_dir, "training_history.json"), "w") as f:
+            json.dump(training_history, f, indent=2)
+            
+        logger.info("Final outputs saved successfully")
+        
     except Exception as e:
-        logger.error(f"Failed to save final outputs: {str(e)}")
-        logger.error(f"Output directory: {final_output_dir}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
+        logger.error(f"Error saving final outputs: {str(e)}")
         raise

@@ -153,10 +153,33 @@ def train_one_epoch(
                 if ema_model is not None:
                     ema_model.step(unet)
                     
+                    # Log EMA metrics periodically
                     if args.use_wandb and step % args.logging_steps == 0:
                         wandb.log({
-                            "ema/decay": ema_model.cur_decay_value
+                            "ema/decay": ema_model.get_decay_value(),
+                            "ema/num_updates": ema_model.num_updates
                         }, step=global_step)
+                    
+                    # Run validation with EMA model periodically
+                    if validator and args.validation_steps > 0 and global_step % args.validation_steps == 0:
+                        logger.info(f"\nRunning EMA model validation at step {global_step}")
+                        ema_validation_metrics = validator.run_validation(
+                            model=ema_model.get_model(),  # Use EMA model for validation
+                            prompts=args.validation_prompts,
+                            output_dir=os.path.join(args.output_dir, f"ema_validation_step_{global_step}"),
+                            num_images_per_prompt=1,
+                            guidance_scale=5.0,
+                            num_inference_steps=28,
+                            height=1024,
+                            width=1024,
+                            log_to_wandb=args.use_wandb
+                        )
+                        
+                        if args.use_wandb:
+                            wandb.log({
+                                'ema_validation': ema_validation_metrics,
+                                'step': global_step
+                            }, step=global_step)
                 
                 global_step += 1
                 
@@ -263,112 +286,102 @@ def get_cosine_schedule_with_warmup(
 
 def train(args, models, train_components, device, dtype):
     """Main training loop"""
-    try:
-        # Initialize training components
-        unet = models["unet"]
-        train_dataloader = train_components["train_dataloader"]
-        optimizer = train_components["optimizer"]
-        lr_scheduler = train_components["lr_scheduler"]
+    training_history = {
+        'loss_history': [],
+        'validation_scores': [],
+        'ema_validation_scores': [],  # Add EMA validation tracking
+        'best_score': float('inf'),
+        'best_ema_score': float('inf')  # Add EMA best score tracking
+    }
+    
+    global_step = 0
+    start_epoch = 0
+    
+    # Resume from checkpoint if specified
+    if args.resume_from_checkpoint:
+        logger.info(f"Resuming from checkpoint: {args.resume_from_checkpoint}")
+        checkpoint_data = load_checkpoint(args.resume_from_checkpoint, models, train_components)
+        start_epoch = checkpoint_data['epoch'] + 1
+        global_step = checkpoint_data.get('global_step', 0)
+        if 'training_history' in checkpoint_data:
+            training_history.update(checkpoint_data['training_history'])
+    
+    logger.info(f"Starting training from epoch {start_epoch}")
+    
+    for epoch in range(start_epoch, args.num_epochs):
+        # Log epoch start
+        logger.info(f"\nStarting epoch {epoch+1}/{args.num_epochs}")
+        if args.use_wandb:
+            wandb.log({"train/epoch": epoch}, step=global_step)
         
-        # Get dataset from dataloader
-        dataset = train_dataloader.dataset
-        
-        # Initialize EMA if enabled
-        ema_model = None
-        if args.use_ema:
-            ema_model = EMAModel(
-                model=unet,
-                decay=args.ema_decay,
-                device=device
-            )
-            train_components["ema_model"] = ema_model
-        
-        validator = train_components.get("validator")
-        tag_weighter = train_components.get("tag_weighter")
-        vae_finetuner = train_components.get("vae_finetuner")
-        
-        # Initialize training history
-        training_history = {
-            'epoch_losses': [],
-            'learning_rates': [],
-            'validation_scores': [],
-            'global_step': 0
-        }
-        
-        global_step = 0
-        
-        # Main epoch loop
-        for epoch in range(args.num_epochs):
-            logger.info(f"\nEpoch {epoch+1}/{args.num_epochs}")
-            
-            # Shuffle dataset before each epoch
-            dataset.shuffle_samples()
-            
-            # Train one epoch
-            epoch_metrics, global_step = train_one_epoch(
-                unet=unet,
-                train_dataloader=train_dataloader,
-                optimizer=optimizer,
-                lr_scheduler=lr_scheduler,
-                ema_model=ema_model,
-                validator=validator,
-                tag_weighter=tag_weighter,
-                vae_finetuner=vae_finetuner,
-                args=args,
-                device=device,
-                dtype=dtype,
-                epoch=epoch,
-                global_step=global_step,
-                models=models,
-                train_components=train_components,
-                training_history=training_history
-            )
-            
-            # Update training history
-            training_history['epoch_losses'].append(epoch_metrics['loss/total'] / len(train_dataloader))
-            training_history['learning_rates'].append(lr_scheduler.get_last_lr()[0])
-            training_history['global_step'] = global_step
-            
-            # Save regular checkpoint
-            if args.save_checkpoints and (epoch + 1) % args.save_epochs == 0:
-                save_checkpoint(
-                    models=models,
-                    train_components=train_components,
-                    args=args,
-                    epoch=epoch,
-                    training_history=training_history,
-                    output_dir=os.path.join(args.output_dir, f"checkpoint-epoch-{epoch+1}")
-                )
-        
-        # Save final checkpoint
-        logger.info("Saving final checkpoint...")
-        save_checkpoint(
+        epoch_metrics, global_step = train_one_epoch(
+            unet=models["unet"],
+            train_dataloader=train_components["train_dataloader"],
+            optimizer=train_components["optimizer"],
+            lr_scheduler=train_components["lr_scheduler"],
+            ema_model=train_components["ema_model"],
+            validator=train_components["validator"],
+            tag_weighter=train_components["tag_weighter"],
+            vae_finetuner=train_components["vae_finetuner"],
+            args=args,
+            device=device,
+            dtype=dtype,
+            epoch=epoch,
+            global_step=global_step,
             models=models,
             train_components=train_components,
-            args=args,
-            epoch=args.num_epochs-1,
-            training_history=training_history,
-            output_dir=os.path.join(args.output_dir, "final")
+            training_history=training_history
         )
         
-        logger.info("\n=== Training Complete ===")
-        return training_history
+        # Run end-of-epoch validation for both regular and EMA models
+        if not args.skip_validation and (epoch + 1) % args.validation_frequency == 0:
+            logger.info("\nRunning end-of-epoch validation...")
+            
+            # Regular model validation
+            validation_metrics = train_components["validator"].run_validation(
+                model=models["unet"],
+                prompts=args.validation_prompts,
+                output_dir=os.path.join(args.output_dir, f"validation_epoch_{epoch+1}"),
+                num_images_per_prompt=1,
+                guidance_scale=5.0,
+                num_inference_steps=28,
+                height=1024,
+                width=1024,
+                log_to_wandb=args.use_wandb
+            )
+            
+            # EMA model validation if enabled
+            if train_components["ema_model"] is not None:
+                ema_validation_metrics = train_components["validator"].run_validation(
+                    model=train_components["ema_model"].get_model(),
+                    prompts=args.validation_prompts,
+                    output_dir=os.path.join(args.output_dir, f"ema_validation_epoch_{epoch+1}"),
+                    num_images_per_prompt=1,
+                    guidance_scale=5.0,
+                    num_inference_steps=28,
+                    height=1024,
+                    width=1024,
+                    log_to_wandb=args.use_wandb
+                )
+                
+                if args.use_wandb:
+                    wandb.log({
+                        "validation/epoch": epoch + 1,
+                        "validation/regular": validation_metrics,
+                        "validation/ema": ema_validation_metrics
+                    }, step=global_step)
         
-    except Exception as e:
-        logger.error(f"Training failed: {str(e)}")
-        logger.error(traceback.format_exc())
-        
-        # Save emergency checkpoint
-        try:
+        # Save checkpoint at epoch end if requested
+        if args.save_checkpoints and (epoch + 1) % args.save_epochs == 0:
+            checkpoint_dir = os.path.join(args.output_dir, f"checkpoint-epoch-{epoch+1}")
             save_checkpoint(
                 models=models,
                 train_components=train_components,
                 args=args,
-                epoch=-1,
+                epoch=epoch,
+                global_step=global_step,
                 training_history=training_history,
-                output_dir=os.path.join(args.output_dir, "emergency")
+                output_dir=checkpoint_dir
             )
-        except Exception as save_error:
-            logger.error(f"Failed to save emergency checkpoint: {str(save_error)}")
-        
-        raise
+    
+    return training_history
