@@ -36,12 +36,16 @@ class ModelValidator:
             variant="fp16"
         ).to(device)
         
-        # Modify pipeline scheduler settings
-        self.pipeline.scheduler.config.update({
+        # Instead of updating the config directly, create a new config
+        scheduler_config = dict(self.pipeline.scheduler.config)
+        scheduler_config.update({
             "prediction_type": "v_prediction" if self.v_prediction else "epsilon",
             "sigma_min": self.sigma_min,
             "sigma_data": self.sigma_data,
         })
+        
+        # Create a new scheduler with the updated config
+        self.pipeline.scheduler = type(self.pipeline.scheduler).from_config(scheduler_config)
         
         # Enable memory optimization
         self.pipeline.enable_vae_slicing()
