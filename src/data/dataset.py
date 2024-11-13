@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 class CustomDataset(Dataset):
     def __init__(self, data_dir, vae, tokenizer, tokenizer_2, text_encoder, text_encoder_2,
-                 cache_dir="latents_cache", no_caching_latents=False):
+                 cache_dir="latents_cache", no_caching_latents=False, all_ar=False):
         """Initialize dataset with image preprocessing
         
         Args:
@@ -32,11 +32,13 @@ class CustomDataset(Dataset):
             text_encoder_2 (CLIPTextModel): Secondary text encoder
             cache_dir (str): Directory for caching latents
             no_caching_latents (bool): Skip latent caching if True
+            all_ar (bool): Accept all aspect ratios without resizing if True
         """
         super().__init__()
         self.data_dir = Path(data_dir)
         self.cache_dir = Path(cache_dir)
         self.no_caching_latents = no_caching_latents
+        self.all_ar = all_ar
         
         if not no_caching_latents:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -81,7 +83,7 @@ class CustomDataset(Dataset):
         valid_images = []
         corrupted_images = []
         
-        for img_path in tqdm(self.image_paths, desc="Preprocessing images", total=len(self.image_paths)):
+        for img_path in tqdm(self.image_paths, desc="Preprocessing images"):
             try:
                 # Verify image can be opened and is valid
                 with Image.open(img_path) as image:
@@ -90,7 +92,12 @@ class CustomDataset(Dataset):
                     if image.mode != 'RGB':
                         image = image.convert('RGB')
                     
-                    # Get current and target dimensions
+                    # If all_ar is True, accept image as-is
+                    if self.all_ar:
+                        valid_images.append(img_path)
+                        continue
+                    
+                    # Original resizing logic for when all_ar is False
                     width, height = image.size
                     target_width, target_height = self._get_target_size(width, height)
                     
@@ -115,14 +122,6 @@ class CustomDataset(Dataset):
             except (IOError, SyntaxError, OSError) as e:
                 logger.error(f"Error preprocessing {img_path}: {str(e)}")
                 corrupted_images.append(img_path)
-                # Remove corrupted image and its caption if exists
-                try:
-                    os.remove(img_path)
-                    caption_path = img_path.with_suffix('.txt')
-                    if caption_path.exists():
-                        os.remove(caption_path)
-                except Exception as del_e:
-                    logger.error(f"Error removing corrupted file {img_path}: {str(del_e)}")
                 continue
                 
             except Exception as e:
@@ -367,11 +366,18 @@ class CustomDataset(Dataset):
                     width = int(width * scale)
                     height = int(height * scale)
             
+            # Round dimensions to multiples of 8
+            width = ((width + 7) // 8) * 8
+            height = ((height + 7) // 8) * 8
+            
             return (width, height)
 
         except Exception as e:
             logger.error(f"Error calculating target size: {str(e)}")
-            return (width, height)  # Keep original dimensions on error
+            # Return rounded dimensions even on error
+            width = ((width + 7) // 8) * 8
+            height = ((height + 7) // 8) * 8
+            return (width, height)
 
     def process_image_size(self, image, target_width, target_height):
         """Process image size with advanced upscaling"""

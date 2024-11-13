@@ -184,7 +184,7 @@ def setup_training(args, models, device, dtype):
     logger.info("Setting up training components...")
     
     try:
-        # Create dataset and dataloader
+        # Initialize dataset with all_ar flag
         dataset = CustomDataset(
             data_dir=args.data_dir,
             vae=models["vae"],
@@ -193,7 +193,8 @@ def setup_training(args, models, device, dtype):
             text_encoder=models["text_encoder"],
             text_encoder_2=models["text_encoder_2"],
             cache_dir=args.cache_dir,
-            no_caching_latents=args.no_caching_latents
+            no_caching_latents=args.no_caching_latents,
+            all_ar=args.all_ar  # Pass the flag to dataset
         )
         
         train_dataloader = DataLoader(

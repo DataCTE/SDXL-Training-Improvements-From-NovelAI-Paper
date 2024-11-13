@@ -139,6 +139,10 @@ def parse_args():
     parser.add_argument('--no_caching_latents', action='store_true',
                        help='Disable caching of VAE latents')
     
+    # Add to argument parser
+    parser.add_argument('--all_ar', action='store_true',
+                       help='Accept all aspect ratios without resizing')
+    
     return parser.parse_args()
 
 def main(args):
