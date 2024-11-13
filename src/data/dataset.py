@@ -67,7 +67,7 @@ class CustomDataset(Dataset):
             self._batch_process_latents()
 
     def _batch_process_latents(self, batch_size=4):
-        """Process and cache latents in batches for better performance"""
+        """Process and cache latents in batches using multiple workers"""
         uncached_images = [
             img_path for img_path, lat_path in zip(self.image_paths, self.latent_paths)
             if not lat_path.exists()
@@ -79,38 +79,67 @@ class CustomDataset(Dataset):
 
         logger.info(f"Caching latents for {len(uncached_images)} images in batches")
         
-        def process_batch(batch_paths):
-            batch_results = []
-            batch_images = []
-            
-            # Load and preprocess images
-            for img_path in batch_paths:
-                try:
-                    image = Image.open(img_path).convert('RGB')
-                    width, height = image.size
-                    
+        # Calculate optimal number of workers
+        num_cpu_workers = min(32, os.cpu_count() * 2)  # CPU-bound tasks
+        num_gpu_workers = 2  # GPU-bound tasks (keep low to avoid OOM)
+        
+        # Group images by size using parallel processing
+        def group_image_by_size(img_path):
+            try:
+                with Image.open(img_path) as img:
+                    width, height = img.size
                     if not self.all_ar:
-                        target_width, target_height = self._get_target_size(width, height)
-                        image = self.process_image_size(image, target_width, target_height)
-                    
-                    transform = transforms.Compose([
-                        transforms.ToTensor(),
-                        transforms.Normalize([0.5], [0.5])
-                    ])
-                    image = transform(image).unsqueeze(0)
-                    batch_images.append((img_path, image))
-                except Exception as e:
-                    logger.error(f"Error processing {img_path}: {str(e)}")
-                    continue
-            
-            if not batch_images:
+                        width, height = self._get_target_size(width, height)
+                    return (img_path, f"{width}x{height}")
+            except Exception as e:
+                logger.error(f"Error reading image {img_path}: {str(e)}")
+                return None
+
+        # Use ThreadPoolExecutor for I/O-bound size checking
+        size_groups = {}
+        with ThreadPoolExecutor(max_workers=num_cpu_workers) as executor:
+            for result in tqdm(
+                executor.map(group_image_by_size, uncached_images),
+                total=len(uncached_images),
+                desc="Grouping images by size"
+            ):
+                if result:
+                    img_path, size_key = result
+                    if size_key not in size_groups:
+                        size_groups[size_key] = []
+                    size_groups[size_key].append(img_path)
+
+        def preprocess_image(img_path):
+            """Preprocess single image"""
+            try:
+                image = Image.open(img_path).convert('RGB')
+                width, height = image.size
+                
+                if not self.all_ar:
+                    target_width, target_height = self._get_target_size(width, height)
+                    image = self.process_image_size(image, target_width, target_height)
+                
+                transform = transforms.Compose([
+                    transforms.ToTensor(),
+                    transforms.Normalize([0.5], [0.5])
+                ])
+                return img_path, transform(image).unsqueeze(0)
+            except Exception as e:
+                logger.error(f"Error preprocessing {img_path}: {str(e)}")
+                return None
+
+        def process_batch_with_vae(batch_data):
+            """Process a batch of images through VAE and generate embeddings"""
+            if not batch_data:
                 return []
             
-            # Process batch through VAE
+            batch_results = []
             try:
+                # Prepare batch
+                paths, tensors = zip(*batch_data)
                 with torch.no_grad():
-                    # Stack images
-                    image_tensor = torch.cat([img for _, img in batch_images], dim=0)
+                    # Stack images of the same size
+                    image_tensor = torch.cat(tensors, dim=0)
                     image_tensor = image_tensor.to(self.vae.device, dtype=self.vae.dtype)
                     
                     # Generate latents
@@ -118,11 +147,9 @@ class CustomDataset(Dataset):
                     latents = latents * self.vae.config.scaling_factor
                     
                     # Process each result
-                    for idx, (img_path, _) in enumerate(batch_images):
-                        latent = latents[idx]
-                        caption_path = Path(img_path).with_suffix('.txt')
-                        
+                    for idx, img_path in enumerate(paths):
                         try:
+                            caption_path = Path(img_path).with_suffix('.txt')
                             with open(caption_path, 'r', encoding='utf-8') as f:
                                 caption = f.read().strip()
                             
@@ -152,9 +179,9 @@ class CustomDataset(Dataset):
                                 pooled_output = text_embeddings_2[0]
                                 hidden_states = text_embeddings_2.hidden_states[-2]
                             
-                            # Create cache data
+                            # Create and save cache data
                             cache_data = {
-                                "latents": latent,
+                                "latents": latents[idx],
                                 "text_embeddings": text_embeddings,
                                 "text_embeddings_2": hidden_states,
                                 "added_cond_kwargs": {
@@ -168,28 +195,46 @@ class CustomDataset(Dataset):
                             batch_results.append(latent_path)
                             
                         except Exception as e:
-                            logger.error(f"Error processing caption for {img_path}: {str(e)}")
+                            logger.error(f"Error processing {img_path}: {str(e)}")
                             continue
-                            
-            except Exception as e:
-                logger.error(f"Error in batch processing: {str(e)}")
                 
+            except Exception as e:
+                logger.error(f"Error in VAE batch processing: {str(e)}")
+            
             # Clear CUDA cache after batch
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             
             return batch_results
 
-        # Process in batches
+        # Process each size group with parallel preprocessing and batch VAE processing
         processed_paths = []
-        for i in tqdm(range(0, len(uncached_images), batch_size), desc="Caching latents"):
-            batch = uncached_images[i:i + batch_size]
-            results = process_batch(batch)
-            processed_paths.extend(results)
-            
-            # Periodic garbage collection
-            if i % (batch_size * 4) == 0:
-                gc.collect()
+        total_images = sum(len(group) for group in size_groups.values())
+        
+        with tqdm(total=total_images, desc="Caching latents") as pbar:
+            for size, group_paths in size_groups.items():
+                logger.info(f"Processing size group {size} ({len(group_paths)} images)")
+                
+                # Preprocess images in parallel
+                preprocessed_batch = []
+                with ThreadPoolExecutor(max_workers=num_cpu_workers) as executor:
+                    for result in executor.map(preprocess_image, group_paths):
+                        if result:
+                            preprocessed_batch.append(result)
+                            if len(preprocessed_batch) >= batch_size:
+                                # Process batch through VAE
+                                results = process_batch_with_vae(preprocessed_batch)
+                                processed_paths.extend(results)
+                                pbar.update(len(preprocessed_batch))
+                                preprocessed_batch = []
+                                gc.collect()
+                
+                # Process remaining images in the last batch
+                if preprocessed_batch:
+                    results = process_batch_with_vae(preprocessed_batch)
+                    processed_paths.extend(results)
+                    pbar.update(len(preprocessed_batch))
+                    gc.collect()
         
         logger.info(f"Successfully cached {len(processed_paths)} latents")
 
