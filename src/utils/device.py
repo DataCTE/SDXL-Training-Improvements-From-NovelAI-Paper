@@ -14,7 +14,7 @@ def to_device(model, device):
     finally:
         model.to(original_device) 
 
-def cleanup(models, train_components, args):
+def cleanup(models, args):
     """Cleanup after training"""
     try:
         # Clean up CUDA memory
