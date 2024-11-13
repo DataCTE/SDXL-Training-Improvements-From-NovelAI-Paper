@@ -153,11 +153,12 @@ def train_one_epoch(
                 if ema_model is not None:
                     ema_model.step(unet)
                     
-                global_step += 1
+                    if args.use_wandb and step % args.logging_steps == 0:
+                        wandb.log({
+                            "ema/decay": ema_model.cur_decay_value
+                        }, step=global_step)
                 
-                # Log EMA decay rate if using wandb
-                if args.use_wandb and step % args.logging_steps == 0:
-                    metrics["ema/decay"] = ema_model.cur_decay_value if ema_model else 0.0
+                global_step += 1
                 
                 # Run validation at specified step intervals
                 if validator and args.validation_steps > 0 and global_step % args.validation_steps == 0:

@@ -3,8 +3,8 @@ import logging
 import traceback
 from diffusers import UNet2DConditionModel, AutoencoderKL
 from transformers import CLIPTokenizer, CLIPTextModel, CLIPModel
-from torch.optim.swa_utils import AveragedModel
 from models.model_validator import ModelValidator
+from training.ema import EMAModel
 
 logger = logging.getLogger(__name__)
 
@@ -81,16 +81,14 @@ def setup_models(args, device, dtype):
         text_encoder.eval()
         text_encoder_2.eval()
         
-        # Initialize EMA model if enabled
+        # Initialize EMA if enabled
         ema_model = None
         if args.use_ema:
             logger.info("Initializing EMA model...")
-            ema_model = AveragedModel(
-                unet,
-                avg_fn=lambda averaged_model_parameter, model_parameter, num_averaged: (
-                    args.ema_decay * averaged_model_parameter + 
-                    (1 - args.ema_decay) * model_parameter
-                )
+            ema_model = EMAModel(
+                model=unet,
+                decay=args.ema_decay,
+                device=device
             )
         
         # Initialize validator
