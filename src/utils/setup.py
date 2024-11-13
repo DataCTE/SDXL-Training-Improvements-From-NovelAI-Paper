@@ -8,7 +8,7 @@ from diffusers.optimization import get_scheduler
 from data.dataset import CustomDataset
 from models.tag_weighter import TagBasedLossWeighter
 from models.vae_finetuner import VAEFineTuner
-from ..infer.text_to_image import ModelValidator
+from inference.text_to_image import ModelValidator
 from training.ema import EMAModel
 import wandb
 import numpy as np
