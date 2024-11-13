@@ -56,50 +56,7 @@ def setup_training(args, models, device, dtype):
         logger.info(f"Processed {dataset.tag_stats['formatted_count']} captions")
         logger.info(f"Found {dataset.tag_stats['niji_count']} anime-style images")
         
-        # Group dataset samples by aspect ratio and size
-        def custom_collate(batch):
-            # Filter out samples that are too small
-            valid_batch = []
-            for item in batch:
-                latent_h, latent_w = item["latents"].shape[-2:]
-                # Check if latent dimensions meet minimum size (32x32 for 256x256 pixel images)
-                if latent_h >= 32 and latent_w >= 32:
-                    valid_batch.append(item)
-            
-            if not valid_batch:
-                raise ValueError("No valid samples in batch (all below minimum size)")
-                
-            # Sort remaining samples by size
-            valid_batch.sort(key=lambda x: (x["latents"].shape[-2], x["latents"].shape[-1]))
-            
-            # Group by exact dimensions
-            grouped = {}
-            for item in valid_batch:
-                size = (item["latents"].shape[-2], item["latents"].shape[-1])
-                if size not in grouped:
-                    grouped[size] = []
-                grouped[size].append(item)
-            
-            # Take the largest group that fits in a batch
-            largest_group = max(grouped.values(), key=len)
-            
-            # Create batch tensors with updated keys
-            batch_dict = {
-                "latents": torch.stack([x["latents"] for x in largest_group]),
-                "text_embeddings": torch.stack([x["text_embeddings"] for x in largest_group]),
-                "added_cond_kwargs": {
-                    "text_embeds": torch.stack([
-                        x["added_cond_kwargs"]["text_embeds"] for x in largest_group
-                    ]),
-                    "time_ids": torch.stack([
-                        x["added_cond_kwargs"]["time_ids"] for x in largest_group
-                    ])
-                }
-            }
-            
-            return batch_dict
-        
-        # Create dataloader with updated collate function
+        # Create dataloader with the imported custom_collate function
         train_dataloader = DataLoader(
             dataset,
             batch_size=args.batch_size,
