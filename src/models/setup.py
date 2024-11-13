@@ -97,7 +97,8 @@ def setup_models(args, device, dtype):
         validator = ModelValidator(
             model_path=args.model_path,
             device=device,
-            dtype=dtype
+            dtype=dtype,
+            zsnr=True
         )
         
         # Return all components
