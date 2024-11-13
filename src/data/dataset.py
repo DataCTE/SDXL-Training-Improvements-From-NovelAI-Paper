@@ -62,11 +62,10 @@ class CustomDataset(Dataset):
                 special_tags['niji'] = True
                 raw_tags = raw_tags[1:]
                 
-            # Handle version number - normalize all versions to 6 only if version tag exists
+            # Handle version number - add masterpiece tag for any version
             if raw_tags and raw_tags[-1].strip() in ['4', '5', '6']:
-                special_tags['version'] = 6
                 raw_tags = raw_tags[:-1]
-                tags.append('6')
+                tags.append('masterpiece')  # Add masterpiece instead of version number
         
         for tag in raw_tags:
             tag = tag.lower().strip()
@@ -120,10 +119,10 @@ class CustomDataset(Dataset):
         base_weight = 1.0
         
         # Apply special tag modifiers
+        if 'masterpiece' in tags:  # Changed from version/quality check to masterpiece
+            base_weight *= 1.3
         if special_tags.get('niji', False):
             base_weight *= 1.2
-        if special_tags.get('quality', 0) == 6:
-            base_weight *= 1.3
         if 'stylize' in special_tags:
             stylize_value = special_tags['stylize']
             stylize_weight = 1.0 + (math.log10(stylize_value) / 3.0)
@@ -171,7 +170,7 @@ class CustomDataset(Dataset):
                     _, special_tags = self._parse_tags(formatted_caption)
                     if special_tags.get('niji', False):
                         stats['niji_count'] += 1
-                    if special_tags.get('quality', 0) == 6:
+                    if special_tags.get('version', 0) == 6:
                         stats['quality_6_count'] += 1
                     if 'stylize' in special_tags:
                         stats['stylize_values'].append(special_tags['stylize'])
