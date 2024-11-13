@@ -56,17 +56,7 @@ def enable_gradient_checkpointing(model):
         logger.warning(f"Model {type(model).__name__} doesn't support gradient checkpointing")
 
 def setup_models(args, device, dtype):
-    """
-    Initialize and configure all models
-    
-    Args:
-        args: Training arguments
-        device: Target device
-        dtype: Model precision
-        
-    Returns:
-        dict: Dictionary containing all model components
-    """
+    """Initialize and configure all models"""
     logger.info("Setting up models...")
     
     try:
@@ -91,71 +81,43 @@ def setup_models(args, device, dtype):
         # Load text encoders and tokenizers
         logger.info("Loading text encoders and tokenizers...")
         tokenizer = CLIPTokenizer.from_pretrained(
-            args.model_path,
-            subfolder="tokenizer"
+            args.model_path, subfolder="tokenizer"
         )
         tokenizer_2 = CLIPTokenizer.from_pretrained(
-            args.model_path,
-            subfolder="tokenizer_2"
+            args.model_path, subfolder="tokenizer_2"
         )
         text_encoder = CLIPTextModel.from_pretrained(
-            args.model_path,
-            subfolder="text_encoder",
-            torch_dtype=dtype
+            args.model_path, subfolder="text_encoder"
         ).to(device)
         text_encoder_2 = CLIPTextModel.from_pretrained(
-            args.model_path,
-            subfolder="text_encoder_2",
-            torch_dtype=dtype
+            args.model_path, subfolder="text_encoder_2"
         ).to(device)
         
-        # Enable gradient checkpointing if requested (moved after model loading)
+        # Enable gradient checkpointing if requested
         if args.gradient_checkpointing:
             logger.info("Enabling gradient checkpointing for models")
-            # Enable for UNet
-            enable_gradient_checkpointing(unet)
-            
-            # Enable for text encoders
-            enable_gradient_checkpointing(text_encoder)
-            enable_gradient_checkpointing(text_encoder_2)
-            
+            for model in [unet, text_encoder, text_encoder_2]:
+                enable_gradient_checkpointing(model)
             logger.info("Gradient checkpointing enabled for all supported models")
         
-        # Freeze text encoders
-        text_encoder.requires_grad_(False)
-        text_encoder_2.requires_grad_(False)
-        text_encoder.eval()
-        text_encoder_2.eval()
-        
-        # Initialize EMA if enabled
+        # Initialize EMA if requested
         ema_model = None
         if args.use_ema:
             logger.info("Initializing EMA model...")
             ema_model = EMAModel(
-                model=unet,
+                unet,
                 decay=args.ema_decay,
                 device=device
             )
         
-        # Initialize validator
-        validator = SDXLInference(
-            model_path=args.model_path,
-            device=device,
-            dtype=dtype,
-            use_resolution_binning=True,
-            sigma_min=args.sigma_min,
-            sigma_data=1.0
-        )
-        
-        # Return all components
+        # Create models dictionary
         models = {
             "unet": unet,
             "vae": vae,
-            "tokenizer": tokenizer,
-            "tokenizer_2": tokenizer_2,
             "text_encoder": text_encoder,
             "text_encoder_2": text_encoder_2,
-            "validator": validator,
+            "tokenizer": tokenizer,
+            "tokenizer_2": tokenizer_2,
             "ema_model": ema_model
         }
         
@@ -164,7 +126,7 @@ def setup_models(args, device, dtype):
         
     except Exception as e:
         logger.error(f"Error during model setup: {str(e)}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
+        logger.error(traceback.format_exc())
         raise
 
 def verify_models(models):
@@ -218,22 +180,11 @@ def verify_models(models):
         return False
 
 def setup_training(args, models, device, dtype):
-    """
-    Initialize all training components
+    """Setup training components"""
+    logger.info("Setting up training components...")
     
-    Args:
-        args: Training arguments
-        models: Dictionary of model components
-        device: Target device
-        dtype: Model precision
-        
-    Returns:
-        dict: Dictionary containing all training components
-    """
     try:
-        logger.info("Setting up training components...")
-        
-        # Create dataset with automatic tag processing
+        # Create dataset and dataloader
         dataset = CustomDataset(
             data_dir=args.data_dir,
             vae=models["vae"],
@@ -241,57 +192,18 @@ def setup_training(args, models, device, dtype):
             tokenizer_2=models["tokenizer_2"],
             text_encoder=models["text_encoder"],
             text_encoder_2=models["text_encoder_2"],
-            cache_dir=args.cache_dir
+            cache_dir=args.cache_dir,
+            no_caching_latents=args.no_caching_latents
         )
         
-        # Log dataset and tag processing statistics
-        if args.use_wandb:
-            wandb.run.summary.update({
-                "dataset/total_images": dataset.tag_stats['total_images'],
-                "dataset/formatted_captions": dataset.tag_stats['formatted_count'],
-                "dataset/niji_ratio": dataset.tag_stats['niji_count'] / dataset.tag_stats['total_images'],
-                "dataset/quality_6_ratio": dataset.tag_stats['quality_6_count'] / dataset.tag_stats['total_images'],
-                "dataset/stylize_mean": np.mean(dataset.tag_stats['stylize_values']),
-                "dataset/chaos_mean": np.mean(dataset.tag_stats['chaos_values']) if dataset.tag_stats['chaos_values'] else 0
-            })
-        
-        logger.info(f"Processed {dataset.tag_stats['formatted_count']} captions")
-        logger.info(f"Found {dataset.tag_stats['niji_count']} anime-style images")
-        
-        # Create dataloader with the imported custom_collate function
         train_dataloader = DataLoader(
             dataset,
             batch_size=args.batch_size,
             shuffle=True,
             collate_fn=custom_collate,
-            num_workers=4,
-            pin_memory=True,
-            drop_last=True,
-            persistent_workers=True,
-            prefetch_factor=2
+            num_workers=args.num_workers,
+            pin_memory=True
         )
-        
-        # Configure memory optimizations
-        if args.gradient_checkpointing:
-            logger.info("Gradient checkpointing enabled - configuring memory optimizations")
-            
-            # Disable model parameters' gradients before training
-            for param in models["unet"].parameters():
-                param.requires_grad_(False)
-            models["unet"].requires_grad_(True)
-            
-            # Configure text encoder gradients if they're being trained
-            for encoder_name in ["text_encoder", "text_encoder_2"]:
-                if encoder_name in models and models[encoder_name] is not None:
-                    for param in models[encoder_name].parameters():
-                        param.requires_grad_(False)
-                    models[encoder_name].requires_grad_(True)
-            
-            # Empty CUDA cache
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                
-            logger.info("Memory optimizations configured")
         
         # Initialize optimizer
         logger.info("Initializing optimizer...")
@@ -340,17 +252,14 @@ def setup_training(args, models, device, dtype):
                 device=device
             )
         
-        # Initialize validator with correct parameters
+        # Initialize validator with existing components
         logger.info("Initializing validator...")
         validator = SDXLInference(
             model_path=None,  # Don't load any model
             device=device,
-            dtype=dtype,
-            use_resolution_binning=True,
-            sigma_min=args.sigma_min,
-            sigma_data=1.0
+            dtype=dtype
         )
-
+        
         # Create pipeline directly from components
         validator.pipeline = StableDiffusionXLPipeline(
             vae=models["vae"],
@@ -359,8 +268,15 @@ def setup_training(args, models, device, dtype):
             tokenizer=models["tokenizer"],
             tokenizer_2=models["tokenizer_2"],
             unet=models["unet"],
-            scheduler=models["scheduler"]
+            scheduler=None  # Will be set by the validator
         ).to(device)
+        
+        # Configure scheduler settings
+        validator.pipeline.scheduler.register_to_config(
+            use_resolution_binning=True,
+            sigma_min=args.sigma_min,
+            sigma_data=1.0
+        )
 
         # Return all components
         train_components = {
