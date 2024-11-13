@@ -49,43 +49,51 @@ def verify_training_components(train_components):
 
 def get_sdxl_bucket_resolutions():
     """
-    Generate SDXL resolution buckets with dynamic aspect ratios
+    Generate SDXL resolution buckets dynamically based on common multipliers.
+    Valid if either dimension is >= 1024px.
     
     Returns:
         list: List of (width, height) tuples representing valid SDXL resolutions
     """
-    base_resolutions = [
-        (1024, 1024),  # 1:1
-        (1152, 896),   # 1.29:1
-        (896, 1152),   # 1:1.29
-        (1216, 832),   # 1.46:1
-        (832, 1216),   # 1:1.46
-        (1344, 768),   # 1.75:1
-        (768, 1344),   # 1:1.75
-        (1536, 640),   # 2.4:1
-        (640, 1536),   # 1:2.4
-    ]
+    buckets = set()
     
-    # Generate scaled versions (0.5x to 1.5x)
-    scale_factors = [0.5, 0.75, 1.0, 1.25, 1.5]
-    buckets = []
+    # Base sizes to scale from
+    base_sizes = [1024, 1280, 1536, 1792, 2048]
     
-    for width, height in base_resolutions:
-        for scale in scale_factors:
-            scaled_w = int(width * scale)
-            scaled_h = int(height * scale)
+    # Aspect ratio multipliers (and their reciprocals)
+    # These create ratios like 1:1, 4:3, 3:2, 16:9, etc.
+    ar_multipliers = [1.0, 1.25, 1.33, 1.5, 1.77, 2.0]
+    
+    for base in base_sizes:
+        for multiplier in ar_multipliers:
+            # Calculate dimensions for both landscape and portrait
+            width = int(base * multiplier)
+            height = base
             
-            # Ensure minimum dimension of 512
-            if scaled_w >= 512 and scaled_h >= 512:
-                # Ensure maximum dimension of 2048
-                if scaled_w <= 2048 and scaled_h <= 2048:
-                    buckets.append((scaled_w, scaled_h))
+            # Add landscape variant if valid
+            if width <= 2048:
+                buckets.add((width, height))
+            
+            # Add portrait variant if valid and not square
+            if multiplier != 1.0 and height <= 2048:
+                buckets.add((height, width))
+            
+            # For smaller base sizes, also try scaling the other dimension
+            if base < 2048:
+                width = base
+                height = int(base * multiplier)
+                
+                if height <= 2048:
+                    buckets.add((width, height))
+                if multiplier != 1.0 and height <= 2048:
+                    buckets.add((height, width))
     
-    return sorted(set(buckets))  # Remove duplicates and sort
+    return sorted(buckets)
 
 def validate_image_dimensions(width, height):
     """
-    Check if image dimensions are close enough to any SDXL bucket resolution
+    Check if image dimensions are valid for SDXL.
+    Image is valid if at least one dimension is >= 1024px.
     
     Args:
         width (int): Image width
@@ -95,33 +103,41 @@ def validate_image_dimensions(width, height):
         tuple: (bool, closest_bucket) - Valid flag and closest matching resolution
     """
     try:
-        # Basic boundary checks
-        if width < 512 or height < 512:
+        # Invalid if BOTH dimensions are below 1024
+        if width < 1024 and height < 1024:
             return False, None
+            
+        # Check maximum dimension
         if width > 2048 or height > 2048:
             return False, None
             
+        # Calculate aspect ratio of input image
+        input_ar = width / height
+        input_pixels = width * height
+        
         # Get all valid SDXL buckets
         buckets = get_sdxl_bucket_resolutions()
         
-        # Calculate aspect ratio of input image
-        input_ar = width / height
-        
-        # Find closest matching bucket
-        min_ar_diff = float('inf')
+        # Find closest matching bucket based on aspect ratio and total pixels
+        min_diff_score = float('inf')
         closest_bucket = None
         
         for bucket_w, bucket_h in buckets:
             bucket_ar = bucket_w / bucket_h
-            ar_diff = abs(input_ar - bucket_ar)
+            bucket_pixels = bucket_w * bucket_h
             
-            if ar_diff < min_ar_diff:
-                min_ar_diff = ar_diff
+            # Calculate difference score based on both AR and total pixels
+            ar_diff = abs(input_ar - bucket_ar)
+            pixel_diff = abs(input_pixels - bucket_pixels) / max(input_pixels, bucket_pixels)
+            diff_score = ar_diff * 2 + pixel_diff  # Weigh AR difference more heavily
+            
+            if diff_score < min_diff_score:
+                min_diff_score = diff_score
                 closest_bucket = (bucket_w, bucket_h)
         
-        # Allow 20% tolerance in aspect ratio difference
-        max_ar_diff = 0.2
-        is_valid = min_ar_diff <= max_ar_diff
+        # Allow 30% tolerance in combined difference score
+        max_diff = 0.3
+        is_valid = min_diff_score <= max_diff
         
         return is_valid, closest_bucket
         
