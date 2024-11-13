@@ -398,47 +398,53 @@ class CustomDataset(Dataset):
             return image.resize((target_width, target_height), Image.LANCZOS)
 
     def _downscale_image(self, image, target_width, target_height):
-        """High-quality downscaling for large images"""
+        """High-quality downscaling optimized for performance while maintaining quality"""
         try:
+            # Convert to numpy once at the start
+            img_np = np.array(image)
+            
+            # Calculate scale factor
             scale_factor = max(image.width / target_width, image.height / target_height)
             
-            # Calculate number of steps for progressive downscaling
-            num_steps = max(1, min(4, int(scale_factor // 2)))
-            
-            current_image = image
+            # Calculate number of steps - fewer steps for smaller scale factors
+            num_steps = max(1, min(3, int(scale_factor // 1.5)))
             
             # Apply initial gaussian blur to prevent aliasing
-            blur_radius = min(2.0, 0.5 * scale_factor)
-            current_image = current_image.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+            # Adjust blur based on scale factor
+            blur_radius = min(2.0, 0.6 * scale_factor)
+            kernel_size = int(blur_radius * 3) | 1  # ensure odd number
+            img_np = cv2.GaussianBlur(img_np, (kernel_size, kernel_size), blur_radius)
             
+            # Apply edge-preserving bilateral filter for large downscaling
+            if scale_factor > 2.0:
+                d = 9  # diameter of pixel neighborhood
+                sigma_color = 75
+                sigma_space = 75
+                img_np = cv2.bilateralFilter(img_np, d, sigma_color, sigma_space)
+            
+            # Progressive downscaling
             for step in range(num_steps):
                 # Calculate intermediate size
-                intermediate_scale = 1.0 + (scale_factor - 1.0) * (num_steps - step - 1) / num_steps
-                intermediate_width = int(target_width * intermediate_scale)
-                intermediate_height = int(target_height * intermediate_scale)
+                progress = (step + 1) / num_steps
+                intermediate_width = int(target_width + (image.width - target_width) * (1 - progress))
+                intermediate_height = int(target_height + (image.height - target_height) * (1 - progress))
                 
-                # Convert to numpy for advanced processing
-                img_np = np.array(current_image)
+                # Use INTER_AREA for downscaling
+                img_np = cv2.resize(img_np, (intermediate_width, intermediate_height), 
+                                  interpolation=cv2.INTER_AREA)
                 
-                # Apply edge-preserving blur (bilateral filter)
-                if step == 0:
-                    img_np = cv2.bilateralFilter(img_np, 9, 75, 75)
-                
-                # High-quality resize with Lanczos
-                current_image = Image.fromarray(img_np).resize(
-                    (intermediate_width, intermediate_height),
-                    Image.LANCZOS
-                )
-                
-                # Apply sharpening on final step
+                # Apply light sharpening on final step
                 if step == num_steps - 1:
-                    enhancer = ImageEnhance.Sharpness(current_image)
-                    current_image = enhancer.enhance(1.1)
+                    kernel = np.array([[-0.5,-0.5,-0.5], 
+                                     [-0.5, 5.0,-0.5],
+                                     [-0.5,-0.5,-0.5]]) / 2.0
+                    img_np = cv2.filter2D(img_np, -1, kernel)
             
-            return current_image
+            # Convert back to PIL
+            return Image.fromarray(img_np)
             
         except Exception as e:
-            logger.error(f"Advanced downscaling failed: {str(e)}, falling back to direct resize")
+            logger.error(f"Advanced downscaling failed: {str(e)}, falling back to basic resize")
             return image.resize((target_width, target_height), Image.LANCZOS)
 
     def __getitem__(self, idx):
