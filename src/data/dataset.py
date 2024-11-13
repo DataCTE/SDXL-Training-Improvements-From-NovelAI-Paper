@@ -10,8 +10,7 @@ import traceback
 import random
 import re
 from utils.validation import validate_dataset
-from basicsr.utils.download_util import load_file_from_url
-from basicsr.utils.realesrgan_utils import RealESRGANer
+import cv2
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -46,21 +45,6 @@ class CustomDataset(Dataset):
         # Process captions and build statistics
         self.tag_stats = self._build_tag_statistics()
         logger.info(f"Processed {len(self.image_paths)} images with tag statistics")
-        
-        # Initialize upscaler with standard model instead of anime
-        model_path = load_file_from_url(
-            'https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-x4plus.pth',
-            model_dir='weights'
-        )
-        self.upscaler = RealESRGANer(
-            scale=4,
-            model_path=model_path,
-            model='RealESRGAN_x4plus',
-            tile=512,
-            tile_pad=32,
-            pre_pad=0,
-            half=True
-        )
 
     def _parse_tags(self, caption):
         """Parse Midjourney-specific tags and general tags"""
@@ -272,7 +256,7 @@ class CustomDataset(Dataset):
         return closest_size
 
     def _process_image_size(self, image, target_width, target_height):
-        """Process image size with AI upscaling for small images and high-quality downscaling for large images"""
+        """Process image size with bicubic upscaling for small images and high-quality downscaling for large images"""
         width, height = image.size
         
         # Calculate scaling factors
@@ -305,17 +289,20 @@ class CustomDataset(Dataset):
             
             return current_image
         
-        # If image is smaller, use AI upscaling
+        # If image is smaller, use bicubic upscaling
         if width_scale < 1 or height_scale < 1:
-            # Convert PIL to numpy array
+            # Convert to numpy array
             img_np = np.array(image)
             
-            # Upscale with RealESRGAN
-            output, _ = self.upscaler.enhance(img_np)
+            # Upscale with OpenCV bicubic
+            upscaled = cv2.resize(
+                img_np, 
+                (target_width, target_height),
+                interpolation=cv2.INTER_CUBIC
+            )
             
-            # Convert back to PIL and resize to target
-            upscaled = Image.fromarray(output)
-            return upscaled.resize((target_width, target_height), Image.Resampling.LANCZOS)
+            # Convert back to PIL
+            return Image.fromarray(upscaled)
         
         return image
 
