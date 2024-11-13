@@ -107,7 +107,9 @@ def setup_training(args, models, device, dtype):
             collate_fn=collate_fn,
             num_workers=4,
             pin_memory=True,
-            drop_last=True  # Drop incomplete batches
+            drop_last=True,
+            persistent_workers=True,
+            prefetch_factor=2
         )
         
         # Configure memory optimizations

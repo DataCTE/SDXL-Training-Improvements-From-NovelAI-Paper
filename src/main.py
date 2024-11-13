@@ -256,6 +256,9 @@ def setup_wandb(args):
     return None
 
 if __name__ == "__main__":
+    # Add multiprocessing start method configuration
+    torch.multiprocessing.set_start_method('spawn')
+    
     setup_torch_backends()
     args = parse_args()
     success = main(args)
