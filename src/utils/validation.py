@@ -2,6 +2,9 @@ import logging
 import os
 import glob
 from PIL import Image
+from pathlib import Path
+from collections import defaultdict
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -129,84 +132,72 @@ def validate_image_dimensions(width, height):
         return True, None  # Default to keeping original dimensions
 
 def validate_dataset(data_dir):
-    """
-    Pre-process validation of all images in dataset, logging improper sizes but allowing them
+    """Validate dataset structure and contents"""
+    data_dir = Path(data_dir)
+    stats = {
+        'total_images': 0,
+        'valid_images': 0,
+        'resize_needed': 0,
+        'missing_captions': 0,
+        'buckets': defaultdict(int)
+    }
     
-    Args:
-        data_dir (str): Directory containing the dataset
+    # Get all image files with supported extensions
+    image_files = []
+    for ext in ['*.png', '*.jpg', '*.jpeg', '*.webp']:
+        image_files.extend(data_dir.glob(ext))
+    
+    stats['total_images'] = len(image_files)
+    
+    # Process each image
+    for img_path in tqdm(image_files, desc="Validating dataset"):
+        caption_path = img_path.with_suffix('.txt')
         
-    Returns:
-        tuple: (is_valid, stats)
-    """
-    try:
-        logger.info(f"Validating dataset in {data_dir}")
-        stats = {
-            "total_images": 0,
-            "valid_images": 0,
-            "resized_images": [],
-            "missing_captions": 0,
-            "bucket_distribution": {}
-        }
-        
-        # Get all image files
-        image_files = glob.glob(os.path.join(data_dir, "*.png"))
-        stats["total_images"] = len(image_files)
-        
-        if stats["total_images"] == 0:
-            logger.error("No images found in dataset directory")
-            return False, stats
-            
-        # Validate each image
-        for img_path in image_files:
-            try:
-                # Check for caption file
-                caption_path = os.path.splitext(img_path)[0] + ".txt"
-                if not os.path.exists(caption_path):
-                    logger.warning(f"Missing caption file for {img_path}")
-                    stats["missing_captions"] += 1
-                    continue
+        try:
+            # Check if caption exists
+            if not caption_path.exists():
+                stats['missing_captions'] += 1
+                logger.warning(f"Missing caption file for {img_path}")
+                continue
                 
-                # Validate image
-                with Image.open(img_path) as img:
-                    width, height = img.size
-                    is_valid, closest_bucket = validate_image_dimensions(width, height)
-                    
-                    if closest_bucket:
-                        bucket_key = f"{closest_bucket[0]}x{closest_bucket[1]}"
-                        stats["bucket_distribution"][bucket_key] = stats["bucket_distribution"].get(bucket_key, 0) + 1
-                        
-                        if not is_valid:
-                            stats["resized_images"].append({
-                                "path": img_path,
-                                "original": (width, height),
-                                "target": closest_bucket
-                            })
-                    
-                    # Check image mode
-                    if img.mode != "RGB":
-                        logger.warning(f"Converting non-RGB image to RGB: {img_path}")
-                    
-                stats["valid_images"] += 1
+            # Validate image
+            with Image.open(img_path) as img:
+                img.verify()  # Verify image integrity
+                img = Image.open(img_path)  # Reopen after verify
+                if img.mode != 'RGB':
+                    img = img.convert('RGB')
                 
-            except Exception as e:
-                logger.error(f"Error validating {img_path}: {str(e)}")
+                # Check dimensions
+                width, height = img.size
+                is_valid, needs_resize = validate_image_dimensions(width, height)
                 
-        # Log validation results
-        logger.info(f"Dataset validation complete:")
-        logger.info(f"Total images: {stats['total_images']}")
-        logger.info(f"Valid images: {stats['valid_images']}")
-        logger.info(f"Images requiring resize: {len(stats['resized_images'])}")
-        logger.info(f"Missing captions: {stats['missing_captions']}")
-        logger.info("\nBucket distribution:")
-        for bucket, count in sorted(stats["bucket_distribution"].items()):
-            logger.info(f"  {bucket}: {count} images")
-        
-        # Dataset is valid if we have at least one valid image
-        is_valid = stats["valid_images"] > 0
-        return is_valid, stats
-        
-    except Exception as e:
-        logger.error(f"Dataset validation failed: {str(e)}")
-        return False, {"error": str(e)}
+                if needs_resize:
+                    stats['resize_needed'] += 1
+                
+                if is_valid:
+                    stats['valid_images'] += 1
+                    # Record bucket information
+                    bucket = f"{width}x{height}"
+                    stats['buckets'][bucket] += 1
+                    
+        except Exception as e:
+            logger.error(f"Error validating {img_path}: {str(e)}")
+            continue
+    
+    # Log statistics
+    logger.info("Dataset validation complete:")
+    logger.info(f"Total images: {stats['total_images']}")
+    logger.info(f"Valid images: {stats['valid_images']}")
+    logger.info(f"Images requiring resize: {stats['resize_needed']}")
+    logger.info(f"Missing captions: {stats['missing_captions']}")
+    logger.info("\nBucket distribution:")
+    
+    # Sort buckets by count
+    sorted_buckets = sorted(stats['buckets'].items(), key=lambda x: x[1], reverse=True)
+    for bucket, count in sorted_buckets[:10]:  # Show top 10 buckets
+        logger.info(f"{bucket}: {count} images")
+    
+    # Validation passes if we have valid images
+    return stats['valid_images'] > 0, stats
     
 
