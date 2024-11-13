@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 class SDXLInference:
     def __init__(
         self,
-        model_path,
+        model_path=None,
         device="cuda",
         dtype=torch.float16,
         variant="fp16",
@@ -24,7 +24,7 @@ class SDXLInference:
         Initialize SDXL inference with custom training parameters.
 
         Args:
-            model_path (str): Path to the model
+            model_path (str, optional): Path to the model. If None, pipeline must be set manually
             device (str): Device to run inference on
             dtype (torch.dtype): Model dtype
             variant (str): Model variant (e.g., 'fp16')
@@ -32,8 +32,6 @@ class SDXLInference:
             sigma_min (float): Minimum sigma value for noise schedule
             sigma_data (float): Sigma data value for noise schedule
         """
-        logger.info(f"Initializing SDXL inference with model: {model_path}")
-        
         self.model_path = model_path
         self.device = device
         self.dtype = dtype
@@ -41,27 +39,29 @@ class SDXLInference:
         self.sigma_min = sigma_min
         self.sigma_data = sigma_data
         
-        # Load pipeline
-        try:
-            self.pipeline = StableDiffusionXLPipeline.from_pretrained(
-                model_path,
-                torch_dtype=dtype,
-                use_safetensors=True,
-                variant=variant
-            ).to(device)
-            
-            # Use our custom scheduler settings
-            self.pipeline.scheduler.register_to_config(
-                use_resolution_binning=use_resolution_binning,
-                sigma_min=sigma_min,
-                sigma_data=sigma_data
-            )
-            
-            logger.info("Model loaded successfully")
-            
-        except Exception as e:
-            logger.error(f"Failed to load model: {str(e)}")
-            raise
+        # Only load pipeline if model_path is provided
+        if model_path is not None:
+            logger.info(f"Initializing SDXL inference with model: {model_path}")
+            try:
+                self.pipeline = StableDiffusionXLPipeline.from_pretrained(
+                    model_path,
+                    torch_dtype=dtype,
+                    use_safetensors=True,
+                    variant=variant
+                ).to(device)
+                
+                # Use our custom scheduler settings
+                self.pipeline.scheduler.register_to_config(
+                    use_resolution_binning=use_resolution_binning,
+                    sigma_min=sigma_min,
+                    sigma_data=sigma_data
+                )
+                
+                logger.info("Model loaded successfully")
+                
+            except Exception as e:
+                logger.error(f"Failed to load model: {str(e)}")
+                raise
 
     def generate_images(
         self,

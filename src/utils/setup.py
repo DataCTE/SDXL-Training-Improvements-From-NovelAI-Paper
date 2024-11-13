@@ -21,6 +21,7 @@ from training.ema import EMAModel
 from data.tag_weighter import TagBasedLossWeighter
 from training.vae_finetuner import VAEFineTuner
 from utils.device import cleanup
+from diffusers import StableDiffusionXLPipeline
 
 
 logger = logging.getLogger(__name__)
@@ -340,18 +341,27 @@ def setup_training(args, models, device, dtype):
             )
         
         # Initialize validator with correct parameters
+        logger.info("Initializing validator...")
         validator = SDXLInference(
-            model_path=args.model_path,
+            model_path=None,  # Don't load any model
             device=device,
             dtype=dtype,
             use_resolution_binning=True,
             sigma_min=args.sigma_min,
             sigma_data=1.0
         )
-        
-        # Update UNet in validator to use training UNet
-        validator.pipeline.unet = models["unet"]  # Explicitly set to training UNet
-        
+
+        # Create pipeline directly from components
+        validator.pipeline = StableDiffusionXLPipeline(
+            vae=models["vae"],
+            text_encoder=models["text_encoder"],
+            text_encoder_2=models["text_encoder_2"],
+            tokenizer=models["tokenizer"],
+            tokenizer_2=models["tokenizer_2"],
+            unet=models["unet"],
+            scheduler=models["scheduler"]
+        ).to(device)
+
         # Return all components
         train_components = {
             "dataset": dataset,
