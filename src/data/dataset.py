@@ -9,7 +9,7 @@ import logging
 import traceback
 import random
 import re
-from ..utils.validation import validate_dataset
+from utils.validation import validate_dataset
 
 logger = logging.getLogger(__name__)
 

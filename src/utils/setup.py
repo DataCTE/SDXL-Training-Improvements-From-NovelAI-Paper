@@ -14,7 +14,7 @@ import wandb
 import numpy as np
 from diffusers import UNet2DConditionModel, AutoencoderKL
 from transformers import CLIPTokenizer, CLIPTextModel
-
+from data.dataset import custom_collate
 
 
 logger = logging.getLogger(__name__)
