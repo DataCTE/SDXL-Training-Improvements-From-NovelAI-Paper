@@ -12,15 +12,7 @@ import re
 from utils.validation import validate_dataset
 import cv2
 import numpy as np
-from torchvision.transforms.functional import rgb_to_grayscale
-from basicsr.archs.rrdbnet_arch import RRDBNet
-from basicsr.utils.download_util import load_file_from_url
-from realesrgan import RealESRGANer
-import torch.nn.functional as F
-from basicsr.utils.download_util import load_file_from_url
-from basicsr.utils.registry import ARCH_REGISTRY
-from realesrgan.archs.srvgg_arch import SRVGGNetCompact
-from realesrgan import RealESRGANer
+from .ultimate_upscaler import UltimateUpscaler, USDUMode, USDUSFMode
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +46,9 @@ class CustomDataset(Dataset):
         # Process captions and build statistics
         self.tag_stats = self._build_tag_statistics()
         logger.info(f"Processed {len(self.image_paths)} images with tag statistics")
+        
+        # Initialize upscaler with DreamShaper model
+        self.upscaler = UltimateUpscaler()
 
     def _parse_tags(self, caption):
         """Parse Midjourney-specific tags and general tags"""
@@ -268,140 +263,119 @@ class CustomDataset(Dataset):
         
         return closest_size
 
-    class ImageProcessor:
-        def __init__(self):
-            """Initialize the image processor with Real-ESRGAN"""
-            self.upsampler = None
-            
-        def _init_upsampler(self):
-            """Lazy initialization of Real-ESRGAN to save memory when not needed"""
-            if self.upsampler is None:
-                try:
-                    # Use SRVGGNetCompact instead of RRDBNet
-                    model = SRVGGNetCompact(num_in_ch=3, num_out_ch=3, num_feat=64, num_conv=16, upscale=2, act_type='prelu')
-                    model_path = load_file_from_url(
-                        'https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x2v3.pth',
-                        model_dir='weights'
-                    )
-                    self.upsampler = RealESRGANer(
-                        scale=2,
-                        model_path=model_path,
-                        model=model,
-                        tile=512,
-                        tile_pad=32,
-                        pre_pad=0,
-                        half=True
-                    )
-                    logger.info("Real-ESRGAN model loaded successfully")
-                except Exception as e:
-                    logger.error(f"Failed to initialize Real-ESRGAN: {str(e)}")
-                    self.upsampler = None
+    def process_image_size(self, image, target_width, target_height):
+        """Process image size with advanced upscaling"""
+        width, height = image.size
+        
+        if width == target_width and height == target_height:
+            return image
 
-        def process_image_size(self, image, target_width, target_height):
-            """
-            Process image size with AI upscaling for small images and high-quality downscaling for large ones
-            
-            Args:
-                image (PIL.Image): Input image
-                target_width (int): Desired width
-                target_height (int): Desired height
-                
-            Returns:
-                PIL.Image: Processed image
-            """
-            width, height = image.size
-            
-            # If image is already the target size, return as-is
-            if width == target_width and height == target_height:
-                return image
-            
-            logger.info(f"Processing image from {width}x{height} to {target_width}x{target_height}")
-            
-            # Calculate scaling factors
-            width_scale = width / target_width
-            height_scale = height / target_height
-            scale_factor = max(width_scale, height_scale)
-            
-            # Handle small images with AI upscaling
+        logger.info(f"Processing image from {width}x{height} to {target_width}x{target_height}")
+        
+        scale_factor = max(target_width / width, target_height / height)
+        
+        try:
             if scale_factor < 1:
-                return self._upscale_image(image, target_width, target_height)
+                # For downscaling, use high-quality downscaling
+                return self._downscale_image(image, target_width, target_height)
+            else:
+                # For upscaling, use AI upscaling only if the image is too small
+                min_size = 768  # Minimum size before using AI upscaling
+                if width < min_size or height < min_size:
+                    return self._upscale_image(image, target_width, target_height)
+                else:
+                    # Use regular Lanczos upscaling for larger images
+                    return image.resize((target_width, target_height), Image.LANCZOS)
+        except Exception as e:
+            logger.error(f"Image processing failed: {str(e)}, falling back to basic resize")
+            return image.resize((target_width, target_height), Image.LANCZOS)
+
+    def _upscale_image(self, image, target_width, target_height):
+        """Upscale image using Ultimate SD Upscaler"""
+        try:
+            # Calculate scale factor
+            scale_factor = max(target_width / image.width, target_height / image.height)
             
-            # Handle large images with progressive downscaling
-            return self._downscale_image(image, target_width, target_height, scale_factor)
-
-        def _upscale_image(self, image, target_width, target_height):
-            """Upscale small images using Real-ESRGAN"""
+            # Get caption for the image
+            caption_path = Path(str(image.filename)).with_suffix('.txt')
             try:
-                # Initialize upsampler if needed
-                self._init_upsampler()
-                if self.upsampler is None:
-                    logger.warning("Falling back to bicubic upscaling")
-                    return image.resize((target_width, target_height), Image.BICUBIC)
+                with open(caption_path, 'r', encoding='utf-8') as f:
+                    prompt = f.read().strip()
+            except:
+                prompt = "high quality, detailed image"  # fallback prompt
+            
+            # Process with upscaler
+            upscaled = self.upscaler.upscale(
+                image=image,
+                prompt=prompt,
+                upscale_factor=scale_factor,
+                mode=USDUMode.LINEAR,
+                tile_width=512,
+                tile_height=512,
+                padding=32,
+                num_steps=20,
+                guidance_scale=7.5,
+                strength=0.4,
+                seam_fix_mode=USDUSFMode.HALF_TILE,
+                seam_fix_denoise=0.35,
+                seam_fix_width=64,
+                seam_fix_mask_blur=8,
+                seam_fix_padding=16
+            )
+            
+            # Final resize to exact target size if needed
+            if upscaled.size != (target_width, target_height):
+                upscaled = upscaled.resize((target_width, target_height), Image.LANCZOS)
                 
-                # Convert PIL to numpy
-                img_np = np.array(image)
-                
-                # Calculate intermediate size for 2x upscaling
-                intermediate_width = min(target_width * 2, 4096)  # Limit max size
-                intermediate_height = min(target_height * 2, 4096)
-                
-                # Upscale with Real-ESRGAN
-                output, _ = self.upsampler.enhance(img_np, outscale=2.0)
-                
-                # Convert back to PIL
-                upscaled = Image.fromarray(output)
-                
-                # Resize to target size with Lanczos
-                if upscaled.size != (target_width, target_height):
-                    upscaled = upscaled.resize((target_width, target_height), Image.LANCZOS)
-                
-                return upscaled
-                
-            except Exception as e:
-                logger.error(f"AI upscaling failed: {str(e)}, falling back to bicubic")
-                return image.resize((target_width, target_height), Image.BICUBIC)
+            return upscaled
+            
+        except Exception as e:
+            logger.error(f"AI upscaling failed: {str(e)}, falling back to basic resize")
+            return image.resize((target_width, target_height), Image.LANCZOS)
 
-        def _downscale_image(self, image, target_width, target_height, scale_factor):
-            """Progressive high-quality downscaling for large images"""
-            try:
-                # Calculate number of steps for progressive downscaling
-                num_steps = max(1, min(4, int(scale_factor // 2)))
+    def _downscale_image(self, image, target_width, target_height):
+        """High-quality downscaling for large images"""
+        try:
+            scale_factor = max(image.width / target_width, image.height / target_height)
+            
+            # Calculate number of steps for progressive downscaling
+            num_steps = max(1, min(4, int(scale_factor // 2)))
+            
+            current_image = image
+            
+            # Apply initial gaussian blur to prevent aliasing
+            blur_radius = min(2.0, 0.5 * scale_factor)
+            current_image = current_image.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+            
+            for step in range(num_steps):
+                # Calculate intermediate size
+                intermediate_scale = 1.0 + (scale_factor - 1.0) * (num_steps - step - 1) / num_steps
+                intermediate_width = int(target_width * intermediate_scale)
+                intermediate_height = int(target_height * intermediate_scale)
                 
-                current_image = image
+                # Convert to numpy for advanced processing
+                img_np = np.array(current_image)
                 
-                # Apply initial gaussian blur to prevent aliasing
-                blur_radius = min(2.0, 0.5 * scale_factor)
-                current_image = current_image.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+                # Apply edge-preserving blur (bilateral filter)
+                if step == 0:
+                    img_np = cv2.bilateralFilter(img_np, 9, 75, 75)
                 
-                for step in range(num_steps):
-                    # Calculate intermediate size
-                    intermediate_scale = 1.0 + (scale_factor - 1.0) * (num_steps - step - 1) / num_steps
-                    intermediate_width = int(target_width * intermediate_scale)
-                    intermediate_height = int(target_height * intermediate_scale)
-                    
-                    # Convert to numpy for advanced processing
-                    img_np = np.array(current_image)
-                    
-                    # Apply edge-preserving blur (bilateral filter)
-                    if step == 0:
-                        img_np = cv2.bilateralFilter(img_np, 9, 75, 75)
-                    
-                    # High-quality resize with Lanczos
-                    current_image = Image.fromarray(img_np).resize(
-                        (intermediate_width, intermediate_height),
-                        Image.LANCZOS
-                    )
-                    
-                    # Apply sharpening on final step
-                    if step == num_steps - 1:
-                        enhancer = ImageEnhance.Sharpness(current_image)
-                        current_image = enhancer.enhance(1.1)
+                # High-quality resize with Lanczos
+                current_image = Image.fromarray(img_np).resize(
+                    (intermediate_width, intermediate_height),
+                    Image.LANCZOS
+                )
                 
-                return current_image
-                
-            except Exception as e:
-                logger.error(f"Advanced downscaling failed: {str(e)}, falling back to direct resize")
-                return image.resize((target_width, target_height), Image.LANCZOS)
+                # Apply sharpening on final step
+                if step == num_steps - 1:
+                    enhancer = ImageEnhance.Sharpness(current_image)
+                    current_image = enhancer.enhance(1.1)
+            
+            return current_image
+            
+        except Exception as e:
+            logger.error(f"Advanced downscaling failed: {str(e)}, falling back to direct resize")
+            return image.resize((target_width, target_height), Image.LANCZOS)
 
     def __getitem__(self, idx):
         image_path = self.image_paths[idx]
@@ -437,7 +411,7 @@ class CustomDataset(Dataset):
             target_width, target_height = self._get_target_size(width, height)
             
             # Process image size with AI upscaling when needed
-            processed_image = self.ImageProcessor().process_image_size(image, target_width, target_height)
+            processed_image = self.process_image_size(image, target_width, target_height)
             
             transform = transforms.Compose([
                 transforms.ToTensor(),
