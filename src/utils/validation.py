@@ -89,7 +89,7 @@ def get_sdxl_bucket_resolutions():
 def validate_image_dimensions(width, height):
     """
     Check if image dimensions are valid for SDXL.
-    Image is valid if at least one dimension is >= 1024px.
+    More permissive validation that only intervenes for significant dimension issues.
     
     Args:
         width (int): Image width
@@ -99,43 +99,42 @@ def validate_image_dimensions(width, height):
         tuple: (bool, closest_bucket) - Valid flag and closest matching resolution
     """
     try:
-        # Invalid if BOTH dimensions are below 1024
-        if width < 1024 and height < 1024:
+        # Only invalid if BOTH dimensions are below 768px (more permissive than 1024)
+        if width < 768 and height < 768:
             return False, None
             
-        # Check maximum dimension
-        if width > 2048 or height > 2048:
+        # Check maximum dimension - only intervene if significantly over 2048
+        if width > 2304 or height > 2304:  # Allow some overflow
             return False, None
             
-        # Calculate aspect ratio of input image
-        input_ar = width / height
-        input_pixels = width * height
+        # Calculate aspect ratio
+        aspect_ratio = width / height
         
-        # Get all valid SDXL buckets
-        buckets = get_sdxl_bucket_resolutions()
-        
-        # Find closest matching bucket based on aspect ratio and total pixels
-        min_diff_score = float('inf')
-        closest_bucket = None
-        
-        for bucket_w, bucket_h in buckets:
-            bucket_ar = bucket_w / bucket_h
-            bucket_pixels = bucket_w * bucket_h
+        # Only intervene for extreme aspect ratios (more than 3:1 or 1:3)
+        if aspect_ratio > 3.0 or aspect_ratio < 0.333:
+            return False, None
             
-            # Calculate difference score based on both AR and total pixels
-            ar_diff = abs(input_ar - bucket_ar)
-            pixel_diff = abs(input_pixels - bucket_pixels) / max(input_pixels, bucket_pixels)
-            diff_score = ar_diff * 2 + pixel_diff  # Weigh AR difference more heavily
+        # If we reach here, the image is considered valid
+        # Only suggest bucket if dimensions are significantly different from SDXL sizes
+        if abs(width - 1024) > 256 or abs(height - 1024) > 256:
+            # Get all valid SDXL buckets
+            buckets = get_sdxl_bucket_resolutions()
             
-            if diff_score < min_diff_score:
-                min_diff_score = diff_score
-                closest_bucket = (bucket_w, bucket_h)
-        
-        # Allow 30% tolerance in combined difference score
-        max_diff = 0.3
-        is_valid = min_diff_score <= max_diff
-        
-        return is_valid, closest_bucket
+            # Find closest matching bucket
+            min_diff = float('inf')
+            closest_bucket = None
+            
+            for bucket_w, bucket_h in buckets:
+                bucket_ar = bucket_w / bucket_h
+                ar_diff = abs(aspect_ratio - bucket_ar)
+                
+                if ar_diff < min_diff:
+                    min_diff = ar_diff
+                    closest_bucket = (bucket_w, bucket_h)
+                    
+            return True, closest_bucket
+            
+        return True, None
         
     except Exception as e:
         logger.error(f"Error validating dimensions: {str(e)}")
