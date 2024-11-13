@@ -24,6 +24,7 @@ from utils.device import cleanup
 from diffusers import StableDiffusionXLPipeline
 from utils.validation import validate_dataset
 import os
+from diffusers import EulerDiscreteScheduler
 
 
 logger = logging.getLogger(__name__)
@@ -278,15 +279,30 @@ def setup_training(args, models, device, dtype):
                 device=device
             )
         
-        # Initialize validator with existing components
+        # Initialize validator with proper scheduler
         logger.info("Initializing validator...")
-        validator = SDXLInference(
-            model_path=None,  # Don't load any model
-            device=device,
-            dtype=dtype
+
+        # Create scheduler first
+        noise_scheduler = EulerDiscreteScheduler(
+            beta_start=0.00085,
+            beta_end=0.012,
+            beta_schedule="scaled_linear",
+            num_train_timesteps=1000,
+            use_karras_sigmas=True,
+            sigma_min=args.sigma_min,
+            sigma_max=160.0,
+            steps_offset=1,
         )
-        
-        # Create pipeline directly from components
+
+        # Create validator with pipeline
+        validator = SDXLInference(
+            model_path=args.model_path,
+            device=device,
+            dtype=dtype,
+            use_resolution_binning=True
+        )
+
+        # Update validator's pipeline with our models and scheduler
         validator.pipeline = StableDiffusionXLPipeline(
             vae=models["vae"],
             text_encoder=models["text_encoder"],
@@ -294,15 +310,8 @@ def setup_training(args, models, device, dtype):
             tokenizer=models["tokenizer"],
             tokenizer_2=models["tokenizer_2"],
             unet=models["unet"],
-            scheduler=None  # Will be set by the validator
+            scheduler=noise_scheduler,
         ).to(device)
-        
-        # Configure scheduler settings
-        validator.pipeline.scheduler.register_to_config(
-            use_resolution_binning=True,
-            sigma_min=args.sigma_min,
-            sigma_data=1.0
-        )
 
         # Return all components
         train_components = {
