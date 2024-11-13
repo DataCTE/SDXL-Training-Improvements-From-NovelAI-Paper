@@ -40,29 +40,6 @@ def setup_models(args, device, dtype):
             torch_dtype=dtype
         ).to(device)
         
-        # Enable gradient checkpointing if requested
-        if args.gradient_checkpointing:
-            logger.info("Enabling gradient checkpointing for models")
-            # Enable for UNet
-            enable_gradient_checkpointing(unet)
-            
-            # Enable for text encoders if they exist
-            if text_encoder is not None:
-                enable_gradient_checkpointing(text_encoder)
-            if text_encoder_2 is not None:
-                enable_gradient_checkpointing(text_encoder_2)
-            
-            logger.info("Gradient checkpointing enabled for all supported models")
-        
-        # Compile model if requested
-        if args.enable_compile:
-            logger.info(f"Compiling UNet with mode: {args.compile_mode}")
-            unet = torch.compile(
-                unet,
-                mode=args.compile_mode,
-                fullgraph=True
-            )
-        
         # Load VAE
         logger.info("Loading VAE...")
         vae = AutoencoderKL.from_pretrained(
@@ -93,6 +70,18 @@ def setup_models(args, device, dtype):
             subfolder="text_encoder_2",
             torch_dtype=dtype
         ).to(device)
+        
+        # Enable gradient checkpointing if requested (moved after model loading)
+        if args.gradient_checkpointing:
+            logger.info("Enabling gradient checkpointing for models")
+            # Enable for UNet
+            enable_gradient_checkpointing(unet)
+            
+            # Enable for text encoders
+            enable_gradient_checkpointing(text_encoder)
+            enable_gradient_checkpointing(text_encoder_2)
+            
+            logger.info("Gradient checkpointing enabled for all supported models")
         
         # Freeze text encoders
         text_encoder.requires_grad_(False)
