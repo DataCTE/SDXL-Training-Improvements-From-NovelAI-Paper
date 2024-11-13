@@ -142,8 +142,8 @@ def setup_models(args, device, dtype):
             device=device,
             dtype=dtype,
             use_resolution_binning=True,
-            sigma_min=sigma_min,
-            sigma_data=sigma_data
+            sigma_min=args.sigma_min,
+            sigma_data=1.0
         )
         
         # Return all components
@@ -345,8 +345,8 @@ def setup_training(args, models, device, dtype):
             device=device,
             dtype=dtype,
             use_resolution_binning=True,
-            sigma_min=sigma_min,
-            sigma_data=sigma_data
+            sigma_min=args.sigma_min,
+            sigma_data=1.0
         )
         
         # Return all components
