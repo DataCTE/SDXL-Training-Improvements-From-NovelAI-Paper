@@ -13,6 +13,7 @@ from utils.validation import validate_dataset
 import cv2
 import numpy as np
 from .ultimate_upscaler import UltimateUpscaler, USDUMode, USDUSFMode
+from utils.validation import validate_image_dimensions
 
 logger = logging.getLogger(__name__)
 
@@ -283,28 +284,51 @@ class CustomDataset(Dataset):
         return stats
 
     def _get_target_size(self, width, height):
-        """Get closest SDXL aspect ratio bucket size"""
-        # SDXL standard aspect ratios
-        sdxl_sizes = [
-            (1024, 1024),  # 1:1
-            (1152, 896),   # ~1.29:1
-            (896, 1152),   # ~1:1.29
-            (1216, 832),   # ~1.46:1
-            (832, 1216),   # ~1:1.46
-            (1344, 768),   # ~1.75:1
-            (768, 1344),   # ~1:1.75
-            (1536, 640),   # ~2.4:1
-            (640, 1536),   # ~1:2.4
-        ]
-        
-        aspect_ratio = width / height
-        closest_size = min(sdxl_sizes, 
-            key=lambda size: abs((size[0] / size[1]) - aspect_ratio))
-        
-        if abs((width / height) - (closest_size[0] / closest_size[1])) > 0.1:
-            logger.info(f"Adjusting aspect ratio from {width}x{height} ({width/height:.2f}) to {closest_size[0]}x{closest_size[1]} ({closest_size[0]/closest_size[1]:.2f})")
-        
-        return closest_size
+        """
+        Get target size based on SDXL validation rules.
+        Valid if either dimension is >= 1024px.
+        """
+        try:
+            # Invalid if BOTH dimensions are below 1024
+            if width < 1024 and height < 1024:
+                # Scale up to ensure at least one dimension is 1024
+                scale = 1024 / max(width, height)
+                new_width = int(width * scale)
+                new_height = int(height * scale)
+                width, height = new_width, new_height
+
+            # Check maximum dimension
+            if width > 2048 or height > 2048:
+                scale = 2048 / max(width, height)
+                width = int(width * scale)
+                height = int(height * scale)
+
+            # Get validation result
+            is_valid, closest_bucket = validate_image_dimensions(width, height)
+            
+            if is_valid and closest_bucket:
+                # Use the validated bucket size if valid
+                return closest_bucket
+            else:
+                # Log why we're falling back
+                if not is_valid:
+                    logger.info(f"Adjusting aspect ratio from {width}x{height} ({width/height:.2f}) to maintain SDXL bounds")
+                
+                # Fallback to maintaining aspect ratio while fitting bounds
+                aspect_ratio = width / height
+                if aspect_ratio > 1:
+                    new_width = min(2048, width)
+                    new_height = int(new_width / aspect_ratio)
+                else:
+                    new_height = min(2048, height)
+                    new_width = int(new_height * aspect_ratio)
+                
+                return (new_width, new_height)
+
+        except Exception as e:
+            logger.error(f"Error calculating target size: {str(e)}")
+            # Fallback to square 1024x1024 if calculation fails
+            return (1024, 1024)
 
     def process_image_size(self, image, target_width, target_height):
         """Process image size with advanced upscaling"""

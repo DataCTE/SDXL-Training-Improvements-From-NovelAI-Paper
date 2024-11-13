@@ -60,9 +60,15 @@ def get_sdxl_bucket_resolutions():
     # Base sizes to scale from
     base_sizes = [1024, 1280, 1536, 1792, 2048]
     
-    # Aspect ratio multipliers (and their reciprocals)
-    # These create ratios like 1:1, 4:3, 3:2, 16:9, etc.
-    ar_multipliers = [1.0, 1.25, 1.33, 1.5, 1.77, 2.0]
+    # Aspect ratio multipliers
+    ar_multipliers = [
+        1.0,    # 1:1
+        1.25,   # 5:4
+        1.33,   # 4:3
+        1.5,    # 3:2
+        1.77,   # 16:9
+        2.0     # 2:1
+    ]
     
     for base in base_sizes:
         for multiplier in ar_multipliers:
@@ -71,22 +77,12 @@ def get_sdxl_bucket_resolutions():
             height = base
             
             # Add landscape variant if valid
-            if width <= 2048:
+            if width <= 2048 and (width >= 1024 or height >= 1024):
                 buckets.add((width, height))
             
             # Add portrait variant if valid and not square
-            if multiplier != 1.0 and height <= 2048:
+            if multiplier != 1.0 and height <= 2048 and (width >= 1024 or height >= 1024):
                 buckets.add((height, width))
-            
-            # For smaller base sizes, also try scaling the other dimension
-            if base < 2048:
-                width = base
-                height = int(base * multiplier)
-                
-                if height <= 2048:
-                    buckets.add((width, height))
-                if multiplier != 1.0 and height <= 2048:
-                    buckets.add((height, width))
     
     return sorted(buckets)
 
