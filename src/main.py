@@ -9,16 +9,13 @@ from pathlib import Path
 
 
 from training.trainer import train
-from training.utils import setup_torch_backends, cleanup
-from models.setup import setup_models
-from training.setup import setup_training
-from training.utils import load_checkpoint, save_checkpoint, save_final_outputs
+from utils.setup import setup_torch_backends, cleanup
+from utils.checkpoint import load_checkpoint, save_checkpoint, save_final_outputs
 from utils.model_card import create_model_card, save_model_card, push_to_hub
 from utils.logging import (
     setup_logging,
     log_system_info,
     log_training_setup,
-    log_gpu_memory,
     setup_wandb,
     cleanup_wandb
 )
