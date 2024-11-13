@@ -10,26 +10,24 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 class ModelValidator:
-    def __init__(self, model_path, device="cuda", dtype=torch.float16, 
-             zsnr=True, sigma_min=0.0292, sigma_data=1.0, min_snr_gamma=5.0,
-             resolution_scaling=True, rescale_cfg=True, scale_method="karras",
-             rescale_multiplier=0.7):
+    def __init__(self, model_path, device="cuda", dtype=torch.float16,
+                 zsnr=True, sigma_min=0.0292, sigma_data=1.0, min_snr_gamma=5.0,
+                 variant="fp16"):
         """
-        Initialize the model validator
-        
+        Initialize the ModelValidator with specified parameters.
+
         Args:
-            model_path (str): Path to the base model
-            device (str): Device to use for inference
-            dtype (torch.dtype): Data type for model
-            zsnr (bool): Whether to use ZSNR noise scheduling
-            sigma_min (float): Minimum sigma value for noise schedule
-            sigma_data (float): Data sigma value for v-prediction
-            min_snr_gamma (float): Minimum SNR gamma value
-            resolution_scaling (bool): Whether to use resolution-dependent scaling
-            rescale_cfg (bool): Whether to use CFG rescaling
-            scale_method (str): CFG rescaling method ('karras' or 'simple')
-            rescale_multiplier (float): Multiplier for CFG rescaling
+            model_path (str): Path to the pre-trained model.
+            device (str): Device to run on, e.g., "cuda" or "cpu".
+            dtype (torch.dtype): Data type for the model.
+            zsnr (bool): Whether to use ZSNR.
+            sigma_min (float): Minimum value for sigma.
+            sigma_data (float): Maximum value for sigma.
+            min_snr_gamma (float): Minimum SNR gamma value.
+            variant (str): Variant to load, e.g., "fp16".
         """
+        logger.info(f"Initializing ModelValidator with model path: {model_path}")
+        
         self.model_path = model_path
         self.device = device
         self.dtype = dtype
@@ -37,127 +35,85 @@ class ModelValidator:
         self.sigma_min = sigma_min
         self.sigma_data = sigma_data
         self.min_snr_gamma = min_snr_gamma
-        self.resolution_scaling = resolution_scaling
-        self.rescale_cfg = rescale_cfg
-        self.scale_method = scale_method
-        self.rescale_multiplier = rescale_multiplier
+        self.variant = variant
         
-        # Always use v-prediction
-        self.v_prediction = True
-        
-        logger.info(f"Initializing validator with model from {model_path}")
-        
-        # Load pipeline
-        self.pipeline = StableDiffusionXLPipeline.from_pretrained(
-            model_path,
-            torch_dtype=dtype,
-            use_safetensors=True
-        )
-        
-        # Create new scheduler config
-        scheduler_config = dict(self.pipeline.scheduler.config)
-        scheduler_config.update({
-            "prediction_type": "v_prediction",
-            "sigma_min": self.sigma_min,
-            "sigma_data": self.sigma_data,
-        })
-        
-        # Create new scheduler with updated config
-        self.pipeline.scheduler = type(self.pipeline.scheduler).from_config(scheduler_config)
-        
-        # Enable memory optimization
-        self.pipeline.enable_vae_slicing()
-        self.pipeline.enable_model_cpu_offload()
-        
-    def karras_rescale(self, cond, uncond, guidance_scale):
-        """Karras CFG rescale method"""
-        std_cond = torch.std(cond, dim=tuple(range(1, cond.ndim)))
-        std_uncond = torch.std(uncond, dim=tuple(range(1, uncond.ndim)))
-        std_cond = std_cond.where(std_cond != 0, torch.ones_like(std_cond))
-        std_uncond = std_uncond.where(std_uncond != 0, torch.ones_like(std_uncond))
-        
-        # Calculate rescale multiplier
-        k = self.rescale_multiplier
-        alpha = k * std_uncond / std_cond
-        
-        # Rescale conditional
-        rescaled_cond = cond * alpha.view(-1, *(1,) * (cond.ndim - 1))
-        
-        # Apply guidance
-        return uncond + guidance_scale * (rescaled_cond - uncond)
+        try:
+            self.pipeline = StableDiffusionXLPipeline.from_pretrained(
+                model_path,
+                torch_dtype=self.dtype,
+                use_safetensors=True,
+                variant=self.variant
+            ).to(self.device)
+            
+            logger.info("Model successfully loaded to device.")
+        except Exception as e:
+            logger.error(f"Error loading model: {str(e)}")
+            raise
+    
+    def generate_images(self, prompts, **generation_kwargs):
+        """
+        Generate images based on the provided prompts.
 
-    def generate_images(self, prompts, num_images_per_prompt=1, negative_prompt=None, **kwargs):
-        """Generate images with custom ZTSNR and CFG rescale settings"""
-        logger.info(f"Generating {len(prompts) * num_images_per_prompt} validation images")
-        
-        default_params = {
-            "num_inference_steps": 28,
-            "guidance_scale": 5.0,
-            "height": 1024,
-            "width": 1024,
-        }
-        default_params.update(kwargs)
+        Args:
+            prompts (list): List of prompts to validate with.
+            **generation_kwargs: Additional arguments for image generation.
+
+        Returns:
+            list: Generated images.
+        """
+        logger.info("Starting image generation.")
         
         generated_images = []
         generation_times = []
         
         try:
-            for prompt in prompts:
+            for idx, prompt in enumerate(prompts):
+                logger.debug(f"Generating image for prompt: {prompt}")
+                
                 start_time = time.time()
                 
-                # Override pipeline's guidance function if using CFG rescale
-                if self.rescale_cfg:
-                    original_guidance = self.pipeline._guidance_scale_embed
-                    self.pipeline._guidance_scale_embed = lambda x, y, z: self.karras_rescale(x, y, z)
-                
-                # Generate images
-                output = self.pipeline(
-                    prompt=prompt,
-                    negative_prompt=negative_prompt,
-                    num_images_per_prompt=num_images_per_prompt,
-                    **default_params
-                )
-                
-                # Restore original guidance function
-                if self.rescale_cfg:
-                    self.pipeline._guidance_scale_embed = original_guidance
-                
+                # Generate image
+                output = self.pipeline(prompt=prompt, **generation_kwargs)
                 gen_time = time.time() - start_time
+                
                 generation_times.append(gen_time)
                 
-                for idx, image in enumerate(output.images):
-                    generated_images.append({
-                        "prompt": prompt,
-                        "image": image,
-                        "generation_time": gen_time,
-                        "image_index": idx
-                    })
+                logger.debug(f"Generated image for prompt: {prompt} in {gen_time:.2f}s")
                 
-                logger.debug(f"Generated {num_images_per_prompt} images for prompt: {prompt}")
-                logger.debug(f"Generation time: {gen_time:.2f}s")
+                generated_image = {
+                    "prompt": prompt,
+                    "image": output.images[0],
+                    "generation_time": gen_time,
+                    "image_index": idx
+                }
                 
-                torch.cuda.empty_cache()
+                generated_images.append(generated_image)
                 
+            logger.info("All images successfully generated.")
+            
         except Exception as e:
             logger.error(f"Error during image generation: {str(e)}")
             raise
-            
-        return generated_images
-
+        
+        finally:
+            torch.cuda.empty_cache()
+        
+        return generated_images, generation_times
+    
     def run_validation(self, prompts, output_dir=None, log_to_wandb=True, **generation_kwargs):
         """
-        Run full validation suite
-        
+        Run full validation suite.
+
         Args:
-            prompts (list): List of prompts to validate with
-            output_dir (str): Directory to save validation images
-            log_to_wandb (bool): Whether to log results to W&B
-            **generation_kwargs: Additional arguments for image generation
-        
+            prompts (list): List of prompts to validate with.
+            output_dir (str): Directory to save validation images.
+            log_to_wandb (bool): Whether to log results to W&B.
+            **generation_kwargs: Additional arguments for image generation.
+
         Returns:
-            dict: Validation metrics
+            dict: Validation metrics.
         """
-        logger.info("Starting validation run")
+        logger.info("Starting validation run.")
         
         if output_dir:
             output_dir = Path(output_dir)
@@ -172,14 +128,16 @@ class ModelValidator:
         
         try:
             # Generate validation images
-            generated_images = self.generate_images(prompts, **generation_kwargs)
+            generated_images, generation_times = self.generate_images(prompts, **generation_kwargs)
             
             validation_metrics["images_generated"] = len(generated_images)
             validation_metrics["successful_generations"] = len(generated_images)
             
             # Calculate average generation time
-            avg_gen_time = sum(img["generation_time"] for img in generated_images) / len(generated_images)
+            avg_gen_time = sum(gen_time for gen_time in generation_times) / len(generation_times)
             validation_metrics["avg_generation_time"] = avg_gen_time
+            
+            logger.info(f"Average generation time: {avg_gen_time:.2f}s")
             
             # Save images if output directory provided
             if output_dir:
@@ -187,71 +145,96 @@ class ModelValidator:
                     image_path = output_dir / f"validation_{idx}.png"
                     gen["image"].save(image_path)
                     logger.debug(f"Saved validation image to {image_path}")
-            
+                    
             # Log to W&B if enabled
             if log_to_wandb and wandb.run is not None:
                 wandb_images = []
                 for idx, gen in enumerate(generated_images):
                     wandb_images.append(
                         wandb.Image(
-                            gen["image"], 
+                            gen["image"],
                             caption=f"Prompt: {gen['prompt']}\nGeneration time: {gen['generation_time']:.2f}s"
                         )
                     )
-                
                 wandb.log({
                     "validation/images": wandb_images,
-                    "validation/avg_generation_time": avg_gen_time,
-                    "validation/successful_generations": validation_metrics["successful_generations"],
-                    "validation/failed_generations": validation_metrics["failed_generations"]
+                    "validation/avg_generation_time": avg_gen_time
                 })
+                
+            logger.info("Validation metrics successfully logged to W&B.")
             
         except Exception as e:
-            logger.error(f"Validation failed: {str(e)}")
-            validation_metrics["failed_generations"] = len(prompts)
+            logger.error(f"Error during validation run: {str(e)}")
             raise
         
         finally:
-            # Clear GPU memory
             torch.cuda.empty_cache()
         
         return validation_metrics
+    
+    def generate_images(self, prompts, **generation_kwargs):
+        """
+        Generate images based on the provided prompts.
 
-    def validate_checkpoint(self, checkpoint_path, prompts, **kwargs):
-        """
-        Validate a specific checkpoint
-        
         Args:
-            checkpoint_path (str): Path to checkpoint to validate
-            prompts (list): List of prompts to validate with
-            **kwargs: Additional arguments for validation
-        
+            prompts (list): List of prompts to validate with.
+            **generation_kwargs: Additional arguments for image generation.
+
         Returns:
-            dict: Validation metrics
+            list: Generated images and their generation times.
         """
-        logger.info(f"Validating checkpoint: {checkpoint_path}")
+        logger.info("Starting image generation.")
         
-        # Load checkpoint
+        generated_images = []
+        generation_times = []
+        
         try:
-            self.pipeline = StableDiffusionXLPipeline.from_pretrained(
-                checkpoint_path,
-                torch_dtype=self.dtype,
-                use_safetensors=True,
-                variant="fp16"
-            ).to(self.device)
+            # Generate images
+            outputs = self.pipeline(prompts=prompts, **generation_kwargs)
             
-            # Run validation
-            metrics = self.run_validation(prompts, **kwargs)
-            
-            # Add checkpoint info to metrics
-            metrics["checkpoint_path"] = checkpoint_path
-            
-            return metrics
+            for output in outputs:
+                gen_time = time.time()
+                
+                generated_image = {
+                    "prompt": output.prompt,
+                    "image": output.images[0],
+                    "generation_time": gen_time
+                }
+                
+                generated_images.append(generated_image)
+                generation_times.append(gen_time)
             
         except Exception as e:
-            logger.error(f"Checkpoint validation failed: {str(e)}")
+            logger.error(f"Error during image generation: {str(e)}")
             raise
         
         finally:
-            # Clear GPU memory
             torch.cuda.empty_cache()
+        
+        return generated_images, generation_times
+    
+    def log_validation_metrics(self, validation_metrics):
+        """
+        Log the validation metrics.
+
+        Args:
+            validation_metrics (dict): Validation metrics to log.
+        """
+        logger.info("Logging validation metrics.")
+        
+        try:
+            if wandb.run is not None:
+                wandb.log(validation_metrics)
+            
+            logger.info(f"Validation metrics successfully logged to W&B.")
+            
+        except Exception as e:
+            logger.error(f"Error logging validation metrics: {str(e)}")
+            raise
+        
+    def cleanup(self):
+        """
+        Clean up resources.
+        """
+        torch.cuda.empty_cache()
+        logger.info("Resources cleaned up.")
