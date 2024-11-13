@@ -96,6 +96,28 @@ def setup_training(args, models, device, dtype):
             drop_last=True  # Drop incomplete batches
         )
         
+        # Configure memory optimizations
+        if args.gradient_checkpointing:
+            logger.info("Gradient checkpointing enabled - configuring memory optimizations")
+            
+            # Disable model parameters' gradients before training
+            for param in models["unet"].parameters():
+                param.requires_grad_(False)
+            models["unet"].requires_grad_(True)
+            
+            # Configure text encoder gradients if they're being trained
+            for encoder_name in ["text_encoder", "text_encoder_2"]:
+                if encoder_name in models and models[encoder_name] is not None:
+                    for param in models[encoder_name].parameters():
+                        param.requires_grad_(False)
+                    models[encoder_name].requires_grad_(True)
+            
+            # Empty CUDA cache
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+            logger.info("Memory optimizations configured")
+        
         # Initialize optimizer
         logger.info("Initializing optimizer...")
         if args.use_adafactor:

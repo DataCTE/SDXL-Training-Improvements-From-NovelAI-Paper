@@ -247,8 +247,8 @@ def load_checkpoint(checkpoint_dir, models, train_components):
         logger.error(f"Error loading checkpoint: {str(e)}")
         raise
 
-def cleanup(args, wandb_run=None):
-    """Cleanup resources after training"""
+def cleanup(models, train_components, args):
+    """Cleanup after training"""
     try:
         # Clean up CUDA memory
         if torch.cuda.is_available():
@@ -256,15 +256,13 @@ def cleanup(args, wandb_run=None):
             if hasattr(torch.cuda, 'memory_stats'):
                 logger.info(f"Final CUDA memory: {torch.cuda.memory_allocated()/1e9:.2f}GB")
         
-        # Close wandb run
-        if wandb_run is not None:
-            wandb_run.finish()
+        # Disable gradient checkpointing for cleanup
+        for model_name, model in models.items():
+            if hasattr(model, "gradient_checkpointing_disable"):
+                model.gradient_checkpointing_disable()
+            elif hasattr(model, "disable_gradient_checkpointing"):
+                model.disable_gradient_checkpointing()
         
-        # Remove temporary files
-        if hasattr(args, 'cache_dir') and os.path.exists(args.cache_dir):
-            logger.info(f"Cleaning up cache directory: {args.cache_dir}")
-            shutil.rmtree(args.cache_dir, ignore_errors=True)
-            
     except Exception as cleanup_error:
         logger.error(f"Error during cleanup: {cleanup_error}")
 

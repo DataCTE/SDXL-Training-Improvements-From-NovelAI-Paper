@@ -35,7 +35,6 @@ def train_one_epoch(
     """Single epoch training loop"""
     try:
         logger.debug("\n=== Starting new epoch ===")
-        epoch_metrics = defaultdict(float)
         
         # Initialize metrics
         window_size = 100
@@ -50,6 +49,19 @@ def train_one_epoch(
             postfix=[0.0, lr_scheduler.get_last_lr()[0]]
         )
         
+        # Set training mode and ensure gradient checkpointing is enabled
+        unet.train()
+        if args.gradient_checkpointing:
+            # Re-enable gradient checkpointing after .train() call
+            if hasattr(unet, "gradient_checkpointing_enable"):
+                unet.gradient_checkpointing_enable()
+            
+            # Also ensure text encoders have gradient checkpointing enabled if they're being trained
+            for encoder in [models.get("text_encoder"), models.get("text_encoder_2")]:
+                if encoder is not None and encoder.training:
+                    if hasattr(encoder, "gradient_checkpointing_enable"):
+                        encoder.gradient_checkpointing_enable()
+
         for step, batch in enumerate(train_dataloader):
             step_start = time.time()
             
@@ -256,7 +268,7 @@ def train_one_epoch(
             step_metrics['step_time'] = time.time() - step_start
             
         progress_bar.close()
-        return epoch_metrics, global_step
+        return global_step
         
     except Exception as e:
         logger.error(f"Error in training loop: {str(e)}")
@@ -297,6 +309,18 @@ def train(args, models, train_components, device, dtype):
     global_step = 0
     start_epoch = 0
     
+    # Monitor memory usage with gradient checkpointing
+    if args.gradient_checkpointing and torch.cuda.is_available():
+        logger.info("\nInitial memory usage with gradient checkpointing:")
+        logger.info(f"Allocated: {torch.cuda.memory_allocated()/1e9:.2f}GB")
+        logger.info(f"Cached: {torch.cuda.memory_reserved()/1e9:.2f}GB")
+        
+        if args.use_wandb:
+            wandb.log({
+                "memory/allocated_gb": torch.cuda.memory_allocated()/1e9,
+                "memory/cached_gb": torch.cuda.memory_reserved()/1e9
+            })
+    
     # Resume from checkpoint if specified
     if args.resume_from_checkpoint:
         logger.info(f"Resuming from checkpoint: {args.resume_from_checkpoint}")
@@ -314,7 +338,7 @@ def train(args, models, train_components, device, dtype):
         if args.use_wandb:
             wandb.log({"train/epoch": epoch}, step=global_step)
         
-        epoch_metrics, global_step = train_one_epoch(
+        global_step = train_one_epoch(
             unet=models["unet"],
             train_dataloader=train_components["train_dataloader"],
             optimizer=train_components["optimizer"],

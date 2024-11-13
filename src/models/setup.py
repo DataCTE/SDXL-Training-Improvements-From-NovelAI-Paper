@@ -8,6 +8,15 @@ from training.ema import EMAModel
 
 logger = logging.getLogger(__name__)
 
+def enable_gradient_checkpointing(model):
+    """Enable gradient checkpointing for a model"""
+    if hasattr(model, "enable_gradient_checkpointing"):
+        model.enable_gradient_checkpointing()
+    elif hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+    else:
+        logger.warning(f"Model {type(model).__name__} doesn't support gradient checkpointing")
+
 def setup_models(args, device, dtype):
     """
     Initialize and configure all models
@@ -33,7 +42,17 @@ def setup_models(args, device, dtype):
         
         # Enable gradient checkpointing if requested
         if args.gradient_checkpointing:
-            unet.enable_gradient_checkpointing()
+            logger.info("Enabling gradient checkpointing for models")
+            # Enable for UNet
+            enable_gradient_checkpointing(unet)
+            
+            # Enable for text encoders if they exist
+            if text_encoder is not None:
+                enable_gradient_checkpointing(text_encoder)
+            if text_encoder_2 is not None:
+                enable_gradient_checkpointing(text_encoder_2)
+            
+            logger.info("Gradient checkpointing enabled for all supported models")
         
         # Compile model if requested
         if args.enable_compile:
