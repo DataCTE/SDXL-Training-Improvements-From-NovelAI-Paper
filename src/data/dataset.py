@@ -46,7 +46,7 @@ class CustomDataset(Dataset):
         logger.info(f"Processed {len(self.image_paths)} images with tag statistics")
 
     def _parse_tags(self, caption):
-        """Parse Midjourney-specific tags"""
+        """Parse Midjourney-specific tags and general tags"""
         tags = []
         special_tags = {}
         
@@ -71,7 +71,11 @@ class CustomDataset(Dataset):
         for tag in raw_tags:
             tag = tag.lower().strip()
             
-            # Handle compound tags with weights (format: "value::weight")
+            # Skip empty tags
+            if not tag:
+                continue
+            
+            # Handle compound tags with weights (format: "tag::weight")
             if '::' in tag:
                 parts = tag.split('::')
                 tag = parts[0].strip()
@@ -85,17 +89,28 @@ class CustomDataset(Dataset):
                 refs = re.findall(r'[a-f0-9]{8}|https?://[^\s>]+', tag)
                 if refs:
                     special_tags['sref'] = refs
+                    continue  # Skip adding sref to regular tags
 
-            # Handle style parameters only if MJ tags exist
+            # Handle MJ style parameters only if MJ tags exist
             if has_mj_tags:
+                is_param = False
                 for param in ['stylize', 'chaos', 'sw', 'sv']:
                     if param in tag:
                         try:
                             value = float(re.search(r'[\d.]+', tag).group())
                             special_tags[param] = value
+                            is_param = True
                         except: continue
+                if is_param:
+                    continue  # Skip adding style parameters to regular tags
 
-            tags.append(tag)
+            # Handle general tags
+            if tag.startswith(('a ', 'an ', 'the ')):  # Remove articles
+                tag = ' '.join(tag.split()[1:])
+            
+            # Add to regular tags if it's not a special parameter
+            if tag:
+                tags.append(tag)
         
         return tags, special_tags
 
