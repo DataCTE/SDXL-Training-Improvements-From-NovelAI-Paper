@@ -15,12 +15,12 @@ import numpy as np
 from diffusers import UNet2DConditionModel, AutoencoderKL
 from transformers import CLIPTokenizer, CLIPTextModel
 from data.dataset import custom_collate
-from src.data.dataset import CustomDataset
-from src.inference.text_to_image import ModelValidator
-from src.training.ema import EMAModel
-from src.models.tag_weighter import TagBasedLossWeighter
-from src.models.vae_finetuner import VAEFineTuner
-from src.utils.device import cleanup
+from data.dataset import CustomDataset
+from inference.text_to_image import ModelValidator
+from training.ema import EMAModel
+from models.tag_weighter import TagBasedLossWeighter
+from models.vae_finetuner import VAEFineTuner
+from utils.device import cleanup
 
 
 logger = logging.getLogger(__name__)
