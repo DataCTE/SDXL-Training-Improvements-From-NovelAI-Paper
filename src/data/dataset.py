@@ -53,16 +53,20 @@ class CustomDataset(Dataset):
         # Split and process tags
         raw_tags = [t.strip() for t in caption.split(',')]
         
-        # Handle anime style/niji at start
-        if raw_tags and ('anime style' in raw_tags[0].lower() or 'niji' in raw_tags[0].lower()):
-            special_tags['niji'] = True
-            raw_tags = raw_tags[1:]
+        # Only handle MJ-specific tags if they exist
+        has_mj_tags = any('niji' in t.lower() or t.strip() in ['4', '5', '6'] for t in raw_tags)
         
-        # Handle version number - normalize all versions to 6
-        if raw_tags and raw_tags[-1].strip() in ['4', '5', '6']:
-            special_tags['version'] = 6  # Always set to 6 regardless of input version
-            raw_tags = raw_tags[:-1]
-            tags.append('6')  # Add version 6 to regular tags
+        if has_mj_tags:
+            # Handle anime style/niji at start
+            if raw_tags and ('anime style' in raw_tags[0].lower() or 'niji' in raw_tags[0].lower()):
+                special_tags['niji'] = True
+                raw_tags = raw_tags[1:]
+                
+            # Handle version number - normalize all versions to 6 only if version tag exists
+            if raw_tags and raw_tags[-1].strip() in ['4', '5', '6']:
+                special_tags['version'] = 6
+                raw_tags = raw_tags[:-1]
+                tags.append('6')
         
         for tag in raw_tags:
             tag = tag.lower().strip()
@@ -82,13 +86,14 @@ class CustomDataset(Dataset):
                 if refs:
                     special_tags['sref'] = refs
 
-            # Handle style parameters
-            for param in ['stylize', 'chaos', 'sw', 'sv']:
-                if param in tag:
-                    try:
-                        value = float(re.search(r'[\d.]+', tag).group())
-                        special_tags[param] = value
-                    except: continue
+            # Handle style parameters only if MJ tags exist
+            if has_mj_tags:
+                for param in ['stylize', 'chaos', 'sw', 'sv']:
+                    if param in tag:
+                        try:
+                            value = float(re.search(r'[\d.]+', tag).group())
+                            special_tags[param] = value
+                        except: continue
 
             tags.append(tag)
         
