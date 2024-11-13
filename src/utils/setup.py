@@ -8,7 +8,7 @@ from diffusers.optimization import get_scheduler
 from data.dataset import CustomDataset
 from data.tag_weighter import TagBasedLossWeighter
 from training.vae_finetuner import VAEFineTuner
-from inference.text_to_image import ModelValidator
+from inference.text_to_image import SDXLInference
 from training.ema import EMAModel
 import wandb
 import numpy as np
@@ -16,7 +16,7 @@ from diffusers import UNet2DConditionModel, AutoencoderKL
 from transformers import CLIPTokenizer, CLIPTextModel
 from data.dataset import custom_collate
 from data.dataset import CustomDataset
-from inference.text_to_image import ModelValidator
+from inference.text_to_image import SDXLInference
 from training.ema import EMAModel
 from data.tag_weighter import TagBasedLossWeighter
 from training.vae_finetuner import VAEFineTuner
@@ -137,11 +137,13 @@ def setup_models(args, device, dtype):
             )
         
         # Initialize validator
-        validator = ModelValidator(
+        validator = SDXLInference(
             model_path=args.model_path,
             device=device,
             dtype=dtype,
-            zsnr=True
+            use_resolution_binning=True,
+            sigma_min=sigma_min,
+            sigma_data=sigma_data
         )
         
         # Return all components
@@ -338,11 +340,13 @@ def setup_training(args, models, device, dtype):
             )
         
         # Initialize validator with correct parameters
-        validator = ModelValidator(
+        validator = SDXLInference(
             model_path=args.model_path,
             device=device,
             dtype=dtype,
-            zsnr=True
+            use_resolution_binning=True,
+            sigma_min=sigma_min,
+            sigma_data=sigma_data
         )
         
         # Return all components

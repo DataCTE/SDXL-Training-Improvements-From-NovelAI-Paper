@@ -11,7 +11,6 @@ from pathlib import Path
 from training.trainer import train
 from utils.setup import (
     setup_torch_backends,
-    cleanup,
     setup_models,
     setup_training
 )
