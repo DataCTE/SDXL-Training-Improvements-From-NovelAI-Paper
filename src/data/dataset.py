@@ -1,5 +1,5 @@
 from pathlib import Path
-from PIL import Image
+from PIL import Image, ImageFilter
 import torch
 import torchvision.transforms as transforms
 from torch.utils.data import Dataset
@@ -10,6 +10,9 @@ import traceback
 import random
 import re
 from utils.validation import validate_dataset
+from basicsr.utils.download_util import load_file_from_url
+from basicsr.utils.realesrgan_utils import RealESRGANer
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +46,21 @@ class CustomDataset(Dataset):
         # Process captions and build statistics
         self.tag_stats = self._build_tag_statistics()
         logger.info(f"Processed {len(self.image_paths)} images with tag statistics")
+        
+        # Initialize upscaler with standard model instead of anime
+        model_path = load_file_from_url(
+            'https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-x4plus.pth',
+            model_dir='weights'
+        )
+        self.upscaler = RealESRGANer(
+            scale=4,
+            model_path=model_path,
+            model='RealESRGAN_x4plus',
+            tile=512,
+            tile_pad=32,
+            pre_pad=0,
+            half=True
+        )
 
     def _parse_tags(self, caption):
         """Parse Midjourney-specific tags and general tags"""
@@ -253,6 +271,54 @@ class CustomDataset(Dataset):
             key=lambda size: abs((size[0] / size[1]) - aspect_ratio))
         return closest_size
 
+    def _process_image_size(self, image, target_width, target_height):
+        """Process image size with AI upscaling for small images and high-quality downscaling for large images"""
+        width, height = image.size
+        
+        # Calculate scaling factors
+        width_scale = width / target_width
+        height_scale = height / target_height
+        
+        # If image is larger than target, use progressive downscaling
+        if width_scale > 1 or height_scale > 1:
+            # Calculate number of steps for progressive downscaling
+            scale_factor = max(width_scale, height_scale)
+            num_steps = max(1, min(4, int(scale_factor // 2)))
+            
+            current_image = image
+            for step in range(num_steps):
+                # Calculate intermediate size
+                intermediate_scale = 1.0 + (scale_factor - 1.0) * (num_steps - step - 1) / num_steps
+                intermediate_width = int(target_width * intermediate_scale)
+                intermediate_height = int(target_height * intermediate_scale)
+                
+                # Apply gaussian blur before resizing to reduce aliasing
+                if step == 0:
+                    blur_radius = min(2.0, 0.5 * scale_factor)
+                    current_image = current_image.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+                
+                # Resize with high-quality Lanczos
+                current_image = current_image.resize(
+                    (intermediate_width, intermediate_height),
+                    Image.Resampling.LANCZOS
+                )
+            
+            return current_image
+        
+        # If image is smaller, use AI upscaling
+        if width_scale < 1 or height_scale < 1:
+            # Convert PIL to numpy array
+            img_np = np.array(image)
+            
+            # Upscale with RealESRGAN
+            output, _ = self.upscaler.enhance(img_np)
+            
+            # Convert back to PIL and resize to target
+            upscaled = Image.fromarray(output)
+            return upscaled.resize((target_width, target_height), Image.Resampling.LANCZOS)
+        
+        return image
+
     def __getitem__(self, idx):
         image_path = self.image_paths[idx]
         latent_path = self.latent_paths[idx]
@@ -286,12 +352,14 @@ class CustomDataset(Dataset):
             width, height = image.size
             target_width, target_height = self._get_target_size(width, height)
             
+            # Process image size with AI upscaling when needed
+            processed_image = self._process_image_size(image, target_width, target_height)
+            
             transform = transforms.Compose([
-                transforms.Resize((target_height, target_width)),
                 transforms.ToTensor(),
                 transforms.Normalize([0.5], [0.5])
             ])
-            image = transform(image).unsqueeze(0)
+            image = transform(processed_image).unsqueeze(0)
             
             # Generate VAE latents
             with torch.no_grad():
