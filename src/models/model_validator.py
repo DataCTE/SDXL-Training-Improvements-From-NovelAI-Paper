@@ -10,7 +10,10 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 class ModelValidator:
-    def __init__(self, model_path, device="cuda", dtype=torch.float16, zsnr=True):
+    def __init__(self, model_path, device="cuda", dtype=torch.float16, 
+             zsnr=True, sigma_min=0.0292, sigma_data=1.0, min_snr_gamma=5.0,
+             resolution_scaling=True, rescale_cfg=True, scale_method="karras",
+             rescale_multiplier=0.7):
         """
         Initialize the model validator
         
@@ -19,16 +22,28 @@ class ModelValidator:
             device (str): Device to use for inference
             dtype (torch.dtype): Data type for model
             zsnr (bool): Whether to use ZSNR noise scheduling
+            sigma_min (float): Minimum sigma value for noise schedule
+            sigma_data (float): Data sigma value for v-prediction
+            min_snr_gamma (float): Minimum SNR gamma value
+            resolution_scaling (bool): Whether to use resolution-dependent scaling
+            rescale_cfg (bool): Whether to use CFG rescaling
+            scale_method (str): CFG rescaling method ('karras' or 'simple')
+            rescale_multiplier (float): Multiplier for CFG rescaling
         """
         self.model_path = model_path
         self.device = device
         self.dtype = dtype
-        self.v_prediction = True  # Always use v-prediction
         self.zsnr = zsnr
+        self.sigma_min = sigma_min
+        self.sigma_data = sigma_data
+        self.min_snr_gamma = min_snr_gamma
+        self.resolution_scaling = resolution_scaling
+        self.rescale_cfg = rescale_cfg
+        self.scale_method = scale_method
+        self.rescale_multiplier = rescale_multiplier
         
-        # Initialize sigma parameters
-        self.sigma_min = 0.0292
-        self.sigma_data = 1.0
+        # Always use v-prediction
+        self.v_prediction = True
         
         logger.info(f"Initializing validator with model from {model_path}")
         
@@ -42,7 +57,7 @@ class ModelValidator:
         # Create new scheduler config
         scheduler_config = dict(self.pipeline.scheduler.config)
         scheduler_config.update({
-            "prediction_type": "v_prediction" if self.v_prediction else "epsilon",
+            "prediction_type": "v_prediction",
             "sigma_min": self.sigma_min,
             "sigma_data": self.sigma_data,
         })

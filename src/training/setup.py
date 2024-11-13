@@ -143,19 +143,16 @@ def setup_training(args, models, device, dtype):
                 device=device
             )
         
-        # Initialize validator with new settings
+        # Initialize validator with correct parameters
         validator = ModelValidator(
             model_path=args.model_path,
             device=device,
             dtype=dtype,
-            # ZTSNR settings
             zsnr=args.zsnr,
-            v_prediction=args.v_prediction,
             sigma_min=args.sigma_min,
             sigma_data=args.sigma_data,
             min_snr_gamma=args.min_snr_gamma,
             resolution_scaling=args.resolution_scaling,
-            # CFG settings
             rescale_cfg=args.rescale_cfg,
             scale_method=args.scale_method,
             rescale_multiplier=args.rescale_multiplier
