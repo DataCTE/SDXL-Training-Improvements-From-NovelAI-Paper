@@ -277,9 +277,8 @@ def train(args, models, train_components, device, dtype):
         if args.use_ema:
             ema_model = EMAModel(
                 model=unet,
-                decay=args.ema_decay,  # Add this to args if not present
-                device=device,
-                dtype=dtype
+                decay=args.ema_decay,
+                device=device
             )
             train_components["ema_model"] = ema_model
         
