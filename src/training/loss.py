@@ -3,6 +3,7 @@ import torch.nn.functional as F
 import logging
 import traceback
 from torchvision import transforms, models
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +48,8 @@ def v_prediction_scaling_factors(sigma, sigma_data=1.0):
     
     return c_out, c_in
 
-def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kwargs=None, sigma_data=1.0):
+def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kwargs=None, 
+                             sigma_data=1.0, tag_weighter=None, batch_tags=None):
     """
     Calculate v-prediction loss with MinSNR weighting
     """
@@ -92,6 +94,19 @@ def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kw
         # Calculate weighted loss
         mse_loss = F.mse_loss(scaled_output, v_target, reduction='none')
         weighted_loss = mse_loss * loss_weight.view(-1, 1, 1, 1)
+        
+        # Apply tag-based weighting
+        if tag_weighter is not None and batch_tags is not None:
+            batch_weights = []
+            for tags, weights, special in zip(batch_tags['tags'], 
+                                           batch_tags['tag_weights'],
+                                           batch_tags['special_tags']):
+                weight = tag_weighter.calculate_weights(tags, weights, special)
+                batch_weights.append(weight)
+            
+            tag_weights = torch.tensor(batch_weights, device=device, dtype=dtype)
+            weighted_loss = weighted_loss * tag_weights.view(-1, 1, 1, 1)
+        
         loss = weighted_loss.mean()
         
         # Collect metrics for monitoring
@@ -104,6 +119,16 @@ def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kw
             'model/v_pred_norm': v_pred.norm().item(),
             'model/snr_mean': snr.mean().item()
         }
+        
+        # Add tag metrics
+        loss_metrics.update({
+            'tags/weight_mean': torch.tensor(batch_weights).mean().item() if batch_weights else 0,
+            'tags/weight_std': torch.tensor(batch_weights).std().item() if batch_weights else 0,
+            'tags/niji_count': sum(1 for t in batch_tags['special_tags'] if t.get('niji', False)),
+            'tags/quality_6_count': sum(1 for t in batch_tags['special_tags'] if t.get('quality', 0) == 6),
+            'tags/stylize_mean': np.mean([t.get('stylize', 0) for t in batch_tags['special_tags']]),
+            'tags/chaos_mean': np.mean([t.get('chaos', 0) for t in batch_tags['special_tags']])
+        })
         
         return loss, loss_metrics
 

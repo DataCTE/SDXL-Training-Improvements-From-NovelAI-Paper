@@ -26,21 +26,33 @@ def setup_training(args, models, device, dtype):
     Returns:
         dict: Dictionary containing all training components
     """
-    logger.info("Setting up training components...")
-    
     try:
-        # Create dataset and dataloader
-        logger.info("Creating dataset...")
+        logger.info("Setting up training components...")
+        
+        # Create dataset with automatic tag processing
         dataset = CustomDataset(
-            args.data_dir,
-            models["vae"],
-            models["tokenizer"],
-            models["tokenizer_2"],
-            models["text_encoder"],
-            models["text_encoder_2"],
-            cache_dir=args.cache_dir,
-            batch_size=args.batch_size
+            data_dir=args.data_dir,
+            vae=models["vae"],
+            tokenizer=models["tokenizer"],
+            tokenizer_2=models["tokenizer_2"],
+            text_encoder=models["text_encoder"],
+            text_encoder_2=models["text_encoder_2"],
+            cache_dir=args.cache_dir
         )
+        
+        # Log dataset and tag processing statistics
+        if args.use_wandb:
+            wandb.run.summary.update({
+                "dataset/total_images": dataset.tag_stats['total_images'],
+                "dataset/formatted_captions": dataset.tag_stats['formatted_count'],
+                "dataset/niji_ratio": dataset.tag_stats['niji_count'] / dataset.tag_stats['total_images'],
+                "dataset/quality_6_ratio": dataset.tag_stats['quality_6_count'] / dataset.tag_stats['total_images'],
+                "dataset/stylize_mean": np.mean(dataset.tag_stats['stylize_values']),
+                "dataset/chaos_mean": np.mean(dataset.tag_stats['chaos_values']) if dataset.tag_stats['chaos_values'] else 0
+            })
+        
+        logger.info(f"Processed {dataset.tag_stats['formatted_count']} captions")
+        logger.info(f"Found {dataset.tag_stats['niji_count']} anime-style images")
         
         # Group dataset samples by aspect ratio and size
         def collate_fn(batch):

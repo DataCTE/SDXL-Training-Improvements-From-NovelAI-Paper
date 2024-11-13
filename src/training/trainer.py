@@ -11,6 +11,8 @@ from training.ema import EMAModel
 from training.utils import save_checkpoint, load_checkpoint
 import math
 import os
+import numpy as np
+
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +33,7 @@ def train_one_epoch(
     models,
     training_history
 ):
-    """Single epoch training loop"""
+    """Single epoch training loop with detailed logging"""
     try:
         logger.debug(f"\n=== Starting epoch {epoch+1} ===")
         
@@ -47,6 +49,7 @@ def train_one_epoch(
         running_loss = 0.0
         loss_history = []
         grad_norm_value = 0.0
+        tag_metrics = defaultdict(list)
         
         progress_bar = tqdm(
             total=len(train_dataloader),
@@ -55,14 +58,12 @@ def train_one_epoch(
             postfix=[0.0, lr_scheduler.get_last_lr()[0]]
         )
         
-        # Set training mode and ensure gradient checkpointing is enabled
+        # Set training mode and ensure gradient checkpointing
         unet.train()
         if args.gradient_checkpointing:
-            # Re-enable gradient checkpointing after .train() call
             if hasattr(unet, "gradient_checkpointing_enable"):
                 unet.gradient_checkpointing_enable()
             
-            # Also ensure text encoders have gradient checkpointing enabled if they're being trained
             for encoder in [models.get("text_encoder"), models.get("text_encoder_2")]:
                 if encoder is not None and encoder.training:
                     if hasattr(encoder, "gradient_checkpointing_enable"):
@@ -72,19 +73,17 @@ def train_one_epoch(
             step_start = time.time()
             
             # Validate batch contents
-            required_keys = ["latents", "text_embeddings", "added_cond_kwargs"]
+            required_keys = ["latents", "text_embeddings", "added_cond_kwargs", "tags", "special_tags", "tag_weights"]
             missing_keys = [key for key in required_keys if key not in batch]
             if missing_keys:
                 raise ValueError(f"Batch missing required keys: {missing_keys}")
             
-            # Move batch to device and handle tensor conversion
+            # Move batch to device
             latents = batch["latents"].to(device, dtype=dtype)
             text_embeddings = batch["text_embeddings"].to(device, dtype=dtype)
-            
-            # Handle added conditioning kwargs
             added_cond_kwargs = {
-                "text_embeds": batch["added_cond_kwargs"]["text_embeds"].to(device, dtype=dtype),
-                "time_ids": batch["added_cond_kwargs"]["time_ids"].to(device, dtype=dtype)
+                k: v.to(device, dtype=dtype) if torch.is_tensor(v) else v
+                for k, v in batch["added_cond_kwargs"].items()
             }
             
             # Get noise schedule with resolution-aware sigma scaling
@@ -107,63 +106,38 @@ def train_one_epoch(
                     "training/step": step,
                 }, step=global_step)
             
-            # Modified training step for BFloat16
-            if dtype == torch.bfloat16:
-                # Convert UNet to bfloat16 but keep embeddings in float32
-                unet = unet.to(dtype=torch.bfloat16)
-                loss, step_metrics = training_loss_v_prediction(
-                    model=unet,
-                    x_0=latents,
-                    sigma=sigma,
-                    text_embeddings=text_embeddings,
-                    added_cond_kwargs=added_cond_kwargs
-                )
-                
-                # Skip batch if loss is unstable
-                if torch.isnan(loss) or torch.isinf(loss) or loss > 1e5:
-                    logger.warning(f"Skipping batch due to unstable loss: {loss.item()}")
-                    continue
-                
-                loss = loss / args.gradient_accumulation_steps
-                loss.backward()
-            else:
-                # Use AMP for float16/float32
-                with torch.amp.autocast('cuda', dtype=dtype):
-                    loss, step_metrics = training_loss_v_prediction(
-                        model=unet,
-                        x_0=latents,
-                        sigma=sigma,
-                        text_embeddings=text_embeddings,
-                        added_cond_kwargs=added_cond_kwargs
-                    )
-                    
-                    # Skip batch if loss was unstable
-                    if loss is None:
-                        continue  # This continue is valid as we're in the training loop
-                    
-                    loss = loss / args.gradient_accumulation_steps
-                
-                scaler = torch.cuda.amp.GradScaler()
-                scaler.scale(loss).backward()
+            # Calculate loss with tag weighting
+            loss, step_metrics = training_loss_v_prediction(
+                model=unet,
+                x_0=latents,
+                sigma=sigma,
+                text_embeddings=text_embeddings,
+                added_cond_kwargs=added_cond_kwargs,
+                tag_weighter=tag_weighter,
+                batch_tags={
+                    'tags': batch['tags'],
+                    'tag_weights': batch['tag_weights'],
+                    'special_tags': batch['special_tags']
+                }
+            )
+            
+            # Skip batch if loss is unstable
+            if torch.isnan(loss) or torch.isinf(loss) or loss > 1e5:
+                logger.warning(f"Skipping batch due to unstable loss: {loss.item()}")
+                continue
+            
+            # Backward pass with gradient accumulation
+            loss = loss / args.gradient_accumulation_steps
+            loss.backward()
             
             if (step + 1) % args.gradient_accumulation_steps == 0:
-                if dtype == torch.bfloat16:
-                    # Clip gradients
-                    grad_norm_value = torch.nn.utils.clip_grad_norm_(
-                        unet.parameters(), 
-                        args.max_grad_norm
-                    )
-                    optimizer.step()
-                else:
-                    # Clip gradients with scaler
-                    scaler.unscale_(optimizer)
-                    grad_norm_value = torch.nn.utils.clip_grad_norm_(
-                        unet.parameters(),
-                        args.max_grad_norm
-                    )
-                    scaler.step(optimizer)
-                    scaler.update()
+                # Clip gradients
+                grad_norm_value = torch.nn.utils.clip_grad_norm_(
+                    unet.parameters(), 
+                    args.max_grad_norm
+                )
                 
+                optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 lr_scheduler.step()
                 
@@ -171,127 +145,68 @@ def train_one_epoch(
                 if ema_model is not None:
                     ema_model.step(unet)
                     
-                    # Log EMA metrics periodically
+                    # Log EMA metrics
                     if args.use_wandb and step % args.logging_steps == 0:
                         wandb.log({
                             "ema/decay": ema_model.get_decay_value(),
                             "ema/num_updates": ema_model.num_updates
                         }, step=global_step)
-                    
-                    # Run validation with EMA model periodically
-                    if validator and args.validation_steps > 0 and global_step % args.validation_steps == 0:
-                        logger.info(f"\nRunning EMA model validation at step {global_step}")
-                        ema_validation_metrics = validator.run_validation(
-                            model=ema_model.get_model(),  # Use EMA model for validation
-                            prompts=args.validation_prompts,
-                            output_dir=os.path.join(args.output_dir, f"ema_validation_step_{global_step}"),
-                            num_images_per_prompt=1,
-                            guidance_scale=5.0,
-                            num_inference_steps=28,
-                            height=1024,
-                            width=1024,
-                            log_to_wandb=args.use_wandb
-                        )
-                        
-                        if args.use_wandb:
-                            wandb.log({
-                                'ema_validation': ema_validation_metrics,
-                                'step': global_step
-                            }, step=global_step)
                 
                 global_step += 1
-                
-                # Run validation at specified step intervals
-                if validator and args.validation_steps > 0 and global_step % args.validation_steps == 0:
-                    logger.info(f"\nRunning validation at step {global_step}")
-                    validation_metrics = validator.run_validation(
-                        prompts=args.validation_prompts,
-                        output_dir=os.path.join(args.output_dir, f"validation_step_{global_step}"),
-                        num_images_per_prompt=1,
-                        guidance_scale=5.0,
-                        num_inference_steps=28,
-                        height=1024,
-                        width=1024,
-                        log_to_wandb=args.use_wandb
-                    )
-                    training_history['validation_scores'].append({
-                        'step': global_step,
-                        'metrics': validation_metrics
-                    })
-                    
-                    if args.use_wandb:
-                        wandb.log({
-                            'validation': validation_metrics,
-                            'step': global_step,
-                            'validation/images': wandb.Image(
-                                os.path.join(args.output_dir, f"validation_step_{global_step}")
-                            )
-                        }, step=global_step)
             
             # Update metrics
             running_loss = 0.9 * running_loss + 0.1 * loss.item() if step > 0 else loss.item()
             loss_history.append(loss.item())
-            logger.debug(f"Running loss: {running_loss:.6f}")
             
-            # Calculate averages
+            # Update tag metrics
+            for key, value in step_metrics.items():
+                if key.startswith('tags/'):
+                    tag_metrics[key].append(value)
+            
+            # Calculate averages for progress bar
             if len(loss_history) > window_size:
                 loss_history = loss_history[-window_size:]
             average_loss = sum(loss_history) / len(loss_history)
-            logger.debug(f"Average loss: {average_loss:.6f}")
             
-            # Log metrics to wandb
-            if args.use_wandb and step % args.logging_steps == 0:
-                metrics = {
-                    # Add epoch metrics
-                    "epoch": epoch,
-                    "epoch/step": step,
-                    "epoch/progress": step / len(train_dataloader),
-                    
-                    # Loss metrics
-                    "loss/current": loss.item(),
-                    "loss/average": average_loss,
-                    "loss/running": running_loss,
-                    
-                    # Gradient metrics
-                    "gradients/norm": grad_norm_value,
-                    
-                    # Learning rates
-                    "lr/unet": lr_scheduler.get_last_lr()[0],
-                    
-                    # Step metrics from loss function
-                    **step_metrics,  # This will include all metrics from training_loss_v_prediction
-                    
-                    # Step counter for x-axis
-                    "step": global_step
-                }
-                
-                wandb.log(metrics)
-                
-                # Debug print all metrics
-                logger.debug("Wandb metrics:")
-                for k, v in metrics.items():
-                    logger.debug(f"  {k}: {v:.6f}")
-            
-            progress_bar.postfix[0] = running_loss
-            progress_bar.postfix[1] = lr_scheduler.get_last_lr()[0]
+            # Update progress bar
+            progress_bar.set_postfix([average_loss, lr_scheduler.get_last_lr()[0]])
             progress_bar.update(1)
             
-            step_metrics['step_time'] = time.time() - step_start
-            
-        progress_bar.close()
+            # Detailed logging
+            if args.use_wandb and step % args.logging_steps == 0:
+                metrics = {
+                    "training/loss": average_loss,
+                    "training/running_loss": running_loss,
+                    "training/grad_norm": grad_norm_value,
+                    "training/learning_rate": lr_scheduler.get_last_lr()[0],
+                    "training/step_time": time.time() - step_start,
+                    # Tag metrics averages
+                    "tags/weight_mean": np.mean(tag_metrics["tags/weight_mean"]),
+                    "tags/niji_ratio": np.mean(tag_metrics["tags/niji_count"]) / args.batch_size,
+                    "tags/quality_6_ratio": np.mean(tag_metrics["tags/quality_6_count"]) / args.batch_size,
+                    "tags/stylize_mean": np.mean(tag_metrics["tags/stylize_mean"]),
+                    "tags/chaos_mean": np.mean(tag_metrics["tags/chaos_mean"])
+                }
+                wandb.log(metrics, step=global_step)
         
-        # Log epoch completion metrics
+        # End of epoch logging
+        epoch_metrics = {
+            "epoch/average_loss": np.mean(loss_history),
+            "epoch/final_lr": lr_scheduler.get_last_lr()[0],
+            "epoch/total_steps": step + 1,
+            "epoch/tag_stats": {
+                k: np.mean(v) for k, v in tag_metrics.items()
+            }
+        }
+        
         if args.use_wandb:
-            wandb.log({
-                "epoch/completed": epoch + 1,
-                "epoch/average_loss": sum(loss_history) / len(loss_history),
-                "epoch/final_lr": lr_scheduler.get_last_lr()[0]
-            }, step=global_step)
+            wandb.log(epoch_metrics, step=global_step)
         
         return global_step
-        
+
     except Exception as e:
         logger.error(f"Error in epoch {epoch+1}: {str(e)}")
+        logger.error(traceback.format_exc())
         raise
 
 def get_cosine_schedule_with_warmup(
