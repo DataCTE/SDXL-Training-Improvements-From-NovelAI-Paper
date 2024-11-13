@@ -10,33 +10,36 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 class ModelValidator:
-    def __init__(self, model_path, device="cuda", dtype=torch.float16):
+    def __init__(self, model_path, device="cuda", dtype=torch.float16, zsnr=True):
+        """
+        Initialize the model validator
+        
+        Args:
+            model_path (str): Path to the base model
+            device (str): Device to use for inference
+            dtype (torch.dtype): Data type for model
+            zsnr (bool): Whether to use ZSNR noise scheduling
+        """
+        self.model_path = model_path
         self.device = device
         self.dtype = dtype
-        self.model_path = model_path
+        self.v_prediction = True  # Always use v-prediction
+        self.zsnr = zsnr
         
-        # ZTSNR + V-Prediction settings
-        self.zsnr = True
-        self.v_prediction = True
-        self.sigma_min = 0.029  # From image
+        # Initialize sigma parameters
+        self.sigma_min = 0.0292
         self.sigma_data = 1.0
-        self.min_snr_gamma = 5.0
-        self.resolution_scaling = True
-        
-        # CFG Rescale settings
-        self.rescale_cfg = True
-        self.scale_method = "karras"  # From image
-        self.rescale_multiplier = 0.7  # From image
         
         logger.info(f"Initializing validator with model from {model_path}")
+        
+        # Load pipeline
         self.pipeline = StableDiffusionXLPipeline.from_pretrained(
             model_path,
             torch_dtype=dtype,
-            use_safetensors=True,
-            variant="fp16"
-        ).to(device)
+            use_safetensors=True
+        )
         
-        # Instead of updating the config directly, create a new config
+        # Create new scheduler config
         scheduler_config = dict(self.pipeline.scheduler.config)
         scheduler_config.update({
             "prediction_type": "v_prediction" if self.v_prediction else "epsilon",
@@ -44,7 +47,7 @@ class ModelValidator:
             "sigma_data": self.sigma_data,
         })
         
-        # Create a new scheduler with the updated config
+        # Create new scheduler with updated config
         self.pipeline.scheduler = type(self.pipeline.scheduler).from_config(scheduler_config)
         
         # Enable memory optimization
