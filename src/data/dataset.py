@@ -12,6 +12,7 @@ import traceback
 import os
 import time
 import glob
+import random
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +95,9 @@ class CustomDataset(Dataset):
                     "image_path": img_path,
                     "caption_path": img_path.with_suffix('.txt')
                 })
+
+        # Add shuffle method
+        self.shuffle_samples()
 
     def create_aspect_buckets(self):
         aspect_buckets = {
@@ -472,6 +476,10 @@ class CustomDataset(Dataset):
 
     def __len__(self):
         return len(self.samples)
+
+    def shuffle_samples(self):
+        """Shuffle the samples list"""
+        random.shuffle(self.samples)
 
 def validate_dataset(data_dir):
     """Pre-process validation of all images in dataset"""

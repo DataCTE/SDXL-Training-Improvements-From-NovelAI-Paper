@@ -269,6 +269,9 @@ def train(args, models, train_components, device, dtype):
         optimizer = train_components["optimizer"]
         lr_scheduler = train_components["lr_scheduler"]
         
+        # Get dataset from dataloader
+        dataset = train_dataloader.dataset
+        
         # Initialize EMA if enabled
         ema_model = None
         if args.use_ema:
@@ -297,6 +300,9 @@ def train(args, models, train_components, device, dtype):
         # Main epoch loop
         for epoch in range(args.num_epochs):
             logger.info(f"\nEpoch {epoch+1}/{args.num_epochs}")
+            
+            # Shuffle dataset before each epoch
+            dataset.shuffle_samples()
             
             # Train one epoch
             epoch_metrics, global_step = train_one_epoch(

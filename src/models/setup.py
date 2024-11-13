@@ -93,16 +93,11 @@ def setup_models(args, device, dtype):
                 )
             )
         
-        # Initialize model validator
-        logger.info("Initializing model validator...")
+        # Initialize validator
         validator = ModelValidator(
-            unet,
-            vae,
-            tokenizer,
-            tokenizer_2,
-            text_encoder,
-            text_encoder_2,
-            device=device
+            model_path=args.model_path,
+            device=device,
+            dtype=dtype
         )
         
         # Return all components
