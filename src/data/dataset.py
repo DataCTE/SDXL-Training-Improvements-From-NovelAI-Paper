@@ -237,6 +237,26 @@ class CustomDataset(Dataset):
         logger.info(f"Formatted {stats['formatted_count']} captions")
         return stats
 
+    def _get_target_size(self, width, height):
+        """Get closest SDXL aspect ratio bucket size"""
+        # SDXL standard aspect ratios (larger sizes)
+        sdxl_sizes = [
+            (1024, 1024),  # 1:1
+            (1152, 896),   # ~1.29:1
+            (896, 1152),   # ~1:1.29
+            (1216, 832),   # ~1.46:1
+            (832, 1216),   # ~1:1.46
+            (1344, 768),   # ~1.75:1
+            (768, 1344),   # ~1:1.75
+            (1536, 640),   # ~2.4:1
+            (640, 1536),   # ~1:2.4
+        ]
+        
+        aspect_ratio = width / height
+        closest_size = min(sdxl_sizes, 
+            key=lambda size: abs((size[0] / size[1]) - aspect_ratio))
+        return closest_size
+
     def __getitem__(self, idx):
         image_path = self.image_paths[idx]
         latent_path = self.latent_paths[idx]
@@ -265,7 +285,13 @@ class CustomDataset(Dataset):
         try:
             # Load and process image
             image = Image.open(image_path).convert('RGB')
+            
+            # Get target size from SDXL buckets
+            width, height = image.size
+            target_width, target_height = self._get_target_size(width, height)
+            
             transform = transforms.Compose([
+                transforms.Resize((target_height, target_width)),
                 transforms.ToTensor(),
                 transforms.Normalize([0.5], [0.5])
             ])
