@@ -288,7 +288,6 @@ def train(args, models, train_components, device, dtype):
             epoch=epoch,
             global_step=global_step,
             models=models,
-            train_components=train_components,
             training_history=training_history
         )
         
