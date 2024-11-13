@@ -47,6 +47,87 @@ def verify_training_components(train_components):
         return False
 
 
+def get_sdxl_bucket_resolutions():
+    """
+    Generate SDXL resolution buckets with dynamic aspect ratios
+    
+    Returns:
+        list: List of (width, height) tuples representing valid SDXL resolutions
+    """
+    base_resolutions = [
+        (1024, 1024),  # 1:1
+        (1152, 896),   # 1.29:1
+        (896, 1152),   # 1:1.29
+        (1216, 832),   # 1.46:1
+        (832, 1216),   # 1:1.46
+        (1344, 768),   # 1.75:1
+        (768, 1344),   # 1:1.75
+        (1536, 640),   # 2.4:1
+        (640, 1536),   # 1:2.4
+    ]
+    
+    # Generate scaled versions (0.5x to 1.5x)
+    scale_factors = [0.5, 0.75, 1.0, 1.25, 1.5]
+    buckets = []
+    
+    for width, height in base_resolutions:
+        for scale in scale_factors:
+            scaled_w = int(width * scale)
+            scaled_h = int(height * scale)
+            
+            # Ensure minimum dimension of 512
+            if scaled_w >= 512 and scaled_h >= 512:
+                # Ensure maximum dimension of 2048
+                if scaled_w <= 2048 and scaled_h <= 2048:
+                    buckets.append((scaled_w, scaled_h))
+    
+    return sorted(set(buckets))  # Remove duplicates and sort
+
+def validate_image_dimensions(width, height):
+    """
+    Check if image dimensions are close enough to any SDXL bucket resolution
+    
+    Args:
+        width (int): Image width
+        height (int): Image height
+        
+    Returns:
+        tuple: (bool, closest_bucket) - Valid flag and closest matching resolution
+    """
+    try:
+        # Basic boundary checks
+        if width < 512 or height < 512:
+            return False, None
+        if width > 2048 or height > 2048:
+            return False, None
+            
+        # Get all valid SDXL buckets
+        buckets = get_sdxl_bucket_resolutions()
+        
+        # Calculate aspect ratio of input image
+        input_ar = width / height
+        
+        # Find closest matching bucket
+        min_ar_diff = float('inf')
+        closest_bucket = None
+        
+        for bucket_w, bucket_h in buckets:
+            bucket_ar = bucket_w / bucket_h
+            ar_diff = abs(input_ar - bucket_ar)
+            
+            if ar_diff < min_ar_diff:
+                min_ar_diff = ar_diff
+                closest_bucket = (bucket_w, bucket_h)
+        
+        # Allow 20% tolerance in aspect ratio difference
+        max_ar_diff = 0.2
+        is_valid = min_ar_diff <= max_ar_diff
+        
+        return is_valid, closest_bucket
+        
+    except Exception as e:
+        logger.error(f"Error validating dimensions: {str(e)}")
+        return False, None
 
 def validate_dataset(data_dir):
     """
@@ -63,8 +144,9 @@ def validate_dataset(data_dir):
         stats = {
             "total_images": 0,
             "valid_images": 0,
-            "improper_sized_images": [],
-            "missing_captions": 0
+            "resized_images": [],
+            "missing_captions": 0,
+            "bucket_distribution": {}
         }
         
         # Get all image files
@@ -88,10 +170,19 @@ def validate_dataset(data_dir):
                 # Validate image
                 with Image.open(img_path) as img:
                     width, height = img.size
-                    if not validate_image_dimensions(width, height):
-                        logger.info(f"Note: Image with non-standard dimensions: {img_path} ({width}x{height})")
-                        stats["improper_sized_images"].append((img_path, width, height))
+                    is_valid, closest_bucket = validate_image_dimensions(width, height)
+                    
+                    if closest_bucket:
+                        bucket_key = f"{closest_bucket[0]}x{closest_bucket[1]}"
+                        stats["bucket_distribution"][bucket_key] = stats["bucket_distribution"].get(bucket_key, 0) + 1
                         
+                        if not is_valid:
+                            stats["resized_images"].append({
+                                "path": img_path,
+                                "original": (width, height),
+                                "target": closest_bucket
+                            })
+                    
                     # Check image mode
                     if img.mode != "RGB":
                         logger.warning(f"Converting non-RGB image to RGB: {img_path}")
@@ -105,8 +196,11 @@ def validate_dataset(data_dir):
         logger.info(f"Dataset validation complete:")
         logger.info(f"Total images: {stats['total_images']}")
         logger.info(f"Valid images: {stats['valid_images']}")
-        logger.info(f"Images with non-standard dimensions: {len(stats['improper_sized_images'])}")
+        logger.info(f"Images requiring resize: {len(stats['resized_images'])}")
         logger.info(f"Missing captions: {stats['missing_captions']}")
+        logger.info("\nBucket distribution:")
+        for bucket, count in sorted(stats["bucket_distribution"].items()):
+            logger.info(f"  {bucket}: {count} images")
         
         # Dataset is valid if we have at least one valid image
         is_valid = stats["valid_images"] > 0
@@ -115,39 +209,5 @@ def validate_dataset(data_dir):
     except Exception as e:
         logger.error(f"Dataset validation failed: {str(e)}")
         return False, {"error": str(e)}
-
-def validate_image_dimensions(width, height):
-    """
-    Check if image dimensions are within SDXL preferred ranges
-    
-    Args:
-        width (int): Image width
-        height (int): Image height
-        
-    Returns:
-        bool: True if dimensions are within preferred range
-    """
-    try:
-        # Preferred dimensions
-        min_size = 256
-        max_size = 2048
-        
-        # Check dimensions
-        if width < min_size or height < min_size:
-            return False
-            
-        if width > max_size or height > max_size:
-            return False
-            
-        # Check aspect ratio (maximum 2:1 or 1:2)
-        aspect_ratio = width / height
-        if aspect_ratio > 2.0 or aspect_ratio < 0.5:
-            return False
-            
-        return True
-        
-    except Exception as e:
-        logger.error(f"Error validating dimensions: {str(e)}")
-        return False
     
 
