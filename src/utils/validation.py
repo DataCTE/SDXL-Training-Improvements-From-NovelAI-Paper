@@ -89,7 +89,7 @@ def get_sdxl_bucket_resolutions():
 def validate_image_dimensions(width, height):
     """
     Check if image dimensions are valid for SDXL.
-    More permissive validation that only intervenes for significant dimension issues.
+    Only intervenes for extreme aspect ratios or very small/large dimensions.
     
     Args:
         width (int): Image width
@@ -99,46 +99,34 @@ def validate_image_dimensions(width, height):
         tuple: (bool, closest_bucket) - Valid flag and closest matching resolution
     """
     try:
-        # Only invalid if BOTH dimensions are below 768px (more permissive than 1024)
-        if width < 768 and height < 768:
-            return False, None
-            
-        # Check maximum dimension - only intervene if significantly over 2048
-        if width > 2304 or height > 2304:  # Allow some overflow
-            return False, None
-            
         # Calculate aspect ratio
         aspect_ratio = width / height
         
-        # Only intervene for extreme aspect ratios (more than 3:1 or 1:3)
-        if aspect_ratio > 3.0 or aspect_ratio < 0.333:
+        # Only invalid in these cases:
+        # 1. If BOTH dimensions are very small (< 512px)
+        if width < 512 and height < 512:
             return False, None
             
-        # If we reach here, the image is considered valid
-        # Only suggest bucket if dimensions are significantly different from SDXL sizes
-        if abs(width - 1024) > 256 or abs(height - 1024) > 256:
-            # Get all valid SDXL buckets
-            buckets = get_sdxl_bucket_resolutions()
+        # 2. If ANY dimension is extremely large (> 2560px)
+        if width > 2560 or height > 2560:
+            return False, None
             
-            # Find closest matching bucket
-            min_diff = float('inf')
-            closest_bucket = None
+        # 3. If aspect ratio is extremely skewed (> 4:1 or < 1:4)
+        if aspect_ratio > 4.0 or aspect_ratio < 0.25:
+            return False, None
             
-            for bucket_w, bucket_h in buckets:
-                bucket_ar = bucket_w / bucket_h
-                ar_diff = abs(aspect_ratio - bucket_ar)
-                
-                if ar_diff < min_diff:
-                    min_diff = ar_diff
-                    closest_bucket = (bucket_w, bucket_h)
-                    
-            return True, closest_bucket
+        # 4. If smallest dimension is tiny (< 384px) while other is normal/large
+        min_dim = min(width, height)
+        max_dim = max(width, height)
+        if min_dim < 384 and max_dim > 768:
+            return False, None
             
+        # Otherwise, the image is valid - keep original dimensions
         return True, None
         
     except Exception as e:
         logger.error(f"Error validating dimensions: {str(e)}")
-        return False, None
+        return True, None  # Default to keeping original dimensions
 
 def validate_dataset(data_dir):
     """

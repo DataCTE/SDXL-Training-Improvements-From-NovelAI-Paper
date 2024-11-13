@@ -286,43 +286,46 @@ class CustomDataset(Dataset):
     def _get_target_size(self, width, height):
         """
         Get target size based on more permissive SDXL validation rules.
-        Only intervenes for significant dimension issues.
+        Only intervenes for extreme cases.
         """
         try:
             # Check if dimensions need adjustment
-            is_valid, closest_bucket = validate_image_dimensions(width, height)
+            is_valid, _ = validate_image_dimensions(width, height)
             
             if not is_valid:
-                # Scale up if too small
-                if width < 768 and height < 768:
-                    scale = 768 / max(width, height)
-                    width = int(width * scale)
-                    height = int(height * scale)
-                
-                # Scale down if too large
-                elif width > 2304 or height > 2304:
-                    scale = 2304 / max(width, height)
-                    width = int(width * scale)
-                    height = int(height * scale)
-                
-                # Adjust extreme aspect ratios
+                min_dim = min(width, height)
+                max_dim = max(width, height)
                 aspect_ratio = width / height
-                if aspect_ratio > 3.0:
-                    width = int(height * 3.0)
-                elif aspect_ratio < 0.333:
-                    height = int(width * 3.0)
+                
+                # Scale up if both dimensions are too small
+                if width < 512 and height < 512:
+                    scale = 512 / min_dim
+                    width = int(width * scale)
+                    height = int(height * scale)
+                
+                # Scale down if any dimension is too large
+                elif max_dim > 2560:
+                    scale = 2560 / max_dim
+                    width = int(width * scale)
+                    height = int(height * scale)
+                
+                # Fix extreme aspect ratios
+                elif aspect_ratio > 4.0:
+                    width = int(height * 4.0)
+                elif aspect_ratio < 0.25:
+                    height = int(width * 4.0)
+                
+                # Fix tiny dimension with normal/large other dimension
+                elif min_dim < 384 and max_dim > 768:
+                    scale = 384 / min_dim
+                    width = int(width * scale)
+                    height = int(height * scale)
             
-            # Use closest bucket only if provided
-            if closest_bucket:
-                return closest_bucket
-            
-            # Otherwise keep original dimensions
             return (width, height)
 
         except Exception as e:
             logger.error(f"Error calculating target size: {str(e)}")
-            # Fallback to original dimensions
-            return (width, height)
+            return (width, height)  # Keep original dimensions on error
 
     def process_image_size(self, image, target_width, target_height):
         """Process image size with advanced upscaling"""
