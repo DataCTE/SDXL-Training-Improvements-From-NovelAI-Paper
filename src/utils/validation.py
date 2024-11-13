@@ -50,7 +50,7 @@ def verify_training_components(train_components):
 
 def validate_dataset(data_dir):
     """
-    Pre-process validation of all images in dataset
+    Pre-process validation of all images in dataset, logging improper sizes but allowing them
     
     Args:
         data_dir (str): Directory containing the dataset
@@ -63,7 +63,7 @@ def validate_dataset(data_dir):
         stats = {
             "total_images": 0,
             "valid_images": 0,
-            "invalid_images": 0,
+            "improper_sized_images": [],
             "missing_captions": 0
         }
         
@@ -89,27 +89,23 @@ def validate_dataset(data_dir):
                 with Image.open(img_path) as img:
                     width, height = img.size
                     if not validate_image_dimensions(width, height):
-                        logger.warning(f"Invalid dimensions for {img_path}: {width}x{height}")
-                        stats["invalid_images"] += 1
-                        continue
+                        logger.info(f"Note: Image with non-standard dimensions: {img_path} ({width}x{height})")
+                        stats["improper_sized_images"].append((img_path, width, height))
                         
                     # Check image mode
                     if img.mode != "RGB":
-                        logger.warning(f"Non-RGB image found: {img_path}")
-                        stats["invalid_images"] += 1
-                        continue
+                        logger.warning(f"Converting non-RGB image to RGB: {img_path}")
                     
                 stats["valid_images"] += 1
                 
             except Exception as e:
                 logger.error(f"Error validating {img_path}: {str(e)}")
-                stats["invalid_images"] += 1
                 
         # Log validation results
         logger.info(f"Dataset validation complete:")
         logger.info(f"Total images: {stats['total_images']}")
         logger.info(f"Valid images: {stats['valid_images']}")
-        logger.info(f"Invalid images: {stats['invalid_images']}")
+        logger.info(f"Images with non-standard dimensions: {len(stats['improper_sized_images'])}")
         logger.info(f"Missing captions: {stats['missing_captions']}")
         
         # Dataset is valid if we have at least one valid image
@@ -122,20 +118,18 @@ def validate_dataset(data_dir):
 
 def validate_image_dimensions(width, height):
     """
-    Validate image dimensions against SDXL requirements
+    Check if image dimensions are within SDXL preferred ranges
     
     Args:
         width (int): Image width
         height (int): Image height
         
     Returns:
-        bool: True if dimensions are valid
+        bool: True if dimensions are within preferred range
     """
     try:
-        # Minimum dimensions (256x256)
+        # Preferred dimensions
         min_size = 256
-        
-        # Maximum dimensions (2048x2048)
         max_size = 2048
         
         # Check dimensions

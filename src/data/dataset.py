@@ -1,5 +1,5 @@
 from pathlib import Path
-from PIL import Image, ImageFilter
+from PIL import Image, ImageFilter, ImageEnhance
 import torch
 import torchvision.transforms as transforms
 from torch.utils.data import Dataset
@@ -12,6 +12,9 @@ import re
 from utils.validation import validate_dataset
 import cv2
 import numpy as np
+from basicsr.archs.rrdbnet_arch import RRDBNet
+from basicsr.utils.download_util import load_file_from_url
+from realesrgan import RealESRGANer
 
 logger = logging.getLogger(__name__)
 
@@ -237,7 +240,7 @@ class CustomDataset(Dataset):
 
     def _get_target_size(self, width, height):
         """Get closest SDXL aspect ratio bucket size"""
-        # SDXL standard aspect ratios (larger sizes)
+        # SDXL standard aspect ratios
         sdxl_sizes = [
             (1024, 1024),  # 1:1
             (1152, 896),   # ~1.29:1
@@ -253,58 +256,145 @@ class CustomDataset(Dataset):
         aspect_ratio = width / height
         closest_size = min(sdxl_sizes, 
             key=lambda size: abs((size[0] / size[1]) - aspect_ratio))
+        
+        if abs((width / height) - (closest_size[0] / closest_size[1])) > 0.1:
+            logger.info(f"Adjusting aspect ratio from {width}x{height} ({width/height:.2f}) to {closest_size[0]}x{closest_size[1]} ({closest_size[0]/closest_size[1]:.2f})")
+        
         return closest_size
 
-    def _process_image_size(self, image, target_width, target_height):
-        """Process image size with bicubic upscaling for small images and high-quality downscaling for large images"""
-        width, height = image.size
-        
-        # Calculate scaling factors
-        width_scale = width / target_width
-        height_scale = height / target_height
-        
-        # If image is larger than target, use progressive downscaling
-        if width_scale > 1 or height_scale > 1:
-            # Calculate number of steps for progressive downscaling
+    class ImageProcessor:
+        def __init__(self):
+            """Initialize the image processor with Real-ESRGAN"""
+            self.upsampler = None
+            
+        def _init_upsampler(self):
+            """Lazy initialization of Real-ESRGAN to save memory when not needed"""
+            if self.upsampler is None:
+                try:
+                    model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=2)
+                    model_path = load_file_from_url(
+                        'https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth',
+                        model_dir='weights'
+                    )
+                    self.upsampler = RealESRGANer(
+                        scale=2,
+                        model_path=model_path,
+                        model=model,
+                        tile=512,
+                        tile_pad=32,
+                        pre_pad=0,
+                        half=True
+                    )
+                    logger.info("Real-ESRGAN model loaded successfully")
+                except Exception as e:
+                    logger.error(f"Failed to initialize Real-ESRGAN: {str(e)}")
+                    self.upsampler = None
+
+        def process_image_size(self, image, target_width, target_height):
+            """
+            Process image size with AI upscaling for small images and high-quality downscaling for large ones
+            
+            Args:
+                image (PIL.Image): Input image
+                target_width (int): Desired width
+                target_height (int): Desired height
+                
+            Returns:
+                PIL.Image: Processed image
+            """
+            width, height = image.size
+            
+            # If image is already the target size, return as-is
+            if width == target_width and height == target_height:
+                return image
+            
+            logger.info(f"Processing image from {width}x{height} to {target_width}x{target_height}")
+            
+            # Calculate scaling factors
+            width_scale = width / target_width
+            height_scale = height / target_height
             scale_factor = max(width_scale, height_scale)
-            num_steps = max(1, min(4, int(scale_factor // 2)))
             
-            current_image = image
-            for step in range(num_steps):
-                # Calculate intermediate size
-                intermediate_scale = 1.0 + (scale_factor - 1.0) * (num_steps - step - 1) / num_steps
-                intermediate_width = int(target_width * intermediate_scale)
-                intermediate_height = int(target_height * intermediate_scale)
+            # Handle small images with AI upscaling
+            if scale_factor < 1:
+                return self._upscale_image(image, target_width, target_height)
+            
+            # Handle large images with progressive downscaling
+            return self._downscale_image(image, target_width, target_height, scale_factor)
+
+        def _upscale_image(self, image, target_width, target_height):
+            """Upscale small images using Real-ESRGAN"""
+            try:
+                # Initialize upsampler if needed
+                self._init_upsampler()
+                if self.upsampler is None:
+                    logger.warning("Falling back to bicubic upscaling")
+                    return image.resize((target_width, target_height), Image.BICUBIC)
                 
-                # Apply gaussian blur before resizing to reduce aliasing
-                if step == 0:
-                    blur_radius = min(2.0, 0.5 * scale_factor)
-                    current_image = current_image.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+                # Convert PIL to numpy
+                img_np = np.array(image)
                 
-                # Resize with high-quality Lanczos
-                current_image = current_image.resize(
-                    (intermediate_width, intermediate_height),
-                    Image.Resampling.LANCZOS
-                )
-            
-            return current_image
-        
-        # If image is smaller, use bicubic upscaling
-        if width_scale < 1 or height_scale < 1:
-            # Convert to numpy array
-            img_np = np.array(image)
-            
-            # Upscale with OpenCV bicubic
-            upscaled = cv2.resize(
-                img_np, 
-                (target_width, target_height),
-                interpolation=cv2.INTER_CUBIC
-            )
-            
-            # Convert back to PIL
-            return Image.fromarray(upscaled)
-        
-        return image
+                # Calculate intermediate size for 2x upscaling
+                intermediate_width = min(target_width * 2, 4096)  # Limit max size
+                intermediate_height = min(target_height * 2, 4096)
+                
+                # Upscale with Real-ESRGAN
+                output, _ = self.upsampler.enhance(img_np, outscale=2.0)
+                
+                # Convert back to PIL
+                upscaled = Image.fromarray(output)
+                
+                # Resize to target size with Lanczos
+                if upscaled.size != (target_width, target_height):
+                    upscaled = upscaled.resize((target_width, target_height), Image.LANCZOS)
+                
+                return upscaled
+                
+            except Exception as e:
+                logger.error(f"AI upscaling failed: {str(e)}, falling back to bicubic")
+                return image.resize((target_width, target_height), Image.BICUBIC)
+
+        def _downscale_image(self, image, target_width, target_height, scale_factor):
+            """Progressive high-quality downscaling for large images"""
+            try:
+                # Calculate number of steps for progressive downscaling
+                num_steps = max(1, min(4, int(scale_factor // 2)))
+                
+                current_image = image
+                
+                # Apply initial gaussian blur to prevent aliasing
+                blur_radius = min(2.0, 0.5 * scale_factor)
+                current_image = current_image.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+                
+                for step in range(num_steps):
+                    # Calculate intermediate size
+                    intermediate_scale = 1.0 + (scale_factor - 1.0) * (num_steps - step - 1) / num_steps
+                    intermediate_width = int(target_width * intermediate_scale)
+                    intermediate_height = int(target_height * intermediate_scale)
+                    
+                    # Convert to numpy for advanced processing
+                    img_np = np.array(current_image)
+                    
+                    # Apply edge-preserving blur (bilateral filter)
+                    if step == 0:
+                        img_np = cv2.bilateralFilter(img_np, 9, 75, 75)
+                    
+                    # High-quality resize with Lanczos
+                    current_image = Image.fromarray(img_np).resize(
+                        (intermediate_width, intermediate_height),
+                        Image.LANCZOS
+                    )
+                    
+                    # Apply sharpening on final step
+                    if step == num_steps - 1:
+                        enhancer = ImageEnhance.Sharpness(current_image)
+                        current_image = enhancer.enhance(1.1)
+                
+                return current_image
+                
+            except Exception as e:
+                logger.error(f"Advanced downscaling failed: {str(e)}, falling back to direct resize")
+                return image.resize((target_width, target_height), Image.LANCZOS)
 
     def __getitem__(self, idx):
         image_path = self.image_paths[idx]
@@ -340,7 +430,7 @@ class CustomDataset(Dataset):
             target_width, target_height = self._get_target_size(width, height)
             
             # Process image size with AI upscaling when needed
-            processed_image = self._process_image_size(image, target_width, target_height)
+            processed_image = self.ImageProcessor().process_image_size(image, target_width, target_height)
             
             transform = transforms.Compose([
                 transforms.ToTensor(),
