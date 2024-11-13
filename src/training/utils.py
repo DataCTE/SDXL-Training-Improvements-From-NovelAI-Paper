@@ -1,8 +1,9 @@
 import torch
 import logging
 import os
-import shutil
-import traceback
+import torch
+from torchvision import transforms
+from torch.nn.utils.rnn import pad_sequence
 from safetensors.torch import load_file, save_file
 from pathlib import Path
 from torch.utils.data import DataLoader
@@ -32,31 +33,51 @@ def setup_torch_backends():
     torch.backends.cuda.enable_mem_efficient_sdp(True)
 
 def custom_collate(batch):
-    """Custom collate function that validates dimensions"""
+    """Custom collate function that validates dimensions and handles varying tensor sizes"""
+
     def validate_latents(latents):
         h, w = latents.shape[-2:]
         min_size = 256 // 8  # Minimum 256 pixels in image space
         max_size = 2048 // 8  # Maximum 2048 pixels in image space
-        return (h >= min_size and w >= min_size and 
+        return (h >= min_size and w >= min_size and
                 h <= max_size and w <= max_size)
 
+    def resize_latents(latents, target_height, target_width):
+        """Resize latents to the given height and width."""
+        return transforms.functional.interpolate(
+            latents,
+            size=(target_height, target_width),
+            mode='nearest'
+        )
+
     # Filter out invalid samples
-    valid_batch = [item for item in batch 
-                  if validate_latents(item['latents'])]
+    valid_batch = [item for item in batch if validate_latents(item['latents'])]
     
     if not valid_batch:
         raise ValueError("No valid samples in batch (all below minimum size)")
-    
-    # Create batch tensors
+
+    # Find the largest dimensions to pad to
+    max_height = max(latent.shape[-2] for latent in [x["latents"] for x in valid_batch])
+    max_width = max(latent.shape[-1] for latent in [x["latents"] for x in valid_batch])
+
+    # Resize or pad latents to the largest dimensions
+    resized_latents = [
+        resize_latents(x["latents"], max_height, max_width)
+        for x in valid_batch
+    ]
+
+    # Stack resized tensors
     batch_dict = {
-        "latents": torch.stack([x["latents"] for x in valid_batch]),
+        "latents": torch.stack(resized_latents),
         "text_embeddings": torch.stack([x["text_embeddings"] for x in valid_batch]),
         "text_embeddings_2": torch.stack([x["text_embeddings_2"] for x in valid_batch]),
         "pooled_text_embeddings_2": torch.stack([x["pooled_text_embeddings_2"] for x in valid_batch]),
         "tags": [x["tags"] for x in valid_batch]
     }
-    
+
     return batch_dict
+
+
 
 def verify_models(models):
     """
