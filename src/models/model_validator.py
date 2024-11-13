@@ -107,7 +107,8 @@ class ModelValidator:
                     generated_images.append({
                         "prompt": prompt,
                         "image": image,
-                        "generation_time": gen_time
+                        "generation_time": gen_time,
+                        "image_index": idx
                     })
                 
                 logger.debug(f"Generated {num_images_per_prompt} images for prompt: {prompt}")
