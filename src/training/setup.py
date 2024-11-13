@@ -57,7 +57,7 @@ def setup_training(args, models, device, dtype):
         logger.info(f"Found {dataset.tag_stats['niji_count']} anime-style images")
         
         # Group dataset samples by aspect ratio and size
-        def collate_fn(batch):
+        def custom_collate(batch):
             # Filter out samples that are too small
             valid_batch = []
             for item in batch:
@@ -104,7 +104,7 @@ def setup_training(args, models, device, dtype):
             dataset,
             batch_size=args.batch_size,
             shuffle=True,
-            collate_fn=collate_fn,
+            collate_fn=custom_collate,
             num_workers=4,
             pin_memory=True,
             drop_last=True,
