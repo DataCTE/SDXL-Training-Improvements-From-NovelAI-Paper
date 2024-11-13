@@ -6,7 +6,7 @@ import wandb
 import logging
 import traceback
 from training.loss import get_sigmas, training_loss_v_prediction
-from utils.setup import save_checkpoint, load_checkpoint
+from utils.checkpoint import save_checkpoint, load_checkpoint
 import math
 import os
 import numpy as np
