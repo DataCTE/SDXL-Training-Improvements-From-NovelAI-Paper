@@ -12,8 +12,14 @@ import re
 from utils.validation import validate_dataset
 import cv2
 import numpy as np
+from torchvision.transforms.functional import rgb_to_grayscale
 from basicsr.archs.rrdbnet_arch import RRDBNet
 from basicsr.utils.download_util import load_file_from_url
+from realesrgan import RealESRGANer
+import torch.nn.functional as F
+from basicsr.utils.download_util import load_file_from_url
+from basicsr.utils.registry import ARCH_REGISTRY
+from realesrgan.archs.srvgg_arch import SRVGGNetCompact
 from realesrgan import RealESRGANer
 
 logger = logging.getLogger(__name__)
@@ -271,9 +277,10 @@ class CustomDataset(Dataset):
             """Lazy initialization of Real-ESRGAN to save memory when not needed"""
             if self.upsampler is None:
                 try:
-                    model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=2)
+                    # Use SRVGGNetCompact instead of RRDBNet
+                    model = SRVGGNetCompact(num_in_ch=3, num_out_ch=3, num_feat=64, num_conv=16, upscale=2, act_type='prelu')
                     model_path = load_file_from_url(
-                        'https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth',
+                        'https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x2v3.pth',
                         model_dir='weights'
                     )
                     self.upsampler = RealESRGANer(
