@@ -10,6 +10,7 @@ from training.loss import get_sigmas, training_loss_v_prediction
 from training.ema import EMAModel
 from training.utils import save_checkpoint, load_checkpoint
 import math
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -128,43 +129,62 @@ def train_one_epoch(
                 scaler.scale(loss).backward()
             
             if (step + 1) % args.gradient_accumulation_steps == 0:
-                # Check gradient norms
-                total_norm = 0.0
-                for p in unet.parameters():
-                    if p.grad is not None:
-                        param_norm = p.grad.data.norm(2)
-                        if torch.isnan(param_norm) or torch.isinf(param_norm):
-                            p.grad = None
-                            continue
-                        total_norm += param_norm.item() ** 2
-                total_norm = total_norm ** 0.5
-                
-                # Skip update if gradients are unstable
-                if total_norm > 1000.0 or total_norm < 1e-6:
-                    logger.warning(f"Skipping update due to unstable gradients: {total_norm}")
-                    optimizer.zero_grad(set_to_none=True)
-                    continue
-                
-                # Clip gradients
-                grad_norm_value = torch.nn.utils.clip_grad_norm_(
-                    unet.parameters(),
-                    args.max_grad_norm,
-                    error_if_nonfinite=False
-                ).item()
-                
                 if dtype == torch.bfloat16:
-                    # Direct optimizer step for BFloat16
+                    # Clip gradients
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        unet.parameters(), 
+                        args.max_grad_norm
+                    )
                     optimizer.step()
                 else:
-                    # Use scaler for float16/float32
+                    # Clip gradients with scaler
+                    scaler.unscale_(optimizer)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        unet.parameters(),
+                        args.max_grad_norm
+                    )
                     scaler.step(optimizer)
                     scaler.update()
                 
                 optimizer.zero_grad(set_to_none=True)
                 lr_scheduler.step()
                 
+                # Update EMA model if it exists
                 if ema_model is not None:
-                    ema_model.update_parameters(unet)
+                    ema_model.step(unet)
+                    
+                global_step += 1
+                
+                # Log EMA decay rate if using wandb
+                if args.use_wandb and step % args.logging_steps == 0:
+                    metrics["ema/decay"] = ema_model.cur_decay_value if ema_model else 0.0
+                
+                # Run validation at specified step intervals
+                if validator and args.validation_steps > 0 and global_step % args.validation_steps == 0:
+                    logger.info(f"\nRunning validation at step {global_step}")
+                    validation_metrics = validator.run_validation(
+                        prompts=args.validation_prompts,
+                        output_dir=os.path.join(args.output_dir, f"validation_step_{global_step}"),
+                        num_images_per_prompt=1,
+                        guidance_scale=5.0,
+                        num_inference_steps=28,
+                        height=1024,
+                        width=1024,
+                        log_to_wandb=args.use_wandb
+                    )
+                    training_history['validation_scores'].append({
+                        'step': global_step,
+                        'metrics': validation_metrics
+                    })
+                    
+                    if args.use_wandb:
+                        wandb.log({
+                            'validation': validation_metrics,
+                            'step': global_step,
+                            'validation/images': wandb.Image(
+                                os.path.join(args.output_dir, f"validation_step_{global_step}")
+                            )
+                        }, step=global_step)
             
             # Update metrics
             running_loss = 0.9 * running_loss + 0.1 * loss.item() if step > 0 else loss.item()
@@ -210,30 +230,13 @@ def train_one_epoch(
             progress_bar.update(1)
             
             step_metrics['step_time'] = time.time() - step_start
-            global_step += 1
-        
+            
         progress_bar.close()
         return epoch_metrics, global_step
+        
     except Exception as e:
-        # Save checkpoint even if training fails
-        logger.error(f"Training failed in epoch {epoch+1}: {str(e)}")
-        logger.error(traceback.format_exc())
-        
-        if models and train_components and training_history:
-            logger.info("Attempting to save checkpoint after failure...")
-            try:
-                save_checkpoint(
-                    checkpoint_dir=args.output_dir,
-                    models=models,
-                    train_components=train_components,
-                    training_state=training_history
-                )
-            except Exception as save_error:
-                logger.error(f"Failed to save checkpoint after training error: {str(save_error)}")
-        else:
-            logger.warning("Cannot save checkpoint: missing required components")
-        
-        raise  # Re-raise the original training error
+        logger.error(f"Error in training loop: {str(e)}")
+        raise
 
 def get_cosine_schedule_with_warmup(
     optimizer: torch.optim.Optimizer,
@@ -258,66 +261,43 @@ def get_cosine_schedule_with_warmup(
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda, last_epoch)
 
 def train(args, models, train_components, device, dtype):
-    """
-    Main training loop
-    
-    Args:
-        args: Training arguments
-        models (dict): Dictionary containing models
-        train_components (dict): Dictionary containing training components
-        device: Target device
-        dtype: Training precision
-    
-    Returns:
-        dict: Training history
-    """
-    # Unpack components
-    unet = models["unet"]
-    train_dataloader = train_components["train_dataloader"]
-    
-    # Initialize optimizer with paper's recommendations
-    optimizer = torch.optim.AdamW(
-        unet.parameters(),
-        lr=args.learning_rate,  # Default should be 1e-5
-        betas=(args.adam_beta1, args.adam_beta2),  # (0.9, 0.999)
-        eps=args.adam_epsilon,
-        weight_decay=args.weight_decay  # 0.01
-    )
-    
-    # Calculate total number of training steps
-    num_training_steps = len(train_dataloader) * args.num_epochs
-    
-    # Create scheduler with warmup and cosine decay
-    lr_scheduler = get_cosine_schedule_with_warmup(
-        optimizer=optimizer,
-        num_warmup_steps=args.warmup_steps,
-        num_training_steps=num_training_steps
-    )
-    
-    # Update train_components with new scheduler
-    train_components["lr_scheduler"] = lr_scheduler
-    
-    ema_model = train_components["ema_model"]
-    validator = train_components["validator"]
-    tag_weighter = train_components["tag_weighter"]
-    vae_finetuner = train_components.get("vae_finetuner")
-    
-    # Initialize training state
-    global_step = 0
-    training_history = {
-        'epoch_losses': [],
-        'learning_rates': [],
-        'grad_norms': [],
-        'validation_scores': [],
-        'step_times': []
-    }
-    
-    logger.info("\n=== Starting Training ===")
-    
-    try:    
+    """Main training loop"""
+    try:
+        # Initialize training components
+        unet = models["unet"]
+        train_dataloader = train_components["train_dataloader"]
+        optimizer = train_components["optimizer"]
+        lr_scheduler = train_components["lr_scheduler"]
+        
+        # Initialize EMA if enabled
+        ema_model = None
+        if args.use_ema:
+            ema_model = EMAModel(
+                model=unet,
+                decay=args.ema_decay,  # Add this to args if not present
+                device=device,
+                dtype=dtype
+            )
+            train_components["ema_model"] = ema_model
+        
+        validator = train_components.get("validator")
+        tag_weighter = train_components.get("tag_weighter")
+        vae_finetuner = train_components.get("vae_finetuner")
+        
+        # Initialize training history
+        training_history = {
+            'epoch_losses': [],
+            'learning_rates': [],
+            'validation_scores': [],
+            'global_step': 0
+        }
+        
+        global_step = 0
+        
+        # Main epoch loop
         for epoch in range(args.num_epochs):
             logger.info(f"\nEpoch {epoch+1}/{args.num_epochs}")
-        
+            
             # Train one epoch
             epoch_metrics, global_step = train_one_epoch(
                 unet=unet,
@@ -338,65 +318,51 @@ def train(args, models, train_components, device, dtype):
                 training_history=training_history
             )
             
-            # Log epoch metrics
-            avg_loss = epoch_metrics['loss/total'] / len(train_dataloader)
-            logger.info(f"Epoch {epoch+1} - Average loss: {avg_loss:.4f}")
-            
             # Update training history
-            training_history['epoch_losses'].append(avg_loss)
+            training_history['epoch_losses'].append(epoch_metrics['loss/total'] / len(train_dataloader))
             training_history['learning_rates'].append(lr_scheduler.get_last_lr()[0])
+            training_history['global_step'] = global_step
             
-            # Run validation
-            if not args.skip_validation and (epoch + 1) % args.validation_frequency == 0:
-                logger.info("Running validation...")
-                validation_metrics = validator.run_paper_validation(args.validation_prompts)
-                training_history['validation_scores'].append(validation_metrics)
-                
-                if args.use_wandb:
-                    wandb.log({
-                        'validation': validation_metrics,
-                        'epoch': epoch + 1
-                    }, step=global_step)
-            
-            
-            # Regular checkpoint saving during training
+            # Save regular checkpoint
             if args.save_checkpoints and (epoch + 1) % args.save_epochs == 0:
-                logger.info("Saving checkpoint...")
                 save_checkpoint(
                     models=models,
                     train_components=train_components,
                     args=args,
                     epoch=epoch,
                     training_history=training_history,
-                    output_dir=args.output_dir
+                    output_dir=os.path.join(args.output_dir, f"checkpoint-epoch-{epoch+1}")
                 )
-            
-            # Always save final checkpoint
-            logger.info("Saving final checkpoint...")
-            save_checkpoint(
-                checkpoint_dir=args.output_dir,
-                models=models,
-                train_components=train_components,
-                training_state=training_history
-            )
-            
-            logger.info("\n=== Training Complete ===")
-            return training_history
+        
+        # Save final checkpoint
+        logger.info("Saving final checkpoint...")
+        save_checkpoint(
+            models=models,
+            train_components=train_components,
+            args=args,
+            epoch=args.num_epochs-1,
+            training_history=training_history,
+            output_dir=os.path.join(args.output_dir, "final")
+        )
+        
+        logger.info("\n=== Training Complete ===")
+        return training_history
         
     except Exception as e:
-        # Save checkpoint even if training fails
         logger.error(f"Training failed: {str(e)}")
         logger.error(traceback.format_exc())
         
-        logger.info("Attempting to save checkpoint after failure...")
+        # Save emergency checkpoint
         try:
             save_checkpoint(
-                checkpoint_dir=args.output_dir,
                 models=models,
                 train_components=train_components,
-                training_state=training_history
+                args=args,
+                epoch=-1,
+                training_history=training_history,
+                output_dir=os.path.join(args.output_dir, "emergency")
             )
         except Exception as save_error:
-            logger.error(f"Failed to save checkpoint after training error: {str(save_error)}")
+            logger.error(f"Failed to save emergency checkpoint: {str(save_error)}")
         
-        raise  # Re-raise the original training error
+        raise

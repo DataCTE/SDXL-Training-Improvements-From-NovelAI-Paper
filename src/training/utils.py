@@ -7,6 +7,8 @@ from safetensors.torch import load_file
 from pathlib import Path
 from torch.utils.data import DataLoader
 import json
+from diffusers import StableDiffusionXLPipeline, EulerDiscreteScheduler
+from diffusers.schedulers import EulerDiscreteScheduler
 
 logger = logging.getLogger(__name__)
 
@@ -302,49 +304,140 @@ def cleanup(args, wandb_run=None):
         logger.error(f"Error during cleanup: {cleanup_error}")
 
 def save_final_outputs(args, models, training_history, train_components):
-    """Save all final training outputs with proper tensor dimension handling"""
+    """Save all final training outputs in proper diffusers format"""
     logger.info(f"Saving final outputs to {args.output_dir}")
     final_output_dir = os.path.join(args.output_dir, "final")
     
     try:
         logger.info("Saving models in diffusers format")
         
-        # Ensure pooled embeddings maintain correct shape before saving
+        # Handle pooled embeddings
         if "pooled_text_embeddings_2" in train_components:
             pooled_embeds = train_components["pooled_text_embeddings_2"]
             if pooled_embeds.ndim == 1:
-                # Get batch size from UNet config
                 batch_size = models["unet"].config.sample_size
-                # Reshape to [batch_size, embed_dim] if flattened
                 pooled_embeds = pooled_embeds.view(batch_size, -1)
                 train_components["pooled_text_embeddings_2"] = pooled_embeds
-        
-        # Save using diffusers built-in methods
-        models["unet"].save_pretrained(os.path.join(final_output_dir, "unet"))
-        models["vae"].save_pretrained(os.path.join(final_output_dir, "vae"))
-        models["text_encoder"].save_pretrained(os.path.join(final_output_dir, "text_encoder"))
-        models["text_encoder_2"].save_pretrained(os.path.join(final_output_dir, "text_encoder_2"))
+
+        # Create scheduler config
+        scheduler_config = {
+            "_class_name": "EulerDiscreteScheduler",
+            "_diffusers_version": "0.25.0",
+            "beta_end": 0.012,
+            "beta_schedule": "scaled_linear",
+            "beta_start": 0.00085,
+            "clip_sample": True,
+            "num_train_timesteps": 1000,
+            "prediction_type": "v_prediction" if args.v_prediction else "epsilon",
+            "steps_offset": 1,
+            "timestep_spacing": "leading",
+            "trained_betas": None,
+            
+            # ZTSNR specific settings
+            "use_karras_sigmas": True,
+            "sigma_min": args.sigma_min,
+            "sigma_max": 20000.0,  # Practical infinity for ZTSNR
+            "sigma_data": args.sigma_data,
+            "min_snr_gamma": args.min_snr_gamma,
+        }
+
+        # Create pipeline config
+        pipeline_config = {
+            "_class_name": "StableDiffusionXLPipeline",
+            "_diffusers_version": "0.25.0",
+            "force_zeros_for_empty_prompt": True,
+            "add_watermarker": False,
+            
+            # Components
+            "text_encoder": ["text_encoder", "text_encoder_2"],
+            "tokenizer": ["tokenizer", "tokenizer_2"],
+            "scheduler": "scheduler",
+            "unet": "unet",
+            "vae": "vae",
+            
+            # SDXL specific
+            "requires_aesthetics_score": True,
+            "force_zeros_for_empty_prompt": True,
+            
+            # Custom inference settings
+            "custom_inference_config": {
+                "guidance_scale": 7.5,
+                "num_inference_steps": 28,
+                "height": 1024,
+                "width": 1024,
+                
+                # CFG Rescale settings
+                "rescale_cfg": args.rescale_cfg,
+                "scale_method": args.scale_method,
+                "rescale_multiplier": args.rescale_multiplier,
+                
+                # Resolution scaling
+                "resolution_scaling": args.resolution_scaling
+            }
+        }
+
+        # Save model components
+        models["unet"].save_pretrained(
+            os.path.join(final_output_dir, "unet"),
+            safe_serialization=True
+        )
+        models["vae"].save_pretrained(
+            os.path.join(final_output_dir, "vae"),
+            safe_serialization=True
+        )
+        models["text_encoder"].save_pretrained(
+            os.path.join(final_output_dir, "text_encoder"),
+            safe_serialization=True
+        )
+        models["text_encoder_2"].save_pretrained(
+            os.path.join(final_output_dir, "text_encoder_2"),
+            safe_serialization=True
+        )
         models["tokenizer"].save_pretrained(os.path.join(final_output_dir, "tokenizer"))
         models["tokenizer_2"].save_pretrained(os.path.join(final_output_dir, "tokenizer_2"))
         
+        # Save scheduler config
+        scheduler_path = os.path.join(final_output_dir, "scheduler/scheduler_config.json")
+        os.makedirs(os.path.dirname(scheduler_path), exist_ok=True)
+        with open(scheduler_path, "w") as f:
+            json.dump(scheduler_config, f, indent=2)
+
+        # Save pipeline config
+        pipeline_path = os.path.join(final_output_dir, "model_index.json")
+        with open(pipeline_path, "w") as f:
+            json.dump(pipeline_config, f, indent=2)
+
         # Save EMA if available
         if train_components.get("ema_model") is not None:
-            logger.info("Saving separate EMA weights")
-            train_components["ema_model"].save_pretrained(os.path.join(final_output_dir, "ema"))
-        
-        # Save training history and metrics
+            logger.info("Saving EMA weights")
+            ema_path = os.path.join(final_output_dir, "ema_unet")
+            train_components["ema_model"].save_pretrained(ema_path, safe_serialization=True)
+
+        # Save training history
         logger.info("Saving training history")
         history_path = os.path.join(final_output_dir, "training_history.pt")
         torch.save(training_history, history_path)
-        
-        # Save training configuration
+
+        # Save full training config
         logger.info("Saving training configuration")
+        training_config = {
+            **vars(args),
+            "scheduler_config": scheduler_config,
+            "pipeline_config": pipeline_config,
+            "training_history": {
+                "num_epochs": args.num_epochs,
+                "batch_size": args.batch_size,
+                "learning_rate": args.learning_rate,
+                "gradient_accumulation_steps": args.gradient_accumulation_steps,
+            }
+        }
+        
         config_path = os.path.join(final_output_dir, "training_config.json")
         with open(config_path, "w") as f:
-            json.dump(vars(args), f, indent=2)
-        
+            json.dump(training_config, f, indent=2)
+
         logger.info("Successfully saved all final outputs")
-        
+
     except Exception as e:
         logger.error(f"Failed to save final outputs: {str(e)}")
         logger.error(f"Output directory: {final_output_dir}")

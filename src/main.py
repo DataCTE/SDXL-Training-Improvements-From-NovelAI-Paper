@@ -106,12 +106,28 @@ def parse_args():
                        help="Number of epochs between saving checkpoints")
     
     # Validation
-    parser.add_argument("--validation_frequency", type=int, default=1)
+    parser.add_argument("--validation_frequency", type=int, default=1,
+                       help="Number of epochs between validation runs")
+    parser.add_argument("--validation_steps", type=int, default=0,
+                       help="Number of steps between validation runs (0 to disable)")
     parser.add_argument("--skip_validation", action="store_true")
     parser.add_argument("--validation_prompts", type=str, nargs="+",
                        default=["a detailed portrait of a girl",
                                "completely black",
-                               "a red ball on top of a blue cube, both infront of a green triangle"])
+                               "a red ball on top of a blue cube"])
+    
+    # ZTSNR + V-Prediction settings
+    parser.add_argument("--zsnr", action="store_true", default=True)
+    parser.add_argument("--v_prediction", action="store_true", default=True)
+    parser.add_argument("--sigma_min", type=float, default=0.029)
+    parser.add_argument("--sigma_data", type=float, default=1.0)
+    parser.add_argument("--min_snr_gamma", type=float, default=5.0)
+    parser.add_argument("--resolution_scaling", action="store_true", default=True)
+    
+    # CFG Rescale settings
+    parser.add_argument("--rescale_cfg", action="store_true", default=True)
+    parser.add_argument("--scale_method", type=str, default="karras")
+    parser.add_argument("--rescale_multiplier", type=float, default=0.7)
     
     # HuggingFace Hub
     parser.add_argument("--push_to_hub", action="store_true")

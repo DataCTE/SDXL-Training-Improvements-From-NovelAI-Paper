@@ -9,6 +9,7 @@ from data.dataset import CustomDataset
 from models.tag_weighter import TagBasedLossWeighter
 from models.vae_finetuner import VAEFineTuner
 from training.utils import custom_collate
+from models.model_validator import ModelValidator
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +143,24 @@ def setup_training(args, models, device, dtype):
                 device=device
             )
         
+        # Initialize validator with new settings
+        validator = ModelValidator(
+            model_path=args.model_path,
+            device=device,
+            dtype=dtype,
+            # ZTSNR settings
+            zsnr=args.zsnr,
+            v_prediction=args.v_prediction,
+            sigma_min=args.sigma_min,
+            sigma_data=args.sigma_data,
+            min_snr_gamma=args.min_snr_gamma,
+            resolution_scaling=args.resolution_scaling,
+            # CFG settings
+            rescale_cfg=args.rescale_cfg,
+            scale_method=args.scale_method,
+            rescale_multiplier=args.rescale_multiplier
+        )
+        
         # Return all components
         train_components = {
             "dataset": dataset,
@@ -153,7 +172,7 @@ def setup_training(args, models, device, dtype):
             "num_update_steps_per_epoch": num_update_steps_per_epoch,
             "num_training_steps": num_training_steps,
             "ema_model": models.get("ema_model", None),
-            "validator": models.get("validator", None)
+            "validator": validator
         }
         
         logger.info("Training setup completed successfully")
