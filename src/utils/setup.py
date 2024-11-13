@@ -14,10 +14,10 @@ import wandb
 import numpy as np
 from diffusers import UNet2DConditionModel, AutoencoderKL
 from transformers import CLIPTokenizer, CLIPTextModel
-from safetensors.torch import load_file, save_file
 from torchvision import transforms
 import json
 import os
+
 
 logger = logging.getLogger(__name__)
 
@@ -451,111 +451,6 @@ def verify_training_components(train_components):
     except Exception as e:
         logger.error(f"Training component verification failed: {str(e)}")
         return False
-
-def save_checkpoint(models, train_components, args, epoch, global_step, training_history, output_dir):
-    """Save training checkpoint using safetensors format"""
-    os.makedirs(output_dir, exist_ok=True)
-    
-    try:
-        # Save UNet
-        unet_path = os.path.join(output_dir, "unet")
-        os.makedirs(unet_path, exist_ok=True)
-        models["unet"].save_pretrained(unet_path, safe_serialization=True)
-        
-        # Save EMA model if it exists
-        if models.get("ema_model") is not None:
-            logger.info("Saving EMA model state...")
-            ema_state = models["ema_model"].state_dict()
-            
-            # Convert model state dict to safetensors format
-            ema_tensors = {
-                f"ema_model.{key}": tensor
-                for key, tensor in ema_state["ema_model"].items()
-            }
-            
-            # Add metadata
-            ema_metadata = {
-                "num_updates": str(ema_state["num_updates"]),
-                "cur_decay_value": str(ema_state["cur_decay_value"])
-            }
-            
-            # Save EMA state using safetensors
-            save_file(
-                ema_tensors,
-                os.path.join(output_dir, "ema.safetensors"),
-                metadata=ema_metadata
-            )
-        
-        # Save training state as JSON
-        training_state = {
-            "epoch": epoch,
-            "global_step": global_step,
-            "training_history": training_history,
-            "args": vars(args)
-        }
-        with open(os.path.join(output_dir, "training_state.json"), "w") as f:
-            json.dump(training_state, f, indent=2)
-        
-        # Save optimizer state
-        torch.save({
-            "optimizer": train_components["optimizer"].state_dict(),
-            "lr_scheduler": train_components["lr_scheduler"].state_dict(),
-        }, os.path.join(output_dir, "optimizer.pt"))
-        
-        logger.info(f"Checkpoint saved successfully to {output_dir}")
-        
-    except Exception as e:
-        logger.error(f"Error saving checkpoint: {str(e)}")
-        raise
-
-def load_checkpoint(checkpoint_dir, models, train_components):
-    """Load checkpoint from safetensors format"""
-    try:
-        logger.info(f"Loading checkpoint from {checkpoint_dir}")
-        
-        # Load UNet
-        unet_path = os.path.join(checkpoint_dir, "unet")
-        if os.path.exists(unet_path):
-            models["unet"].load_state_dict(
-                load_file(os.path.join(unet_path, "diffusion_pytorch_model.safetensors"))
-            )
-        
-        # Load EMA if it exists
-        ema_path = os.path.join(checkpoint_dir, "ema.safetensors")
-        if os.path.exists(ema_path) and models.get("ema_model") is not None:
-            logger.info("Loading EMA model state...")
-            
-            # Load tensors and metadata
-            ema_tensors = load_file(ema_path)
-            ema_metadata = load_file(ema_path, metadata_only=True)
-            
-            # Reconstruct EMA state dict
-            ema_state = {
-                "ema_model": {
-                    key.replace("ema_model.", ""): tensor
-                    for key, tensor in ema_tensors.items()
-                },
-                "num_updates": int(ema_metadata["num_updates"]),
-                "cur_decay_value": float(ema_metadata["cur_decay_value"])
-            }
-            
-            models["ema_model"].load_state_dict(ema_state)
-        
-        # Load training state from JSON
-        with open(os.path.join(checkpoint_dir, "training_state.json"), "r") as f:
-            training_state = json.load(f)
-        
-        # Load optimizer state (using PyTorch)
-        optimizer_state = torch.load(os.path.join(checkpoint_dir, "optimizer.pt"))
-        train_components["optimizer"].load_state_dict(optimizer_state["optimizer"])
-        train_components["lr_scheduler"].load_state_dict(optimizer_state["lr_scheduler"])
-        
-        logger.info("Checkpoint loaded successfully")
-        return training_state
-        
-    except Exception as e:
-        logger.error(f"Error loading checkpoint: {str(e)}")
-        raise
 
 def cleanup(models, train_components, args):
     """Cleanup after training"""
