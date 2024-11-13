@@ -15,8 +15,9 @@ import numpy as np
 from .ultimate_upscaler import UltimateUpscaler, USDUMode, USDUSFMode
 from utils.validation import validate_image_dimensions
 import os
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import functools
+import gc
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,137 @@ class CustomDataset(Dataset):
         self._preprocess_images()
         self.tag_stats = self._build_tag_statistics()
         logger.info(f"Processed {len(self.image_paths)} images with tag statistics")
+
+        # Add batch processing for initial caching
+        if not no_caching_latents:
+            self._batch_process_latents()
+
+    def _batch_process_latents(self, batch_size=4):
+        """Process and cache latents in batches for better performance"""
+        uncached_images = [
+            img_path for img_path, lat_path in zip(self.image_paths, self.latent_paths)
+            if not lat_path.exists()
+        ]
+        
+        if not uncached_images:
+            logger.info("All latents are already cached")
+            return
+
+        logger.info(f"Caching latents for {len(uncached_images)} images in batches")
+        
+        def process_batch(batch_paths):
+            batch_results = []
+            batch_images = []
+            
+            # Load and preprocess images
+            for img_path in batch_paths:
+                try:
+                    image = Image.open(img_path).convert('RGB')
+                    width, height = image.size
+                    
+                    if not self.all_ar:
+                        target_width, target_height = self._get_target_size(width, height)
+                        image = self.process_image_size(image, target_width, target_height)
+                    
+                    transform = transforms.Compose([
+                        transforms.ToTensor(),
+                        transforms.Normalize([0.5], [0.5])
+                    ])
+                    image = transform(image).unsqueeze(0)
+                    batch_images.append((img_path, image))
+                except Exception as e:
+                    logger.error(f"Error processing {img_path}: {str(e)}")
+                    continue
+            
+            if not batch_images:
+                return []
+            
+            # Process batch through VAE
+            try:
+                with torch.no_grad():
+                    # Stack images
+                    image_tensor = torch.cat([img for _, img in batch_images], dim=0)
+                    image_tensor = image_tensor.to(self.vae.device, dtype=self.vae.dtype)
+                    
+                    # Generate latents
+                    latents = self.vae.encode(image_tensor).latent_dist.sample()
+                    latents = latents * self.vae.config.scaling_factor
+                    
+                    # Process each result
+                    for idx, (img_path, _) in enumerate(batch_images):
+                        latent = latents[idx]
+                        caption_path = Path(img_path).with_suffix('.txt')
+                        
+                        try:
+                            with open(caption_path, 'r', encoding='utf-8') as f:
+                                caption = f.read().strip()
+                            
+                            # Generate text embeddings
+                            text_inputs = self.tokenizer(
+                                caption,
+                                padding="max_length",
+                                max_length=self.tokenizer.model_max_length,
+                                truncation=True,
+                                return_tensors="pt"
+                            ).to(self.text_encoder.device)
+                            
+                            text_inputs_2 = self.tokenizer_2(
+                                caption,
+                                padding="max_length",
+                                max_length=self.tokenizer_2.model_max_length,
+                                truncation=True,
+                                return_tensors="pt"
+                            ).to(self.text_encoder_2.device)
+                            
+                            with torch.no_grad():
+                                text_embeddings = self.text_encoder(text_inputs.input_ids)[0]
+                                text_embeddings_2 = self.text_encoder_2(
+                                    text_inputs_2.input_ids,
+                                    output_hidden_states=True
+                                )
+                                pooled_output = text_embeddings_2[0]
+                                hidden_states = text_embeddings_2.hidden_states[-2]
+                            
+                            # Create cache data
+                            cache_data = {
+                                "latents": latent,
+                                "text_embeddings": text_embeddings,
+                                "text_embeddings_2": hidden_states,
+                                "added_cond_kwargs": {
+                                    "text_embeds": pooled_output,
+                                    "time_ids": self._get_add_time_ids(image_tensor[idx:idx+1])
+                                }
+                            }
+                            
+                            latent_path = self.cache_dir / f"{Path(img_path).stem}_latents.pt"
+                            torch.save(cache_data, latent_path)
+                            batch_results.append(latent_path)
+                            
+                        except Exception as e:
+                            logger.error(f"Error processing caption for {img_path}: {str(e)}")
+                            continue
+                            
+            except Exception as e:
+                logger.error(f"Error in batch processing: {str(e)}")
+                
+            # Clear CUDA cache after batch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            return batch_results
+
+        # Process in batches
+        processed_paths = []
+        for i in tqdm(range(0, len(uncached_images), batch_size), desc="Caching latents"):
+            batch = uncached_images[i:i + batch_size]
+            results = process_batch(batch)
+            processed_paths.extend(results)
+            
+            # Periodic garbage collection
+            if i % (batch_size * 4) == 0:
+                gc.collect()
+        
+        logger.info(f"Successfully cached {len(processed_paths)} latents")
 
     def _preprocess_images(self):
         """Preprocess all images to correct SDXL sizes and remove corrupted images"""
