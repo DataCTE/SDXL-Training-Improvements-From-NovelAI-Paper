@@ -19,11 +19,14 @@ logger = logging.getLogger(__name__)
 
 class CustomDataset(Dataset):
     def __init__(self, data_dir, vae, tokenizer, tokenizer_2, text_encoder, text_encoder_2,
-                 cache_dir="latents_cache"):
+                 cache_dir="latents_cache", no_caching_latents=False):
         super().__init__()
         self.data_dir = Path(data_dir)
         self.cache_dir = Path(cache_dir)
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.no_caching_latents = no_caching_latents
+        
+        if not no_caching_latents:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
         
         # Validate dataset first
         valid = validate_dataset(data_dir)[0]
@@ -194,8 +197,8 @@ class CustomDataset(Dataset):
             tags, special_tags = self._parse_tags(caption)
             tag_weights = self._calculate_tag_weights(tags, special_tags)
 
-        # Load cached latents if available
-        if latent_path.exists():
+        # Load cached latents if available and caching is enabled
+        if not self.no_caching_latents and latent_path.exists():
             cached_data = torch.load(latent_path)
             return {
                 "latents": cached_data["latents"],
@@ -207,7 +210,7 @@ class CustomDataset(Dataset):
                 "tag_weights": tag_weights
             }
         
-        # Generate latents if not cached
+        # Generate VAE latents
         try:
             # Load and process image
             image = Image.open(image_path).convert('RGB')
@@ -222,6 +225,7 @@ class CustomDataset(Dataset):
                 image = image.to(self.vae.device, dtype=self.vae.dtype)
                 latents = self.vae.encode(image).latent_dist.sample()
                 latents = latents * self.vae.config.scaling_factor
+                latents = latents.squeeze(0)
             
             # Process text embeddings
             text_inputs = self.tokenizer(
@@ -257,14 +261,15 @@ class CustomDataset(Dataset):
                     "time_ids": self._get_add_time_ids(image),
                 }
             
-            # Save to cache
-            cache_data = {
-                "latents": latents,
-                "text_embeddings": text_embeddings,
-                "text_embeddings_2": hidden_states,
-                "added_cond_kwargs": added_cond_kwargs
-            }
-            torch.save(cache_data, latent_path)
+            # Save to cache only if caching is enabled
+            if not self.no_caching_latents:
+                cache_data = {
+                    "latents": latents,
+                    "text_embeddings": text_embeddings,
+                    "text_embeddings_2": hidden_states,
+                    "added_cond_kwargs": added_cond_kwargs
+                }
+                torch.save(cache_data, latent_path)
             
             return {
                 "latents": latents,

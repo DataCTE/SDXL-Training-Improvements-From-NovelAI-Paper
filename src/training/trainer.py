@@ -12,6 +12,7 @@ from training.utils import save_checkpoint, load_checkpoint
 import math
 import os
 import numpy as np
+from data.dataset import CustomDataset
 
 
 logger = logging.getLogger(__name__)

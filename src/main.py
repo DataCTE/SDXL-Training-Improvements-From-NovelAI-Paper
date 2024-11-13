@@ -134,6 +134,10 @@ def parse_args():
     parser.add_argument("--hub_model_id", type=str)
     parser.add_argument("--hub_private", action="store_true")
     
+    # No caching latents
+    parser.add_argument('--no_caching_latents', action='store_true',
+                       help='Disable caching of VAE latents')
+    
     return parser.parse_args()
 
 def main(args):
