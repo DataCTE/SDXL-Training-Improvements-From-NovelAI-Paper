@@ -342,13 +342,7 @@ def setup_training(args, models, device, dtype):
             model_path=args.model_path,
             device=device,
             dtype=dtype,
-            zsnr=args.zsnr,
-            sigma_min=args.sigma_min,
-            sigma_data=args.sigma_data,
-            min_snr_gamma=args.min_snr_gamma,
-            rescale_cfg=args.rescale_cfg,
-            scale_method=args.scale_method,
-            rescale_multiplier=args.rescale_multiplier
+            zsnr=True
         )
         
         # Return all components
