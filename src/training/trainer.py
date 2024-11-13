@@ -29,7 +29,6 @@ def train_one_epoch(
     epoch,
     global_step,
     models,
-    train_components,
     training_history
 ):
     """Single epoch training loop"""
@@ -143,7 +142,7 @@ def train_one_epoch(
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 if dtype == torch.bfloat16:
                     # Clip gradients
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                    grad_norm_value = torch.nn.utils.clip_grad_norm_(
                         unet.parameters(), 
                         args.max_grad_norm
                     )
@@ -151,7 +150,7 @@ def train_one_epoch(
                 else:
                     # Clip gradients with scaler
                     scaler.unscale_(optimizer)
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                    grad_norm_value = torch.nn.utils.clip_grad_norm_(
                         unet.parameters(),
                         args.max_grad_norm
                     )
