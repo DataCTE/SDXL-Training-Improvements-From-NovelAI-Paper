@@ -46,9 +46,16 @@ class CustomDataset(Dataset):
         if not valid:
             raise ValueError("Dataset validation failed")
             
-        # Get all valid image paths
-        self.image_paths = sorted(list(self.data_dir.glob("*.png")))
+        # Get all valid image paths (support multiple formats)
+        self.image_paths = []
+        for ext in ['*.png', '*.jpg', '*.jpeg', '*.webp']:
+            self.image_paths.extend(self.data_dir.glob(ext))
+        self.image_paths = sorted(self.image_paths)
+        
         self.latent_paths = [self.cache_dir / f"{path.stem}_latents.pt" for path in self.image_paths]
+        
+        # Log dataset size
+        logger.info(f"Found {len(self.image_paths)} images in dataset")
         
         # Store model references
         self.vae = vae
@@ -74,7 +81,7 @@ class CustomDataset(Dataset):
         valid_images = []
         corrupted_images = []
         
-        for img_path in tqdm(self.image_paths, desc="Preprocessing images"):
+        for img_path in tqdm(self.image_paths, desc="Preprocessing images", total=len(self.image_paths)):
             try:
                 # Verify image can be opened and is valid
                 with Image.open(img_path) as image:
@@ -95,10 +102,15 @@ class CustomDataset(Dataset):
                     # Process image size with advanced scaling
                     processed = self.process_image_size(image, target_width, target_height)
                     
-                    # Save processed image
-                    processed.save(img_path, quality=95)
+                    # Save processed image as PNG for consistency
+                    output_path = img_path.with_suffix('.png')
+                    processed.save(output_path, format='PNG', quality=95)
+                    
+                    if output_path != img_path:
+                        os.remove(img_path)  # Remove original if format changed
+                        
                     logger.info(f"Processed {img_path}: {width}x{height} -> {target_width}x{target_height}")
-                    valid_images.append(img_path)
+                    valid_images.append(output_path)
                     
             except (IOError, SyntaxError, OSError) as e:
                 logger.error(f"Error preprocessing {img_path}: {str(e)}")
