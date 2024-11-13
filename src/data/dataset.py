@@ -13,6 +13,7 @@ import os
 import time
 import glob
 import random
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -57,32 +58,33 @@ class CustomDataset(Dataset):
             special_tags['niji'] = True
             raw_tags = raw_tags[1:]
         
-        # Handle quality tag (6) at end
-        if raw_tags and raw_tags[-1].strip() == '6':
-            special_tags['quality'] = 6
-            raw_tags = raw_tags[:-1]
-        
         for tag in raw_tags:
             tag = tag.lower().strip()
             
-            # Handle stylize
-            if 'stylize' in tag or '--s' in tag:
+            # Handle compound tags with weights (format: "value::weight")
+            if '::' in tag:
+                parts = tag.split('::')
+                tag = parts[0].strip()
                 try:
-                    value = int(tag.split('(')[1].split(')')[0])
-                    special_tags['stylize'] = max(1, min(1000, value))
-                except:
-                    special_tags['stylize'] = 100
-            
-            # Handle chaos
-            elif 'chaos' in tag:
-                try:
-                    value = int(tag.split('(')[1].split(')')[0])
-                    special_tags['chaos'] = max(0, min(100, value))
-                except:
-                    special_tags['chaos'] = 0
-            
-            else:
-                tags.append(tag)
+                    weight = float(parts[1])
+                    special_tags[f'{tag}_weight'] = weight
+                except: pass
+
+            # Handle style references
+            if 'sref' in tag:
+                refs = re.findall(r'[a-f0-9]{8}|https?://[^\s>]+', tag)
+                if refs:
+                    special_tags['sref'] = refs
+
+            # Handle numeric parameters
+            for param in ['stylize', 'chaos', 'quality', 'sw', 'sv']:
+                if param in tag:
+                    try:
+                        value = float(re.search(r'[\d.]+', tag).group())
+                        special_tags[param] = value
+                    except: continue
+
+            tags.append(tag)
         
         return tags, special_tags
 
