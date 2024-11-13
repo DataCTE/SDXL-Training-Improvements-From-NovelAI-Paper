@@ -142,6 +142,57 @@ class CustomDataset(Dataset):
             
         return weights
 
+    def _format_caption(self, caption):
+        """Format caption by cleaning and standardizing tags"""
+        # Remove extra whitespace and normalize separators
+        caption = re.sub(r'\s+', ' ', caption.strip())
+        caption = re.sub(r'\s*,\s*', ', ', caption)
+        
+        # Split into tags
+        tags = [t.strip().lower() for t in caption.split(',')]
+        
+        # Process tags
+        formatted_tags = []
+        special_params = []
+        
+        # Check if it has MJ-specific tags
+        has_mj_tags = any('niji' in t.lower() or t.strip() in ['4', '5', '6'] for t in tags)
+        
+        for tag in tags:
+            # Skip empty tags
+            if not tag:
+                continue
+                
+            # Handle special parameters (like --ar, etc)
+            if tag.startswith('--'):
+                special_params.append(tag)
+                continue
+                
+            # Handle version numbers - convert to masterpiece (only if MJ tags present)
+            if has_mj_tags and tag in ['4', '5', '6']:
+                if 'masterpiece' not in formatted_tags:
+                    formatted_tags.append('masterpiece')
+                continue
+                
+            # Handle style parameters (only if MJ tags present)
+            if has_mj_tags and any(param in tag for param in ['stylize', 'chaos', 'quality', 'niji']):
+                special_params.append(tag)
+                continue
+                
+            # Clean up regular tags
+            tag = tag.strip()
+            if tag.startswith(('a ', 'an ', 'the ')):  # Remove articles
+                tag = ' '.join(tag.split()[1:])
+            
+            formatted_tags.append(tag)
+        
+        # Combine tags and parameters
+        formatted_caption = ', '.join(formatted_tags)
+        if special_params:
+            formatted_caption += ', ' + ', '.join(special_params)
+            
+        return formatted_caption
+
     def _build_tag_statistics(self):
         """Build dataset-wide tag statistics and format captions"""
         stats = {
