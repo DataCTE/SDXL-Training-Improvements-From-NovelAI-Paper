@@ -154,8 +154,6 @@ def parse_args():
     # Performance and Training Settings
     parser.add_argument('--mixed_precision', action='store_true', default=True,
                        help='Enable mixed precision training')
-    parser.add_argument('--max_grad_norm', type=float, default=1.0,
-                       help='Maximum gradient norm for clipping')
     return parser.parse_args()
 
 def main(args):
