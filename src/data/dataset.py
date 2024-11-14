@@ -1218,14 +1218,19 @@ class BucketSampler(Sampler):
     """
     def __init__(self, dataset, batch_size, drop_last=True):
         super().__init__(dataset)
-        if not hasattr(dataset, 'buckets'):
-            raise ValueError("Dataset must have 'buckets' attribute for BucketSampler")
+        if not hasattr(dataset, 'bucket_data'):
+            raise ValueError("Dataset must have 'bucket_data' attribute for BucketSampler")
         
         self.batch_size = batch_size
         self.drop_last = drop_last
+        
         # Store (bucket, index) pairs for all valid samples
-        self.samples = [(bucket, idx) for bucket, indices in dataset.buckets.items() 
-                       for idx in indices]
+        self.samples = []
+        for bucket, img_paths in dataset.bucket_data.items():
+            for img_path in img_paths:
+                idx = dataset.image_paths.index(img_path)
+                self.samples.append((bucket, idx))
+                
         if not self.samples:
             raise ValueError("No valid samples found in dataset buckets")
         
@@ -1235,15 +1240,16 @@ class BucketSampler(Sampler):
     def _validate_buckets(self, dataset):
         """Validate bucket configurations to prevent runtime errors"""
         bucket_sizes = {}
-        for bucket, indices in dataset.buckets.items():
-            if not indices:  # Skip empty buckets
+        for bucket, img_paths in dataset.bucket_data.items():
+            if not img_paths:  # Skip empty buckets
                 continue
             # Sample an image from each bucket to verify size
-            sample_idx = indices[0]
+            sample_path = img_paths[0]
             try:
-                sample = dataset[sample_idx]
+                idx = dataset.image_paths.index(sample_path)
+                sample = dataset[idx]
                 if sample is None:
-                    raise ValueError(f"Invalid sample at index {sample_idx} in bucket {bucket}")
+                    raise ValueError(f"Invalid sample at index {idx} in bucket {bucket}")
                 bucket_sizes[bucket] = sample['bucket_size']
             except Exception as e:
                 raise ValueError(f"Error validating bucket {bucket}: {str(e)}")
