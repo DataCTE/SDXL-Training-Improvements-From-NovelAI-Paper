@@ -51,7 +51,7 @@ def setup_models(args, device, dtype):
         models = {}
         
         logger.info("Loading SDXL pipeline...")
-        pipeline = DiffusionPipeline.from_pretrained(
+        pipeline = StableDiffusionXLPipeline.from_pretrained(
             args.pretrained_model_name_or_path,
             torch_dtype=dtype,
             use_safetensors=True,
