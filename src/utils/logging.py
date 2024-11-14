@@ -127,12 +127,28 @@ def setup_wandb(args):
             )
         )
         
-        # Define custom metrics for more efficient tracking
-        wandb.define_metric("train/loss", summary="min")
-        wandb.define_metric("train/lr", summary="last")
-        wandb.define_metric("validation/metrics/*", summary="mean")
-        wandb.define_metric("memory/*", summary="max")
-        wandb.define_metric("performance/*", summary="mean")
+        # Define loss metrics
+        wandb.define_metric("loss/*", summary="min", step_metric="global_step")
+        wandb.define_metric("train/loss", summary="min", step_metric="global_step")
+        wandb.define_metric("val/loss", summary="min", step_metric="global_step")
+        
+        # Define learning rate metrics
+        wandb.define_metric("lr/*", summary="last", step_metric="global_step")
+        wandb.define_metric("train/lr", summary="last", step_metric="global_step")
+        
+        # Define epoch metrics
+        wandb.define_metric("epoch", summary="max")
+        wandb.define_metric("epoch/*", step_metric="epoch")
+        
+        # Define validation metrics
+        wandb.define_metric("validation/*", summary="last", step_metric="epoch")
+        
+        # Define performance metrics
+        wandb.define_metric("performance/*", summary="mean", step_metric="global_step")
+        wandb.define_metric("memory/*", summary="max", step_metric="global_step")
+        
+        # Define gradient metrics
+        wandb.define_metric("gradients/*", summary="mean", step_metric="global_step")
         
         logging.info(f"Initialized W&B run: {run.name}")
         return run
@@ -140,6 +156,66 @@ def setup_wandb(args):
     except Exception as e:
         logging.error(f"Failed to initialize W&B: {str(e)}")
         return None
+
+def log_metrics_batch(metrics_dict, step=None):
+    """
+    Efficiently log metrics in batches to reduce API calls
+    
+    Args:
+        metrics_dict (dict): Dictionary of metrics to log
+        step (int, optional): Global training step
+    """
+    if not wandb.run:
+        return
+        
+    try:
+        wandb.log(metrics_dict, step=step)
+    except Exception as e:
+        logging.warning(f"Failed to log metrics batch: {str(e)}")
+
+def log_model_gradients(model, step):
+    """
+    Log model gradient statistics
+    
+    Args:
+        model: PyTorch model
+        step (int): Global training step
+    """
+    if not wandb.run:
+        return
+        
+    try:
+        grad_dict = {}
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                grad_dict[f"gradients/{name}/mean"] = param.grad.mean().item()
+                grad_dict[f"gradients/{name}/std"] = param.grad.std().item()
+                grad_dict[f"gradients/{name}/norm"] = param.grad.norm().item()
+        
+        if grad_dict:
+            wandb.log(grad_dict, step=step)
+    except Exception as e:
+        logging.warning(f"Failed to log model gradients: {str(e)}")
+
+def log_memory_stats(step):
+    """
+    Log GPU memory statistics
+    
+    Args:
+        step (int): Global training step
+    """
+    if not wandb.run or not torch.cuda.is_available():
+        return
+        
+    try:
+        memory_stats = {
+            "memory/allocated": torch.cuda.memory_allocated() / 1024**2,  # MB
+            "memory/reserved": torch.cuda.memory_reserved() / 1024**2,    # MB
+            "memory/max_allocated": torch.cuda.max_memory_allocated() / 1024**2,  # MB
+        }
+        wandb.log(memory_stats, step=step)
+    except Exception as e:
+        logging.warning(f"Failed to log memory stats: {str(e)}")
 
 def cleanup_wandb(run):
     """
@@ -158,20 +234,3 @@ def cleanup_wandb(run):
             run.finish(quiet=True)  # Suppress verbose output
         except Exception as e:
             logging.error(f"Error closing W&B run: {str(e)}")
-
-def log_metrics_batch(metrics_dict, step=None):
-    """
-    Efficiently log metrics in batches to reduce API calls
-    
-    Args:
-        metrics_dict (dict): Dictionary of metrics to log
-        step (int, optional): Global training step
-    """
-    if not wandb.run:
-        return
-    
-    try:
-        # Use wandb.log with step to ensure correct metric tracking
-        wandb.log(metrics_dict, step=step)
-    except Exception as e:
-        logging.error(f"Metrics logging failed: {str(e)}")

@@ -9,11 +9,6 @@ from pathlib import Path
 
 
 from training.trainer import train
-from utils.setup import (
-    setup_torch_backends,
-    setup_models,
-    setup_training
-)
 from utils.checkpoint import load_checkpoint, save_checkpoint, save_final_outputs
 from utils.model_card import create_model_card, save_model_card, push_to_hub
 from utils.logging import (
@@ -21,7 +16,9 @@ from utils.logging import (
     log_system_info,
     log_training_setup,
     setup_wandb,
-    cleanup_wandb
+    cleanup_wandb,
+    log_memory_stats,
+    log_model_gradients
 )
 
 logger = logging.getLogger(__name__)
@@ -140,9 +137,15 @@ def parse_args():
     parser.add_argument("--resume_from_checkpoint", type=str)
     
     # Logging and monitoring
-    parser.add_argument("--use_wandb", action="store_true")
-    parser.add_argument("--wandb_project", type=str, default="sdxl-training")
-    parser.add_argument("--wandb_run_name", type=str)
+    parser.add_argument("--use_wandb", action="store_true", help="Enable Weights & Biases logging")
+    parser.add_argument("--wandb_project", type=str, default="sdxl-training",
+                       help="W&B project name")
+    parser.add_argument("--wandb_run_name", type=str, default=None,
+                       help="W&B run name (default: auto-generated)")
+    parser.add_argument("--wandb_watch", action="store_true",
+                       help="Enable W&B model parameter and gradient logging")
+    parser.add_argument("--wandb_log_freq", type=int, default=10,
+                       help="Log metrics every N steps")
     parser.add_argument("--logging_steps", type=int, default=10,
                        help="Number of steps between logging updates")
     parser.add_argument("--save_epochs", type=int, default=1,
@@ -189,116 +192,80 @@ def main(args):
     """Main training pipeline"""
     wandb_run = None
     try:
-        # Setup logging
-        setup_logging(log_dir=args.output_dir)
+        # Set up logging
+        setup_logging(args)
         log_system_info()
         
-        # Initialize W&B
+        # Set up Weights & Biases
         wandb_run = setup_wandb(args)
         
-        # Setup environment
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        dtype = torch.bfloat16
-        logger.info(f"Using device: {device}, dtype: {dtype}")
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            if hasattr(torch.cuda, 'memory_stats'):
-                logger.info(f"Initial CUDA memory: {torch.cuda.memory_allocated()/1e9:.2f}GB")
-
-        # === Initialize Components ===
-        models = setup_models(args, device, dtype)
-        train_components = setup_training(args, models, device, dtype)
+        # Log training setup and initial system state
+        log_training_setup(args)
+        if wandb_run and args.wandb_watch:
+            wandb_run.watch(models.unet, log="all", log_freq=args.wandb_log_freq)
         
-        # Load checkpoint if resuming
-        start_epoch = 0
-        if args.resume_from_checkpoint:
-            logger.info(f"Loading checkpoint from {args.resume_from_checkpoint}")
-            training_state = load_checkpoint(args.resume_from_checkpoint, models, train_components)
-            start_epoch = training_state["epoch"] + 1
-            logger.info(f"Resuming from epoch {start_epoch}")
+        # Load model and log initial memory stats
+        models, train_components, training_history = load_checkpoint(args)
+        if wandb_run:
+            log_memory_stats(step=0)
+        
+        # Train model
+        global_step = 0
+        for epoch in range(args.num_epochs):
+            logger.info(f"Starting epoch {epoch + 1}/{args.num_epochs}")
             
-        # Log training setup
-        log_training_setup(args, models, train_components)
-        
-        # === Training ===
-        logger.info("\nStarting training...")
-        training_history = train(args, models, train_components, device, dtype)
-        
-        # === Save Outputs ===
-        logger.info("\nSaving final outputs...")
+            # Train for one epoch
+            epoch_metrics = train(args, models, train_components)
+            
+            if wandb_run:
+                # Log epoch metrics
+                wandb.log({
+                    "epoch": epoch + 1,
+                    "epoch/loss": epoch_metrics["loss"],
+                    "epoch/learning_rate": epoch_metrics["learning_rate"],
+                    **{f"epoch/{k}": v for k, v in epoch_metrics.items() 
+                       if k not in ["loss", "learning_rate"]}
+                }, step=global_step)
+                
+                # Log model gradients
+                log_model_gradients(models.unet, step=global_step)
+                
+                # Log memory stats
+                log_memory_stats(step=global_step)
+            
+            global_step += len(train_components["train_dataloader"])
+
+        # Save final outputs
         save_final_outputs(args, models, training_history, train_components)
-        
-        # Create and save model card
-        model_card = create_model_card(args, training_history)
-        if model_card:
-            save_model_card(model_card, args.output_dir)
-            
-            # Push to Hub if requested
-            if args.push_to_hub:
-                logger.info("\nPushing to HuggingFace Hub...")
-                try:
-                    push_to_hub(
-                        args.hub_model_id,
-                        args.output_dir,
-                        args.hub_private,
-                        model_card
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to push to Hub: {str(e)}")
 
-        logger.info("\n=== Training Pipeline Completed Successfully ===")
+        # Push to HuggingFace Hub
+        if args.push_to_hub:
+            push_to_hub(args, models)
+
+        # Save model card
+        save_model_card(args, models)
+        
+        # Log final metrics if using W&B
+        if wandb_run:
+            wandb.log({
+                "training/completed": True,
+                "training/total_steps": global_step,
+                "training/final_loss": epoch_metrics["loss"],
+                "training/final_lr": epoch_metrics["learning_rate"]
+            })
+        
         return True
-
-    except KeyboardInterrupt:
-        logger.warning("\nTraining interrupted by user")
-        emergency_dir = os.path.join(args.output_dir, "emergency_checkpoint")
-        logger.info(f"Saving emergency checkpoint to {emergency_dir}")
-        try:
-            save_checkpoint(models, train_components, args, -1, training_history, emergency_dir)
-        except Exception as save_error:
-            logger.error(f"Failed to save emergency checkpoint: {save_error}")
-        return False
-
+        
     except Exception as e:
-        logger.error(f"\nTraining failed with error: {str(e)}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
+        logger.error(f"Training failed with error: {str(e)}")
+        logger.error(traceback.format_exc())
+        if wandb_run:
+            wandb.log({"training/failed": True, "training/error": str(e)})
         return False
-
+        
     finally:
-        cleanup_wandb(wandb_run)
-
-def setup_wandb(args):
-    """Initialize Weights & Biases logging"""
-    if args.use_wandb:
-        wandb.init(
-            project=args.wandb_project,
-            name=args.wandb_run_name,
-            config=vars(args),
-            group="training",
-        )
-        
-        # Define metric groupings
-        wandb.define_metric("loss/*", summary="min")
-        wandb.define_metric("model/*", summary="last")
-        wandb.define_metric("noise/*", summary="mean")
-        wandb.define_metric("lr/*", summary="last")
-        
-        # Create custom panels
-        wandb.define_metric("loss/current", step_metric="step")
-        wandb.define_metric("loss/average", step_metric="step")
-        wandb.define_metric("loss/running", step_metric="step")
-        wandb.define_metric("lr/textencoder", step_metric="step")
-        wandb.define_metric("lr/unet", step_metric="step")
-        
-        # Add epoch-specific metric groupings
-        wandb.define_metric("epoch", summary="max")
-        wandb.define_metric("epoch/*", step_metric="epoch")
-        wandb.define_metric("epoch/progress", summary="last")
-        wandb.define_metric("epoch/average_loss", summary="min")
-        
-        return wandb.run
-    return None
+        if wandb_run:
+            cleanup_wandb(wandb_run)
 
 if __name__ == "__main__":
     try:
