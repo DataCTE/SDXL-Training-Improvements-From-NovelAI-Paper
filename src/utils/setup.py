@@ -200,6 +200,32 @@ def setup_models(args, device, dtype):
         logger.error(traceback.format_exc())
         raise
 
+def clean_error_message(error_msg):
+    # Clean up shape mismatch errors
+    lines = error_msg.split('\n')
+    cleaned_lines = []
+    
+    for line in lines:
+        # Skip lines that are just parameter names
+        if line.strip().endswith('"') or line.strip().endswith('.'):
+            continue
+            
+        # Simplify shape mismatch messages
+        if "size mismatch for" in line:
+            parts = line.split(': ')
+            if len(parts) >= 2:
+                param_name = parts[0].split('size mismatch for ')[1]
+                shapes = parts[1].split('copying a param with shape ')[1]
+                # Extract just the shapes
+                current_shape = shapes.split(', the shape in current model is ')[1]
+                checkpoint_shape = shapes.split(', the shape in current model is ')[0]
+                cleaned_line = f"Shape mismatch - {param_name}: expected {current_shape}, got {checkpoint_shape}"
+                cleaned_lines.append(cleaned_line)
+        else:
+            cleaned_lines.append(line)
+    
+    return '\n'.join(cleaned_lines)
+
 def setup_training(args, models, device, dtype):
     """Setup training components"""
     logger.info("Starting training setup process...")
@@ -419,17 +445,22 @@ def setup_training(args, models, device, dtype):
     except Exception as e:
         error_msg = str(e)
         error_traceback = traceback.format_exc()
-        error_lines = error_traceback.split('\n')
+        
+        # Clean up the error message
+        cleaned_error = clean_error_message(error_msg)
+        cleaned_traceback = clean_error_message(error_traceback)
+        
+        error_lines = cleaned_traceback.split('\n')
         
         # Write to file if error is longer than 3 lines
         if len(error_lines) > 3:
             with open('training_setup_error.log', 'w') as f:
-                f.write(error_traceback)
+                f.write(cleaned_traceback)
             logger.error("✗ Training setup failed")
-            logger.error(f"Error details: {error_msg}")
+            logger.error(f"Error details: {cleaned_error}")
             logger.error(f"Full error traceback has been written to 'training_setup_error.log'")
         else:
             logger.error("✗ Training setup failed")
-            logger.error(f"Error details: {error_msg}")
-            logger.error(error_traceback)
+            logger.error(f"Error details: {cleaned_error}")
+            logger.error(cleaned_traceback)
         raise
