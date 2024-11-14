@@ -301,8 +301,13 @@ def setup_wandb(args):
     return None
 
 if __name__ == "__main__":
-    # Add multiprocessing start method configuration
-    torch.multiprocessing.set_start_method('spawn')
+    try:
+        # Try to set the start method only if it hasn't been set yet
+        if not torch.multiprocessing.get_start_method(allow_none=True):
+            torch.multiprocessing.set_start_method('spawn')
+    except RuntimeError as e:
+        # If already set, just log and continue
+        logger.info("Multiprocessing start method already set")
     
     setup_torch_backends()
     args = parse_args()
