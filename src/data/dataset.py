@@ -1098,3 +1098,51 @@ class CustomDataset(Dataset):
         except Exception as e:
             logger.error(f"Error getting item {idx}: {str(e)}")
             return None
+
+def custom_collate(batch):
+    """
+    Custom collate function for DataLoader that handles batches with same-sized images
+    and supports aspect ratio bucketing.
+    
+    Args:
+        batch: List of samples from the dataset
+        
+    Returns:
+        Collated batch dictionary with:
+        - pixel_values: Stacked image tensors
+        - input_ids: Stacked token tensors
+        - attention_mask: Stacked attention masks
+        - bucket_size: Tuple of (height, width) for the current bucket
+    """
+    # Filter out None values that might come from failed loading
+    batch = [b for b in batch if b is not None]
+    if not batch:
+        return None
+        
+    # All images in a batch should have same dimensions due to bucketing
+    pixel_values = torch.stack([item["pixel_values"] for item in batch])
+    input_ids = torch.stack([item["input_ids"] for item in batch]) if "input_ids" in batch[0] else None
+    attention_mask = torch.stack([item["attention_mask"] for item in batch]) if "attention_mask" in batch[0] else None
+    
+    # Get bucket size from first item
+    bucket_size = batch[0]["pixel_values"].shape[-2:]  # (H, W)
+    
+    collated_batch = {
+        "pixel_values": pixel_values,
+        "bucket_size": bucket_size
+    }
+    
+    if input_ids is not None:
+        collated_batch["input_ids"] = input_ids
+    if attention_mask is not None:
+        collated_batch["attention_mask"] = attention_mask
+        
+    # Add any additional fields that are present in all batch items
+    extra_keys = [k for k in batch[0].keys() if k not in ["pixel_values", "input_ids", "attention_mask", "bucket_size"]]
+    for k in extra_keys:
+        if isinstance(batch[0][k], torch.Tensor):
+            collated_batch[k] = torch.stack([item[k] for item in batch])
+        else:
+            collated_batch[k] = [item[k] for item in batch]
+            
+    return collated_batch
