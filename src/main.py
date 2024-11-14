@@ -199,13 +199,15 @@ def main(args):
         # Set up Weights & Biases
         wandb_run = setup_wandb(args)
         
+        # Load model and log initial memory stats
+        models, train_components, training_history = load_checkpoint(args)
+        
         # Log training setup and initial system state
-        log_training_setup(args)
+        log_training_setup(args, models, train_components)
+        
         if wandb_run and args.wandb_watch:
             wandb_run.watch(models.unet, log="all", log_freq=args.wandb_log_freq)
         
-        # Load model and log initial memory stats
-        models, train_components, training_history = load_checkpoint(args)
         if wandb_run:
             log_memory_stats(step=0)
         
