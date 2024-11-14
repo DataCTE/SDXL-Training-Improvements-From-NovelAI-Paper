@@ -9,7 +9,6 @@ from training import (
 
 from data import (
     CustomDataset,
-    custom_collate,
     TagBasedLossWeighter,
     UltimateUpscaler,
     USDUMode,
@@ -54,7 +53,6 @@ __all__ = [
     
     # Data
     'CustomDataset',
-    'custom_collate',
     'TagBasedLossWeighter',
     'UltimateUpscaler',
     'USDUMode',

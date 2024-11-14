@@ -1,10 +1,9 @@
-from .dataset import CustomDataset, custom_collate
+from .dataset import CustomDataset
 from .tag_weighter import TagBasedLossWeighter
 from .ultimate_upscaler import UltimateUpscaler, USDUMode, USDUSFMode
 
 __all__ = [
     'CustomDataset',
-    'custom_collate',
     'TagBasedLossWeighter',
     'UltimateUpscaler',
     'USDUMode',
