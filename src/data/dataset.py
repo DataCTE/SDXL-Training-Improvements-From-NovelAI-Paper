@@ -1137,3 +1137,62 @@ def custom_collate(batch):
             collated_batch[k] = [item[k] for item in batch]
             
     return collated_batch
+
+def create_dataloader(
+    data_dir: str,
+    batch_size: int,
+    num_workers: int = None,
+    cache_dir: str = "latents_cache",
+    all_ar: bool = False,
+    shuffle: bool = True,
+    pin_memory: bool = True,
+    prefetch_factor: int = 2,
+    persistent_workers: bool = True
+):
+    """
+    Create a DataLoader with the CustomDataset.
+    
+    Args:
+        data_dir (str): Directory containing the training images
+        batch_size (int): Batch size for training
+        num_workers (int, optional): Number of worker processes
+        cache_dir (str, optional): Directory to cache latents
+        all_ar (bool, optional): Accept all aspect ratios without resizing
+        shuffle (bool, optional): Whether to shuffle the dataset
+        pin_memory (bool, optional): Use pinned memory for faster GPU transfer
+        prefetch_factor (int, optional): Number of batches to prefetch per worker
+        persistent_workers (bool, optional): Keep worker processes alive between epochs
+    
+    Returns:
+        torch.utils.data.DataLoader: Configured data loader
+    """
+    try:
+        # Initialize dataset
+        dataset = CustomDataset(
+            data_dir=data_dir,
+            cache_dir=cache_dir,
+            all_ar=all_ar,
+            num_workers=num_workers
+        )
+        
+        # Create data loader
+        dataloader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers if num_workers is not None else min(8, os.cpu_count() or 1),
+            pin_memory=pin_memory,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None,
+            persistent_workers=persistent_workers if num_workers > 0 else False,
+            collate_fn=custom_collate
+        )
+        
+        logger.info(f"Created DataLoader with {len(dataset)} samples")
+        logger.info(f"Batch size: {batch_size}, Num workers: {num_workers}")
+        
+        return dataloader
+        
+    except Exception as e:
+        logger.error(f"Failed to create DataLoader: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise
