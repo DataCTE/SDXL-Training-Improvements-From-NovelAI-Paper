@@ -1,6 +1,6 @@
 from .checkpoint import save_checkpoint, load_checkpoint, save_final_outputs
 from .device import cleanup, get_device, to_device
-from .hub import push_to_hub, verify_training_components
+from .hub import push_to_hub
 from .logging import (
     setup_logging,
     log_system_info,
@@ -20,7 +20,6 @@ __all__ = [
     'get_device',
     'to_device',
     'push_to_hub',
-    'verify_training_components',
     'setup_logging',
     'log_system_info',
     'log_training_setup',
