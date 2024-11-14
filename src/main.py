@@ -21,6 +21,7 @@ from utils.logging import (
     log_model_gradients
 )
 from training.trainer import get_cosine_schedule_with_warmup
+from data.dataset import create_dataloader
 
 
 logger = logging.getLogger(__name__)
@@ -169,10 +170,6 @@ def parse_args():
     parser.add_argument("--hub_model_id", type=str)
     parser.add_argument("--hub_private", action="store_true")
     
-    # No caching latents
-    parser.add_argument('--no_caching_latents', action='store_true',
-                       help='Disable caching of VAE latents')
-    
     # Add to argument parser
     parser.add_argument('--all_ar', action='store_true',
                        help='Accept all aspect ratios without resizing')
@@ -219,13 +216,11 @@ def main(args):
                         model.gradient_checkpointing_enable()
         
         # Setup data loader first since we need it for lr_scheduler
-        from training.data import create_dataloader
         train_dataloader = create_dataloader(
             data_dir=args.data_dir,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
             all_ar=args.all_ar,
-            no_caching_latents=args.no_caching_latents,
             cache_dir=args.cache_dir
         )
         
