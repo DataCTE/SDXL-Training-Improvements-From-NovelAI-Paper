@@ -56,14 +56,15 @@ class UltimateUpscaler:
         tile_height: int,
         padding: int = 32
     ) -> Image.Image:
-        """Create a mask for a single tile"""
+        """Create a mask for a single tile with padding"""
         mask = Image.new("L", (width, height), "black")
         draw = ImageDraw.Draw(mask)
         
-        x1 = x * tile_width
-        y1 = y * tile_height
-        x2 = min(x1 + tile_width, width)
-        y2 = min(y1 + tile_height, height)
+        # Calculate tile coordinates with padding
+        x1 = max(0, x * tile_width - padding)
+        y1 = max(0, y * tile_height - padding)
+        x2 = min(x1 + tile_width + 2 * padding, width)
+        y2 = min(y1 + tile_height + 2 * padding, height)
         
         draw.rectangle([x1, y1, x2, y2], fill="white")
         return mask

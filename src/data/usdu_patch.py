@@ -16,14 +16,32 @@ def round_length(length, multiple=8):
 
 
 # Upscaler
-old_init = usdu.USDUpscaler.__init__
+old_init = usdu.UltimateUpscaler.__init__
 
-def new_init(self, p, image, upscaler_index, save_redraw, save_seams_fix, tile_width, tile_height):
+def new_init(self, *args, **kwargs):
+    # Extract image and upscale factor before calling old_init
+    if 'image' in kwargs:
+        image = kwargs['image']
+    elif args:
+        image = args[0]  # Assuming image is first positional argument
+    else:
+        raise ValueError("Image not provided to initializer")
+
+    if 'p' in kwargs:
+        p = kwargs['p']
+    elif len(args) > 1:
+        p = args[1]  # Assuming p is second positional argument
+    else:
+        raise ValueError("Processing parameters not provided to initializer")
+
+    # Round dimensions before original initialization
     p.width = round_length(image.width * p.upscale_by)
     p.height = round_length(image.height * p.upscale_by)
-    old_init(self, p, image, upscaler_index, save_redraw, save_seams_fix, tile_width, tile_height)
 
-usdu.USDUpscaler.__init__ = new_init
+    # Now call original init with updated parameters
+    old_init(self, *args, **kwargs)
+
+usdu.UltimateUpscaler.__init__ = new_init
 
 # Redraw
 old_setup_redraw = usdu.USDURedraw.init_draw
