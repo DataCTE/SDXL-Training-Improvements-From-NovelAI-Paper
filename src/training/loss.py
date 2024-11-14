@@ -4,21 +4,41 @@ import logging
 import traceback
 from torchvision import transforms, models
 import numpy as np
+from typing import Optional, Dict, Any, Tuple
 
 logger = logging.getLogger(__name__)
 
-def get_sigmas(num_inference_steps=28, sigma_min=0.0292, height=1024, width=1024):
+def get_sigmas(num_inference_steps: int = 28, 
+               sigma_min: float = 0.0292, 
+               height: int = 1024, 
+               width: int = 1024,
+               verbose: bool = True) -> torch.Tensor:
     """
-    Generate sigmas for ZTSNR with resolution-dependent scaling using 28-step native schedule
-    Modified for better noise control and ZTSNR support
+    Generate sigmas for ZTSNR with resolution-dependent scaling using 28-step native schedule.
+    Implements NovelAI's quadratic scaling for redundant signal (section 2.3).
+    
+    Args:
+        num_inference_steps: Number of inference steps (default: 28 from NovelAI paper)
+        sigma_min: Minimum sigma value (default: 0.0292 from SDXL paper)
+        height: Image height for resolution scaling
+        width: Image width for resolution scaling
+        verbose: Whether to log sigma schedule details
+    
+    Returns:
+        torch.Tensor: Generated sigma schedule
     """
-    # Calculate resolution-dependent sigma_max with quadratic scaling (section 2.3)
+    # Calculate resolution-dependent sigma_max with quadratic scaling
     base_res = 1024 * 1024
     current_res = height * width
     scale_factor = (current_res / base_res)  # Quadratic scaling for redundant signal
     
     # Use 20000 as practical infinity approximation for ZTSNR (appendix A.2)
     sigma_max = 20000.0 * scale_factor
+    
+    if verbose:
+        logger.info(f"Generating sigma schedule:")
+        logger.info(f"- Resolution: {width}x{height} (scale factor: {scale_factor:.3f})")
+        logger.info(f"- Sigma range: {sigma_min:.4f} to {sigma_max:.1f}")
     
     # Use non-linear spacing with EDM-style karras schedule
     rho = 7.0  # EDM's recommended value
@@ -28,29 +48,65 @@ def get_sigmas(num_inference_steps=28, sigma_min=0.0292, height=1024, width=1024
     # Log-space interpolation with sigma conversion
     sigmas = (sigma_max ** (1/rho) + t * (sigma_min ** (1/rho) - sigma_max ** (1/rho))) ** rho
     
+    if verbose:
+        logger.info(f"- Schedule steps: {num_inference_steps}")
+        logger.info(f"- First 3 sigmas: {sigmas[:3].tolist()}")
+        logger.info(f"- Last 3 sigmas: {sigmas[-3:].tolist()}")
+    
     return sigmas
 
-def v_prediction_scaling_factors(sigma, sigma_data=1.0):
+def v_prediction_scaling_factors(sigma: torch.Tensor, 
+                               sigma_data: float = 1.0) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Compute v-prediction scaling factors according to paper equations (11)-(13)
+    Compute v-prediction scaling factors according to NovelAI paper equations (11)-(13).
+    Implements the Karras preconditioner for v-prediction parameterization.
+    
+    Args:
+        sigma: Noise level
+        sigma_data: Data standard deviation (default: 1.0 for normalized latents)
+    
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: (c_skip, c_out, c_in) scaling factors
     """
-    # Skip factor for zero terminal SNR case
+    # Skip factor for zero terminal SNR case (eq. 11)
     c_skip = (sigma_data**2) / (sigma**2 + sigma_data**2)
     
-    # Output scaling with negative sign for v-prediction
+    # Output scaling with negative sign for v-prediction (eq. 12)
     c_out = (-sigma * sigma_data) / torch.sqrt(sigma**2 + sigma_data**2)
     
-    # Input scaling for proper normalization
+    # Input scaling for proper normalization (eq. 13)
     c_in = 1 / torch.sqrt(sigma**2 + sigma_data**2)
     
     return c_skip, c_out, c_in
 
-def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kwargs=None, 
-                             sigma_data=1.0, tag_weighter=None, batch_tags=None, min_snr_gamma=5.0):
+def training_loss_v_prediction(model: torch.nn.Module,
+                             x_0: torch.Tensor,
+                             sigma: torch.Tensor,
+                             text_embeddings: torch.Tensor,
+                             added_cond_kwargs: Optional[Dict[str, Any]] = None,
+                             sigma_data: float = 1.0,
+                             tag_weighter: Optional[Any] = None,
+                             batch_tags: Optional[Any] = None,
+                             min_snr_gamma: float = 5.0,
+                             verbose: bool = False) -> torch.Tensor:
     """
-    Calculate v-prediction loss with MinSNR weighting and optimized performance
+    Calculate v-prediction loss with MinSNR weighting and SDXL architecture support.
+    Implements NovelAI's v-prediction and MinSNR improvements (sections 2.1, 2.4).
+    
     Args:
-        min_snr_gamma: Minimum SNR value for loss weighting (default: 5.0 from paper)
+        model: UNet model (must match SDXL architecture)
+        x_0: Clean data
+        sigma: Noise level
+        text_embeddings: Combined CLIP embeddings (SDXL format)
+        added_cond_kwargs: Additional conditioning (time_ids, text_embeds)
+        sigma_data: Data standard deviation
+        tag_weighter: Optional tag weighting function
+        batch_tags: Optional batch tags for weighting
+        min_snr_gamma: Minimum SNR value (γ) for loss weighting
+        verbose: Whether to log detailed loss information
+    
+    Returns:
+        torch.Tensor: Computed loss value
     """
     try:
         dtype = x_0.dtype
@@ -72,7 +128,7 @@ def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kw
         # Scale model input for proper normalization
         model_input = c_in * x_noisy
         
-        # Forward pass
+        # Forward pass through SDXL UNet
         model_output = model(
             model_input,
             sigma,
@@ -83,7 +139,7 @@ def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kw
         # Calculate target
         target = c_in * x_0
         
-        # Calculate SNR for loss weighting
+        # Calculate SNR for loss weighting (MinSNR)
         snr = (sigma_data / sigma) ** 2
         min_snr = torch.full_like(snr, min_snr_gamma)
         loss_weights = (snr / min_snr).clamp(max=1.0)
@@ -98,12 +154,20 @@ def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kw
             tag_weights = tag_weighter(batch_tags)
             loss = loss * tag_weights.mean()
         
+        if verbose:
+            logger.info(f"Loss computation details:")
+            logger.info(f"- Input shape: {x_0.shape}")
+            logger.info(f"- Current sigma: {sigma.mean().item():.4f}")
+            logger.info(f"- SNR: {snr.mean().item():.4f}")
+            logger.info(f"- Loss weights: {loss_weights.mean().item():.4f}")
+            logger.info(f"- Raw loss: {loss.item():.4f}")
+        
         return loss
-    
+        
     except Exception as e:
         logger.error(f"Error in v-prediction loss calculation: {str(e)}")
-        logger.error(traceback.format_exc())
-        raise e
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise
 
 class PerceptualLoss:
     def __init__(self, device="cuda"):

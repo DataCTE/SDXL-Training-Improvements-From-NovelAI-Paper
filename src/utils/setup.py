@@ -58,6 +58,56 @@ def enable_gradient_checkpointing(model):
     else:
         logger.warning(f"Model {type(model).__name__} doesn't support gradient checkpointing")
 
+def verify_unet_config(config):
+    """Verify that UNet configuration matches SDXL architecture requirements
+    
+    According to Table 1 and Section 2.1 of the SDXL paper:
+    - Uses heterogeneous distribution of transformer blocks [0,2,10]
+    - Removes lowest level (8x downsampling)
+    - Channel multipliers [1,2,4]
+    - Context dimension 2048 (for combined CLIP ViT-L & OpenCLIP ViT-bigG)
+    """
+    expected_config = {
+        'cross_attention_dim': 2048,  # Combined dimension for dual text encoders
+        'transformer_layers_per_block': [0, 2, 10],  # Heterogeneous transformer distribution
+        'channel_mult': [1, 2, 4],  # Channel multipliers without 8x level
+        'in_channels': 4,  # Standard for SD models
+        'out_channels': 4,  # Standard for SD models
+        'num_res_blocks': 2,  # Standard architecture 
+        'attention_resolutions': [4, 8],  # Attention at 1/4 and 1/8 resolution
+        'use_linear_projection': True,  # For improved stability
+    }
+    
+    missing_keys = []
+    mismatched_values = []
+    
+    for key, value in expected_config.items():
+        if key not in config:
+            missing_keys.append(key)
+        elif config[key] != value:
+            mismatched_values.append(
+                f"{key}: expected {value}, got {config[key]}"
+            )
+    
+    if missing_keys:
+        logger.warning(f"Missing config keys: {', '.join(missing_keys)}")
+    
+    if mismatched_values:
+        logger.warning(
+            "Config mismatches found:\n" + 
+            "\n".join(mismatched_values)
+        )
+        
+    if missing_keys or mismatched_values:
+        logger.warning(
+            "Model architecture differs from SDXL specification. "
+            "This may cause compatibility issues."
+        )
+    else:
+        logger.info("UNet configuration verification passed")
+    
+    return True
+
 def setup_models(args, device, dtype):
     """Initialize and configure all models"""
     logger.info("Setting up models...")
@@ -65,11 +115,24 @@ def setup_models(args, device, dtype):
     try:
         # Load UNet
         logger.info("Loading UNet...")
-        unet = UNet2DConditionModel.from_pretrained(
+        unet_config = UNet2DConditionModel.load_config(
             args.model_path,
-            subfolder="unet",
-            torch_dtype=dtype
-        ).to(device)
+            subfolder="unet"
+        )
+        logger.info(f"Loaded UNet config: {unet_config}")
+        
+        # Verify configuration matches SDXL architecture
+        verify_unet_config(unet_config)
+        
+        unet = UNet2DConditionModel.from_config(unet_config)
+        unet.load_state_dict(
+            UNet2DConditionModel.from_pretrained(
+                args.model_path,
+                subfolder="unet",
+                torch_dtype=dtype
+            ).state_dict()
+        )
+        unet = unet.to(device)
         
         # Load VAE
         logger.info("Loading VAE...")

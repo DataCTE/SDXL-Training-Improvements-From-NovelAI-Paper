@@ -4,18 +4,19 @@ import time
 import logging
 import traceback
 from collections import defaultdict
+from typing import Dict, Any, Optional, Tuple
 
 import torch
 import wandb
 import numpy as np
 from tqdm import tqdm
+from torch.cuda.amp import autocast, GradScaler
 
 from training import get_sigmas, training_loss_v_prediction
 from utils import save_checkpoint, load_checkpoint
 from utils.logging import log_metrics_batch
 
 logger = logging.getLogger(__name__)
-
 
 class AverageMeter(object):
     """Computes and stores the average and current value"""
@@ -40,119 +41,153 @@ class AverageMeter(object):
         fmtstr = '{name} {val' + self.fmt + '} ({avg' + self.fmt + '})'
         return fmtstr.format(**self.__dict__)
 
-
 def train_one_epoch(
-    model, optimizer, lr_scheduler, train_dataloader, 
-    tag_weighter, device, dtype, 
-    gradient_accumulation_steps=1, 
-    max_grad_norm=1.0, 
-    mixed_precision=True,
-    min_snr_gamma=5.0,
-    sigma_data=1.0,
-    sigma_min=0.01,
-    resolution_scaling=1.0,
-    rescale_cfg=None,
-    scale_method="linear",
-    rescale_multiplier=1.0,
-    vae_finetuner=None,
-    vae_train_freq=10
-):
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    lr_scheduler: torch.optim.lr_scheduler._LRScheduler,
+    train_dataloader: torch.utils.data.DataLoader,
+    tag_weighter: Optional[Any],
+    device: torch.device,
+    dtype: torch.dtype,
+    gradient_accumulation_steps: int = 1,
+    max_grad_norm: float = 1.0,
+    mixed_precision: bool = True,
+    min_snr_gamma: float = 5.0,
+    sigma_data: float = 1.0,
+    use_ztsnr: bool = True,
+    vae_finetuner: Optional[Any] = None,
+    vae_train_freq: int = 10,
+    verbose: bool = False
+) -> Tuple[float, Dict[str, float]]:
+    """
+    Train one epoch with NovelAI improvements including v-prediction, ZTSNR, and MinSNR.
+    
+    Args:
+        model: SDXL UNet model
+        optimizer: Optimizer instance
+        lr_scheduler: Learning rate scheduler
+        train_dataloader: Training data loader with aspect ratio bucketing
+        tag_weighter: Optional tag weighting function
+        device: Training device
+        dtype: Training dtype (e.g., torch.float32, torch.bfloat16)
+        gradient_accumulation_steps: Number of steps for gradient accumulation
+        max_grad_norm: Maximum gradient norm for clipping
+        mixed_precision: Whether to use mixed precision training
+        min_snr_gamma: Minimum SNR gamma value for loss weighting
+        sigma_data: Data standard deviation (typically 1.0)
+        use_ztsnr: Whether to use Zero Terminal SNR
+        vae_finetuner: Optional VAE finetuner instance
+        vae_train_freq: Frequency of VAE training steps
+        verbose: Whether to log detailed training information
+    
+    Returns:
+        Tuple[float, Dict[str, float]]: Average loss and metrics dictionary
+    """
     model.train()
-    total_loss = 0.0
-    batch_time = AverageMeter('Batch', ':6.3f')
-    data_time = AverageMeter('Data', ':6.3f')
-    losses = AverageMeter('Loss', ':.4e')
-    vae_losses = AverageMeter('VAE Loss', ':.4e') if vae_finetuner else None
+    scaler = GradScaler(enabled=mixed_precision)
+    
+    # Initialize metrics
+    metrics = {
+        'batch_time': AverageMeter('Batch', ':6.3f'),
+        'data_time': AverageMeter('Data', ':6.3f'),
+        'loss': AverageMeter('Loss', ':.4e'),
+        'vae_loss': AverageMeter('VAE Loss', ':.4e') if vae_finetuner else None,
+        'grad_norm': AverageMeter('Grad Norm', ':.4e'),
+        'lr': AverageMeter('LR', ':.2e')
+    }
     
     end = time.time()
-    global_step = 0
+    optimizer.zero_grad(set_to_none=True)
     
     for batch_idx, batch in enumerate(train_dataloader):
-        # Measure data loading time
-        data_time.update(time.time() - end)
-        
-        # Unpack batch with efficient unpacking
-        latents = batch['latents'].to(device, dtype=dtype, non_blocking=True)
-        text_embeddings = batch['text_embeddings'].to(device, dtype=dtype, non_blocking=True)
-        added_cond_kwargs = {
-            k: v.to(device, dtype=dtype, non_blocking=True) 
-            if torch.is_tensor(v) else v 
-            for k, v in batch['added_cond_kwargs'].items()
-        }
-        
-        # Get resolution-dependent sigma
-        height, width = latents.shape[2:4]
-        sigma = get_sigmas(height=height * 8, width=width * 8)[0].to(device, dtype=dtype)
-        
-        # Forward pass and loss computation
-        with torch.amp.autocast('cuda', enabled=mixed_precision):
-            # UNet training step
-            loss = training_loss_v_prediction(
-                model, 
-                latents, 
-                sigma, 
-                text_embeddings, 
-                added_cond_kwargs=added_cond_kwargs,
-                tag_weighter=tag_weighter,
-                batch_tags=batch,
-                min_snr_gamma=min_snr_gamma,
-                sigma_data=sigma_data,
-                sigma_min=sigma_min,
-                resolution_scaling=resolution_scaling,
-                rescale_cfg=rescale_cfg,
-                scale_method=scale_method,
-                rescale_multiplier=rescale_multiplier
-            )
+        try:
+            # Measure data loading time
+            metrics['data_time'].update(time.time() - end)
             
-            # VAE finetuning step if enabled and it's time
+            # Move data to device efficiently
+            latents = batch['latents'].to(device, dtype=dtype, non_blocking=True)
+            text_embeddings = batch['text_embeddings'].to(device, dtype=dtype, non_blocking=True)
+            added_cond_kwargs = {
+                k: v.to(device, dtype=dtype, non_blocking=True) 
+                if torch.is_tensor(v) else v 
+                for k, v in batch.get('added_cond_kwargs', {}).items()
+            }
+            
+            # Get resolution-dependent sigma for ZTSNR
+            height, width = latents.shape[2:4]
+            sigma = get_sigmas(
+                height=height * 8,  # Scale to pixel space
+                width=width * 8,
+                verbose=verbose
+            )[0].to(device, dtype=dtype)
+            
+            # Forward pass with mixed precision
+            with autocast(device_type='cuda', dtype=dtype, enabled=mixed_precision):
+                # UNet training step
+                loss = training_loss_v_prediction(
+                    model=model,
+                    x_0=latents,
+                    sigma=sigma,
+                    text_embeddings=text_embeddings,
+                    added_cond_kwargs=added_cond_kwargs,
+                    tag_weighter=tag_weighter,
+                    batch_tags=batch,
+                    min_snr_gamma=min_snr_gamma,
+                    sigma_data=sigma_data,
+                    verbose=verbose
+                )
+                
+                # Scale loss for gradient accumulation
+                loss = loss / gradient_accumulation_steps
+            
+            # Backward pass with gradient scaling
+            scaler.scale(loss).backward()
+            
+            # VAE finetuning step if enabled
             if vae_finetuner and batch_idx % vae_train_freq == 0:
                 vae_loss = vae_finetuner.training_step(batch)
-                vae_losses.update(vae_loss.item())
+                metrics['vae_loss'].update(vae_loss.item())
             
-            # Normalize loss for gradient accumulation
-            loss = loss / gradient_accumulation_steps
-        
-        # Backward pass
-        loss.backward()
-        
-        # Gradient accumulation and optimization
-        if (batch_idx + 1) % gradient_accumulation_steps == 0:
-            # Clip gradients
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            # Update weights if gradient accumulation complete
+            if (batch_idx + 1) % gradient_accumulation_steps == 0:
+                # Unscale gradients for clipping
+                scaler.unscale_(optimizer)
+                
+                # Compute gradient norm for monitoring
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    max_grad_norm
+                )
+                metrics['grad_norm'].update(grad_norm.item())
+                
+                # Optimizer step with gradient scaling
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                
+                # Update learning rate
+                lr_scheduler.step()
+                metrics['lr'].update(optimizer.param_groups[0]['lr'])
             
-            # Optimizer step
-            optimizer.step()
-            lr_scheduler.step()
-            optimizer.zero_grad(set_to_none=True)
+            # Update metrics
+            metrics['loss'].update(loss.item() * gradient_accumulation_steps)
+            metrics['batch_time'].update(time.time() - end)
             
-            # VAE optimizer step if enabled
-            if vae_finetuner and batch_idx % vae_train_freq == 0:
-                vae_finetuner.optimizer_step()
+            # Log progress
+            if verbose and batch_idx % 10 == 0:
+                logger.info(f'Batch: [{batch_idx}/{len(train_dataloader)}]')
+                for name, meter in metrics.items():
+                    if meter is not None:
+                        logger.info(f'  {name}: {meter}')
             
-            # Update tracking metrics
-            total_loss += loss.item() * gradient_accumulation_steps
-            losses.update(loss.item() * gradient_accumulation_steps)
+            end = time.time()
             
-            # Log metrics efficiently
-            if wandb.run:
-                metrics = {
-                    "train/loss": loss.item() * gradient_accumulation_steps,
-                    "train/lr": lr_scheduler.get_last_lr()[0],
-                    "performance/batch_time": batch_time.avg,
-                    "performance/data_time": data_time.avg
-                }
-                if vae_finetuner and batch_idx % vae_train_freq == 0:
-                    metrics["train/vae_loss"] = vae_losses.avg
-                log_metrics_batch(metrics, step=global_step)
-            
-            global_step += 1
-        
-        # Measure batch time
-        batch_time.update(time.time() - end)
-        end = time.time()
+        except Exception as e:
+            logger.error(f"Error in training step: {str(e)}")
+            logger.error(traceback.format_exc())
+            continue
     
-    return global_step
-
+    return metrics['loss'].avg, {k: v.avg if v is not None else 0.0 for k, v in metrics.items()}
 
 def train(args, models, train_components, device, dtype):
     """Main training loop with improved v-prediction and ZTSNR support"""
@@ -214,7 +249,7 @@ def train(args, models, train_components, device, dtype):
             log_metrics_batch({"train/epoch": epoch}, step=global_step)
         
         # Train one epoch
-        global_step = train_one_epoch(
+        avg_loss, metrics = train_one_epoch(
             model=model,
             optimizer=optimizer,
             lr_scheduler=lr_scheduler,
@@ -227,13 +262,10 @@ def train(args, models, train_components, device, dtype):
             mixed_precision=args.mixed_precision,
             min_snr_gamma=args.min_snr_gamma,
             sigma_data=args.sigma_data,
-            sigma_min=args.sigma_min,
-            resolution_scaling=args.resolution_scaling,
-            rescale_cfg=args.rescale_cfg,
-            scale_method=args.scale_method,
-            rescale_multiplier=args.rescale_multiplier,
+            use_ztsnr=args.use_ztsnr,
             vae_finetuner=train_components.get("vae_finetuner"),
-            vae_train_freq=args.vae_train_freq
+            vae_train_freq=args.vae_train_freq,
+            verbose=args.verbose
         )
         
         # Run end-of-epoch validation
@@ -304,7 +336,6 @@ def train(args, models, train_components, device, dtype):
             )
     
     return training_history
-
 
 def get_cosine_schedule_with_warmup(
     optimizer: torch.optim.Optimizer,

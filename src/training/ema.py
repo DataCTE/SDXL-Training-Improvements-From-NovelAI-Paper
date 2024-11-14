@@ -99,121 +99,118 @@ class EMAModel:
     
     def get_decay(self, optimization_step: int) -> float:
         """
-        Calculate decay rate using improved scheduling from NovelAI.
-        
-        Args:
-            optimization_step: Current optimization step
-            
-        Returns:
-            float: Current decay rate
+        Compute dynamic decay rate based on optimization step.
+        Uses improved scheduling from NovelAI paper.
         """
-        if optimization_step < self.update_after_step:
-            return 0.0
+        step = max(0, optimization_step - self.update_after_step)
         
-        value = 1 - (1 + optimization_step - self.update_after_step) ** -self.power
-        
-        if self.use_ema_warmup:
-            value = 1 - (1 - value) * math.cos(math.pi * 0.5 * min(1.0, optimization_step / self.inv_gamma))
-        
-        return max(self.min_decay, min(value, self.max_decay))
-    
-    def _update_param(
-        self,
-        ema_param: torch.Tensor,
-        model_param: torch.Tensor,
-        param_name: str,
-        decay: float
-    ) -> None:
-        """
-        Update a single parameter with momentum and gradient-based weighting.
-        
-        Args:
-            ema_param: Parameter in EMA model
-            model_param: Parameter in training model
-            param_name: Name of the parameter
-            decay: Current decay rate
-        """
-        # Calculate parameter difference
-        diff = model_param.data - ema_param.data
-        
-        # Update momentum
-        self.param_momentum[param_name] = (
-            self.param_momentum[param_name] * decay +
-            diff * (1 - decay)
-        )
-        
-        # Apply update with gradient-based weighting
-        if model_param.grad is not None:
-            grad_norm = model_param.grad.norm().item()
-            self.grad_norms[param_name] = (
-                self.grad_norms[param_name] * 0.9 +
-                grad_norm * 0.1
+        if self.use_ema_warmup and step <= self.update_after_step:
+            decay = min(
+                self.max_decay,
+                (1 + step / (self.update_after_step * self.inv_gamma)) ** -self.power
             )
-            update_weight = 1.0 / (1.0 + self.grad_norms[param_name] * self.grad_scale_factor)
         else:
-            update_weight = 1.0
+            decay = min(
+                self.max_decay,
+                (1 + step) ** -self.power
+            )
         
-        ema_param.data.add_(self.param_momentum[param_name] * update_weight)
-    
-    def step(
-        self,
-        model: torch.nn.Module,
-        step: Optional[int] = None,
-        grad_scale: Optional[float] = None
-    ) -> None:
-        """
-        Update EMA model parameters with improved update strategy.
-        
-        Args:
-            model: Current model
-            step: Optional step number (uses internal count if None)
-            grad_scale: Optional gradient scale factor
-        """
-        if step is not None:
-            self.optimization_step = step
-        else:
-            self.optimization_step += 1
-        
-        # Skip updates before warmup or if not update step
-        if self.optimization_step < self.update_after_step or self.optimization_step % self.update_every != 0:
-            return
-        
-        # Calculate current decay rate
-        decay = self.get_decay(self.optimization_step)
+        decay = max(self.min_decay, decay)
         self.decay_history.append(decay)
         
-        with torch.no_grad():
-            # Update parameters with momentum and gradient weighting
-            for (name, ema_param), (_, model_param) in zip(
-                self.ema_model.named_parameters(),
-                model.named_parameters()
-            ):
-                if model_param.requires_grad:
-                    self._update_param(ema_param, model_param, name, decay)
+        return decay
     
-    def get_model(self) -> torch.nn.Module:
-        """Get current EMA model"""
-        return self.ema_model
-    
-    def state_dict(self) -> Dict[str, Any]:
-        """Get complete state including momentum and gradient tracking"""
-        return {
-            'ema_model': self.ema_model.state_dict(),
-            'optimization_step': self.optimization_step,
-            'param_momentum': self.param_momentum,
-            'grad_norms': self.grad_norms,
-            'decay_history': list(self.decay_history),
-            'initial_params': self.initial_params
-        }
-    
-    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
-        """Load complete state including momentum and gradient tracking"""
-        self.ema_model.load_state_dict(state_dict['ema_model'])
-        self.optimization_step = state_dict.get('optimization_step', 0)
-        self.param_momentum = state_dict.get('param_momentum', {})
-        self.grad_norms = state_dict.get('grad_norms', {})
-        self.decay_history = deque(
-            state_dict.get('decay_history', []),
-            maxlen=self.decay_history.maxlen
+    def get_param_decay(self, name: str, grad_norm: float) -> float:
+        """
+        Compute parameter-specific decay rate based on gradient norm.
+        """
+        base_decay = self.get_decay(self.optimization_step)
+        
+        # Update gradient norm moving average
+        self.grad_norms[name] = (
+            self.grad_norms[name] * 0.9 +
+            grad_norm * 0.1
         )
-        self.initial_params = state_dict.get('initial_params', {})
+        
+        # Scale decay by gradient norm
+        decay = base_decay * (1.0 - self.grad_scale_factor * 
+                            math.tanh(self.grad_norms[name]))
+        
+        return max(self.min_decay, min(self.max_decay, decay))
+    
+    def step(self, model: torch.nn.Module):
+        """
+        Update EMA model with improved parameter-specific momentum.
+        """
+        self.optimization_step += 1
+        
+        # Skip update if before start or not on update step
+        if (self.optimization_step < self.update_after_step or
+            self.optimization_step % self.update_every != 0):
+            return
+        
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if not param.requires_grad:
+                    continue
+                    
+                # Get EMA parameter
+                ema_param = self.ema_model.get_parameter(name)
+                
+                # Compute gradient norm for adaptive decay
+                if param.grad is not None:
+                    grad_norm = param.grad.norm().item()
+                else:
+                    grad_norm = 0.0
+                
+                # Get parameter-specific decay
+                decay = self.get_param_decay(name, grad_norm)
+                
+                # Update parameter-specific momentum
+                self.param_momentum[name] = (
+                    decay * self.param_momentum[name] +
+                    (1 - decay) * (param.data - ema_param.data)
+                )
+                
+                # Update EMA parameter
+                ema_param.data.add_(self.param_momentum[name])
+    
+    def copy_to(self, target_model: torch.nn.Module):
+        """
+        Copy EMA parameters to target model.
+        """
+        with torch.no_grad():
+            for name, param in self.ema_model.named_parameters():
+                target_param = target_model.get_parameter(name)
+                target_param.copy_(param)
+    
+    def store(self, parameters: Dict[str, torch.Tensor]):
+        """
+        Store current parameters for restoration.
+        """
+        with torch.no_grad():
+            for name, param in self.ema_model.named_parameters():
+                parameters[name] = param.clone()
+    
+    def restore(self, parameters: Dict[str, torch.Tensor]):
+        """
+        Restore parameters from storage.
+        """
+        with torch.no_grad():
+            for name, param in self.ema_model.named_parameters():
+                param.copy_(parameters[name])
+    
+    def get_decay_info(self) -> Dict[str, Any]:
+        """
+        Get information about current decay rates and momentum.
+        """
+        return {
+            'current_decay': self.get_decay(self.optimization_step),
+            'decay_history': list(self.decay_history),
+            'param_momentum': {
+                k: v for k, v in self.param_momentum.items()
+            },
+            'grad_norms': {
+                k: v for k, v in self.grad_norms.items()
+            }
+        }

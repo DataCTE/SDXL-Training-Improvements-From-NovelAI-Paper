@@ -755,52 +755,40 @@ class CustomDataset(Dataset):
             return image.resize((target_width, target_height), Image.LANCZOS)
 
     def _initialize_buckets(self):
-        """Initialize resolution buckets for efficient batching"""
-        logger.info("Initializing resolution buckets...")
+        """Initialize aspect ratio buckets according to NovelAI paper section 4.1.2"""
+        logger.info("Initializing aspect ratio buckets...")
+        buckets = []
         
-        self.buckets = {}
-        bucket_indices = {}  # Maps image path to bucket index
-        
-        # Calculate bucket resolutions
-        bucket_resos = []
-        for h in range(self.min_bucket_reso, self.max_bucket_reso + self.bucket_reso_steps, self.bucket_reso_steps):
-            for w in range(self.min_bucket_reso, self.max_bucket_reso + self.bucket_reso_steps, self.bucket_reso_steps):
-                if self.resolution_type == "square" and abs(h - w) > self.bucket_reso_steps:
-                    continue
-                elif self.resolution_type == "portrait" and w >= h:
-                    continue
-                elif self.resolution_type == "landscape" and h >= w:
-                    continue
-                bucket_resos.append((h, w))
-        
-        # Sort by area for better memory usage
-        bucket_resos.sort(key=lambda x: x[0] * x[1])
-        
-        # Assign images to buckets in parallel
-        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-            futures = []
-            for img_path in self.image_paths:
-                futures.append(executor.submit(self._assign_to_bucket, img_path, bucket_resos))
+        # Generate buckets based on max dimensions
+        width = 256
+        while width <= self.max_bucket_reso:
+            # Find largest height that satisfies constraints
+            height = self.max_bucket_reso
+            while height * width > 512 * 768 or height > self.max_bucket_reso:
+                height -= 64
+            if height >= self.min_bucket_reso:
+                buckets.append((width, height))
+            width += 64
             
-            for future in tqdm(as_completed(futures), total=len(futures), desc="Assigning to buckets"):
-                img_path, bucket_size = future.result()
-                if bucket_size is not None:
-                    if bucket_size not in self.buckets:
-                        self.buckets[bucket_size] = []
-                    self.buckets[bucket_size].append(img_path)
-                    bucket_indices[img_path] = len(self.buckets[bucket_size]) - 1
+        # Add portrait buckets
+        width = 256
+        while width <= self.max_bucket_reso:
+            height = self.max_bucket_reso
+            while height * width > 512 * 768 or height > self.max_bucket_reso:
+                height -= 64
+            if height >= self.min_bucket_reso and (height, width) not in buckets:
+                buckets.append((height, width))
+            width += 64
+            
+        # Add square bucket
+        buckets.append((512, 512))
         
-        # Store bucket information
-        self.bucket_resos = bucket_resos
-        self.bucket_indices = bucket_indices
-        
-        # Log bucket statistics
-        total_images = sum(len(bucket) for bucket in self.buckets.values())
-        logger.info(f"Created {len(self.buckets)} buckets with {total_images} total images")
-        for (h, w), images in self.buckets.items():
-            logger.info(f"Bucket {h}x{w}: {len(images)} images")
+        # Store bucket info
+        self.buckets = buckets
+        self.bucket_data = {bucket: [] for bucket in buckets}
+        logger.info(f"Created {len(buckets)} aspect ratio buckets")
 
-    def _assign_to_bucket(self, img_path, bucket_resos):
+    def _assign_to_bucket(self, img_path):
         """Assign an image to the most appropriate bucket"""
         try:
             with Image.open(img_path) as img:
@@ -810,7 +798,7 @@ class CustomDataset(Dataset):
                 best_bucket = None
                 min_area_diff = float('inf')
                 
-                for bucket_h, bucket_w in bucket_resos:
+                for bucket_h, bucket_w in self.buckets:
                     # Skip if bucket is too small
                     if bucket_h < height or bucket_w < width:
                         continue
@@ -946,7 +934,7 @@ class CustomDataset(Dataset):
         best_bucket = None
         min_area_diff = float('inf')
         
-        for bucket_h, bucket_w in self.bucket_resos:
+        for bucket_h, bucket_w in self.buckets:
             if bucket_h < height or bucket_w < width:
                 continue
             
@@ -957,7 +945,7 @@ class CustomDataset(Dataset):
         
         if best_bucket is None:
             # If no bucket fits, use the largest bucket
-            best_bucket = max(self.bucket_resos, key=lambda x: x[0] * x[1])
+            best_bucket = max(self.buckets, key=lambda x: x[0] * x[1])
         
         return best_bucket
     
