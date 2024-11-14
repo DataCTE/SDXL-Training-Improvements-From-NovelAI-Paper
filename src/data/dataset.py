@@ -994,6 +994,50 @@ class CustomDataset(Dataset):
         
         return result
 
+    def custom_collate(self, batch):
+        """
+        Custom collate function for DataLoader with advanced batch handling.
+        Handles variable size inputs and applies proper padding.
+        
+        Args:
+            batch: List of tuples (latent, text_ids, text_ids_2)
+            
+        Returns:
+            dict: Collated batch with proper padding
+        """
+        latents = torch.stack([item["latent"] for item in batch])
+        input_ids = torch.stack([item["input_ids"] for item in batch])
+        input_ids_2 = torch.stack([item["input_ids_2"] for item in batch])
+        
+        # Get original image sizes for proper scaling
+        original_sizes = torch.tensor([[item["original_size"][0], item["original_size"][1]] for item in batch])
+        target_sizes = torch.tensor([[item["target_size"][0], item["target_size"][1]] for item in batch])
+        
+        # Collate attention masks if present
+        attention_mask = None
+        if "attention_mask" in batch[0]:
+            attention_mask = torch.stack([item["attention_mask"] for item in batch])
+        
+        attention_mask_2 = None
+        if "attention_mask_2" in batch[0]:
+            attention_mask_2 = torch.stack([item["attention_mask_2"] for item in batch])
+        
+        # Handle tag weights if present
+        tag_weights = None
+        if "tag_weights" in batch[0]:
+            tag_weights = torch.stack([item["tag_weights"] for item in batch])
+        
+        return {
+            "latent": latents,
+            "input_ids": input_ids,
+            "input_ids_2": input_ids_2,
+            "original_size": original_sizes,
+            "target_size": target_sizes,
+            "attention_mask": attention_mask,
+            "attention_mask_2": attention_mask_2,
+            "tag_weights": tag_weights
+        }
+
     def __getitem__(self, idx):
         """Get a single item with improved text augmentation and bucketing"""
         try:
