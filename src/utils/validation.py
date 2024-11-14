@@ -5,9 +5,9 @@ from PIL import Image
 from pathlib import Path
 from collections import defaultdict
 from tqdm import tqdm
-from transformers import CLIPTextModel
+from transformers import CLIPTextModel, CLIPTokenizer
 import torch
-from diffusers import AutoencoderKL, UNet2DConditionModel, CLIPTokenizer
+from diffusers import AutoencoderKL, UNet2DConditionModel
 
 logger = logging.getLogger(__name__)
 
