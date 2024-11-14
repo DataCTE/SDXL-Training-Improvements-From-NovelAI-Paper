@@ -7,21 +7,14 @@ from transformers.optimization import Adafactor
 from diffusers.optimization import get_scheduler
 from data.dataset import CustomDataset
 from data.tag_weighter import TagBasedLossWeighter
-from training.vae_finetuner import VAEFineTuner
-from inference.text_to_image import SDXLInference
 from training.ema import EMAModel
 import wandb
 import numpy as np
-from diffusers import UNet2DConditionModel, AutoencoderKL
+from diffusers import StableDiffusionXLPipeline
 from transformers import CLIPTokenizer, CLIPTextModel
-from data.dataset import custom_collate
-from data.dataset import CustomDataset
 from inference.text_to_image import SDXLInference
-from training.ema import EMAModel
-from data.tag_weighter import TagBasedLossWeighter
 from training.vae_finetuner import VAEFineTuner
 from utils.device import cleanup
-from diffusers import StableDiffusionXLPipeline
 from diffusers import EulerDiscreteScheduler
 
 
@@ -63,93 +56,39 @@ def setup_models(args, device, dtype):
     try:
         models = {}
         
-        # Step 1: Load UNet
-        logger.info("Step 1/5: Loading UNet...")
+        # Step 1: Load complete SDXL pipeline
+        logger.info("Step 1/2: Loading SDXL pipeline...")
         try:
-            unet = UNet2DConditionModel.from_pretrained(
+            pipeline = StableDiffusionXLPipeline.from_pretrained(
                 args.model_path,
-                subfolder="unet",
-                torch_dtype=dtype
-            ).to(device)
-            logger.info(" UNet loaded successfully")
-            models["unet"] = unet
-        except Exception as e:
-            logger.error(" Failed to load UNet")
-            error_msg = clean_error_message(traceback.format_exc())
-            logger.error(error_msg)
-            raise
-        
-        # Step 2: Load VAE
-        logger.info("Step 2/5: Loading VAE...")
-        try:
-            vae = AutoencoderKL.from_pretrained(
-                args.model_path,
-                subfolder="vae",
-                torch_dtype=dtype
-            ).to(device)
-            vae.requires_grad_(False)
-            vae.eval()
-            logger.info(" VAE loaded successfully and set to eval mode")
-            models["vae"] = vae
-        except Exception as e:
-            logger.error(" Failed to load VAE")
-            error_msg = clean_error_message(traceback.format_exc())
-            logger.error(error_msg)
-            raise
-        
-        # Step 3: Load Text Encoders and Tokenizers
-        logger.info("Step 3/5: Loading text encoders and tokenizers...")
-        try:
-            # Load tokenizers
-            logger.info("  Loading tokenizers...")
-            tokenizer = CLIPTokenizer.from_pretrained(
-                args.model_path, subfolder="tokenizer"
+                torch_dtype=dtype,
+                use_safetensors=True,
+                variant="fp16"
             )
-            tokenizer_2 = CLIPTokenizer.from_pretrained(
-                args.model_path, subfolder="tokenizer_2"
-            )
-            logger.info("  Tokenizers loaded successfully")
+            pipeline.to(device)
             
-            # Load text encoders
-            logger.info("  Loading text encoders...")
-            text_encoder = CLIPTextModel.from_pretrained(
-                args.model_path, subfolder="text_encoder"
-            ).to(device)
-            text_encoder_2 = CLIPTextModel.from_pretrained(
-                args.model_path, subfolder="text_encoder_2"
-            ).to(device)
-            logger.info("  Text encoders loaded successfully")
+            # Extract components
+            models["unet"] = pipeline.unet
+            models["vae"] = pipeline.vae
+            models["text_encoder"] = pipeline.text_encoder
+            models["text_encoder_2"] = pipeline.text_encoder_2
+            models["tokenizer"] = pipeline.tokenizer
+            models["tokenizer_2"] = pipeline.tokenizer_2
             
-            models.update({
-                "tokenizer": tokenizer,
-                "tokenizer_2": tokenizer_2,
-                "text_encoder": text_encoder,
-                "text_encoder_2": text_encoder_2
-            })
+            # Set VAE to eval mode
+            models["vae"].requires_grad_(False)
+            models["vae"].eval()
+            
+            logger.info(" SDXL pipeline loaded and components extracted successfully")
+            
         except Exception as e:
-            logger.error(" Failed to load text encoders/tokenizers")
+            logger.error(" Failed to load SDXL pipeline")
             error_msg = clean_error_message(traceback.format_exc())
             logger.error(error_msg)
             raise
-        
-        # Step 4: Setup Gradient Checkpointing
-        if args.gradient_checkpointing:
-            logger.info("Step 4/5: Enabling gradient checkpointing...")
-            try:
-                for model_name in ["unet", "text_encoder", "text_encoder_2"]:
-                    if model_name in models:
-                        enable_gradient_checkpointing(models[model_name])
-                logger.info(" Gradient checkpointing enabled for all supported models")
-            except Exception as e:
-                logger.error(" Failed to enable gradient checkpointing")
-                error_msg = clean_error_message(traceback.format_exc())
-                logger.error(error_msg)
-                raise
-        else:
-            logger.info("Step 4/5: Skipping gradient checkpointing (not enabled)")
-        
-        # Step 5: Initialize EMA
-        logger.info("Step 5/5: Setting up EMA...")
+            
+        # Step 2: Initialize EMA
+        logger.info("Step 2/2: Setting up EMA...")
         if args.use_ema:
             try:
                 logger.info("  Initializing EMA model with parameters:")
