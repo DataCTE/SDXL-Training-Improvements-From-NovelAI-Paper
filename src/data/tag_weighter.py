@@ -1,7 +1,7 @@
 import torch
 import logging
 import traceback
-from typing import Dict, List, Set, Union, Optional
+from typing import Dict, Set, Optional
 
 logger = logging.getLogger(__name__)
 

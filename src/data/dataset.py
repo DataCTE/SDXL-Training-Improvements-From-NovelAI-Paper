@@ -1,5 +1,5 @@
 from pathlib import Path
-from PIL import Image, ImageFilter, ImageEnhance
+from PIL import Image
 import torch
 import torchvision.transforms as transforms
 from torch.utils.data import Dataset
@@ -9,14 +9,12 @@ import logging
 import traceback
 import random
 import re
-from utils.validation import validate_dataset
 import cv2
 import numpy as np
 from .ultimate_upscaler import UltimateUpscaler, USDUMode, USDUSFMode
 from utils.validation import validate_image_dimensions
 import os
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
-import functools
+from concurrent.futures import ThreadPoolExecutor
 import gc
 
 logger = logging.getLogger(__name__)

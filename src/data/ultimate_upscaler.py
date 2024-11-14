@@ -1,12 +1,10 @@
 import math
 import torch
 import logging
-from PIL import Image, ImageDraw, ImageOps, ImageFilter
+from PIL import Image, ImageDraw, ImageFilter
 from diffusers import StableDiffusionInpaintPipeline, DDIMScheduler
 from enum import Enum
-from pathlib import Path
-from typing import List, Tuple, Optional, Union
-import numpy as np
+
 
 logger = logging.getLogger(__name__)
 

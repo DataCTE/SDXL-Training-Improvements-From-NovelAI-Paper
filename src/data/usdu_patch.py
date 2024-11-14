@@ -1,5 +1,5 @@
 # Make some patches to the script
-from ultimate_upscaler import UltimateUpscaler as usdu
+from .ultimate_upscaler import UltimateUpscaler as usdu
 import math
 from PIL import Image
 
