@@ -95,6 +95,9 @@ class CustomDataset(Dataset):
             self._batch_process_latents_efficient()
         self.tag_stats = self._build_tag_statistics()
         
+        # Set collate function
+        self.collate_fn = self.custom_collate
+        
     def _initialize_dataset(self):
         """Initialize dataset with improved image validation"""
         logger.info("Initializing dataset...")
@@ -1228,7 +1231,7 @@ def create_dataloader(
             pin_memory=pin_memory,
             prefetch_factor=prefetch_factor if num_workers > 0 else None,
             persistent_workers=persistent_workers if num_workers > 0 else False,
-            collate_fn=custom_collate
+            collate_fn=dataset.collate_fn
         )
         
         logger.info(f"Created DataLoader with {len(dataset)} samples")

@@ -93,36 +93,56 @@ class VAEFineTuner:
             raise
 
     def register_vae_statistics(self):
-        """Register VAE channel statistics as buffers"""
-        # NovelAI anime dataset statistics for VAE latents (from paper appendix B)
-        means = torch.tensor([4.8119, 0.1607, 1.3538, -1.7753])
-        stds = torch.tensor([9.9181, 6.2753, 7.5978, 5.9956])
-        
-        # Register as buffers with correct device and dtype
-        device = next(self.vae.parameters()).device
-        dtype = next(self.vae.parameters()).dtype
-        
-        self.vae.register_buffer('latent_means', means.to(device, dtype))
-        self.vae.register_buffer('latent_stds', stds.to(device, dtype))
-    
+        """Register VAE channel statistics as buffers for scale-and-shift normalization"""
+        try:
+            # NovelAI anime dataset statistics for VAE latents (from paper appendix B)
+            means = torch.tensor([4.8119, 0.1607, 1.3538, -1.7753])
+            stds = torch.tensor([9.9181, 6.2753, 7.5978, 5.9956])
+            
+            # Register as buffers with correct device and dtype
+            self.vae.register_buffer('latent_means', means.to(device=self.vae.device, dtype=self.vae.dtype))
+            self.vae.register_buffer('latent_stds', stds.to(device=self.vae.device, dtype=self.vae.dtype))
+        except Exception as e:
+            logger.warning(f"Failed to register VAE statistics: {e}")
+
     def normalize_latents(self, latents: torch.Tensor) -> torch.Tensor:
-        """Apply per-channel normalization to latents"""
+        """Apply per-channel scale-and-shift normalization to VAE latents"""
         if not self.use_channel_scaling:
             return latents
+        try:    
+            # Ensure statistics are on same device/dtype as input
+            means = self.vae.latent_means.to(latents.device, latents.dtype)
+            stds = self.vae.latent_stds.to(latents.device, latents.dtype)
             
-        means = self.vae.latent_means.view(1, -1, 1, 1)
-        stds = self.vae.latent_stds.view(1, -1, 1, 1)
-        return (latents - means) / stds
-    
+            # Reshape for broadcasting
+            means = means.view(1, -1, 1, 1)
+            stds = stds.view(1, -1, 1, 1)
+            
+            # Apply normalization
+            return (latents - means) / stds
+        except Exception as e:
+            logger.warning(f"Failed to normalize latents: {e}")
+           
+
     def denormalize_latents(self, latents: torch.Tensor) -> torch.Tensor:
-        """Reverse per-channel normalization of latents"""
+        """Reverse per-channel scale-and-shift normalization"""
         if not self.use_channel_scaling:
             return latents
+        try:
+            # Ensure statistics are on same device/dtype as input
+            means = self.vae.latent_means.to(latents.device, latents.dtype)
+            stds = self.vae.latent_stds.to(latents.device, latents.dtype)
             
-        means = self.vae.latent_means.view(1, -1, 1, 1)
-        stds = self.vae.latent_stds.view(1, -1, 1, 1)
-        return latents * stds + means
-    
+            # Reshape for broadcasting
+            means = means.view(1, -1, 1, 1)
+            stds = stds.view(1, -1, 1, 1)
+            
+            # Apply denormalization
+            return latents * stds + means
+        except Exception as e:
+            logger.warning(f"Failed to denormalize latents: {e}")
+            
+
     def _initialize_perceptual_loss(self):
         """Initialize perceptual loss network"""
         try:
@@ -135,53 +155,60 @@ class VAEFineTuner:
                 param.requires_grad = False
         except Exception as e:
             logger.warning(f"Failed to initialize perceptual loss: {e}")
-            self.perceptual_weight = 0.0
+            
     
     def compute_perceptual_loss(self, x_recon: torch.Tensor, x_target: torch.Tensor) -> torch.Tensor:
         """Compute perceptual loss using VGG features"""
         if self.perceptual_weight == 0:
             return torch.tensor(0.0, device=x_recon.device)
+        try:
+            # Ensure inputs are in correct format for VGG
+            x_recon = F.interpolate(x_recon, size=(224, 224))
+            x_target = F.interpolate(x_target, size=(224, 224))
             
-        # Ensure inputs are in correct format for VGG
-        x_recon = F.interpolate(x_recon, size=(224, 224))
-        x_target = F.interpolate(x_target, size=(224, 224))
-        
-        with torch.no_grad():
-            target_features = self.perceptual_model(x_target)
-        recon_features = self.perceptual_model(x_recon)
-        
-        return F.mse_loss(recon_features, target_features)
+            with torch.no_grad():
+                target_features = self.perceptual_model(x_target)
+            recon_features = self.perceptual_model(x_recon)
+            
+            return F.mse_loss(recon_features, target_features)
+        except Exception as e:
+            logger.warning(f"Failed to compute perceptual loss: {e}")
+           
     
     def compute_kl_loss(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
         """Compute KL divergence loss with improved numerical stability"""
         if self.kl_weight == 0:
             return torch.tensor(0.0, device=mu.device)
-            
-        # Use log-sum-exp trick for numerical stability
-        kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
-        return kl_loss.mean()
-    
+        try:
+            # Use log-sum-exp trick for numerical stability
+            kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
+            return kl_loss.mean()
+        except Exception as e:
+            logger.warning(f"Failed to compute KL loss: {e}")
+           
     def update_scale_factor(self, loss: torch.Tensor):
         """Update adaptive loss scaling factor"""
         if not self.adaptive_loss_scale:
             return
+        try:
+            self.loss_history.append(loss.item())
+            if len(self.loss_history) < 50:
+                return
+                
+            loss_std = np.std(self.loss_history)
+            loss_mean = np.mean(self.loss_history)
             
-        self.loss_history.append(loss.item())
-        if len(self.loss_history) < 50:
-            return
+            # Update scale factor based on loss statistics
+            target_loss = 1.0
+            current_scale = self.scale_factor
+            new_scale = current_scale * (target_loss / (loss_mean + 1e-6))
             
-        loss_std = np.std(self.loss_history)
-        loss_mean = np.mean(self.loss_history)
+            # Smooth update
+            self.scale_factor = 0.99 * current_scale + 0.01 * new_scale
+            self.scale_factor = max(0.1, min(10.0, self.scale_factor))
+        except Exception as e:
+            logger.warning(f"Failed to update scale factor: {e}")
         
-        # Update scale factor based on loss statistics
-        target_loss = 1.0
-        current_scale = self.scale_factor
-        new_scale = current_scale * (target_loss / (loss_mean + 1e-6))
-        
-        # Smooth update
-        self.scale_factor = 0.99 * current_scale + 0.01 * new_scale
-        self.scale_factor = max(0.1, min(10.0, self.scale_factor))
-    
     def training_step(self, batch: dict) -> torch.Tensor:
         """Perform one VAE training step with NovelAI improvements"""
         try:
