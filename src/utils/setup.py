@@ -55,7 +55,7 @@ def setup_models(args, device, dtype):
             min_decay=args.ema_min_decay,
             max_decay=args.ema_max_decay,
             update_every=args.ema_update_every,
-            use_warmup=args.use_ema_warmup,
+            use_ema_warmup=args.use_ema_warmup,
             grad_scale_factor=args.ema_grad_scale_factor
         )
     
