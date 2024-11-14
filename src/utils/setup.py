@@ -56,15 +56,32 @@ def setup_models(args, device, dtype):
     try:
         models = {}
         
-        # Step 1: Load complete SDXL pipeline
+        # Step 1: Load complete SDXL pipeline with strict=False
         logger.info("Step 1/2: Loading SDXL pipeline...")
         try:
             pipeline = StableDiffusionXLPipeline.from_pretrained(
                 args.model_path,
                 torch_dtype=dtype,
                 use_safetensors=True,
-                variant="fp16"
+                variant="fp16",
+                strict=False
             )
+            
+            # Add architecture verification
+            logger.info("Verifying model architecture...")
+            expected_keys = set(pipeline.unet.state_dict().keys())
+            loaded_keys = set(torch.load(f"{args.model_path}/unet/diffusion_pytorch_model.safetensors").keys())
+            missing_keys = expected_keys - loaded_keys
+            unexpected_keys = loaded_keys - expected_keys
+            
+            if missing_keys:
+                logger.warning(f"Missing keys in checkpoint: {len(missing_keys)} keys")
+                logger.debug(f"First few missing keys: {list(missing_keys)[:5]}")
+            
+            if unexpected_keys:
+                logger.warning(f"Unexpected keys in checkpoint: {len(unexpected_keys)} keys")
+                logger.debug(f"First few unexpected keys: {list(unexpected_keys)[:5]}")
+            
             pipeline.to(device)
             
             # Extract components
@@ -79,14 +96,18 @@ def setup_models(args, device, dtype):
             models["vae"].requires_grad_(False)
             models["vae"].eval()
             
-            logger.info(" SDXL pipeline loaded and components extracted successfully")
+            logger.info("SDXL pipeline loaded and components extracted successfully")
             
         except Exception as e:
-            logger.error(" Failed to load SDXL pipeline")
+            logger.error("Failed to load SDXL pipeline")
             error_msg = clean_error_message(traceback.format_exc())
             logger.error(error_msg)
-            raise
             
+            # Add detailed error analysis
+            if "size mismatch" in str(e):
+                analyze_size_mismatches(str(e))
+            raise
+        
         # Step 2: Initialize EMA
         logger.info("Step 2/2: Setting up EMA...")
         if args.use_ema:
@@ -138,6 +159,44 @@ def setup_models(args, device, dtype):
         logger.error(" Model setup failed")
         logger.error(error_msg)
         raise
+
+def analyze_size_mismatches(error_msg):
+    """Analyze and log detailed information about size mismatches"""
+    logger.error("\nDetailed size mismatch analysis:")
+    
+    # Extract all size mismatch information
+    mismatches = []
+    for line in error_msg.split('\n'):
+        if "size mismatch for" in line:
+            param = line.split('size mismatch for ')[1].split(':')[0]
+            shapes = line.split(': ')[1].split('copying a param with shape ')[1]
+            expected = shapes.split(', the shape in current model is ')[0]
+            actual = shapes.split(', the shape in current model is ')[1]
+            mismatches.append({
+                'param': param,
+                'expected': expected,
+                'actual': actual
+            })
+    
+    # Group mismatches by pattern
+    pattern_groups = {}
+    for mismatch in mismatches:
+        param_parts = mismatch['param'].split('.')
+        pattern = '.'.join(param_parts[:-2])  # Group by module path
+        if pattern not in pattern_groups:
+            pattern_groups[pattern] = []
+        pattern_groups[pattern].append(mismatch)
+    
+    # Log analysis
+    logger.error(f"Found {len(mismatches)} size mismatches in {len(pattern_groups)} module groups:")
+    for pattern, group in pattern_groups.items():
+        logger.error(f"\nModule: {pattern}")
+        logger.error(f"Number of mismatches: {len(group)}")
+        logger.error("Example mismatches:")
+        for mismatch in group[:3]:  # Show first 3 examples
+            logger.error(f"  Parameter: {mismatch['param']}")
+            logger.error(f"  Expected: {mismatch['expected']}")
+            logger.error(f"  Actual: {mismatch['actual']}")
 
 def setup_training(args, models, device, dtype):
     """Setup training components"""
