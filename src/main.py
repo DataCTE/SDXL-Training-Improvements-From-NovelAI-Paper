@@ -125,6 +125,22 @@ def parse_args():
     parser.add_argument("--vae_learning_rate", type=float, default=1e-6)
     parser.add_argument("--vae_train_freq", type=int, default=10)
     
+    # VAE finetuning parameters
+    parser.add_argument("--finetune_vae", action="store_true",
+                       help="Enable VAE finetuning")
+    parser.add_argument("--vae_learning_rate", type=float, default=1e-6,
+                       help="Learning rate for VAE finetuning")
+    parser.add_argument("--use_8bit_adam", action="store_true",
+                       help="Use 8-bit Adam optimizer for memory efficiency")
+    parser.add_argument("--gradient_checkpointing", action="store_true",
+                       help="Enable gradient checkpointing to save memory")
+    parser.add_argument("--adaptive_loss_scale", action="store_true",
+                       help="Use adaptive loss scaling for VAE")
+    parser.add_argument("--kl_weight", type=float, default=0.0,
+                       help="Weight for KL divergence loss")
+    parser.add_argument("--perceptual_weight", type=float, default=0.0,
+                       help="Weight for perceptual loss")
+    
     # Tag weighting
     parser.add_argument("--min_tag_weight", type=float, default=0.1)
     parser.add_argument("--max_tag_weight", type=float, default=3.0)
