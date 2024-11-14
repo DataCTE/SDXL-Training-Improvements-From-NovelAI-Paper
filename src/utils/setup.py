@@ -13,6 +13,7 @@ from inference.text_to_image import SDXLInference
 from training.vae_finetuner import VAEFineTuner
 from diffusers import EulerDiscreteScheduler
 import os
+from checkpoint import load_checkpoint
 
 logger = logging.getLogger(__name__)
 
@@ -45,78 +46,7 @@ def enable_gradient_checkpointing(model):
     else:
         logger.warning(f"Model {type(model).__name__} doesn't support gradient checkpointing")
 
-def setup_models(args, device, dtype):
-    """Initialize and configure all models"""
-    try:
-        models = {}
-        
-        logger.info("Loading SDXL pipeline...")
-        pipeline = StableDiffusionXLPipeline.from_pretrained(
-            args.model_path,  
-            torch_dtype=dtype,
-            use_safetensors=True,
-            variant="fp16" if dtype == torch.float16 else None,
-            local_files_only=False,
-            resume_download=True,
-            force_download=True
-        )
-        
-        logger.info(f"Moving pipeline to device: {device}")
-        pipeline.to(device)
-        
-        # Extract components
-        logger.info("Extracting model components...")
-        models["unet"] = pipeline.unet
-        models["vae"] = pipeline.vae
-        models["text_encoder"] = pipeline.text_encoder
-        models["text_encoder_2"] = pipeline.text_encoder_2
-        models["tokenizer"] = pipeline.tokenizer
-        models["tokenizer_2"] = pipeline.tokenizer_2
-        
-        logger.info("Model setup completed successfully")
-        return models
 
-    except Exception as e:
-        logger.error(f"\nTraining failed with error: {str(e)}")
-        raise e
-
-def analyze_size_mismatches(error_msg):
-    """Analyze and log detailed information about size mismatches"""
-    logger.error("\nDetailed size mismatch analysis:")
-    
-    # Extract all size mismatch information
-    mismatches = []
-    for line in error_msg.split('\n'):
-        if "size mismatch for" in line:
-            param = line.split('size mismatch for ')[1].split(':')[0]
-            shapes = line.split(': ')[1].split('copying a param with shape ')[1]
-            expected = shapes.split(', the shape in current model is ')[0]
-            actual = shapes.split(', the shape in current model is ')[1]
-            mismatches.append({
-                'param': param,
-                'expected': expected,
-                'actual': actual
-            })
-    
-    # Group mismatches by pattern
-    pattern_groups = {}
-    for mismatch in mismatches:
-        param_parts = mismatch['param'].split('.')
-        pattern = '.'.join(param_parts[:-2])  # Group by module path
-        if pattern not in pattern_groups:
-            pattern_groups[pattern] = []
-        pattern_groups[pattern].append(mismatch)
-    
-    # Log analysis
-    logger.error(f"Found {len(mismatches)} size mismatches in {len(pattern_groups)} module groups:")
-    for pattern, group in pattern_groups.items():
-        logger.error(f"\nModule: {pattern}")
-        logger.error(f"Number of mismatches: {len(group)}")
-        logger.error("Example mismatches:")
-        for mismatch in group[:3]:  # Show first 3 examples
-            logger.error(f"  Parameter: {mismatch['param']}")
-            logger.error(f"  Expected: {mismatch['expected']}")
-            logger.error(f"  Actual: {mismatch['actual']}")
 
 def setup_training(args, models, device, dtype):
     """Setup training components"""

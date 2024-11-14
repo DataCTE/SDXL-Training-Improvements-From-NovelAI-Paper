@@ -10,7 +10,7 @@ from .logging import (
     cleanup_wandb
 )
 from .model_card import create_model_card, save_model_card
-from .setup import setup_models, setup_training
+from .setup import setup_training
 from .validation import validate_dataset
 
 __all__ = [
@@ -31,7 +31,6 @@ __all__ = [
     'cleanup_wandb',
     'create_model_card',
     'save_model_card',
-    'setup_models',
     'setup_training',
     'validate_dataset'
 ]
