@@ -120,20 +120,15 @@ def parse_args():
     parser.add_argument("--gradient_checkpointing", action="store_true",
                        help="Enable gradient checkpointing to save memory at the expense of speed")
     
-    # EMA and VAE settings
-    parser.add_argument("--finetune_vae", action="store_true")
-    parser.add_argument("--vae_learning_rate", type=float, default=1e-6)
-    parser.add_argument("--vae_train_freq", type=int, default=10)
-    
     # VAE finetuning parameters
     parser.add_argument("--finetune_vae", action="store_true",
                        help="Enable VAE finetuning")
     parser.add_argument("--vae_learning_rate", type=float, default=1e-6,
                        help="Learning rate for VAE finetuning")
+    parser.add_argument("--vae_train_freq", type=int, default=10,
+                       help="How often to update VAE during training")
     parser.add_argument("--use_8bit_adam", action="store_true",
                        help="Use 8-bit Adam optimizer for memory efficiency")
-    parser.add_argument("--gradient_checkpointing", action="store_true",
-                       help="Enable gradient checkpointing to save memory")
     parser.add_argument("--adaptive_loss_scale", action="store_true",
                        help="Use adaptive loss scaling for VAE")
     parser.add_argument("--kl_weight", type=float, default=0.0,
