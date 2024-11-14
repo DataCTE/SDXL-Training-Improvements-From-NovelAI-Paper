@@ -4,7 +4,7 @@ import logging
 from PIL import Image, ImageDraw, ImageFilter
 from diffusers import StableDiffusionInpaintPipeline, DDIMScheduler
 from enum import Enum
-
+from typing import List
 
 logger = logging.getLogger(__name__)
 
