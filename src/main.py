@@ -275,8 +275,7 @@ if __name__ == "__main__":
     except RuntimeError as e:
         # If already set, just log and continue
         logger.info("Multiprocessing start method already set")
-    
-    setup_torch_backends()
+
     args = parse_args()
     success = main(args)
     sys.exit(0 if success else 1)
