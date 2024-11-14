@@ -47,107 +47,49 @@ def enable_gradient_checkpointing(model):
 
 def setup_models(args, device, dtype):
     """Initialize and configure all models"""
-    logger.info("Starting model setup process...")
-    
     try:
         models = {}
         
-        # Step 1: Load complete SDXL pipeline
-        logger.info("Step 1/2: Loading SDXL pipeline...")
-        try:
-            # Load pipeline from local path or Hugging Face hub
-            pipeline = StableDiffusionXLPipeline.from_pretrained(
-                args.model_path,
-                torch_dtype=dtype,
-                use_safetensors=True,
-                dtype=dtype
+        logger.info("Loading SDXL pipeline...")
+        pipeline = DiffusionPipeline.from_pretrained(
+            args.pretrained_model_name_or_path,
+            torch_dtype=dtype,
+            use_safetensors=True,
+            variant="fp16" if dtype == torch.float16 else None
+        )
+        
+        # Load checkpoint with strict=False to allow partial loading
+        if args.resume_from_checkpoint:
+            logger.info(f"Loading checkpoint from {args.resume_from_checkpoint}")
+            checkpoint = torch.load(args.resume_from_checkpoint, map_location="cpu")
+            
+            # Load state dict with strict=False and log results
+            logger.info("Loading UNet weights with strict=False...")
+            missing_keys, unexpected_keys = pipeline.unet.load_state_dict(
+                checkpoint["unet"], strict=False
             )
             
-            # Update architecture verification to be informative rather than restrictive
-            logger.info("Verifying model architecture...")
-            model_shapes = {name: param.shape for name, param in pipeline.unet.named_parameters()}
-            logger.info(f"Loaded UNet with {len(model_shapes)} parameters")
-            logger.debug("Sample parameter shapes:")
-            for name in list(model_shapes.keys())[:5]:  # Log first 5 shapes as reference
-                logger.debug(f"  {name}: {model_shapes[name]}")
-            
-            pipeline.to(device)
-            
-            # Extract components
-            models["unet"] = pipeline.unet
-            models["vae"] = pipeline.vae
-            models["text_encoder"] = pipeline.text_encoder
-            models["text_encoder_2"] = pipeline.text_encoder_2
-            models["tokenizer"] = pipeline.tokenizer
-            models["tokenizer_2"] = pipeline.tokenizer_2
-            
-            # Set VAE to eval mode
-            models["vae"].requires_grad_(False)
-            models["vae"].eval()
-            
-            logger.info("SDXL pipeline loaded and components extracted successfully")
-            
-        except Exception as e:
-            logger.error("Failed to load SDXL pipeline")
-            error_msg = clean_error_message(traceback.format_exc())
-            logger.error(error_msg)
-            
-            # Add detailed error analysis
-            if "size mismatch" in str(e):
-                analyze_size_mismatches(str(e))
-            raise
+            if missing_keys:
+                logger.warning(f"Missing keys when loading checkpoint: {missing_keys}")
+            if unexpected_keys:
+                logger.warning(f"Unexpected keys in checkpoint: {unexpected_keys}")
         
-        # Step 2: Initialize EMA
-        logger.info("Step 2/2: Setting up EMA...")
-        if args.use_ema:
-            try:
-                logger.info("  Initializing EMA model with parameters:")
-                logger.info(f"  - Base decay rate: {args.ema_decay}")
-                logger.info(f"  - Update after step: {args.ema_update_after_step}")
-                logger.info(f"  - Update frequency: {args.ema_update_every}")
-                logger.info(f"  - Warmup enabled: {args.use_ema_warmup}")
-                
-                ema_model = EMAModel(
-                    model=models["unet"],
-                    decay=args.ema_decay,
-                    update_after_step=args.ema_update_after_step,
-                    inv_gamma=args.ema_inv_gamma,
-                    power=args.ema_power,
-                    min_decay=args.ema_min_decay,
-                    max_decay=args.ema_max_decay,
-                    device=device,
-                    update_every=args.ema_update_every,
-                    use_ema_warmup=args.use_ema_warmup,
-                    grad_scale_factor=args.ema_grad_scale_factor
-                )
-                logger.info("  EMA model initialized successfully")
-                models["ema_model"] = ema_model
-            except Exception as e:
-                logger.error("  Failed to initialize EMA model")
-                error_msg = clean_error_message(traceback.format_exc())
-                logger.error(error_msg)
-                raise
-        else:
-            logger.info("  Skipping EMA initialization (not enabled)")
-            models["ema_model"] = None
+        logger.info(f"Moving pipeline to device: {device}")
+        pipeline.to(device)
         
-        # Final verification
-        logger.info("Verifying model initialization...")
-        required_models = ["unet", "vae", "text_encoder", "text_encoder_2", "tokenizer", "tokenizer_2"]
-        missing_models = [model for model in required_models if model not in models]
+        # Extract components
+        logger.info("Extracting model components...")
+        models["unet"] = pipeline.unet
+        models["vae"] = pipeline.vae
+        models["text_encoder"] = pipeline.text_encoder
+        models["text_encoder_2"] = pipeline.text_encoder_2
         
-        if missing_models:
-            raise ValueError(f"Missing required models: {', '.join(missing_models)}")
-        
-        logger.info(" All models initialized successfully")
         logger.info("Model setup completed successfully")
         return models
-        
+
     except Exception as e:
-        error_msg = clean_error_message(traceback.format_exc())
-        logger.error("Model setup failed")
-        logger.error(error_msg)
-        raise
+        logger.error(f"\nTraining failed with error: {str(e)}")
+        raise e
 
 def analyze_size_mismatches(error_msg):
     """Analyze and log detailed information about size mismatches"""
