@@ -9,7 +9,7 @@ from diffusers.optimization import get_scheduler
 from training.ema import EMAModel
 from data.dataset import create_dataloader
 from utils.validation import Validator
-from data.tag_weighter import TagWeighter
+from data.tag_weighter import TagBasedLossWeighter
 from training.vae_finetuner import VAEFinetuner
 
 logger = logging.getLogger(__name__)
@@ -117,7 +117,7 @@ def setup_training(args, models, device, dtype):
     # Initialize tag weighter if requested
     tag_weighter = None
     if args.use_tag_weighting:
-        tag_weighter = TagWeighter(
+        tag_weighter = TagBasedLossWeighter(
             min_weight=args.min_tag_weight,
             max_weight=args.max_tag_weight
         )
