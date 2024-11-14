@@ -270,7 +270,7 @@ def main(args):
                 power=args.ema_power,
                 min_decay=args.ema_min_decay,
                 max_decay=args.ema_max_decay,
-                use_warmup=args.use_ema_warmup,
+                use_ema_warmup=args.use_ema_warmup,
                 grad_scale_factor=args.ema_grad_scale_factor
             )
         else:
