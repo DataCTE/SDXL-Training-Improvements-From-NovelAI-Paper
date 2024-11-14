@@ -60,8 +60,6 @@ def parse_args():
                        help="EMA decay rate")
     parser.add_argument("--ema_update_after_step", type=int, default=100,
                        help="Start EMA after this many steps")
-    parser.add_argument("--ema_inv_gamma", type=float, default=1.0,
-                       help="Inverse multiplicative factor of EMA warmup length")
     parser.add_argument("--ema_power", type=float, default=0.6667,
                        help="Power for decay rate schedule (default: 2/3)")
     parser.add_argument("--ema_min_decay", type=float, default=0.0,
@@ -72,8 +70,6 @@ def parse_args():
                        help="Update EMA every N steps")
     parser.add_argument("--use_ema_warmup", action="store_true", default=True,
                        help="Use EMA warmup")
-    parser.add_argument("--ema_grad_scale_factor", type=float, default=0.5,
-                       help="Factor for gradient-based update weighting")
     
     # V-prediction parameters
     parser.add_argument("--min_snr_gamma", type=float, default=5.0,
@@ -263,15 +259,14 @@ def main(args):
             from training.ema import EMAModel
             ema = EMAModel(
                 models["unet"],
+                model_path=args.model_path,
                 decay=args.ema_decay,
                 update_after_step=args.ema_update_after_step,
                 update_every=args.ema_update_every,
-                inv_gamma=args.ema_inv_gamma,
                 power=args.ema_power,
                 min_decay=args.ema_min_decay,
                 max_decay=args.ema_max_decay,
-                use_ema_warmup=args.use_ema_warmup,
-                grad_scale_factor=args.ema_grad_scale_factor
+                use_ema_warmup=args.use_ema_warmup
             )
         else:
             ema = None
