@@ -154,13 +154,8 @@ def parse_args():
     # Performance and Training Settings
     parser.add_argument('--mixed_precision', action='store_true', default=True,
                        help='Enable mixed precision training')
-    parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
-                       help='Number of gradient accumulation steps')
     parser.add_argument('--max_grad_norm', type=float, default=1.0,
                        help='Maximum gradient norm for clipping')
-    parser.add_argument('--gradient_checkpointing', action='store_true', default=False,
-                       help='Enable gradient checkpointing to save memory')
-    
     return parser.parse_args()
 
 def main(args):
