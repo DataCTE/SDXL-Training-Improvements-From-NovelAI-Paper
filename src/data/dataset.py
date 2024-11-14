@@ -64,12 +64,16 @@ class CustomDataset(Dataset):
         self.text_encoder = text_encoder
         self.text_encoder_2 = text_encoder_2
         
-        # Initialize upscaler
-        self.upscaler = UltimateUpscaler(
-            model_path="Lykon/DreamShaper",
-            device=self.vae.device,
-            dtype=self.vae.dtype
-        )
+        # Initialize upscaler only if needed
+        if not all_ar:
+            self.upscaler = UltimateUpscaler(
+                model_path="Lykon/DreamShaper",
+                device=self.vae.device,
+                dtype=self.vae.dtype
+            )
+        else:
+            self.upscaler = None
+            logger.info("Skipping upscaler initialization since all_ar is enabled")
         
         # Performance optimization
         self.num_workers = num_workers or min(os.cpu_count(), 32)
@@ -695,6 +699,14 @@ class CustomDataset(Dataset):
 
     def _upscale_image(self, image, target_width, target_height):
         """Upscale image using Ultimate SD Upscaler"""
+        if self.all_ar:
+            # Just return original image when all_ar is True
+            return image
+            
+        if self.upscaler is None:
+            logger.warning("Upscaler not initialized but _upscale_image called")
+            return image
+            
         try:
             # Calculate scale factor
             scale_factor = max(target_width / image.width, target_height / image.height)
