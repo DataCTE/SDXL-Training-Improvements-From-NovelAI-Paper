@@ -32,6 +32,7 @@ def train_one_epoch(
     """Single epoch training loop with detailed logging"""
     try:
         logger.debug(f"\n=== Starting epoch {epoch+1} ===")
+        logger.debug(f"DataLoader length: {len(train_dataloader)}")
         
         # Move wandb logging after ensuring global_step is at least 1
         global_step = max(1, global_step)
@@ -48,6 +49,7 @@ def train_one_epoch(
         grad_norm_value = 0.0
         tag_metrics = defaultdict(list)
         
+        logger.debug("Setting up progress bar...")
         progress_bar = tqdm(
             total=len(train_dataloader),
             desc=f"Epoch {epoch+1}",
@@ -56,6 +58,7 @@ def train_one_epoch(
         )
         
         # Set training mode and ensure gradient checkpointing
+        logger.debug("Setting up model training mode...")
         unet.train()
         if args.gradient_checkpointing:
             if hasattr(unet, "gradient_checkpointing_enable"):
@@ -66,14 +69,21 @@ def train_one_epoch(
                     if hasattr(encoder, "gradient_checkpointing_enable"):
                         encoder.gradient_checkpointing_enable()
 
+        logger.debug("Starting batch iteration...")
         for step, batch in enumerate(train_dataloader):
+            logger.debug(f"Processing batch {step}")
             step_start = time.time()
             
             # Validate batch contents
             required_keys = ["latents", "text_embeddings", "added_cond_kwargs", "tags", "special_tags", "tag_weights"]
             missing_keys = [key for key in required_keys if key not in batch]
             if missing_keys:
+                logger.error(f"Batch keys: {batch.keys()}")
                 raise ValueError(f"Batch missing required keys: {missing_keys}")
+            
+            # Log batch shapes for debugging
+            logger.debug(f"Latents shape: {batch['latents'].shape}")
+            logger.debug(f"Text embeddings shape: {batch['text_embeddings'].shape}")
             
             # Move batch to device
             latents = batch["latents"].to(device, dtype=dtype)
@@ -276,21 +286,22 @@ def train(args, models, train_components, device, dtype):
         if args.use_wandb:
             wandb.log({"train/epoch": epoch}, step=global_step)
         
-            global_step = train_one_epoch(
-                unet=models["unet"],
-                train_dataloader=train_components["train_dataloader"],
-                optimizer=train_components["optimizer"],
-                lr_scheduler=train_components["lr_scheduler"],
-                ema_model=train_components["ema_model"],
-                tag_weighter=train_components["tag_weighter"],
-                vae_finetuner=train_components["vae_finetuner"],
-                args=args,
-                device=device,
-                dtype=dtype,
-                epoch=epoch,
-                global_step=global_step,
-                models=models
-            )
+        # Run training epoch (moved outside of wandb condition)
+        global_step = train_one_epoch(
+            unet=models["unet"],
+            train_dataloader=train_components["train_dataloader"],
+            optimizer=train_components["optimizer"],
+            lr_scheduler=train_components["lr_scheduler"],
+            ema_model=train_components["ema_model"],
+            tag_weighter=train_components["tag_weighter"],
+            vae_finetuner=train_components["vae_finetuner"],
+            args=args,
+            device=device,
+            dtype=dtype,
+            epoch=epoch,
+            global_step=global_step,
+            models=models
+        )
         
         # Run end-of-epoch validation
         if not args.skip_validation and (epoch + 1) % args.validation_frequency == 0:
