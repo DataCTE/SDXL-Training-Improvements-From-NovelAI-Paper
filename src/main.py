@@ -221,7 +221,12 @@ def main(args):
             batch_size=args.batch_size,
             num_workers=args.num_workers,
             all_ar=args.all_ar,
-            cache_dir=args.cache_dir
+            cache_dir=args.cache_dir,
+            vae=models["vae"],
+            tokenizer=models["tokenizer"],
+            tokenizer_2=models["tokenizer_2"],
+            text_encoder=models["text_encoder"],
+            text_encoder_2=models["text_encoder_2"]
         )
         
         # Setup optimizer

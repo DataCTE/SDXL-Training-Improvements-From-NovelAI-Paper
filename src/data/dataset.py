@@ -1192,6 +1192,11 @@ def custom_collate(batch):
 def create_dataloader(
     data_dir: str,
     batch_size: int,
+    vae,
+    tokenizer,
+    tokenizer_2,
+    text_encoder,
+    text_encoder_2,
     num_workers: int = None,
     cache_dir: str = "latents_cache",
     all_ar: bool = False,
@@ -1206,6 +1211,11 @@ def create_dataloader(
     Args:
         data_dir (str): Directory containing the training images
         batch_size (int): Batch size for training
+        vae: VAE model component
+        tokenizer: Primary tokenizer
+        tokenizer_2: Secondary tokenizer
+        text_encoder: Primary text encoder
+        text_encoder_2: Secondary text encoder
         num_workers (int, optional): Number of worker processes
         cache_dir (str, optional): Directory to cache latents
         all_ar (bool, optional): Accept all aspect ratios without resizing
@@ -1221,6 +1231,11 @@ def create_dataloader(
         # Initialize dataset
         dataset = CustomDataset(
             data_dir=data_dir,
+            vae=vae,
+            tokenizer=tokenizer,
+            tokenizer_2=tokenizer_2,
+            text_encoder=text_encoder,
+            text_encoder_2=text_encoder_2,
             cache_dir=cache_dir,
             all_ar=all_ar,
             num_workers=num_workers
