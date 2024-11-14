@@ -22,8 +22,6 @@ from data.tag_weighter import TagBasedLossWeighter
 from training.vae_finetuner import VAEFineTuner
 from utils.device import cleanup
 from diffusers import StableDiffusionXLPipeline
-from utils.validation import validate_dataset, validate_model_components, validate_training_args, validate_vae_finetuner_config, validate_ema_config
-import os
 from diffusers import EulerDiscreteScheduler
 
 
@@ -58,56 +56,6 @@ def enable_gradient_checkpointing(model):
     else:
         logger.warning(f"Model {type(model).__name__} doesn't support gradient checkpointing")
 
-def verify_unet_config(config):
-    """Verify that UNet configuration matches SDXL architecture requirements
-    
-    According to Table 1 and Section 2.1 of the SDXL paper:
-    - Uses heterogeneous distribution of transformer blocks [0,2,10]
-    - Removes lowest level (8x downsampling)
-    - Channel multipliers [1,2,4]
-    - Context dimension 2048 (for combined CLIP ViT-L & OpenCLIP ViT-bigG)
-    """
-    expected_config = {
-        'cross_attention_dim': 2048,  # Combined dimension for dual text encoders
-        'transformer_layers_per_block': [0, 2, 10],  # Heterogeneous transformer distribution
-        'channel_mult': [1, 2, 4],  # Channel multipliers without 8x level
-        'in_channels': 4,  # Standard for SD models
-        'out_channels': 4,  # Standard for SD models
-        'num_res_blocks': 2,  # Standard architecture 
-        'attention_resolutions': [4, 8],  # Attention at 1/4 and 1/8 resolution
-        'use_linear_projection': True,  # For improved stability
-    }
-    
-    missing_keys = []
-    mismatched_values = []
-    
-    for key, value in expected_config.items():
-        if key not in config:
-            missing_keys.append(key)
-        elif config[key] != value:
-            mismatched_values.append(
-                f"{key}: expected {value}, got {config[key]}"
-            )
-    
-    if missing_keys:
-        logger.warning(f"Missing config keys: {', '.join(missing_keys)}")
-    
-    if mismatched_values:
-        logger.warning(
-            "Config mismatches found:\n" + 
-            "\n".join(mismatched_values)
-        )
-        
-    if missing_keys or mismatched_values:
-        logger.warning(
-            "Model architecture differs from SDXL specification. "
-            "This may cause compatibility issues."
-        )
-    else:
-        logger.info("UNet configuration verification passed")
-    
-    return True
-
 def setup_models(args, device, dtype):
     """Initialize and configure all models"""
     logger.info("Setting up models...")
@@ -115,38 +63,11 @@ def setup_models(args, device, dtype):
     try:
         # Load UNet
         logger.info("Loading UNet...")
-        unet_config = UNet2DConditionModel.load_config(
-            args.model_path,
-            subfolder="unet"
-        )
-        logger.info(f"Loaded UNet config: {unet_config}")
-        
-        # Fix SDXL architecture configuration - only essential parameters
-        sdxl_updates = {
-            'transformer_layers_per_block': [0, 2, 10],  # Correct transformer distribution
-            'cross_attention_dim': 2048,  # Combined CLIP dimension
-            'use_linear_projection': True  # For improved stability
-        }
-        
-        # Update config with SDXL architecture requirements
-        for key, value in sdxl_updates.items():
-            if key not in unet_config or unet_config[key] != value:
-                logger.info(f"Updating UNet config: {key} = {value}")
-                unet_config[key] = value
-        
-        # Initialize UNet with corrected config
-        unet = UNet2DConditionModel.from_config(unet_config)
-        
-        # Load pretrained weights
-        pretrained_unet = UNet2DConditionModel.from_pretrained(
+        unet = UNet2DConditionModel.from_pretrained(
             args.model_path,
             subfolder="unet",
             torch_dtype=dtype
-        )
-        
-        # Transfer weights
-        unet.load_state_dict(pretrained_unet.state_dict())
-        unet = unet.to(device)
+        ).to(device)
         
         # Load VAE
         logger.info("Loading VAE...")
@@ -209,40 +130,14 @@ def setup_models(args, device, dtype):
         logger.error(traceback.format_exc())
         raise
 
-def verify_models(models):
-    """
-    Verify that all models are present and properly configured
-    
-    Args:
-        models (dict): Dictionary of model components
-        
-    Returns:
-        bool: True if verification passes
-    """
-    try:
-        is_valid, error_msg = validate_model_components(models)
-        if not is_valid:
-            raise ValueError(error_msg)
-            
-        return True
-        
-    except Exception as e:
-        logger.error(f"Model verification failed: {str(e)}")
-        return False
-
 def setup_training(args, models, device, dtype):
     """Setup training components"""
     logger.info("Setting up training components...")
     
     try:
         # Validate training arguments first
-        is_valid, error_msg = validate_training_args(args)
-        if not is_valid:
-            raise ValueError(f"Training arguments validation failed: {error_msg}")
-            
-        # Add default num_workers if not specified
         if not hasattr(args, 'num_workers'):
-            args.num_workers = min(8, os.cpu_count() or 1)  # Default to min(8, CPU cores)
+            args.num_workers = min(8, torch.get_num_threads() or 1)  # Default to min(8, CPU cores)
             logger.info(f"Using default num_workers: {args.num_workers}")
 
         # Initialize dataset without validation if all_ar is True
@@ -260,11 +155,6 @@ def setup_training(args, models, device, dtype):
                 num_workers=args.num_workers
             )
         else:
-            # Validate dataset first
-            valid, stats = validate_dataset(args.data_dir)
-            if not valid:
-                raise ValueError(f"Dataset validation failed: {stats}")
-                
             dataset = CustomDataset(
                 data_dir=args.data_dir,
                 vae=models["vae"],
@@ -292,10 +182,6 @@ def setup_training(args, models, device, dtype):
                 'use_channel_scaling': args.use_channel_scaling
             }
             
-            is_valid, error_msg = validate_vae_finetuner_config(vae_config)
-            if not is_valid:
-                raise ValueError(f"VAE finetuner validation failed: {error_msg}")
-                
             vae_finetuner = VAEFineTuner(
                 models["vae"],
                 **vae_config
@@ -315,10 +201,6 @@ def setup_training(args, models, device, dtype):
                 'grad_scale_factor': args.ema_grad_scale_factor
             }
             
-            is_valid, error_msg = validate_ema_config(ema_config)
-            if not is_valid:
-                raise ValueError(f"EMA validation failed: {error_msg}")
-                
             ema = EMAModel(
                 models["unet"],
                 **ema_config,
