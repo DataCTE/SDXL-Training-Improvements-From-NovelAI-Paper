@@ -273,8 +273,8 @@ def main(args):
         
         # Setup tag weighter if enabled
         if args.use_tag_weighting:
-            from data.tag_weighter import TagWeighter
-            tag_weighter = TagWeighter(
+            from data.tag_weighter import TagBasedLossWeighter
+            tag_weighter = TagBasedLossWeighter(
                 min_weight=args.min_tag_weight,
                 max_weight=args.max_tag_weight
             )
