@@ -826,11 +826,12 @@ def custom_collate(batch):
                 h <= max_size and w <= max_size)
 
     def resize_latents(latents, target_height, target_width):
-        return transforms.functional.interpolate(
-            latents,
+        # Use torch.nn.functional instead of transforms.functional
+        return torch.nn.functional.interpolate(
+            latents.unsqueeze(0),  # Add batch dimension
             size=(target_height, target_width),
             mode='nearest'
-        )
+        ).squeeze(0)  # Remove batch dimension
 
     # Filter out invalid samples
     valid_batch = [item for item in batch if validate_latents(item['latents'])]
@@ -848,13 +849,20 @@ def custom_collate(batch):
         for x in valid_batch
     ]
 
-    # Stack resized tensors
+    # Stack tensors
     batch_dict = {
         "latents": torch.stack(resized_latents),
         "text_embeddings": torch.stack([x["text_embeddings"] for x in valid_batch]),
         "text_embeddings_2": torch.stack([x["text_embeddings_2"] for x in valid_batch]),
-        "pooled_text_embeddings_2": torch.stack([x["pooled_text_embeddings_2"] for x in valid_batch]),
-        "tags": [x["tags"] for x in valid_batch]
+        "added_cond_kwargs": {
+            k: torch.stack([x["added_cond_kwargs"][k] for x in valid_batch])
+            if torch.is_tensor(valid_batch[0]["added_cond_kwargs"][k])
+            else [x["added_cond_kwargs"][k] for x in valid_batch]
+            for k in valid_batch[0]["added_cond_kwargs"]
+        },
+        "tags": [x["tags"] for x in valid_batch],
+        "special_tags": [x["special_tags"] for x in valid_batch],
+        "tag_weights": [x["tag_weights"] for x in valid_batch]
     }
 
     return batch_dict
