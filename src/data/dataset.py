@@ -192,6 +192,9 @@ class CustomDataset(Dataset):
                             pooled_output = text_embeddings_2[0]
                             hidden_states = text_embeddings_2.hidden_states[-2]
                         
+                        # Reshape pooled output to match hidden states dimensions
+                        pooled_output = pooled_output.unsqueeze(1).unsqueeze(2).expand(-1, hidden_states.size(1), hidden_states.size(2), -1)
+                        
                         # Save cache data
                         cache_data = {
                             "latents": latents[idx],
@@ -749,6 +752,9 @@ class CustomDataset(Dataset):
                 # Get pooled and hidden states
                 pooled_output = text_embeddings_2[0]
                 hidden_states = text_embeddings_2.hidden_states[-2]
+                
+                # Reshape pooled output to match hidden states dimensions
+                pooled_output = pooled_output.unsqueeze(1).unsqueeze(2).expand(-1, hidden_states.size(1), hidden_states.size(2), -1)
                 
                 # Create added conditions
                 added_cond_kwargs = {
