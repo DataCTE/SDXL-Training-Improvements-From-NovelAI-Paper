@@ -269,19 +269,20 @@ def main(args):
         if args.use_ema:
             from training.ema import EMAModel
             ema = EMAModel(
-                models["unet"],
                 model_path=args.model_path,
-                decay=args.ema_decay,
                 update_after_step=args.ema_update_after_step,
                 update_every=args.ema_update_every,
+                decay=args.ema_decay,
                 power=args.ema_power,
                 min_decay=args.ema_min_decay,
                 max_decay=args.ema_max_decay,
                 use_ema_warmup=args.use_ema_warmup
             )
+            ema.to(device=device, dtype=dtype)
+            models["ema"] = ema
         else:
             ema = None
-        
+            
         # Setup tag weighter if enabled
         if args.use_tag_weighting:
             from data.tag_weighter import TagBasedLossWeighter
@@ -313,7 +314,6 @@ def main(args):
         train_components = {
             "optimizer": optimizer,
             "lr_scheduler": lr_scheduler,
-            "ema": ema,
             "train_dataloader": train_dataloader,
             "tag_weighter": tag_weighter,
             "vae_finetuner": vae_finetuner
