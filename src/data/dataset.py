@@ -681,7 +681,7 @@ class CustomDataset(Dataset):
         target_width = max(target_width, self.min_bucket_reso)
         target_height = max(target_height, self.min_bucket_reso)
         
-        return target_width, target_height
+        return target_height, target_width
 
     def process_image_size(self, image, target_width, target_height):
         """Process image size with advanced resizing"""
@@ -809,7 +809,7 @@ class CustomDataset(Dataset):
         while width >= self.min_bucket_reso:
             height = self.min_bucket_reso
             while height * width <= 1024 * 1024 and height <= self.max_bucket_reso:  # Increased max area
-                buckets.append((width, height))
+                buckets.append((height, width))  
                 height += self.bucket_reso_steps
             width -= self.bucket_reso_steps
         
@@ -818,72 +818,85 @@ class CustomDataset(Dataset):
         while height >= self.min_bucket_reso:
             width = self.min_bucket_reso
             while height * width <= 1024 * 1024 and width <= self.max_bucket_reso:  # Increased max area
-                if (width, height) not in buckets:
-                    buckets.append((width, height))
+                if (height, width) not in buckets:  
+                    buckets.append((height, width))
                 width += self.bucket_reso_steps
             height -= self.bucket_reso_steps
         
         # Add square buckets at different resolutions
         for size in range(self.min_bucket_reso, self.max_bucket_reso + 1, self.bucket_reso_steps):
-            if (size, size) not in buckets:
-                buckets.append((size, size))
+            bucket = (size, size)
+            if bucket not in buckets:
+                buckets.append(bucket)
         
         # Store bucket info
         self.buckets = sorted(buckets, key=lambda x: x[0] * x[1])  # Sort by area for efficiency
         self.bucket_data = {bucket: [] for bucket in buckets}
         self.image_to_bucket = {}
         
-        # Assign images to buckets
-        for img_path in self.image_paths:
-            img_path, bucket = self._assign_to_bucket(img_path)
-            if bucket is not None:
-                self.bucket_data[bucket].append(img_path)
-                self.image_to_bucket[img_path] = bucket
-            else:
-                # If no suitable bucket found, create a new one
-                with Image.open(img_path) as img:
-                    width, height = img.size
-                    target_w, target_h = self._get_target_size(width, height)
-                    new_bucket = (target_w, target_h)
-                    if new_bucket not in self.buckets:
-                        self.buckets.append(new_bucket)
-                        self.bucket_data[new_bucket] = []
-                    self.bucket_data[new_bucket].append(img_path)
-                    self.image_to_bucket[img_path] = new_bucket
-        
+        # Process images in parallel for faster bucket assignment
+        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+            # Submit all tasks
+            future_to_path = {
+                executor.submit(self._assign_to_bucket, path): path 
+                for path in self.image_paths
+            }
+            
+            # Process results as they complete
+            for future in tqdm(as_completed(future_to_path), total=len(future_to_path), desc="Assigning images to buckets"):
+                img_path, bucket = future.result()
+                if bucket is not None:
+                    self.bucket_data[bucket].append(img_path)
+                    self.image_to_bucket[img_path] = bucket
+                else:
+                    # If no suitable bucket found, create a new one
+                    with Image.open(img_path) as img:
+                        width, height = img.size
+                        target_h, target_w = self._get_target_size(width, height)
+                        new_bucket = (target_h, target_w)
+                        if new_bucket not in self.buckets:
+                            self.buckets.append(new_bucket)
+                            self.bucket_data[new_bucket] = []
+                        self.bucket_data[new_bucket].append(img_path)
+                        self.image_to_bucket[img_path] = new_bucket
+    
         # Remove empty buckets
         empty_buckets = [bucket for bucket, images in self.bucket_data.items() if not images]
         for bucket in empty_buckets:
             del self.bucket_data[bucket]
             self.buckets.remove(bucket)
-        
+    
         logger.info(f"Created {len(self.buckets)} aspect ratio buckets")
         logger.info(f"Images assigned to buckets: {sum(len(samples) for samples in self.bucket_data.values())}")
-        logger.info(f"Bucket sizes: {[(w,h) for w,h in self.buckets]}")
+        logger.info(f"Bucket sizes: {[(h,w) for h,w in self.buckets]}")
 
     def _assign_to_bucket(self, img_path):
-        """Assign an image to the most appropriate bucket"""
+        """Assign an image to the most appropriate bucket with optimized comparison"""
         try:
             with Image.open(img_path) as img:
                 width, height = img.size
                 
-                # Find the best fitting bucket
+                # Calculate target size first
+                target_h, target_w = self._get_target_size(width, height)
+                target_area = target_h * target_w
+                
+                # Find the best fitting bucket using area-based comparison
                 best_bucket = None
                 min_area_diff = float('inf')
                 
                 for bucket_h, bucket_w in self.buckets:
                     # Skip if bucket is too small
-                    if bucket_h < height or bucket_w < width:
+                    if bucket_h < target_h or bucket_w < target_w:
                         continue
                     
                     # Calculate area difference
-                    area_diff = (bucket_h * bucket_w) - (height * width)
+                    area_diff = abs((bucket_h * bucket_w) - target_area)
                     if area_diff < min_area_diff:
                         min_area_diff = area_diff
                         best_bucket = (bucket_h, bucket_w)
-                
+            
                 return img_path, best_bucket
-                
+            
         except Exception as e:
             logger.error(f"Error assigning {img_path} to bucket: {str(e)}")
             return img_path, None
