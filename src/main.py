@@ -82,8 +82,10 @@ def parse_args():
                       help="Multiplier for CFG rescaling")
     
     # Training mode flags
-    parser.add_argument("--zsnr", action="store_true", default=True,
+    parser.add_argument("--use_ztsnr", action="store_true", default=True,
                       help="Enable Zero Terminal SNR training")
+    parser.add_argument("--zsnr", action="store_true", default=True,
+                      help="[DEPRECATED] Use --use_ztsnr instead")
     parser.add_argument("--v_prediction", action="store_true", default=True,
                       help="Enable v-prediction parameterization")
     parser.add_argument("--resolution_scaling", action="store_true", default=True,
@@ -198,6 +200,11 @@ def main(args):
     """Main training pipeline"""
     wandb_run = None
     try:
+        # Handle deprecated zsnr argument
+        if hasattr(args, 'zsnr') and args.zsnr and not hasattr(args, 'use_ztsnr'):
+            logger.warning("The --zsnr argument is deprecated. Please use --use_ztsnr instead.")
+            args.use_ztsnr = args.zsnr
+            
         # Set up logging
         setup_logging(os.path.join("logs", args.wandb_run_name) if args.wandb_run_name else "logs")
         log_system_info()
