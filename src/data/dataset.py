@@ -2,7 +2,8 @@ from pathlib import Path
 from PIL import Image
 import torch
 import torchvision.transforms as transforms
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader, Sampler
+from torch.utils.data.sampler import SubsetRandomSampler
 import math
 from tqdm import tqdm
 import logging
@@ -1057,34 +1058,25 @@ class CustomDataset(Dataset):
         return result
 
     def custom_collate(self, batch):
-        """
-        Custom collate function for DataLoader with advanced batch handling.
-        Handles variable size inputs and applies proper padding.
-        """
+        """Custom collate function that ensures all items in a batch are from the same bucket"""
         # Filter out None values from failed __getitem__ calls
         batch = [item for item in batch if item is not None]
         if not batch:
             raise RuntimeError("Empty batch after filtering None values")
         
-        # Get the target size for this batch from the first item's bucket
-        if self.enable_bucket_sampler:
-            target_size = batch[0].get('bucket_size')
-            if target_size is None:
-                raise ValueError("No bucket size found in batch item")
-            target_h, target_w = target_size
-            
-            # Verify all items in batch have same bucket size
-            for item in batch:
-                if item.get('bucket_size') != target_size:
-                    raise ValueError(f"Inconsistent bucket sizes in batch: {item.get('bucket_size')} vs {target_size}")
+        # All items should have the same bucket size since we're using BucketSampler
+        bucket_size = batch[0]['bucket_size']
+        if not all(item['bucket_size'] == bucket_size for item in batch):
+            sizes = [item['bucket_size'] for item in batch]
+            raise ValueError(f"Inconsistent bucket sizes in batch: {sizes}")
         
-        # Stack tensors with consistent sizes
+        # Stack tensors
         try:
             latents = torch.stack([item['latents'] for item in batch])
             text_embeddings = torch.stack([item['text_embeddings'] for item in batch])
             text_embeddings_2 = torch.stack([item['text_embeddings_2'] for item in batch])
             
-            # Handle added_cond_kwargs
+            # Handle added_cond_kwargs if present
             added_cond_kwargs = {}
             if 'added_cond_kwargs' in batch[0]:
                 for key in batch[0]['added_cond_kwargs']:
@@ -1102,7 +1094,7 @@ class CustomDataset(Dataset):
                 'text_embeddings': text_embeddings,
                 'text_embeddings_2': text_embeddings_2,
                 'added_cond_kwargs': added_cond_kwargs,
-                'bucket_size': target_size if self.enable_bucket_sampler else None
+                'bucket_size': bucket_size
             }
             
         except Exception as e:
@@ -1220,139 +1212,139 @@ class CustomDataset(Dataset):
             return None
 
 
-class BucketBatchSampler:
-    """Batch sampler that ensures samples in the same batch come from the same bucket"""
-    def __init__(self, dataset, batch_size, shuffle=True):
-        self.dataset = dataset
+class BucketSampler(Sampler):
+    """
+    Sampler that creates batches of samples from the same bucket to ensure consistent tensor sizes.
+    """
+    def __init__(self, dataset, batch_size, drop_last=True):
+        super().__init__(dataset)
+        if not hasattr(dataset, 'buckets'):
+            raise ValueError("Dataset must have 'buckets' attribute for BucketSampler")
+        
         self.batch_size = batch_size
-        self.shuffle = shuffle
+        self.drop_last = drop_last
+        # Store (bucket, index) pairs for all valid samples
+        self.samples = [(bucket, idx) for bucket, indices in dataset.buckets.items() 
+                       for idx in indices]
+        if not self.samples:
+            raise ValueError("No valid samples found in dataset buckets")
         
-        # Create bucket-based indices mapping
-        self.bucket_indices = {}
-        self.bucket_to_dataset_idx = {}  # Maps bucket indices to dataset indices
-        dataset_idx = 0
-        
-        for bucket, samples in dataset.bucket_data.items():
-            bucket_indices = []
-            for _ in samples:
-                bucket_indices.append(dataset_idx)
-                self.bucket_to_dataset_idx[dataset_idx] = bucket
-                dataset_idx += 1
-            self.bucket_indices[bucket] = bucket_indices
+        # Pre-validate all buckets
+        self._validate_buckets(dataset)
+    
+    def _validate_buckets(self, dataset):
+        """Validate bucket configurations to prevent runtime errors"""
+        bucket_sizes = {}
+        for bucket, indices in dataset.buckets.items():
+            if not indices:  # Skip empty buckets
+                continue
+            # Sample an image from each bucket to verify size
+            sample_idx = indices[0]
+            try:
+                sample = dataset[sample_idx]
+                if sample is None:
+                    raise ValueError(f"Invalid sample at index {sample_idx} in bucket {bucket}")
+                bucket_sizes[bucket] = sample['bucket_size']
+            except Exception as e:
+                raise ValueError(f"Error validating bucket {bucket}: {str(e)}")
     
     def __iter__(self):
-        if self.shuffle:
-            # Shuffle indices within each bucket
-            for indices in self.bucket_indices.values():
-                random.shuffle(indices)
+        """Return batches of indices, where each batch contains images from the same bucket"""
+        if not self.samples:
+            raise RuntimeError("No samples available for iteration")
+            
+        # Group samples by bucket
+        bucket_samples = defaultdict(list)
+        for bucket, idx in self.samples:
+            bucket_samples[bucket].append(idx)
         
-        # Create batches from each bucket
-        all_batches = []
-        for bucket, indices in self.bucket_indices.items():
-            for i in range(0, len(indices), self.batch_size):
-                batch = indices[i:i + self.batch_size]
-                if len(batch) == self.batch_size:  # Only use full batches
-                    all_batches.append(batch)
+        # Create complete batches from each bucket
+        batches = []
+        for bucket, indices in bucket_samples.items():
+            # Shuffle indices within the bucket
+            indices = indices.copy()  # Create a copy to prevent modifying original
+            random.shuffle(indices)
+            
+            # Create full batches
+            complete_batches = len(indices) // self.batch_size
+            for i in range(complete_batches):
+                start_idx = i * self.batch_size
+                batch = indices[start_idx:start_idx + self.batch_size]
+                batches.append(batch)
+            
+            # Handle remaining samples if not dropping last
+            if not self.drop_last and len(indices) % self.batch_size > 0:
+                last_batch = indices[complete_batches * self.batch_size:]
+                if len(last_batch) >= self.batch_size // 2:  # Only keep if reasonable size
+                    batches.append(last_batch)
         
-        if self.shuffle:
-            random.shuffle(all_batches)
+        if not batches:
+            raise RuntimeError("No valid batches could be created")
+            
+        # Shuffle the batches themselves
+        random.shuffle(batches)
         
-        for batch in all_batches:
-            yield batch
+        # Flatten batches into single list of indices
+        indices = []
+        for batch in batches:
+            indices.extend(batch)
+            
+        return iter(indices)
     
     def __len__(self):
-        total = 0
-        for indices in self.bucket_indices.values():
-            total += len(indices) // self.batch_size
-        return total
+        if self.drop_last:
+            return len(self.samples) - (len(self.samples) % self.batch_size)
+        return len(self.samples)
 
 
 def create_dataloader(
-    data_dir: str,
-    batch_size: int,
-    vae,
-    tokenizer,
-    tokenizer_2,
-    text_encoder,
-    text_encoder_2,
-    num_workers: int = None,
-    cache_dir: str = "latents_cache",
-    all_ar: bool = False,
-    shuffle: bool = True,
-    pin_memory: bool = True,
-    prefetch_factor: int = 2,
-    persistent_workers: bool = True
+    data_dir,
+    batch_size,
+    num_workers=None,
+    tokenizer=None,
+    text_encoder=None,
+    tokenizer_2=None,
+    text_encoder_2=None,
+    vae=None,
+    enable_bucket_sampler=True,
+    **kwargs
 ):
-    """
-    Create a DataLoader with the CustomDataset and bucket-aware batching.
+    """Create a DataLoader with bucketing support"""
+    dataset = CustomDataset(
+        data_dir=data_dir,
+        vae=vae,
+        tokenizer=tokenizer,
+        text_encoder=text_encoder,
+        tokenizer_2=tokenizer_2,
+        text_encoder_2=text_encoder_2,
+        enable_bucket_sampler=enable_bucket_sampler,
+        **kwargs
+    )
     
-    Args:
-        data_dir (str): Directory containing the training images
-        batch_size (int): Batch size for training
-        vae: VAE model component
-        tokenizer: Primary tokenizer
-        tokenizer_2: Secondary tokenizer
-        text_encoder: Primary text encoder
-        text_encoder_2: Secondary text encoder
-        num_workers (int, optional): Number of worker processes
-        cache_dir (str, optional): Directory to cache latents
-        all_ar (bool, optional): Accept all aspect ratios without resizing
-        shuffle (bool, optional): Whether to shuffle the dataset
-        pin_memory (bool, optional): Use pinned memory for faster GPU transfer
-        prefetch_factor (int, optional): Number of batches to prefetch per worker
-        persistent_workers (bool, optional): Keep worker processes alive between epochs
-    
-    Returns:
-        torch.utils.data.DataLoader: Configured data loader with bucket-aware batching
-    """
-    try:
-        # Initialize dataset
-        dataset = CustomDataset(
-            data_dir=data_dir,
-            vae=vae,
-            tokenizer=tokenizer,
-            tokenizer_2=tokenizer_2,
-            text_encoder=text_encoder,
-            text_encoder_2=text_encoder_2,
-            cache_dir=cache_dir,
-            all_ar=all_ar,
-            num_workers=num_workers
+    if enable_bucket_sampler:
+        # Create bucket-aware sampler
+        sampler = BucketSampler(
+            dataset,
+            batch_size=batch_size,
+            drop_last=True
         )
-        
-        # Create bucket-aware batch sampler if bucketing is enabled
-        if dataset.enable_bucket_sampler:
-            batch_sampler = BucketBatchSampler(dataset, batch_size, shuffle=shuffle)
-            
-            # Create data loader with batch sampler
-            dataloader = torch.utils.data.DataLoader(
-                dataset,
-                batch_sampler=batch_sampler,
-                num_workers=num_workers if num_workers is not None else min(8, os.cpu_count() or 1),
-                pin_memory=pin_memory,
-                prefetch_factor=prefetch_factor if num_workers > 0 else None,
-                persistent_workers=persistent_workers if num_workers > 0 else False,
-                collate_fn=dataset.collate_fn
-            )
-        else:
-            # Fallback to regular batching if bucketing is disabled
-            dataloader = torch.utils.data.DataLoader(
-                dataset,
-                batch_size=batch_size,
-                shuffle=shuffle,
-                num_workers=num_workers if num_workers is not None else min(8, os.cpu_count() or 1),
-                pin_memory=pin_memory,
-                prefetch_factor=prefetch_factor if num_workers > 0 else None,
-                persistent_workers=persistent_workers if num_workers > 0 else False,
-                collate_fn=dataset.collate_fn
-            )
-        
-        logger.info(f"Created DataLoader with {len(dataset)} samples")
-        logger.info(f"Batch size: {batch_size}, Num workers: {num_workers}")
-        logger.info(f"Bucketing enabled: {dataset.enable_bucket_sampler}")
-        
-        return dataloader
-        
-    except Exception as e:
-        logger.error(f"Failed to create DataLoader: {str(e)}")
-        logger.error(traceback.format_exc())
-        raise
+    else:
+        sampler = None
+    
+    # Create DataLoader with custom sampler
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size if not enable_bucket_sampler else 1,  # Batch size handled by sampler
+        shuffle=not enable_bucket_sampler,  # Don't shuffle if using bucket sampler
+        num_workers=num_workers if num_workers is not None else 0,
+        sampler=sampler,
+        collate_fn=dataset.collate_fn,
+        pin_memory=True,
+        drop_last=True
+    )
+    
+    logger.info(f"Created DataLoader with {len(dataset)} samples")
+    logger.info(f"Batch size: {batch_size}, Num workers: {num_workers}")
+    logger.info(f"Bucketing enabled: {enable_bucket_sampler}")
+    
+    return dataloader
