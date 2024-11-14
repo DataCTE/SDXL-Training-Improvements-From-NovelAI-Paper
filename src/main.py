@@ -193,7 +193,7 @@ def main(args):
     wandb_run = None
     try:
         # Set up logging
-        setup_logging(args)
+        setup_logging(os.path.join("logs", args.wandb_run_name) if args.wandb_run_name else "logs")
         log_system_info()
         
         # Set up Weights & Biases
