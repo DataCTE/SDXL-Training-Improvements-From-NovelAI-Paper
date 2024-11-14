@@ -149,6 +149,8 @@ def parse_args():
     parser.add_argument("--resume_from_checkpoint", type=str)
     
     # Logging and monitoring
+    parser.add_argument("--verbose", action="store_true", default=False,
+                       help="Enable verbose output during training")
     parser.add_argument("--use_wandb", action="store_true", help="Enable Weights & Biases logging")
     parser.add_argument("--wandb_project", type=str, default="sdxl-training",
                        help="W&B project name")
