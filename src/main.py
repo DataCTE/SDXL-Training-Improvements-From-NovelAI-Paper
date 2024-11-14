@@ -199,11 +199,106 @@ def main(args):
         # Set up Weights & Biases
         wandb_run = setup_wandb(args)
         
-        # Load model and initialize components
-        models, _, training_history = load_checkpoint(args)
+        # Set device and dtype
+        device = torch.device("cuda")
+        dtype = torch.float16 if args.mixed_precision else torch.float32
         
-        # Set up training components
-        train_components = setup_training(args, models, device=torch.device("cuda"), dtype=torch.float16)
+        # Load model and initialize components
+        models, optimizer_state, training_history = load_checkpoint(args)
+        
+        # Move models to device
+        for model_name, model in models.items():
+            model.to(device=device, dtype=dtype)
+            if args.gradient_checkpointing:
+                model.enable_gradient_checkpointing()
+        
+        # Setup optimizer
+        if args.use_adafactor:
+            from transformers import Adafactor
+            optimizer = Adafactor(
+                models["unet"].parameters(),
+                lr=args.learning_rate,
+                weight_decay=args.weight_decay,
+                scale_parameter=True,
+                relative_step=False
+            )
+        else:
+            optimizer = torch.optim.AdamW(
+                models["unet"].parameters(),
+                lr=args.learning_rate,
+                betas=(args.adam_beta1, args.adam_beta2),
+                eps=args.adam_epsilon,
+                weight_decay=args.weight_decay
+            )
+        
+        if optimizer_state:
+            optimizer.load_state_dict(optimizer_state)
+        
+        # Setup learning rate scheduler
+        lr_scheduler = get_cosine_schedule_with_warmup(
+            optimizer=optimizer,
+            num_warmup_steps=args.warmup_steps,
+            num_training_steps=args.num_epochs * len(train_dataloader)
+        )
+        
+        # Setup EMA
+        if args.use_ema:
+            from training.ema import EMAModel
+            ema = EMAModel(
+                models["unet"],
+                decay=args.ema_decay,
+                update_after_step=args.ema_update_after_step,
+                update_every=args.ema_update_every,
+                inv_gamma=args.ema_inv_gamma,
+                power=args.ema_power,
+                min_decay=args.ema_min_decay,
+                max_decay=args.ema_max_decay,
+                use_warmup=args.use_ema_warmup,
+                grad_scale_factor=args.ema_grad_scale_factor
+            )
+        else:
+            ema = None
+        
+        # Setup tag weighter if enabled
+        if args.use_tag_weighting:
+            from training.tag_weighter import TagWeighter
+            tag_weighter = TagWeighter(
+                min_weight=args.min_tag_weight,
+                max_weight=args.max_tag_weight
+            )
+        else:
+            tag_weighter = None
+        
+        # Setup VAE finetuner if enabled
+        if args.finetune_vae:
+            from training.vae_finetuner import VAEFinetuner
+            vae_finetuner = VAEFinetuner(
+                vae=models["vae"],
+                learning_rate=args.vae_learning_rate
+            )
+        else:
+            vae_finetuner = None
+        
+        # Setup data loader
+        from training.data import create_dataloader
+        train_dataloader = create_dataloader(
+            data_dir=args.data_dir,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            all_ar=args.all_ar,
+            no_caching_latents=args.no_caching_latents,
+            cache_dir=args.cache_dir
+        )
+        
+        # Create components dictionary
+        train_components = {
+            "optimizer": optimizer,
+            "lr_scheduler": lr_scheduler,
+            "ema": ema,
+            "train_dataloader": train_dataloader,
+            "tag_weighter": tag_weighter,
+            "vae_finetuner": vae_finetuner
+        }
         
         # Log training setup and initial system state
         log_training_setup(args, models, train_components)
