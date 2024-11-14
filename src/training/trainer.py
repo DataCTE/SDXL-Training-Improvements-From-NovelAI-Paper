@@ -53,13 +53,16 @@ def train_one_epoch(
     resolution_scaling=1.0,
     rescale_cfg=None,
     scale_method="linear",
-    rescale_multiplier=1.0
+    rescale_multiplier=1.0,
+    vae_finetuner=None,
+    vae_train_freq=10
 ):
     model.train()
     total_loss = 0.0
     batch_time = AverageMeter('Batch', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
+    vae_losses = AverageMeter('VAE Loss', ':.4e') if vae_finetuner else None
     
     end = time.time()
     global_step = 0
@@ -83,6 +86,7 @@ def train_one_epoch(
         
         # Forward pass and loss computation
         with torch.amp.autocast('cuda', enabled=mixed_precision):
+            # UNet training step
             loss = training_loss_v_prediction(
                 model, 
                 latents, 
@@ -100,6 +104,11 @@ def train_one_epoch(
                 rescale_multiplier=rescale_multiplier
             )
             
+            # VAE finetuning step if enabled and it's time
+            if vae_finetuner and batch_idx % vae_train_freq == 0:
+                vae_loss = vae_finetuner.training_step(batch)
+                vae_losses.update(vae_loss.item())
+            
             # Normalize loss for gradient accumulation
             loss = loss / gradient_accumulation_steps
         
@@ -116,18 +125,25 @@ def train_one_epoch(
             lr_scheduler.step()
             optimizer.zero_grad(set_to_none=True)
             
+            # VAE optimizer step if enabled
+            if vae_finetuner and batch_idx % vae_train_freq == 0:
+                vae_finetuner.optimizer_step()
+            
             # Update tracking metrics
             total_loss += loss.item() * gradient_accumulation_steps
             losses.update(loss.item() * gradient_accumulation_steps)
             
             # Log metrics efficiently
             if wandb.run:
-                log_metrics_batch({
+                metrics = {
                     "train/loss": loss.item() * gradient_accumulation_steps,
                     "train/lr": lr_scheduler.get_last_lr()[0],
                     "performance/batch_time": batch_time.avg,
                     "performance/data_time": data_time.avg
-                }, step=global_step)
+                }
+                if vae_finetuner and batch_idx % vae_train_freq == 0:
+                    metrics["train/vae_loss"] = vae_losses.avg
+                log_metrics_batch(metrics, step=global_step)
             
             global_step += 1
         
@@ -215,7 +231,9 @@ def train(args, models, train_components, device, dtype):
             resolution_scaling=args.resolution_scaling,
             rescale_cfg=args.rescale_cfg,
             scale_method=args.scale_method,
-            rescale_multiplier=args.rescale_multiplier
+            rescale_multiplier=args.rescale_multiplier,
+            vae_finetuner=train_components.get("vae_finetuner"),
+            vae_train_freq=args.vae_train_freq
         )
         
         # Run end-of-epoch validation

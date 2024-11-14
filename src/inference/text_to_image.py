@@ -1,11 +1,17 @@
 import torch
-from diffusers import StableDiffusionXLPipeline
 import logging
-from pathlib import Path
-import time
-import wandb
-from training.loss import get_sigmas  # Import our custom sigma scheduler
 import numpy as np
+import time
+from pathlib import Path
+import wandb
+from diffusers import (
+    StableDiffusionXLPipeline,
+    EulerDiscreteScheduler,
+    AutoencoderKL
+)
+from training.loss import get_sigmas
+from utils.prompt_utils import process_prompt, get_prompt_embeds
+from utils.latent_utils import apply_noise_offset, get_latents_from_seed
 
 logger = logging.getLogger(__name__)
 
@@ -16,45 +22,88 @@ class SDXLInference:
         device="cuda",
         dtype=torch.float16,
         variant="fp16",
+        use_v_prediction=True,
         use_resolution_binning=True,
+        use_zero_terminal_snr=True,
         sigma_min=0.0292,
+        sigma_max=160.0,
         sigma_data=1.0,
+        min_snr_gamma=5.0,
+        noise_offset=0.0357,
+        prompt_max_length=77,
     ):
         """
-        Initialize SDXL inference with custom training parameters.
+        Initialize SDXL inference with NovelAI improvements.
 
         Args:
             model_path (str, optional): Path to the model. If None, pipeline must be set manually
             device (str): Device to run inference on
             dtype (torch.dtype): Model dtype
             variant (str): Model variant (e.g., 'fp16')
+            use_v_prediction (bool): Whether to use v-prediction parameterization
             use_resolution_binning (bool): Whether to use resolution-dependent sigma scaling
+            use_zero_terminal_snr (bool): Whether to use Zero Terminal SNR
             sigma_min (float): Minimum sigma value for noise schedule
+            sigma_max (float): Maximum sigma value for noise schedule
             sigma_data (float): Sigma data value for noise schedule
+            min_snr_gamma (float): Minimum SNR value for loss weighting
+            noise_offset (float): Noise offset for improved sample quality
+            prompt_max_length (int): Maximum prompt length
         """
         self.model_path = model_path
         self.device = device
         self.dtype = dtype
+        self.use_v_prediction = use_v_prediction
         self.use_resolution_binning = use_resolution_binning
+        self.use_zero_terminal_snr = use_zero_terminal_snr
         self.sigma_min = sigma_min
+        self.sigma_max = sigma_max
         self.sigma_data = sigma_data
+        self.min_snr_gamma = min_snr_gamma
+        self.noise_offset = noise_offset
+        self.prompt_max_length = prompt_max_length
         
         # Only load pipeline if model_path is provided
         if model_path is not None:
             logger.info(f"Initializing SDXL inference with model: {model_path}")
             try:
+                # Initialize scheduler with NovelAI improvements
+                scheduler = EulerDiscreteScheduler(
+                    beta_start=0.00085,
+                    beta_end=0.012,
+                    beta_schedule="scaled_linear",
+                    num_train_timesteps=1000,
+                    use_karras_sigmas=True,
+                    sigma_min=sigma_min,
+                    sigma_max=sigma_max,
+                    steps_offset=1,
+                )
+                
+                # Initialize pipeline
                 self.pipeline = StableDiffusionXLPipeline.from_pretrained(
                     model_path,
                     torch_dtype=dtype,
                     use_safetensors=True,
-                    variant=variant
+                    variant=variant,
+                    scheduler=scheduler
                 ).to(device)
                 
-                # Use our custom scheduler settings
+                # Update VAE config
+                if isinstance(self.pipeline.vae, AutoencoderKL):
+                    self.pipeline.vae.config.scaling_factor = 0.13025
+                
+                # Enable memory efficient attention
+                self.pipeline.enable_xformers_memory_efficient_attention()
+                
+                # Set custom configs
                 self.pipeline.scheduler.register_to_config(
+                    use_v_prediction=use_v_prediction,
                     use_resolution_binning=use_resolution_binning,
+                    use_zero_terminal_snr=use_zero_terminal_snr,
                     sigma_min=sigma_min,
-                    sigma_data=sigma_data
+                    sigma_max=sigma_max,
+                    sigma_data=sigma_data,
+                    min_snr_gamma=min_snr_gamma
                 )
                 
                 logger.info("Model loaded successfully")
@@ -72,11 +121,15 @@ class SDXLInference:
         num_inference_steps=28,
         height=1024,
         width=1024,
+        seed=None,
         output_dir=None,
+        rescale_cfg=True,
+        scale_method="karras",
+        rescale_multiplier=0.7,
         **additional_kwargs
     ):
         """
-        Generate images using the SDXL model.
+        Generate images using SDXL with NovelAI improvements.
 
         Args:
             prompts (str or list): Prompt(s) to generate images from
@@ -86,7 +139,11 @@ class SDXLInference:
             num_inference_steps (int): Number of denoising steps
             height (int): Image height
             width (int): Image width
+            seed (int, optional): Random seed for reproducibility
             output_dir (str, optional): Directory to save generated images
+            rescale_cfg (bool): Whether to use CFG rescaling
+            scale_method (str): Method for CFG rescaling ('karras' or 'simple')
+            rescale_multiplier (float): Multiplier for CFG rescaling
             **additional_kwargs: Additional arguments for pipeline
         
         Returns:
@@ -103,23 +160,64 @@ class SDXLInference:
                 sigmas = get_sigmas(
                     num_inference_steps=num_inference_steps,
                     sigma_min=self.sigma_min,
+                    sigma_max=self.sigma_max,
                     height=height,
                     width=width
                 ).to(self.device)
                 self.pipeline.scheduler.sigmas = sigmas
             
-            # Generate images
+            # Process prompts and get embeddings
+            prompt_embeds = []
             for prompt in prompts:
+                processed_prompt = process_prompt(
+                    prompt,
+                    max_length=self.prompt_max_length
+                )
+                embeds = get_prompt_embeds(
+                    processed_prompt,
+                    self.pipeline.tokenizer,
+                    self.pipeline.text_encoder,
+                    self.device,
+                    self.dtype
+                )
+                prompt_embeds.append(embeds)
+            
+            # Generate images
+            for idx, (prompt, embed) in enumerate(zip(prompts, prompt_embeds)):
                 start_time = time.time()
                 
+                # Get latents from seed if provided
+                latents = None
+                if seed is not None:
+                    latents = get_latents_from_seed(
+                        seed + idx,
+                        num_images_per_prompt,
+                        height,
+                        width,
+                        self.pipeline.vae.config.latent_channels,
+                        self.device,
+                        self.dtype
+                    )
+                
+                # Apply CFG rescaling if enabled
+                effective_guidance_scale = guidance_scale
+                if rescale_cfg:
+                    if scale_method == "karras":
+                        effective_guidance_scale = guidance_scale * rescale_multiplier * (1 - torch.exp(-guidance_scale))
+                    else:  # simple
+                        effective_guidance_scale = guidance_scale * rescale_multiplier
+                
+                # Generate with NovelAI improvements
                 output = self.pipeline(
-                    prompt=prompt,
+                    prompt_embeds=embed,
                     negative_prompt=negative_prompt,
                     num_images_per_prompt=num_images_per_prompt,
-                    guidance_scale=guidance_scale,
+                    guidance_scale=effective_guidance_scale,
                     num_inference_steps=num_inference_steps,
                     height=height,
                     width=width,
+                    latents=latents,
+                    noise_offset=self.noise_offset if self.use_v_prediction else None,
                     **additional_kwargs
                 )
                 
@@ -130,8 +228,8 @@ class SDXLInference:
                     output_dir = Path(output_dir)
                     output_dir.mkdir(exist_ok=True, parents=True)
                     
-                    for idx, image in enumerate(output.images):
-                        image_path = output_dir / f"{len(results)}_{idx}.png"
+                    for img_idx, image in enumerate(output.images):
+                        image_path = output_dir / f"{len(results)}_{img_idx}.png"
                         image.save(image_path)
                 
                 # Collect results
@@ -141,9 +239,17 @@ class SDXLInference:
                     "generation_time": generation_time,
                     "metadata": {
                         "guidance_scale": guidance_scale,
+                        "effective_guidance_scale": effective_guidance_scale,
                         "num_inference_steps": num_inference_steps,
                         "height": height,
-                        "width": width
+                        "width": width,
+                        "seed": seed + idx if seed is not None else None,
+                        "use_v_prediction": self.use_v_prediction,
+                        "use_resolution_binning": self.use_resolution_binning,
+                        "use_zero_terminal_snr": self.use_zero_terminal_snr,
+                        "rescale_cfg": rescale_cfg,
+                        "scale_method": scale_method,
+                        "rescale_multiplier": rescale_multiplier
                     }
                 }
                 results.append(result)
@@ -202,7 +308,9 @@ class SDXLInference:
                             wandb.Image(
                                 img,
                                 caption=f"Prompt: {result['prompt']}\n"
-                                f"Time: {result['generation_time']:.2f}s"
+                                f"Time: {result['generation_time']:.2f}s\n"
+                                f"CFG: {result['metadata']['guidance_scale']:.1f} "
+                                f"(effective: {result['metadata']['effective_guidance_scale']:.1f})"
                             )
                         )
                 

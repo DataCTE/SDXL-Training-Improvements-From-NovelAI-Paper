@@ -280,6 +280,38 @@ def setup_training(args, models, device, dtype):
                 learning_rate=args.vae_learning_rate,
                 device=device
             )
+            
+            # Initialize VAE optimizer
+            if args.use_adafactor:
+                vae_optimizer = Adafactor(
+                    vae_finetuner.vae.parameters(),
+                    lr=args.vae_learning_rate,
+                    scale_parameter=True,
+                    relative_step=False,
+                    warmup_init=False
+                )
+            else:
+                vae_optimizer = AdamW8bit(
+                    vae_finetuner.vae.parameters(),
+                    lr=args.vae_learning_rate,
+                    betas=(0.9, 0.999)
+                )
+            
+            # Calculate VAE training steps
+            vae_steps_per_epoch = len(train_dataloader) // args.vae_train_freq
+            vae_training_steps = args.num_epochs * vae_steps_per_epoch
+            
+            # Initialize VAE learning rate scheduler
+            logger.info("Setting up VAE learning rate scheduler...")
+            vae_scheduler = get_scheduler(
+                "cosine",
+                optimizer=vae_optimizer,
+                num_warmup_steps=args.warmup_steps,
+                num_training_steps=vae_training_steps
+            )
+            
+            # Set optimizer and scheduler in VAE finetuner
+            vae_finetuner.set_optimizer(vae_optimizer, vae_scheduler)
         
         # Initialize validator with proper scheduler
         logger.info("Initializing validator...")
@@ -336,4 +368,3 @@ def setup_training(args, models, device, dtype):
         logger.error(f"Error during training setup: {str(e)}")
         logger.error(f"Traceback: {traceback.format_exc()}")
         raise
-

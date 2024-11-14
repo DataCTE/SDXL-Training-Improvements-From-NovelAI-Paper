@@ -22,66 +22,137 @@ logger = logging.getLogger(__name__)
 class CustomDataset(Dataset):
     def __init__(self, data_dir, vae, tokenizer, tokenizer_2, text_encoder, text_encoder_2,
                  cache_dir="latents_cache", no_caching_latents=False, all_ar=False, 
-                 max_dimension=2048, num_workers=None, prefetch_factor=2):
+                 max_dimension=2048, num_workers=None, prefetch_factor=2, 
+                 min_size=512, max_size=2048, resolution_type="square",
+                 enable_bucket_sampler=True, bucket_reso_steps=64,
+                 min_bucket_reso=256, max_bucket_reso=2048,
+                 token_dropout_rate=0.1, caption_dropout_rate=0.1):
         """
-        Optimized Dataset initialization with enhanced performance features
+        Enhanced dataset initialization with NovelAI improvements
+        Args:
+            resolution_type: One of ["square", "portrait", "landscape"] for aspect ratio handling
+            enable_bucket_sampler: Use bucketing for efficient batching
+            bucket_reso_steps: Resolution steps for bucketing (64 recommended)
+            token_dropout_rate: Rate for random token dropout during training
+            caption_dropout_rate: Rate for entire caption dropout
         """
         super().__init__()
         
-        # Use more efficient path handling
+        # Basic initialization
         self.data_dir = Path(data_dir)
         self.cache_dir = Path(cache_dir)
-        
-        # Performance and memory optimization flags
         self.no_caching_latents = no_caching_latents
         self.all_ar = all_ar
-        self.max_dimension = max_dimension
         
-        # Parallel processing configuration
-        self.num_workers = num_workers or min(os.cpu_count(), 32)
-        self.prefetch_factor = prefetch_factor
+        # Resolution and bucketing parameters
+        self.min_size = min_size
+        self.max_size = max_size
+        self.resolution_type = resolution_type
+        self.enable_bucket_sampler = enable_bucket_sampler
+        self.bucket_reso_steps = bucket_reso_steps
+        self.min_bucket_reso = min_bucket_reso
+        self.max_bucket_reso = max_bucket_reso
         
-        # Create cache directory if needed
-        if not no_caching_latents:
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
+        # Text augmentation parameters
+        self.token_dropout_rate = token_dropout_rate
+        self.caption_dropout_rate = caption_dropout_rate
         
-        # Use more memory-efficient image path collection
-        self.image_paths = sorted(
-            path for ext in ['*.png', '*.jpg', '*.jpeg', '*.webp']
-            for path in self.data_dir.glob(ext)
-        )
-        
-        # Efficient latent path generation
-        self.latent_paths = [self.cache_dir / f"{path.stem}_latents.pt" for path in self.image_paths]
-        
-        # Logging with more concise information
-        logger.info(f"Dataset initialized: {len(self.image_paths)} images")
-        
-        # Store model references with weak references to prevent memory leaks
+        # Model components
         self.vae = vae
         self.tokenizer = tokenizer
         self.tokenizer_2 = tokenizer_2
         self.text_encoder = text_encoder
         self.text_encoder_2 = text_encoder_2
         
-        # Lazy initialization of processors
-        self._upscaler = None
+        # Performance optimization
+        self.num_workers = num_workers or min(os.cpu_count(), 32)
+        self.prefetch_factor = prefetch_factor
         
-        # Preprocessing with more efficient parallel processing
-        self._preprocess_images_parallel()
-        self.tag_stats = self._build_tag_statistics()
+        # Create cache directory
+        if not no_caching_latents:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
         
-        # Batch latent caching with improved efficiency
+        # Initialize image paths
+        self._initialize_dataset()
+        
+        # Initialize bucketing
+        if self.enable_bucket_sampler:
+            self._initialize_buckets()
+            
+        # Process latents and build tag statistics
         if not no_caching_latents:
             self._batch_process_latents_efficient()
-
-    @property
-    def upscaler(self):
-        """Lazy loading of upscaler to reduce initial memory overhead"""
-        if self._upscaler is None and not self.all_ar:
-            from .ultimate_upscaler import UltimateUpscaler
-            self._upscaler = UltimateUpscaler()
-        return self._upscaler
+        self.tag_stats = self._build_tag_statistics()
+        
+    def _initialize_dataset(self):
+        """Initialize dataset with improved image validation"""
+        logger.info("Initializing dataset...")
+        
+        # Collect image paths
+        image_paths = []
+        for ext in ['*.png', '*.jpg', '*.jpeg', '*.webp']:
+            image_paths.extend(self.data_dir.glob(ext))
+        
+        # Validate images in parallel
+        valid_paths = []
+        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+            futures = []
+            for path in image_paths:
+                futures.append(executor.submit(self._validate_image, path))
+            
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Validating images"):
+                result = future.result()
+                if result is not None:
+                    valid_paths.append(result)
+        
+        self.image_paths = sorted(valid_paths)
+        self.latent_paths = [self.cache_dir / f"{path.stem}_latents.pt" for path in self.image_paths]
+        logger.info(f"Found {len(self.image_paths)} valid images")
+        
+    def _validate_image(self, img_path):
+        """Validate single image with improved error handling"""
+        try:
+            # Check caption file
+            caption_path = img_path.with_suffix('.txt')
+            if not caption_path.exists():
+                logger.warning(f"Skipping {img_path}: No caption file")
+                return None
+                
+            # Validate image
+            with Image.open(img_path) as img:
+                if img.mode not in ['RGB', 'RGBA']:
+                    img = img.convert('RGB')
+                
+                # Get dimensions
+                width, height = img.size
+                
+                # Basic validation
+                if width < self.min_size or height < self.min_size:
+                    logger.warning(f"Skipping {img_path}: Too small ({width}x{height})")
+                    return None
+                    
+                if width > self.max_size or height > self.max_size:
+                    logger.warning(f"Skipping {img_path}: Too large ({width}x{height})")
+                    return None
+                
+                # Aspect ratio validation
+                if not self.all_ar:
+                    aspect_ratio = width / height
+                    if self.resolution_type == "square" and not 0.95 <= aspect_ratio <= 1.05:
+                        logger.warning(f"Skipping {img_path}: Not square ({aspect_ratio:.2f})")
+                        return None
+                    elif self.resolution_type == "portrait" and aspect_ratio >= 1:
+                        logger.warning(f"Skipping {img_path}: Not portrait ({aspect_ratio:.2f})")
+                        return None
+                    elif self.resolution_type == "landscape" and aspect_ratio <= 1:
+                        logger.warning(f"Skipping {img_path}: Not landscape ({aspect_ratio:.2f})")
+                        return None
+                
+                return img_path
+                
+        except Exception as e:
+            logger.error(f"Error validating {img_path}: {str(e)}")
+            return None
 
     def _preprocess_images_parallel(self):
         """
@@ -683,198 +754,303 @@ class CustomDataset(Dataset):
             logger.error(f"Advanced downscaling failed: {str(e)}, falling back to basic resize")
             return image.resize((target_width, target_height), Image.LANCZOS)
 
-    def __getitem__(self, idx):
-        image_path = self.image_paths[idx]
-        latent_path = self.latent_paths[idx]
-        caption_path = image_path.with_suffix('.txt')
-
-        # Load caption and process tags
-        with open(caption_path, 'r', encoding='utf-8') as f:
-            caption = f.read().strip()
-            tags, special_tags = self._parse_tags(caption)
-            tag_weights = self._calculate_tag_weights(tags, special_tags)
-
-        # Load cached latents if available and caching is enabled
-        if not self.no_caching_latents and latent_path.exists():
-            cached_data = torch.load(latent_path)
-            return {
-                "latents": cached_data["latents"],
-                "text_embeddings": cached_data["text_embeddings"],
-                "text_embeddings_2": cached_data["text_embeddings_2"],
-                "added_cond_kwargs": cached_data["added_cond_kwargs"],
-                "tags": tags,
-                "special_tags": special_tags,
-                "tag_weights": tag_weights
-            }
+    def _initialize_buckets(self):
+        """Initialize resolution buckets for efficient batching"""
+        logger.info("Initializing resolution buckets...")
         
-        # Generate VAE latents
+        self.buckets = {}
+        bucket_indices = {}  # Maps image path to bucket index
+        
+        # Calculate bucket resolutions
+        bucket_resos = []
+        for h in range(self.min_bucket_reso, self.max_bucket_reso + self.bucket_reso_steps, self.bucket_reso_steps):
+            for w in range(self.min_bucket_reso, self.max_bucket_reso + self.bucket_reso_steps, self.bucket_reso_steps):
+                if self.resolution_type == "square" and abs(h - w) > self.bucket_reso_steps:
+                    continue
+                elif self.resolution_type == "portrait" and w >= h:
+                    continue
+                elif self.resolution_type == "landscape" and h >= w:
+                    continue
+                bucket_resos.append((h, w))
+        
+        # Sort by area for better memory usage
+        bucket_resos.sort(key=lambda x: x[0] * x[1])
+        
+        # Assign images to buckets in parallel
+        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+            futures = []
+            for img_path in self.image_paths:
+                futures.append(executor.submit(self._assign_to_bucket, img_path, bucket_resos))
+            
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Assigning to buckets"):
+                img_path, bucket_size = future.result()
+                if bucket_size is not None:
+                    if bucket_size not in self.buckets:
+                        self.buckets[bucket_size] = []
+                    self.buckets[bucket_size].append(img_path)
+                    bucket_indices[img_path] = len(self.buckets[bucket_size]) - 1
+        
+        # Store bucket information
+        self.bucket_resos = bucket_resos
+        self.bucket_indices = bucket_indices
+        
+        # Log bucket statistics
+        total_images = sum(len(bucket) for bucket in self.buckets.values())
+        logger.info(f"Created {len(self.buckets)} buckets with {total_images} total images")
+        for (h, w), images in self.buckets.items():
+            logger.info(f"Bucket {h}x{w}: {len(images)} images")
+
+    def _assign_to_bucket(self, img_path, bucket_resos):
+        """Assign an image to the most appropriate bucket"""
         try:
-            # Load and process image
-            image = Image.open(image_path).convert('RGB')
+            with Image.open(img_path) as img:
+                width, height = img.size
+                
+                # Find the best fitting bucket
+                best_bucket = None
+                min_area_diff = float('inf')
+                
+                for bucket_h, bucket_w in bucket_resos:
+                    # Skip if bucket is too small
+                    if bucket_h < height or bucket_w < width:
+                        continue
+                    
+                    # Calculate area difference
+                    area_diff = (bucket_h * bucket_w) - (height * width)
+                    if area_diff < min_area_diff:
+                        min_area_diff = area_diff
+                        best_bucket = (bucket_h, bucket_w)
+                
+                return img_path, best_bucket
+                
+        except Exception as e:
+            logger.error(f"Error assigning {img_path} to bucket: {str(e)}")
+            return img_path, None
+
+    def _apply_text_transforms(self, caption):
+        """Apply text augmentation transforms"""
+        if random.random() < self.caption_dropout_rate:
+            return ""
+        
+        if self.token_dropout_rate > 0:
+            tokens = caption.split(",")
+            tokens = [token.strip() for token in tokens if token.strip()]
             
-            # Get target size from SDXL buckets
-            width, height = image.size
-            target_width, target_height = self._get_target_size(width, height)
+            # Keep tokens with probability (1 - token_dropout_rate)
+            tokens = [token for token in tokens if random.random() > self.token_dropout_rate]
             
-            # Process image size with AI upscaling when needed
-            processed_image = self.process_image_size(image, target_width, target_height)
+            # Ensure at least one token remains
+            if not tokens:
+                tokens = [random.choice(caption.split(",")).strip()]
             
+            return ", ".join(tokens)
+        
+        return caption
+
+    def _process_uncached_item(self, img_path, caption_path):
+        """Process an item that hasn't been cached yet"""
+        # Load and process image
+        with Image.open(img_path) as image:
+            image = image.convert('RGB')
+            
+            # Get bucket dimensions
+            bucket_h, bucket_w = self._get_bucket_size(image.size)
+            
+            # Process image with advanced resizing
+            processed_image = self._advanced_resize(image, bucket_w, bucket_h)
+            
+            # Convert to tensor and normalize
             transform = transforms.Compose([
                 transforms.ToTensor(),
                 transforms.Normalize([0.5], [0.5])
             ])
-            image = transform(processed_image).unsqueeze(0)
+            image_tensor = transform(processed_image).unsqueeze(0)
             
             # Generate VAE latents
             with torch.no_grad():
-                image = image.to(self.vae.device, dtype=self.vae.dtype)
-                latents = self.vae.encode(image).latent_dist.sample()
+                image_tensor = image_tensor.to(self.vae.device, dtype=self.vae.dtype)
+                latents = self.vae.encode(image_tensor).latent_dist.sample()
                 latents = latents * self.vae.config.scaling_factor
                 latents = latents.squeeze(0)
             
-            # Process text embeddings
+            # Load and process caption
+            with open(caption_path, 'r', encoding='utf-8') as f:
+                caption = f.read().strip()
+            
+            # Apply text augmentation
+            caption = self._apply_text_transforms(caption)
+            
+            # Generate text embeddings
             text_inputs = self.tokenizer(
                 caption,
                 padding="max_length",
                 max_length=self.tokenizer.model_max_length,
                 truncation=True,
                 return_tensors="pt"
-            )
+            ).to(self.text_encoder.device)
+            
             text_inputs_2 = self.tokenizer_2(
                 caption,
                 padding="max_length",
                 max_length=self.tokenizer_2.model_max_length,
                 truncation=True,
                 return_tensors="pt"
-            )
+            ).to(self.text_encoder_2.device)
             
-            # Generate text embeddings
             with torch.no_grad():
-                text_embeddings = self.text_encoder(text_inputs.input_ids.to(self.text_encoder.device))[0]
+                text_embeddings = self.text_encoder(text_inputs.input_ids)[0]
                 text_embeddings_2 = self.text_encoder_2(
-                    text_inputs_2.input_ids.to(self.text_encoder_2.device),
+                    text_inputs_2.input_ids,
                     output_hidden_states=True
                 )
-                
-                # Get pooled and hidden states
                 pooled_output = text_embeddings_2[0]
                 hidden_states = text_embeddings_2.hidden_states[-2]
-                
-                # Reshape pooled output to match hidden states dimensions
-                pooled_output = pooled_output.unsqueeze(1).unsqueeze(2).expand(-1, hidden_states.size(1), hidden_states.size(2), -1)
-                
-                # Create added conditions
-                added_cond_kwargs = {
-                    "text_embeds": pooled_output,
-                    "time_ids": self._get_add_time_ids(image),
-                }
             
-            # Save to cache only if caching is enabled
-            if not self.no_caching_latents:
-                cache_data = {
-                    "latents": latents,
-                    "text_embeddings": text_embeddings,
-                    "text_embeddings_2": hidden_states,
-                    "added_cond_kwargs": added_cond_kwargs
-                }
-                torch.save(cache_data, latent_path)
+            # Generate time embeddings
+            original_size = image.size
+            target_size = (bucket_w, bucket_h)
+            crop_coords_top_left = (0, 0)
+            crop_coords_bottom_right = original_size
             
-            # Ensure all tensors are on CPU before returning
-            return {
-                "latents": latents.cpu(),
-                "text_embeddings": text_embeddings.cpu(),
-                "text_embeddings_2": hidden_states.cpu(),
-                "added_cond_kwargs": {
-                    k: v.cpu() if torch.is_tensor(v) else v
-                    for k, v in added_cond_kwargs.items()
+            add_time_ids = torch.tensor([
+                original_size[0],          # original width
+                original_size[1],          # original height
+                target_size[0],            # target width
+                target_size[1],            # target height
+                crop_coords_top_left[0],     # crop left
+                crop_coords_top_left[1],     # crop top
+                crop_coords_bottom_right[0], # crop right
+                crop_coords_bottom_right[1]  # crop bottom
+            ]).unsqueeze(0)
+            
+            # Prepare cache data
+            cache_data = {
+                'latents': latents,
+                'text_embeddings': text_embeddings,
+                'text_embeddings_2': hidden_states,
+                'added_cond_kwargs': {
+                    'text_embeds': pooled_output.unsqueeze(1).unsqueeze(2),
+                    'time_ids': add_time_ids
                 },
-                "tags": tags,
-                "special_tags": special_tags,
-                "tag_weights": tag_weights
+                'original_caption': caption,
+                'bucket_size': (bucket_h, bucket_w)
             }
             
-        except Exception as e:
-            logger.error(f"Error processing {image_path}: {str(e)}")
-            logger.error(traceback.format_exc())
-            raise
-
-    def _get_add_time_ids(self, image):
-        """Generate time ids for SDXL conditioning"""
-        original_size = image.shape[-2:]  # (height, width)
-        target_size = (1024, 1024)  # SDXL default
-        crop_coords_top_left = (0, 0)
-        crop_coords_bottom_right = (original_size[0], original_size[1])
-        
-        add_time_ids = torch.tensor([
-            original_size[1],  # original width
-            original_size[0],  # original height
-            target_size[1],    # target width
-            target_size[0],    # target height
-            crop_coords_top_left[1],      # crop top
-            crop_coords_top_left[0],      # crop left
-            crop_coords_bottom_right[1],  # crop bottom
-            crop_coords_bottom_right[0],  # crop right
-        ])
-        
-        return add_time_ids.unsqueeze(0)
-
-    def __len__(self):
-        return len(self.image_paths)
-
-    def shuffle_samples(self):
-        """Shuffle the dataset samples"""
-        combined = list(zip(self.image_paths, self.latent_paths))
-        random.shuffle(combined)
-        self.image_paths, self.latent_paths = zip(*combined)
-
-
-def custom_collate(batch):
-    """Custom collate function that validates dimensions and handles varying tensor sizes"""
-    def validate_latents(latents):
-        h, w = latents.shape[-2:]
-        min_size = 256 // 8  # Minimum 256 pixels in image space
-        max_size = 2048 // 8  # Maximum 2048 pixels in image space
-        return (h >= min_size and w >= min_size and
-                h <= max_size and w <= max_size)
-
-    def resize_latents(latents, target_height, target_width):
-        # Use torch.nn.functional instead of transforms.functional
-        return torch.nn.functional.interpolate(
-            latents.unsqueeze(0),  # Add batch dimension
-            size=(target_height, target_width),
-            mode='nearest'
-        ).squeeze(0)  # Remove batch dimension
-
-    # Filter out invalid samples
-    valid_batch = [item for item in batch if validate_latents(item['latents'])]
+            return cache_data
     
-    if not valid_batch:
-        raise ValueError("No valid samples in batch (all below minimum size)")
+    def _get_bucket_size(self, image_size):
+        """Get the most appropriate bucket size for an image"""
+        width, height = image_size
+        
+        # Find best fitting bucket
+        best_bucket = None
+        min_area_diff = float('inf')
+        
+        for bucket_h, bucket_w in self.bucket_resos:
+            if bucket_h < height or bucket_w < width:
+                continue
+            
+            area_diff = (bucket_h * bucket_w) - (height * width)
+            if area_diff < min_area_diff:
+                min_area_diff = area_diff
+                best_bucket = (bucket_h, bucket_w)
+        
+        if best_bucket is None:
+            # If no bucket fits, use the largest bucket
+            best_bucket = max(self.bucket_resos, key=lambda x: x[0] * x[1])
+        
+        return best_bucket
+    
+    def _advanced_resize(self, image, target_width, target_height):
+        """Advanced image resizing with aspect ratio preservation"""
+        width, height = image.size
+        
+        # Calculate target dimensions preserving aspect ratio
+        aspect_ratio = width / height
+        target_aspect = target_width / target_height
+        
+        if aspect_ratio > target_aspect:
+            # Image is wider than target
+            new_width = target_width
+            new_height = int(target_width / aspect_ratio)
+        else:
+            # Image is taller than target
+            new_height = target_height
+            new_width = int(target_height * aspect_ratio)
+        
+        # High-quality downscaling
+        if width > new_width or height > new_height:
+            # Use Lanczos for downscaling
+            image = image.resize((new_width, new_height), Image.LANCZOS)
+        else:
+            # Use bicubic for upscaling
+            image = image.resize((new_width, new_height), Image.BICUBIC)
+        
+        # Create new image with padding
+        result = Image.new('RGB', (target_width, target_height))
+        left = (target_width - new_width) // 2
+        top = (target_height - new_height) // 2
+        result.paste(image, (left, top))
+        
+        return result
 
-    # Find the largest dimensions to pad to
-    max_height = max(latent.shape[-2] for latent in [x["latents"] for x in valid_batch])
-    max_width = max(latent.shape[-1] for latent in [x["latents"] for x in valid_batch])
-
-    # Resize or pad latents to the largest dimensions
-    resized_latents = [
-        resize_latents(x["latents"], max_height, max_width)
-        for x in valid_batch
-    ]
-
-    # Stack tensors
-    batch_dict = {
-        "latents": torch.stack(resized_latents).cpu(),
-        "text_embeddings": torch.stack([x["text_embeddings"] for x in valid_batch]).cpu(),
-        "text_embeddings_2": torch.stack([x["text_embeddings_2"] for x in valid_batch]).cpu(),
-        "added_cond_kwargs": {
-            k: torch.stack([x["added_cond_kwargs"][k] for x in valid_batch]).cpu()
-            if torch.is_tensor(valid_batch[0]["added_cond_kwargs"][k])
-            else [x["added_cond_kwargs"][k] for x in valid_batch]
-            for k in valid_batch[0]["added_cond_kwargs"]
-        },
-        "tags": [x["tags"] for x in valid_batch],
-        "special_tags": [x["special_tags"] for x in valid_batch],
-        "tag_weights": [x["tag_weights"] for x in valid_batch]
-    }
-
-    return batch_dict
+    def __getitem__(self, idx):
+        """Get a single item with improved text augmentation and bucketing"""
+        try:
+            img_path = self.image_paths[idx]
+            caption_path = Path(img_path).with_suffix('.txt')
+            
+            # Load cached latents if available
+            if not self.no_caching_latents and self.latent_paths[idx].exists():
+                cache_data = torch.load(self.latent_paths[idx])
+                
+                # Apply text augmentation
+                with open(caption_path, 'r', encoding='utf-8') as f:
+                    caption = f.read().strip()
+                caption = self._apply_text_transforms(caption)
+                
+                # Generate new text embeddings if caption changed
+                if caption != cache_data.get('original_caption', ''):
+                    text_inputs = self.tokenizer(
+                        caption,
+                        padding="max_length",
+                        max_length=self.tokenizer.model_max_length,
+                        truncation=True,
+                        return_tensors="pt"
+                    ).to(self.text_encoder.device)
+                    
+                    text_inputs_2 = self.tokenizer_2(
+                        caption,
+                        padding="max_length",
+                        max_length=self.tokenizer_2.model_max_length,
+                        truncation=True,
+                        return_tensors="pt"
+                    ).to(self.text_encoder_2.device)
+                    
+                    with torch.no_grad():
+                        text_embeddings = self.text_encoder(text_inputs.input_ids)[0]
+                        text_embeddings_2 = self.text_encoder_2(
+                            text_inputs_2.input_ids,
+                            output_hidden_states=True
+                        )
+                        pooled_output = text_embeddings_2[0]
+                        hidden_states = text_embeddings_2.hidden_states[-2]
+                        
+                    cache_data.update({
+                        'text_embeddings': text_embeddings,
+                        'text_embeddings_2': hidden_states,
+                        'added_cond_kwargs': {
+                            'text_embeds': pooled_output.unsqueeze(1).unsqueeze(2),
+                            'time_ids': cache_data['added_cond_kwargs']['time_ids']
+                        },
+                        'original_caption': caption
+                    })
+                
+                return cache_data
+            
+            # Process uncached item
+            return self._process_uncached_item(img_path, caption_path)
+        
+        except Exception as e:
+            logger.error(f"Error getting item {idx}: {str(e)}")
+            return None
