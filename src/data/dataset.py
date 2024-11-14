@@ -1047,7 +1047,7 @@ class CustomDataset(Dataset):
         Returns:
             dict: Collated batch with proper padding
         """
-        latents = torch.stack([item["latent"] for item in batch])
+        latents = torch.stack([item["latents"] for item in batch])
         input_ids = torch.stack([item["input_ids"] for item in batch])
         input_ids_2 = torch.stack([item["input_ids_2"] for item in batch])
         
@@ -1070,7 +1070,7 @@ class CustomDataset(Dataset):
             tag_weights = torch.stack([item["tag_weights"] for item in batch])
         
         return {
-            "latent": latents,
+            "latents": latents,
             "input_ids": input_ids,
             "input_ids_2": input_ids_2,
             "original_size": original_sizes,
