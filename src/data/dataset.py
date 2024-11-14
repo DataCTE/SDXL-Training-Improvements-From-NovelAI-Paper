@@ -133,6 +133,10 @@ class CustomDataset(Dataset):
                 # Get dimensions
                 width, height = img.size
                 
+                # If all_ar is True, accept all sizes
+                if self.all_ar:
+                    return img_path
+                
                 # Basic validation
                 if width < self.min_size or height < self.min_size:
                     # Instead of skipping, try to upscale
@@ -245,13 +249,19 @@ class CustomDataset(Dataset):
                     return None
                     
                 with Image.open(img_path) as img:
-                    # If all_ar is True, use original dimensions
+                    # Get dimensions
                     width, height = img.size
-                    # Limit maximum dimension while preserving aspect ratio
-                    if max(width, height) > 2048:
+                    
+                    # If all_ar is True, just round to multiples of 8
+                    if self.all_ar:
+                        width = ((width + 7) // 8) * 8
+                        height = ((height + 7) // 8) * 8
+                    # Otherwise limit maximum dimension while preserving aspect ratio
+                    elif max(width, height) > 2048:
                         scale = 2048 / max(width, height)
                         width = int(width * scale)
                         height = int(height * scale)
+                        
                     return (img_path, f"{width}x{height}")
             except Exception as e:
                 logger.error(f"Error reading image {img_path}: {str(e)}")
@@ -286,9 +296,16 @@ class CustomDataset(Dataset):
                 for path in batch_paths:
                     try:
                         with Image.open(path) as img:
-                            # Scale down if needed while preserving aspect ratio
                             width, height = img.size
-                            if max(width, height) > 2048:
+                            
+                            # If all_ar is True, just round to multiples of 8
+                            if self.all_ar:
+                                width = ((width + 7) // 8) * 8
+                                height = ((height + 7) // 8) * 8
+                                if width != img.size[0] or height != img.size[1]:
+                                    img = img.resize((width, height), Image.LANCZOS)
+                            # Otherwise scale down if needed while preserving aspect ratio
+                            elif max(width, height) > 2048:
                                 scale = 2048 / max(width, height)
                                 new_width = int(width * scale)
                                 new_height = int(height * scale)
@@ -595,10 +612,15 @@ class CustomDataset(Dataset):
         Only intervenes for extreme cases.
         """
         try:
-            # Check if dimensions need adjustment
-            is_valid, _ = validate_image_dimensions(width, height)
-            
-            if not is_valid:
+            # If all_ar is True, keep original size
+            if self.all_ar:
+                # Just round to multiples of 8 for VAE
+                width = ((width + 7) // 8) * 8
+                height = ((height + 7) // 8) * 8
+                return (width, height)
+                
+            # Basic validation - only check minimum size
+            if width < 256 or height < 256:
                 min_dim = min(width, height)
                 max_dim = max(width, height)
                 aspect_ratio = width / height
@@ -606,12 +628,6 @@ class CustomDataset(Dataset):
                 # Scale up if both dimensions are too small
                 if width < 512 and height < 512:
                     scale = 512 / min_dim
-                    width = int(width * scale)
-                    height = int(height * scale)
-                
-                # Scale down if any dimension is too large
-                elif max_dim > 2560:
-                    scale = 2560 / max_dim
                     width = int(width * scale)
                     height = int(height * scale)
                 
@@ -642,6 +658,16 @@ class CustomDataset(Dataset):
 
     def process_image_size(self, image, target_width, target_height):
         """Process image size with advanced upscaling"""
+        # If all_ar is True, keep original size
+        if self.all_ar:
+            width, height = image.size
+            # Just round to multiples of 8 for VAE
+            width = ((width + 7) // 8) * 8
+            height = ((height + 7) // 8) * 8
+            if width == image.size[0] and height == image.size[1]:
+                return image
+            return image.resize((width, height), Image.LANCZOS)
+            
         width, height = image.size
         
         if width == target_width and height == target_height:

@@ -12,8 +12,9 @@ def validate_dataset(data_dir):
         data_dir = Path(data_dir)
         if not data_dir.exists():
             return False, "Dataset directory does not exist"
-            
-        image_files = list(data_dir.glob("**/*.jpg")) + list(data_dir.glob("**/*.png"))
+
+        # all types of images    
+        image_files = data_dir.glob("**/*.*")
         if not image_files:
             return False, "No image files found in dataset directory"
             
@@ -22,10 +23,11 @@ def validate_dataset(data_dir):
     except Exception as e:
         return False, str(e)
 
+
 def validate_image_dimensions(width, height):
     """Basic image dimension validation"""
     try:
-        # only to small images
+        # only check minimum size
         if width < 256 or height < 256:
             return False, "Image is too small"
             
