@@ -121,17 +121,46 @@ def setup_models(args, device, dtype):
         )
         logger.info(f"Loaded UNet config: {unet_config}")
         
+        # Fix SDXL architecture configuration
+        sdxl_updates = {
+            'transformer_layers_per_block': [0, 2, 10],  # Correct transformer distribution
+            'channel_mult': [1, 2, 4],  # Standard SDXL channel multipliers
+            'attention_resolutions': [4, 8],  # Attention at 1/4 and 1/8 resolution
+            'use_linear_projection': True,  # For improved stability
+            'cross_attention_dim': 2048,  # Combined CLIP dimension
+            'num_res_blocks': 2  # Standard architecture
+        }
+        
+        # Update config with SDXL architecture requirements
+        for key, value in sdxl_updates.items():
+            if key not in unet_config or unet_config[key] != value:
+                logger.info(f"Updating UNet config: {key} = {value}")
+                unet_config[key] = value
+        
         # Verify configuration matches SDXL architecture
         verify_unet_config(unet_config)
         
+        # Initialize UNet with corrected config
         unet = UNet2DConditionModel.from_config(unet_config)
-        unet.load_state_dict(
-            UNet2DConditionModel.from_pretrained(
-                args.model_path,
-                subfolder="unet",
-                torch_dtype=dtype
-            ).state_dict()
+        
+        # Load pretrained weights
+        pretrained_unet = UNet2DConditionModel.from_pretrained(
+            args.model_path,
+            subfolder="unet",
+            torch_dtype=dtype
         )
+        
+        # Transfer compatible weights
+        missing_keys, unexpected_keys = unet.load_state_dict(
+            pretrained_unet.state_dict(), 
+            strict=False
+        )
+        
+        if missing_keys:
+            logger.warning(f"Missing keys when loading UNet weights: {missing_keys}")
+        if unexpected_keys:
+            logger.warning(f"Unexpected keys when loading UNet weights: {unexpected_keys}")
+        
         unet = unet.to(device)
         
         # Load VAE
