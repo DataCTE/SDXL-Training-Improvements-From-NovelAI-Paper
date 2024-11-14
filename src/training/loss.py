@@ -46,122 +46,64 @@ def v_prediction_scaling_factors(sigma, sigma_data=1.0):
     return c_skip, c_out, c_in
 
 def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kwargs=None, 
-                             sigma_data=1.0, tag_weighter=None, batch_tags=None):
+                             sigma_data=1.0, tag_weighter=None, batch_tags=None, min_snr_gamma=5.0):
     """
     Calculate v-prediction loss with MinSNR weighting and optimized performance
+    Args:
+        min_snr_gamma: Minimum SNR value for loss weighting (default: 5.0 from paper)
     """
     try:
-        # Optimize device and dtype handling
         dtype = x_0.dtype
         device = x_0.device
         
-        # Ensure consistent dtype for all inputs
+        # Ensure consistent dtype and device
         sigma = sigma.to(dtype=dtype, device=device)
         text_embeddings = text_embeddings.to(dtype=dtype, device=device)
         
-        # Preprocess conditional inputs with performance in mind
-        if added_cond_kwargs is None:
-            added_cond_kwargs = {}
+        # Calculate noise
+        noise = torch.randn_like(x_0)
         
-        # Handle dual text encoders (CLIP ViT-L and OpenCLIP ViT-bigG)
-        if 'time_ids' in added_cond_kwargs:
-            time_ids = added_cond_kwargs['time_ids']
-            # Get text embedding dimensions for both encoders
-            batch_size = text_embeddings.size(0)
-            seq_len = text_embeddings.size(1) if text_embeddings.dim() > 2 else 1
-            hidden_dim = text_embeddings.size(-1)
-            
-            # Reshape time_ids to match concatenated embeddings
-            if time_ids.dim() == 1:
-                # Single time embedding -> expand for both encoders
-                time_ids = time_ids.view(batch_size, 1)
-                time_ids = time_ids.unsqueeze(-1).expand(-1, seq_len, -1)
-            elif time_ids.dim() == 2:
-                # Already batch x sequence, ensure proper sequence length
-                if time_ids.size(1) == 1:
-                    time_ids = time_ids.expand(-1, seq_len)
-            elif time_ids.dim() == 4:
-                # Handle spatial time embeddings
-                time_ids = time_ids.view(batch_size, -1)
-                time_ids = time_ids.unsqueeze(1).expand(-1, seq_len, -1)
-            
-            added_cond_kwargs['time_ids'] = time_ids
-
-        # Use torch.no_grad for inference to reduce memory overhead
-        with torch.no_grad():
-            # Generate noise more efficiently
-            noise = torch.randn_like(x_0, dtype=dtype, device=device)
-            
-            # Create noisy input with less memory allocation
-            x_t = x_0 + noise * sigma.view(-1, 1, 1, 1)
-            
-            # Compute scaling factors with less overhead
-            c_skip, c_out, c_in = v_prediction_scaling_factors(sigma, sigma_data)
-            
-            # Predict with minimal overhead
-            v_pred = model(x_t, sigma, text_embeddings, added_cond_kwargs=added_cond_kwargs).sample
-            
-            # Scale prediction and target more efficiently
-            scaled_output = c_skip.view(-1, 1, 1, 1) * x_t + c_out.view(-1, 1, 1, 1) * v_pred
-            v_target = c_in.view(-1, 1, 1, 1) * noise
-            
-            # Compute SNR with tensor operations (section 2.4)
-            snr = (sigma_data / sigma) ** 2
-            min_snr_gamma = 5.0  # As recommended in the paper
-            
-            # MinSNR loss weighting with better ZTSNR handling
-            loss_weight = torch.where(
-                snr > min_snr_gamma,
-                torch.ones_like(snr) * min_snr_gamma,
-                snr
-            )
-            
-            # Compute loss with reduced memory allocations
-            mse_loss = F.mse_loss(scaled_output, v_target, reduction='none')
-            weighted_loss = mse_loss * loss_weight.view(-1, 1, 1, 1)
-            
-            # Optional tag-based weighting with early exit if no weighting
-            if tag_weighter is not None and batch_tags is not None:
-                batch_weights = []
-                for tags, weights, special in zip(batch_tags['tags'], 
-                                               batch_tags['tag_weights'],
-                                               batch_tags['special_tags']):
-                    weight = tag_weighter.calculate_weights(tags, weights, special)
-                    batch_weights.append(weight)
-                
-                tag_weights = torch.tensor(batch_weights, device=device, dtype=dtype)
-                weighted_loss = weighted_loss * tag_weights.view(-1, 1, 1, 1)
-            
-            # Compute final loss
-            loss = weighted_loss.mean()
-            
-            # Collect metrics with minimal overhead
-            loss_metrics = {
-                'loss/total': loss.item(),
-                'loss/mse_raw': mse_loss.mean().item(),
-                'loss/weight_mean': loss_weight.mean().item(),
-                'model/sigma_mean': sigma.mean().item(),
-                'model/sigma_std': sigma.std().item(),
-                'model/v_pred_norm': v_pred.norm().item(),
-                'model/snr_mean': snr.mean().item()
-            }
-            
-            # Efficiently compute tag metrics
-            if tag_weighter is not None and batch_tags is not None:
-                loss_metrics.update({
-                    'tags/weight_mean': torch.tensor(batch_weights).mean().item() if batch_weights else 0,
-                    'tags/weight_std': torch.tensor(batch_weights).std().item() if batch_weights else 0,
-                    'tags/niji_count': sum(1 for t in batch_tags['special_tags'] if t.get('niji', False)),
-                    'tags/quality_6_count': sum(1 for t in batch_tags['special_tags'] if t.get('quality', 0) == 6),
-                    'tags/stylize_mean': np.mean([t.get('stylize', 0) for t in batch_tags['special_tags']]),
-                    'tags/chaos_mean': np.mean([t.get('chaos', 0) for t in batch_tags['special_tags']])
-                })
-            
-            return loss, loss_metrics
-
+        # Get v-prediction scaling factors
+        c_skip, c_out, c_in = v_prediction_scaling_factors(sigma, sigma_data)
+        
+        # Calculate noised input
+        x_noisy = c_skip * x_0 + c_out * noise
+        
+        # Scale model input for proper normalization
+        model_input = c_in * x_noisy
+        
+        # Forward pass
+        model_output = model(
+            model_input,
+            sigma,
+            text_embeddings,
+            added_cond_kwargs=added_cond_kwargs
+        )
+        
+        # Calculate target
+        target = c_in * x_0
+        
+        # Calculate SNR for loss weighting
+        snr = (sigma_data / sigma) ** 2
+        min_snr = torch.full_like(snr, min_snr_gamma)
+        loss_weights = (snr / min_snr).clamp(max=1.0)
+        
+        # Calculate weighted MSE loss
+        loss = F.mse_loss(model_output, target, reduction='none')
+        loss = loss.mean(dim=(1, 2, 3))
+        loss = (loss * loss_weights).mean()
+        
+        # Apply tag weighting if provided
+        if tag_weighter is not None and batch_tags is not None:
+            tag_weights = tag_weighter(batch_tags)
+            loss = loss * tag_weights.mean()
+        
+        return loss
+    
     except Exception as e:
-        logger.error(f"Error in training_loss_v_prediction: {str(e)}\n{traceback.format_exc()}")
-        raise
+        logger.error(f"Error in v-prediction loss calculation: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise e
 
 class PerceptualLoss:
     def __init__(self, device="cuda"):

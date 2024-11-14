@@ -46,7 +46,14 @@ def train_one_epoch(
     tag_weighter, device, dtype, 
     gradient_accumulation_steps=1, 
     max_grad_norm=1.0, 
-    mixed_precision=True
+    mixed_precision=True,
+    min_snr_gamma=5.0,
+    sigma_data=1.0,
+    sigma_min=0.01,
+    resolution_scaling=1.0,
+    rescale_cfg=None,
+    scale_method="linear",
+    rescale_multiplier=1.0
 ):
     model.train()
     total_loss = 0.0
@@ -70,19 +77,27 @@ def train_one_epoch(
             for k, v in batch['added_cond_kwargs'].items()
         }
         
-        # Prepare sigma with efficient sampling
-        sigma = torch.rand(latents.size(0), device=device, dtype=dtype) * 0.9 + 0.1
+        # Get resolution-dependent sigma
+        height, width = latents.shape[2:4]
+        sigma = get_sigmas(height=height * 8, width=width * 8)[0].to(device, dtype=dtype)
         
         # Forward pass and loss computation
         with torch.amp.autocast('cuda', enabled=mixed_precision):
-            loss, metrics = training_loss_v_prediction(
+            loss = training_loss_v_prediction(
                 model, 
                 latents, 
                 sigma, 
                 text_embeddings, 
                 added_cond_kwargs=added_cond_kwargs,
                 tag_weighter=tag_weighter,
-                batch_tags=batch
+                batch_tags=batch,
+                min_snr_gamma=min_snr_gamma,
+                sigma_data=sigma_data,
+                sigma_min=sigma_min,
+                resolution_scaling=resolution_scaling,
+                rescale_cfg=rescale_cfg,
+                scale_method=scale_method,
+                rescale_multiplier=rescale_multiplier
             )
             
             # Normalize loss for gradient accumulation
@@ -124,7 +139,16 @@ def train_one_epoch(
 
 
 def train(args, models, train_components, device, dtype):
-    """Main training loop"""
+    """Main training loop with improved v-prediction and ZTSNR support"""
+    model = models["unet"]
+    if args.use_ema:
+        ema_model = models["ema"]
+    
+    optimizer = train_components["optimizer"]
+    lr_scheduler = train_components["lr_scheduler"]
+    train_dataloader = train_components["train_dataloader"]
+    tag_weighter = train_components["tag_weighter"]
+    
     training_history = {
         'loss_history': [],
         'validation_scores': [],
@@ -165,24 +189,33 @@ def train(args, models, train_components, device, dtype):
     # Update UNet in validator to use training UNet
     validator.pipeline.unet = models["unet"]
 
+    # Training loop
+    logger.info("\nStarting training loop...")
     for epoch in range(start_epoch, args.num_epochs):
         # Log epoch start
         logger.info(f"\nStarting epoch {epoch+1}/{args.num_epochs}")
         if args.use_wandb:
             log_metrics_batch({"train/epoch": epoch}, step=global_step)
         
-        # Run training epoch (moved outside of wandb condition)
+        # Train one epoch
         global_step = train_one_epoch(
-            model=models["unet"],
-            optimizer=train_components["optimizer"],
-            lr_scheduler=train_components["lr_scheduler"],
-            train_dataloader=train_components["train_dataloader"],
-            tag_weighter=train_components["tag_weighter"],
+            model=model,
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+            train_dataloader=train_dataloader,
+            tag_weighter=tag_weighter,
             device=device,
             dtype=dtype,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
             max_grad_norm=args.max_grad_norm,
-            mixed_precision=args.mixed_precision
+            mixed_precision=args.mixed_precision,
+            min_snr_gamma=args.min_snr_gamma,
+            sigma_data=args.sigma_data,
+            sigma_min=args.sigma_min,
+            resolution_scaling=args.resolution_scaling,
+            rescale_cfg=args.rescale_cfg,
+            scale_method=args.scale_method,
+            rescale_multiplier=args.rescale_multiplier
         )
         
         # Run end-of-epoch validation

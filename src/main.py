@@ -53,6 +53,29 @@ def parse_args():
     parser.add_argument("--warmup_steps", type=int, default=1000,
                        help="Number of warmup steps for learning rate scheduler")
     
+    # V-prediction parameters
+    parser.add_argument("--min_snr_gamma", type=float, default=5.0,
+                      help="Minimum SNR value for loss weighting (default: 5.0)")
+    parser.add_argument("--sigma_data", type=float, default=1.0,
+                      help="Data standard deviation for v-prediction (default: 1.0)")
+    parser.add_argument("--sigma_min", type=float, default=0.029,
+                      help="Minimum sigma value for ZTSNR schedule")
+    parser.add_argument("--rescale_multiplier", type=float, default=0.7,
+                      help="Multiplier for CFG rescaling")
+    
+    # Training mode flags
+    parser.add_argument("--zsnr", action="store_true", default=True,
+                      help="Enable Zero Terminal SNR training")
+    parser.add_argument("--v_prediction", action="store_true", default=True,
+                      help="Enable v-prediction parameterization")
+    parser.add_argument("--resolution_scaling", action="store_true", default=True,
+                      help="Enable resolution-dependent sigma scaling")
+    parser.add_argument("--rescale_cfg", action="store_true", default=True,
+                      help="Enable CFG rescaling")
+    parser.add_argument("--scale_method", type=str, default="karras",
+                      choices=["karras", "simple"],
+                      help="Method for CFG rescaling (karras or simple)")
+    
     # AdamW optimizer arguments
     parser.add_argument("--adam_beta1", type=float, default=0.9,
                        help="The beta1 parameter for the Adam optimizer")
@@ -116,19 +139,6 @@ def parse_args():
                        default=["a detailed portrait of a girl",
                                "completely black",
                                "a red ball on top of a blue cube"])
-    
-    # ZTSNR + V-Prediction settings
-    parser.add_argument("--zsnr", action="store_true", default=True)
-    parser.add_argument("--v_prediction", action="store_true", default=True)
-    parser.add_argument("--sigma_min", type=float, default=0.029)
-    parser.add_argument("--sigma_data", type=float, default=1.0)
-    parser.add_argument("--min_snr_gamma", type=float, default=5.0)
-    parser.add_argument("--resolution_scaling", action="store_true", default=True)
-    
-    # CFG Rescale settings
-    parser.add_argument("--rescale_cfg", action="store_true", default=True)
-    parser.add_argument("--scale_method", type=str, default="karras")
-    parser.add_argument("--rescale_multiplier", type=float, default=0.7)
     
     # HuggingFace Hub
     parser.add_argument("--push_to_hub", action="store_true")
