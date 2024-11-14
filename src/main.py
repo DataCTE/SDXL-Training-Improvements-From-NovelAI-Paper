@@ -199,14 +199,17 @@ def main(args):
         # Set up Weights & Biases
         wandb_run = setup_wandb(args)
         
-        # Load model and log initial memory stats
-        models, train_components, training_history = load_checkpoint(args)
+        # Load model and initialize components
+        models, _, training_history = load_checkpoint(args)
+        
+        # Set up training components
+        train_components = setup_training(args, models, device=torch.device("cuda"), dtype=torch.float16)
         
         # Log training setup and initial system state
         log_training_setup(args, models, train_components)
         
         if wandb_run and args.wandb_watch:
-            wandb_run.watch(models.unet, log="all", log_freq=args.wandb_log_freq)
+            wandb_run.watch(models["unet"], log="all", log_freq=args.wandb_log_freq)
         
         if wandb_run:
             log_memory_stats(step=0)

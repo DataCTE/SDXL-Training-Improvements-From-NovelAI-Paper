@@ -8,13 +8,40 @@ import json
 
 logger = logging.getLogger(__name__)
 
-def load_checkpoint(checkpoint_dir, models, train_components):
-    """ load using diffusers """
+def load_checkpoint(args):
+    """Load model using diffusers"""
     try:
-        logger.info(f"Loading checkpoint from {checkpoint_dir}")
-        return StableDiffusionXLPipeline.from_pretrained(model_path=checkpoint_dir, torch_dtype=torch.float16)
+        logger.info(f"Loading model from {args.model_path}")
+        
+        # Load the pipeline
+        pipeline = StableDiffusionXLPipeline.from_pretrained(
+            args.model_path,
+            torch_dtype=torch.float16
+        )
+        
+        # Extract models
+        models = {
+            "unet": pipeline.unet,
+            "vae": pipeline.vae,
+            "text_encoder": pipeline.text_encoder,
+            "text_encoder_2": pipeline.text_encoder_2,
+            "tokenizer": pipeline.tokenizer,
+            "tokenizer_2": pipeline.tokenizer_2,
+            "scheduler": pipeline.scheduler
+        }
+        
+        # Initialize training components
+        train_components = {}
+        training_history = {
+            'loss_history': [],
+            'validation_scores': [],
+            'best_score': float('inf')
+        }
+        
+        return models, train_components, training_history
+        
     except Exception as e:
-        logger.error(f"Failed to load checkpoint: {str(e)}")
+        logger.error(f"Failed to load model: {str(e)}")
         raise
 
 def save_checkpoint(checkpoint_dir, models, train_components, training_state):
