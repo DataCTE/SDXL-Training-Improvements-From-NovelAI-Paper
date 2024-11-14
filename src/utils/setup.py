@@ -288,6 +288,18 @@ def setup_training(args, models, device, dtype):
             )
             components["tag_weighter"] = tag_weighter
             
+            # Initialize EMA if enabled
+            if args.use_ema:
+                logger.info("  Setting up EMA model...")
+                ema_model = EMAModel(
+                    models["unet"],
+                    decay=args.ema_decay,
+                    update_after_step=args.ema_start_step,
+                    device=device
+                )
+                models["ema"] = ema_model
+                logger.info("  ✓ EMA model initialized")
+            
             # Noise scheduler
             logger.info("  Configuring noise scheduler...")
             noise_scheduler = EulerDiscreteScheduler(
