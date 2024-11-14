@@ -75,8 +75,15 @@ def setup_models(args, device, dtype):
             models["unet"] = unet
         except Exception as e:
             logger.error(" Failed to load UNet")
-            logger.error(f"Error details: {str(e)}")
-            logger.error(traceback.format_exc())
+            logger.error(f"Error details: {clean_error_message(str(e))}")
+            error_traceback = clean_error_message(traceback.format_exc())
+            error_lines = error_traceback.split('\n')
+            if len(error_lines) > 3:
+                with open('unet_load_error.log', 'w') as f:
+                    f.write(error_traceback)
+                logger.error("Full error traceback written to 'unet_load_error.log'")
+            else:
+                logger.error(error_traceback)
             raise
         
         # Step 2: Load VAE
@@ -93,8 +100,15 @@ def setup_models(args, device, dtype):
             models["vae"] = vae
         except Exception as e:
             logger.error(" Failed to load VAE")
-            logger.error(f"Error details: {str(e)}")
-            logger.error(traceback.format_exc())
+            logger.error(f"Error details: {clean_error_message(str(e))}")
+            error_traceback = clean_error_message(traceback.format_exc())
+            error_lines = error_traceback.split('\n')
+            if len(error_lines) > 3:
+                with open('vae_load_error.log', 'w') as f:
+                    f.write(error_traceback)
+                logger.error("Full error traceback written to 'vae_load_error.log'")
+            else:
+                logger.error(error_traceback)
             raise
         
         # Step 3: Load Text Encoders and Tokenizers
@@ -128,8 +142,15 @@ def setup_models(args, device, dtype):
             })
         except Exception as e:
             logger.error(" Failed to load text encoders/tokenizers")
-            logger.error(f"Error details: {str(e)}")
-            logger.error(traceback.format_exc())
+            logger.error(f"Error details: {clean_error_message(str(e))}")
+            error_traceback = clean_error_message(traceback.format_exc())
+            error_lines = error_traceback.split('\n')
+            if len(error_lines) > 3:
+                with open('text_encoder_load_error.log', 'w') as f:
+                    f.write(error_traceback)
+                logger.error("Full error traceback written to 'text_encoder_load_error.log'")
+            else:
+                logger.error(error_traceback)
             raise
         
         # Step 4: Setup Gradient Checkpointing
@@ -142,8 +163,15 @@ def setup_models(args, device, dtype):
                 logger.info(" Gradient checkpointing enabled for all supported models")
             except Exception as e:
                 logger.error(" Failed to enable gradient checkpointing")
-                logger.error(f"Error details: {str(e)}")
-                logger.error(traceback.format_exc())
+                logger.error(f"Error details: {clean_error_message(str(e))}")
+                error_traceback = clean_error_message(traceback.format_exc())
+                error_lines = error_traceback.split('\n')
+                if len(error_lines) > 3:
+                    with open('gradient_checkpointing_error.log', 'w') as f:
+                        f.write(error_traceback)
+                    logger.error("Full error traceback written to 'gradient_checkpointing_error.log'")
+                else:
+                    logger.error(error_traceback)
                 raise
         else:
             logger.info("Step 4/5: Skipping gradient checkpointing (not enabled)")
@@ -175,8 +203,15 @@ def setup_models(args, device, dtype):
                 models["ema_model"] = ema_model
             except Exception as e:
                 logger.error("  Failed to initialize EMA model")
-                logger.error(f"  Error details: {str(e)}")
-                logger.error(traceback.format_exc())
+                logger.error(f"  Error details: {clean_error_message(str(e))}")
+                error_traceback = clean_error_message(traceback.format_exc())
+                error_lines = error_traceback.split('\n')
+                if len(error_lines) > 3:
+                    with open('ema_initialization_error.log', 'w') as f:
+                        f.write(error_traceback)
+                    logger.error("Full error traceback written to 'ema_initialization_error.log'")
+                else:
+                    logger.error(error_traceback)
                 raise
         else:
             logger.info("  Skipping EMA initialization (not enabled)")
@@ -196,8 +231,15 @@ def setup_models(args, device, dtype):
         
     except Exception as e:
         logger.error(" Model setup failed")
-        logger.error(f"Error details: {str(e)}")
-        logger.error(traceback.format_exc())
+        logger.error(f"Error details: {clean_error_message(str(e))}")
+        error_traceback = clean_error_message(traceback.format_exc())
+        error_lines = error_traceback.split('\n')
+        if len(error_lines) > 3:
+            with open('model_setup_error.log', 'w') as f:
+                f.write(error_traceback)
+            logger.error("Full error traceback written to 'model_setup_error.log'")
+        else:
+            logger.error(error_traceback)
         raise
 
 def clean_error_message(error_msg):
