@@ -80,17 +80,23 @@ class CustomDataset(Dataset):
 
         logger.info(f"Caching latents for {len(uncached_images)} images in batches")
         
-        # Calculate optimal number of workers
-        num_cpu_workers = min(8, os.cpu_count())  # Reduced CPU workers
-        chunk_size = batch_size * 4  # Process images in chunks
-        
         # Group images by size using parallel processing
         def group_image_by_size(img_path):
             try:
+                # First check if caption file exists
+                caption_path = Path(img_path).with_suffix('.txt')
+                if not caption_path.exists():
+                    logger.warning(f"Skipping {img_path}: No caption file found")
+                    return None
+                    
                 with Image.open(img_path) as img:
+                    # If all_ar is True, use original dimensions
                     width, height = img.size
-                    if not self.all_ar:
-                        width, height = self._get_target_size(width, height)
+                    # Limit maximum dimension while preserving aspect ratio
+                    if max(width, height) > 2048:
+                        scale = 2048 / max(width, height)
+                        width = int(width * scale)
+                        height = int(height * scale)
                     return (img_path, f"{width}x{height}")
             except Exception as e:
                 logger.error(f"Error reading image {img_path}: {str(e)}")
@@ -98,7 +104,8 @@ class CustomDataset(Dataset):
 
         # Use ThreadPoolExecutor for I/O-bound size checking
         size_groups = {}
-        with ThreadPoolExecutor(max_workers=num_cpu_workers) as executor:
+        valid_images = []
+        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
             for result in tqdm(
                 executor.map(group_image_by_size, uncached_images),
                 total=len(uncached_images),
@@ -109,106 +116,112 @@ class CustomDataset(Dataset):
                     if size_key not in size_groups:
                         size_groups[size_key] = []
                     size_groups[size_key].append(img_path)
+                    valid_images.append(img_path)
 
-        def preprocess_image(img_path):
-            """Preprocess single image"""
-            try:
-                image = Image.open(img_path).convert('RGB')
-                width, height = image.size
-                
-                if not self.all_ar:
-                    target_width, target_height = self._get_target_size(width, height)
-                    image = self.process_image_size(image, target_width, target_height)
-                
-                transform = transforms.Compose([
-                    transforms.ToTensor(),
-                    transforms.Normalize([0.5], [0.5])
-                ])
-                return img_path, transform(image).unsqueeze(0)
-            except Exception as e:
-                logger.error(f"Error preprocessing {img_path}: {str(e)}")
-                return None
-
-        def process_batch_with_vae(batch_data):
+        def process_batch_with_vae(batch_paths):
             """Process a batch of images through VAE and generate embeddings"""
-            if not batch_data:
+            if not batch_paths:
                 return []
             
             batch_results = []
             try:
-                # Prepare batch
-                paths, tensors = zip(*batch_data)
+                # Process images in batch
+                images = []
+                valid_paths = []
+                for path in batch_paths:
+                    try:
+                        with Image.open(path) as img:
+                            # Scale down if needed while preserving aspect ratio
+                            width, height = img.size
+                            if max(width, height) > 2048:
+                                scale = 2048 / max(width, height)
+                                new_width = int(width * scale)
+                                new_height = int(height * scale)
+                                img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                            
+                            if img.mode != 'RGB':
+                                img = img.convert('RGB')
+                            
+                            # Transform image
+                            image_tensor = transforms.ToTensor()(img)
+                            image_tensor = transforms.Normalize([0.5], [0.5])(image_tensor)
+                            images.append(image_tensor)
+                            valid_paths.append(path)
+                    except Exception as e:
+                        logger.error(f"Error processing image {path}: {str(e)}")
+                        continue
+
+                if not images:
+                    return []
+
+                # Stack images and process through VAE
                 with torch.no_grad():
-                    # Stack images of the same size
-                    image_tensor = torch.cat(tensors, dim=0)
-                    image_tensor = image_tensor.to(self.vae.device, dtype=self.vae.dtype)
-                    
-                    # Generate latents
+                    image_tensor = torch.stack(images).to(self.vae.device, dtype=self.vae.dtype)
                     latents = self.vae.encode(image_tensor).latent_dist.sample()
                     latents = latents * self.vae.config.scaling_factor
-                    
-                    # Process each result
-                    for idx, img_path in enumerate(paths):
-                        try:
-                            caption_path = Path(img_path).with_suffix('.txt')
-                            with open(caption_path, 'r', encoding='utf-8') as f:
-                                caption = f.read().strip()
-                            
-                            # Generate text embeddings
-                            text_inputs = self.tokenizer(
-                                caption,
-                                padding="max_length",
-                                max_length=self.tokenizer.model_max_length,
-                                truncation=True,
-                                return_tensors="pt"
-                            ).to(self.text_encoder.device)
-                            
-                            text_inputs_2 = self.tokenizer_2(
-                                caption,
-                                padding="max_length",
-                                max_length=self.tokenizer_2.model_max_length,
-                                truncation=True,
-                                return_tensors="pt"
-                            ).to(self.text_encoder_2.device)
-                            
-                            with torch.no_grad():
-                                text_embeddings = self.text_encoder(text_inputs.input_ids)[0]
-                                text_embeddings_2 = self.text_encoder_2(
-                                    text_inputs_2.input_ids,
-                                    output_hidden_states=True
-                                )
-                                pooled_output = text_embeddings_2[0]
-                                hidden_states = text_embeddings_2.hidden_states[-2]
-                            
-                            # Create and save cache data
-                            cache_data = {
-                                "latents": latents[idx],
-                                "text_embeddings": text_embeddings,
-                                "text_embeddings_2": hidden_states,
-                                "added_cond_kwargs": {
-                                    "text_embeds": pooled_output,
-                                    "time_ids": self._get_add_time_ids(image_tensor[idx:idx+1])
-                                }
+
+                # Process each result
+                for idx, img_path in enumerate(valid_paths):
+                    try:
+                        caption_path = Path(img_path).with_suffix('.txt')
+                        with open(caption_path, 'r', encoding='utf-8') as f:
+                            caption = f.read().strip()
+                        
+                        # Generate text embeddings
+                        text_inputs = self.tokenizer(
+                            caption,
+                            padding="max_length",
+                            max_length=self.tokenizer.model_max_length,
+                            truncation=True,
+                            return_tensors="pt"
+                        ).to(self.text_encoder.device)
+                        
+                        text_inputs_2 = self.tokenizer_2(
+                            caption,
+                            padding="max_length",
+                            max_length=self.tokenizer_2.model_max_length,
+                            truncation=True,
+                            return_tensors="pt"
+                        ).to(self.text_encoder_2.device)
+                        
+                        with torch.no_grad():
+                            text_embeddings = self.text_encoder(text_inputs.input_ids)[0]
+                            text_embeddings_2 = self.text_encoder_2(
+                                text_inputs_2.input_ids,
+                                output_hidden_states=True
+                            )
+                            pooled_output = text_embeddings_2[0]
+                            hidden_states = text_embeddings_2.hidden_states[-2]
+                        
+                        # Save cache data
+                        cache_data = {
+                            "latents": latents[idx],
+                            "text_embeddings": text_embeddings,
+                            "text_embeddings_2": hidden_states,
+                            "added_cond_kwargs": {
+                                "text_embeds": pooled_output,
+                                "time_ids": self._get_add_time_ids(image_tensor[idx:idx+1])
                             }
-                            
-                            latent_path = self.cache_dir / f"{Path(img_path).stem}_latents.pt"
-                            torch.save(cache_data, latent_path)
-                            batch_results.append(latent_path)
-                            
-                        except Exception as e:
-                            logger.error(f"Error processing {img_path}: {str(e)}")
-                            continue
+                        }
+                        
+                        latent_path = self.cache_dir / f"{Path(img_path).stem}_latents.pt"
+                        torch.save(cache_data, latent_path)
+                        batch_results.append(latent_path)
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing {img_path}: {str(e)}")
+                        continue
+
+                # Clear memory
+                del image_tensor, latents
+                torch.cuda.empty_cache()
                 
             except Exception as e:
-                logger.error(f"Error in VAE batch processing: {str(e)}")
-            
-            # Clear CUDA cache after batch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                logger.error(f"Error in batch processing: {str(e)}")
             
             return batch_results
 
-        # Process each size group with chunked parallel preprocessing
+        # Process each size group
         processed_paths = []
         total_images = sum(len(group) for group in size_groups.values())
         
@@ -217,33 +230,15 @@ class CustomDataset(Dataset):
                 logger.info(f"Processing size group {size} ({len(group_paths)} images)")
                 
                 # Process images in chunks
-                for chunk_start in range(0, len(group_paths), chunk_size):
-                    chunk_end = min(chunk_start + chunk_size, len(group_paths))
-                    chunk_paths = group_paths[chunk_start:chunk_end]
+                for chunk_start in range(0, len(group_paths), batch_size):
+                    chunk_paths = group_paths[chunk_start:chunk_start + batch_size]
+                    results = process_batch_with_vae(chunk_paths)
+                    processed_paths.extend(results)
+                    pbar.update(len(chunk_paths))
                     
-                    # Preprocess chunk in parallel
-                    preprocessed_batch = []
-                    with ThreadPoolExecutor(max_workers=num_cpu_workers) as executor:
-                        for result in executor.map(preprocess_image, chunk_paths):
-                            if result:
-                                preprocessed_batch.append(result)
-                                if len(preprocessed_batch) >= batch_size:
-                                    # Process batch through VAE
-                                    results = process_batch_with_vae(preprocessed_batch)
-                                    processed_paths.extend(results)
-                                    pbar.update(len(preprocessed_batch))
-                                    preprocessed_batch = []
-                    
-                    # Process remaining images in the chunk
-                    if preprocessed_batch:
-                        results = process_batch_with_vae(preprocessed_batch)
-                        processed_paths.extend(results)
-                        pbar.update(len(preprocessed_batch))
-                    
-                    # Cleanup after each chunk
+                    # Cleanup
                     gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                    torch.cuda.empty_cache()
         
         logger.info(f"Successfully cached {len(processed_paths)} latents")
 
