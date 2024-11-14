@@ -10,7 +10,7 @@ from training.ema import EMAModel
 from data.dataset import create_dataloader
 from utils.validation import Validator
 from data.tag_weighter import TagBasedLossWeighter
-from training.vae_finetuner import VAEFinetuner
+from training.vae_finetuner import VAEFineTuner
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +125,7 @@ def setup_training(args, models, device, dtype):
     # Initialize VAE finetuner if requested
     vae_finetuner = None
     if args.finetune_vae:
-        vae_finetuner = VAEFinetuner(
+        vae_finetuner = VAEFineTuner(
             vae=models["vae"],
             learning_rate=args.vae_learning_rate,
             device=device,
