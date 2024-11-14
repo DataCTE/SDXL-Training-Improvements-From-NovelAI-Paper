@@ -206,7 +206,7 @@ def main(args):
         wandb_run = setup_wandb(args)
         
         # Set device and dtype
-        device = torch.device("cuda")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         dtype = torch.float16 if args.mixed_precision else torch.float32
         
         # Load model and initialize components
@@ -334,7 +334,7 @@ def main(args):
             logger.info(f"Starting epoch {epoch + 1}/{args.num_epochs}")
             
             # Train for one epoch
-            epoch_metrics = train(args, models, train_components)
+            epoch_metrics = train(args, models, train_components, device, dtype)
             
             if wandb_run:
                 # Log epoch metrics
