@@ -22,7 +22,7 @@ from data.tag_weighter import TagBasedLossWeighter
 from training.vae_finetuner import VAEFineTuner
 from utils.device import cleanup
 from diffusers import StableDiffusionXLPipeline
-from utils.validation import validate_dataset
+from utils.validation import validate_dataset, validate_model_components, validate_training_args, validate_vae_finetuner_config, validate_ema_config
 import os
 from diffusers import EulerDiscreteScheduler
 
@@ -142,40 +142,11 @@ def verify_models(models):
     Returns:
         bool: True if verification passes
     """
-    required_models = [
-        "unet",
-        "vae",
-        "tokenizer",
-        "tokenizer_2",
-        "text_encoder",
-        "text_encoder_2"
-    ]
-    
     try:
-        # Check for required models
-        for model_name in required_models:
-            if model_name not in models:
-                raise ValueError(f"Missing required model: {model_name}")
-        
-        # Put models in eval mode before verification
-        models["text_encoder"].eval()
-        models["text_encoder_2"].eval()
-        models["vae"].eval()
-        
-        # Verify model states
-        assert not models["text_encoder"].training, "Text encoder should be in eval mode"
-        assert not models["text_encoder_2"].training, "Text encoder 2 should be in eval mode"
-        assert not models["vae"].training, "VAE should be in eval mode"
-        
-        # Verify gradient states
-        assert not models["text_encoder"].requires_grad, "Text encoder should not require gradients"
-        assert not models["text_encoder_2"].requires_grad, "Text encoder 2 should not require gradients"
-        assert not models["vae"].requires_grad, "VAE should not require gradients"
-        
-        # Put UNet back in train mode if it was in training
-        if models["unet"].training:
-            models["unet"].train()
-        
+        is_valid, error_msg = validate_model_components(models)
+        if not is_valid:
+            raise ValueError(error_msg)
+            
         return True
         
     except Exception as e:
@@ -187,6 +158,11 @@ def setup_training(args, models, device, dtype):
     logger.info("Setting up training components...")
     
     try:
+        # Validate training arguments first
+        is_valid, error_msg = validate_training_args(args)
+        if not is_valid:
+            raise ValueError(f"Training arguments validation failed: {error_msg}")
+            
         # Add default num_workers if not specified
         if not hasattr(args, 'num_workers'):
             args.num_workers = min(8, os.cpu_count() or 1)  # Default to min(8, CPU cores)
@@ -208,9 +184,9 @@ def setup_training(args, models, device, dtype):
             )
         else:
             # Validate dataset first
-            valid = validate_dataset(args.data_dir)
+            valid, stats = validate_dataset(args.data_dir)
             if not valid:
-                raise ValueError("Dataset validation failed")
+                raise ValueError(f"Dataset validation failed: {stats}")
                 
             dataset = CustomDataset(
                 data_dir=args.data_dir,
@@ -224,7 +200,54 @@ def setup_training(args, models, device, dtype):
                 all_ar=False,
                 num_workers=args.num_workers
             )
-        
+            
+        # Setup VAE finetuner if enabled
+        if hasattr(args, 'vae_finetuning') and args.vae_finetuning:
+            vae_config = {
+                'learning_rate': args.vae_learning_rate,
+                'min_snr_gamma': args.min_snr_gamma,
+                'adaptive_loss_scale': args.adaptive_loss_scale,
+                'kl_weight': args.kl_weight,
+                'perceptual_weight': args.perceptual_weight,
+                'use_8bit_adam': args.use_8bit_adam,
+                'gradient_checkpointing': args.gradient_checkpointing,
+                'mixed_precision': args.mixed_precision,
+                'use_channel_scaling': args.use_channel_scaling
+            }
+            
+            is_valid, error_msg = validate_vae_finetuner_config(vae_config)
+            if not is_valid:
+                raise ValueError(f"VAE finetuner validation failed: {error_msg}")
+                
+            vae_finetuner = VAEFineTuner(
+                models["vae"],
+                **vae_config
+            )
+            
+        # Setup EMA if enabled
+        if hasattr(args, 'use_ema') and args.use_ema:
+            ema_config = {
+                'decay': args.ema_decay,
+                'update_after_step': args.ema_update_after_step,
+                'inv_gamma': args.ema_inv_gamma,
+                'power': args.ema_power,
+                'min_decay': args.ema_min_decay,
+                'max_decay': args.ema_max_decay,
+                'update_every': args.ema_update_every,
+                'use_ema_warmup': args.use_ema_warmup,
+                'grad_scale_factor': args.ema_grad_scale_factor
+            }
+            
+            is_valid, error_msg = validate_ema_config(ema_config)
+            if not is_valid:
+                raise ValueError(f"EMA validation failed: {error_msg}")
+                
+            ema = EMAModel(
+                models["unet"],
+                **ema_config,
+                device=device
+            )
+
         train_dataloader = DataLoader(
             dataset,
             batch_size=args.batch_size,
@@ -271,51 +294,6 @@ def setup_training(args, models, device, dtype):
             max_weight=args.max_tag_weight
         )
         
-        # Initialize VAE finetuner if enabled
-        vae_finetuner = None
-        if args.finetune_vae:
-            logger.info("Initializing VAE finetuner...")
-            vae_finetuner = VAEFineTuner(
-                models["vae"],
-                learning_rate=args.vae_learning_rate,
-                device=device
-            )
-            
-            # Initialize VAE optimizer
-            if args.use_adafactor:
-                vae_optimizer = Adafactor(
-                    vae_finetuner.vae.parameters(),
-                    lr=args.vae_learning_rate,
-                    scale_parameter=True,
-                    relative_step=False,
-                    warmup_init=False
-                )
-            else:
-                vae_optimizer = AdamW8bit(
-                    vae_finetuner.vae.parameters(),
-                    lr=args.vae_learning_rate,
-                    betas=(0.9, 0.999)
-                )
-            
-            # Calculate VAE training steps
-            vae_steps_per_epoch = len(train_dataloader) // args.vae_train_freq
-            vae_training_steps = args.num_epochs * vae_steps_per_epoch
-            
-            # Initialize VAE learning rate scheduler
-            logger.info("Setting up VAE learning rate scheduler...")
-            vae_scheduler = get_scheduler(
-                "cosine",
-                optimizer=vae_optimizer,
-                num_warmup_steps=args.warmup_steps,
-                num_training_steps=vae_training_steps
-            )
-            
-            # Set optimizer and scheduler in VAE finetuner
-            vae_finetuner.set_optimizer(vae_optimizer, vae_scheduler)
-        
-        # Initialize validator with proper scheduler
-        logger.info("Initializing validator...")
-
         # Create scheduler first
         noise_scheduler = EulerDiscreteScheduler(
             beta_start=0.00085,
