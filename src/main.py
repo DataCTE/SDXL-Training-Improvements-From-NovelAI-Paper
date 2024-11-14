@@ -269,8 +269,9 @@ def main(args):
         if args.use_ema:
             from training.ema import EMAModel
             ema = EMAModel(
-            model=models["unet"],  # Add the required model argument
+            model=models["unet"],  
             model_path=args.model_path,
+            device=device,
             update_after_step=args.ema_update_after_step,
             update_every=args.ema_update_every,
             decay=args.ema_decay,
@@ -279,7 +280,7 @@ def main(args):
             max_decay=args.ema_max_decay,
             use_ema_warmup=args.use_ema_warmup
             )
-            ema.to(device=device, dtype=dtype)
+            
             models["ema"] = ema
         else:
             ema = None
