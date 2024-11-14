@@ -75,15 +75,8 @@ def setup_models(args, device, dtype):
             models["unet"] = unet
         except Exception as e:
             logger.error(" Failed to load UNet")
-            logger.error(f"Error details: {clean_error_message(str(e))}")
-            error_traceback = clean_error_message(traceback.format_exc())
-            error_lines = error_traceback.split('\n')
-            if len(error_lines) > 3:
-                with open('unet_load_error.log', 'w') as f:
-                    f.write(error_traceback)
-                logger.error("Full error traceback written to 'unet_load_error.log'")
-            else:
-                logger.error(error_traceback)
+            error_msg = clean_error_message(traceback.format_exc())
+            logger.error(error_msg)
             raise
         
         # Step 2: Load VAE
@@ -100,15 +93,8 @@ def setup_models(args, device, dtype):
             models["vae"] = vae
         except Exception as e:
             logger.error(" Failed to load VAE")
-            logger.error(f"Error details: {clean_error_message(str(e))}")
-            error_traceback = clean_error_message(traceback.format_exc())
-            error_lines = error_traceback.split('\n')
-            if len(error_lines) > 3:
-                with open('vae_load_error.log', 'w') as f:
-                    f.write(error_traceback)
-                logger.error("Full error traceback written to 'vae_load_error.log'")
-            else:
-                logger.error(error_traceback)
+            error_msg = clean_error_message(traceback.format_exc())
+            logger.error(error_msg)
             raise
         
         # Step 3: Load Text Encoders and Tokenizers
@@ -142,15 +128,8 @@ def setup_models(args, device, dtype):
             })
         except Exception as e:
             logger.error(" Failed to load text encoders/tokenizers")
-            logger.error(f"Error details: {clean_error_message(str(e))}")
-            error_traceback = clean_error_message(traceback.format_exc())
-            error_lines = error_traceback.split('\n')
-            if len(error_lines) > 3:
-                with open('text_encoder_load_error.log', 'w') as f:
-                    f.write(error_traceback)
-                logger.error("Full error traceback written to 'text_encoder_load_error.log'")
-            else:
-                logger.error(error_traceback)
+            error_msg = clean_error_message(traceback.format_exc())
+            logger.error(error_msg)
             raise
         
         # Step 4: Setup Gradient Checkpointing
@@ -163,15 +142,8 @@ def setup_models(args, device, dtype):
                 logger.info(" Gradient checkpointing enabled for all supported models")
             except Exception as e:
                 logger.error(" Failed to enable gradient checkpointing")
-                logger.error(f"Error details: {clean_error_message(str(e))}")
-                error_traceback = clean_error_message(traceback.format_exc())
-                error_lines = error_traceback.split('\n')
-                if len(error_lines) > 3:
-                    with open('gradient_checkpointing_error.log', 'w') as f:
-                        f.write(error_traceback)
-                    logger.error("Full error traceback written to 'gradient_checkpointing_error.log'")
-                else:
-                    logger.error(error_traceback)
+                error_msg = clean_error_message(traceback.format_exc())
+                logger.error(error_msg)
                 raise
         else:
             logger.info("Step 4/5: Skipping gradient checkpointing (not enabled)")
@@ -203,15 +175,8 @@ def setup_models(args, device, dtype):
                 models["ema_model"] = ema_model
             except Exception as e:
                 logger.error("  Failed to initialize EMA model")
-                logger.error(f"  Error details: {clean_error_message(str(e))}")
-                error_traceback = clean_error_message(traceback.format_exc())
-                error_lines = error_traceback.split('\n')
-                if len(error_lines) > 3:
-                    with open('ema_initialization_error.log', 'w') as f:
-                        f.write(error_traceback)
-                    logger.error("Full error traceback written to 'ema_initialization_error.log'")
-                else:
-                    logger.error(error_traceback)
+                error_msg = clean_error_message(traceback.format_exc())
+                logger.error(error_msg)
                 raise
         else:
             logger.info("  Skipping EMA initialization (not enabled)")
@@ -230,43 +195,10 @@ def setup_models(args, device, dtype):
         return models
         
     except Exception as e:
+        error_msg = clean_error_message(traceback.format_exc())
         logger.error(" Model setup failed")
-        logger.error(f"Error details: {clean_error_message(str(e))}")
-        error_traceback = clean_error_message(traceback.format_exc())
-        error_lines = error_traceback.split('\n')
-        if len(error_lines) > 3:
-            with open('model_setup_error.log', 'w') as f:
-                f.write(error_traceback)
-            logger.error("Full error traceback written to 'model_setup_error.log'")
-        else:
-            logger.error(error_traceback)
+        logger.error(error_msg)
         raise
-
-def clean_error_message(error_msg):
-    # Clean up shape mismatch errors
-    lines = error_msg.split('\n')
-    cleaned_lines = []
-    
-    for line in lines:
-        # Skip lines that are just parameter names
-        if line.strip().endswith('"') or line.strip().endswith('.'):
-            continue
-            
-        # Simplify shape mismatch messages
-        if "size mismatch for" in line:
-            parts = line.split(': ')
-            if len(parts) >= 2:
-                param_name = parts[0].split('size mismatch for ')[1]
-                shapes = parts[1].split('copying a param with shape ')[1]
-                # Extract just the shapes
-                current_shape = shapes.split(', the shape in current model is ')[1]
-                checkpoint_shape = shapes.split(', the shape in current model is ')[0]
-                cleaned_line = f"Shape mismatch - {param_name}: expected {current_shape}, got {checkpoint_shape}"
-                cleaned_lines.append(cleaned_line)
-        else:
-            cleaned_lines.append(line)
-    
-    return '\n'.join(cleaned_lines)
 
 def setup_training(args, models, device, dtype):
     """Setup training components"""
@@ -284,8 +216,8 @@ def setup_training(args, models, device, dtype):
             logger.info("✓ Training parameters validated")
         except Exception as e:
             logger.error("✗ Failed to validate training parameters")
-            logger.error(f"Error details: {str(e)}")
-            logger.error(traceback.format_exc())
+            error_msg = clean_error_message(traceback.format_exc())
+            logger.error(error_msg)
             raise
 
         # Step 2: Initialize Dataset
@@ -314,8 +246,8 @@ def setup_training(args, models, device, dtype):
             logger.info("✓ Dataset initialized successfully")
         except Exception as e:
             logger.error("✗ Failed to initialize dataset")
-            logger.error(f"Error details: {str(e)}")
-            logger.error(traceback.format_exc())
+            error_msg = clean_error_message(traceback.format_exc())
+            logger.error(error_msg)
             raise
 
         # Step 3: Setup DataLoader
@@ -334,8 +266,8 @@ def setup_training(args, models, device, dtype):
             logger.info("✓ DataLoader setup complete")
         except Exception as e:
             logger.error("✗ Failed to setup data loader")
-            logger.error(f"Error details: {str(e)}")
-            logger.error(traceback.format_exc())
+            error_msg = clean_error_message(traceback.format_exc())
+            logger.error(error_msg)
             raise
 
         # Step 4: Initialize Optimizer and Scheduler
@@ -379,8 +311,8 @@ def setup_training(args, models, device, dtype):
             logger.info("✓ Optimizer and scheduler initialized")
         except Exception as e:
             logger.error("✗ Failed to initialize optimizer and scheduler")
-            logger.error(f"Error details: {str(e)}")
-            logger.error(traceback.format_exc())
+            error_msg = clean_error_message(traceback.format_exc())
+            logger.error(error_msg)
             raise
 
         # Step 5: Initialize VAE Finetuner (if enabled)
@@ -410,8 +342,8 @@ def setup_training(args, models, device, dtype):
                 components["vae_finetuner"] = None
         except Exception as e:
             logger.error("✗ Failed to initialize VAE finetuner")
-            logger.error(f"Error details: {str(e)}")
-            logger.error(traceback.format_exc())
+            error_msg = clean_error_message(traceback.format_exc())
+            logger.error(error_msg)
             raise
 
         # Step 6: Initialize Additional Components
@@ -440,8 +372,8 @@ def setup_training(args, models, device, dtype):
             logger.info("✓ Additional components initialized")
         except Exception as e:
             logger.error("✗ Failed to initialize additional components")
-            logger.error(f"Error details: {str(e)}")
-            logger.error(traceback.format_exc())
+            error_msg = clean_error_message(traceback.format_exc())
+            logger.error(error_msg)
             raise
 
         # Step 7: Setup Validator
@@ -468,8 +400,8 @@ def setup_training(args, models, device, dtype):
             logger.info("✓ Validator setup complete")
         except Exception as e:
             logger.error("✗ Failed to setup validator")
-            logger.error(f"Error details: {str(e)}")
-            logger.error(traceback.format_exc())
+            error_msg = clean_error_message(traceback.format_exc())
+            logger.error(error_msg)
             raise
 
         # Final verification
@@ -485,24 +417,38 @@ def setup_training(args, models, device, dtype):
         return components
         
     except Exception as e:
-        error_msg = str(e)
-        error_traceback = traceback.format_exc()
-        
-        # Clean up the error message
-        cleaned_error = clean_error_message(error_msg)
-        cleaned_traceback = clean_error_message(error_traceback)
-        
-        error_lines = cleaned_traceback.split('\n')
-        
-        # Write to file if error is longer than 3 lines
-        if len(error_lines) > 3:
-            with open('training_setup_error.log', 'w') as f:
-                f.write(cleaned_traceback)
-            logger.error("✗ Training setup failed")
-            logger.error(f"Error details: {cleaned_error}")
-            logger.error(f"Full error traceback has been written to 'training_setup_error.log'")
-        else:
-            logger.error("✗ Training setup failed")
-            logger.error(f"Error details: {cleaned_error}")
-            logger.error(cleaned_traceback)
+        error_msg = clean_error_message(traceback.format_exc())
+        logger.error("✗ Training setup failed")
+        logger.error(error_msg)
         raise
+
+def clean_error_message(error_msg):
+    """Clean up error messages and identify key mismatch locations"""
+    lines = error_msg.split('\n')
+    cleaned_lines = []
+    
+    for line in lines:
+        if "size mismatch for" in line:
+            try:
+                # Extract parameter name and location
+                frame = next((l for l in lines if 'File "' in l and '.py", line' in l), None)
+                if frame:
+                    file_path = frame.split('File "')[1].split('", line')[0]
+                    line_num = frame.split('", line ')[1].split(',')[0]
+                    param = line.split('size mismatch for ')[1].split(':')[0]
+                    shapes = line.split(': ')[1].split('copying a param with shape ')[1]
+                    expected = shapes.split(', the shape in current model is ')[0]
+                    actual = shapes.split(', the shape in current model is ')[1]
+                    
+                    cleaned_lines.append(f"Shape mismatch in {file_path}:{line_num}")
+                    cleaned_lines.append(f"Parameter: {param}")
+                    cleaned_lines.append(f"Expected shape: {expected}")
+                    cleaned_lines.append(f"Actual shape: {actual}")
+            except:
+                cleaned_lines.append(line)
+        elif 'File "' in line and '.py", line' in line:
+            cleaned_lines.append(line)
+        elif any(x in line.lower() for x in ['error', 'exception', 'failed', 'traceback']):
+            cleaned_lines.append(line)
+    
+    return '\n'.join(cleaned_lines)
