@@ -12,32 +12,38 @@ def get_sigmas(num_inference_steps=28, sigma_min=0.0292, height=1024, width=1024
     Generate sigmas for ZTSNR with resolution-dependent scaling using 28-step native schedule
     Modified for better noise control and ZTSNR support
     """
-    # Calculate resolution-dependent sigma_max with more conservative scaling
+    # Calculate resolution-dependent sigma_max with quadratic scaling (section 2.3)
     base_res = 1024 * 1024
     current_res = height * width
-    scale_factor = (current_res / base_res) ** 0.5  
+    scale_factor = (current_res / base_res)  # Quadratic scaling for redundant signal
     
-    # Use 20000 as practical infinity approximation for ZTSNR
+    # Use 20000 as practical infinity approximation for ZTSNR (appendix A.2)
     sigma_max = 20000.0 * scale_factor
     
-    # Use non-linear spacing for better detail preservation
+    # Use non-linear spacing with EDM-style karras schedule
+    rho = 7.0  # EDM's recommended value
     t = torch.linspace(0, 1, num_inference_steps)
-    t = torch.sqrt(t)  # Non-linear spacing
+    inv_rho = 1.0 / rho
     
-    # Log-space interpolation with smoothing
-    sigmas = torch.exp(t * torch.log(torch.tensor(sigma_min)) + 
-                      (1-t) * torch.log(torch.tensor(sigma_max)))
+    # Log-space interpolation with sigma conversion
+    sigmas = (sigma_max ** (1/rho) + t * (sigma_min ** (1/rho) - sigma_max ** (1/rho))) ** rho
     
     return sigmas
 
 def v_prediction_scaling_factors(sigma, sigma_data=1.0):
     """
-    Compute v-prediction scaling factors according to paper equations (12), (13)
+    Compute v-prediction scaling factors according to paper equations (11)-(13)
     """
+    # Skip factor for zero terminal SNR case
+    c_skip = (sigma_data**2) / (sigma**2 + sigma_data**2)
+    
+    # Output scaling with negative sign for v-prediction
     c_out = (-sigma * sigma_data) / torch.sqrt(sigma**2 + sigma_data**2)
+    
+    # Input scaling for proper normalization
     c_in = 1 / torch.sqrt(sigma**2 + sigma_data**2)
     
-    return c_out, c_in
+    return c_skip, c_out, c_in
 
 def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kwargs=None, 
                              sigma_data=1.0, tag_weighter=None, batch_tags=None):
@@ -57,12 +63,28 @@ def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kw
         if added_cond_kwargs is None:
             added_cond_kwargs = {}
         
-        # Ensure time_ids are properly shaped for concatenation
+        # Handle dual text encoders (CLIP ViT-L and OpenCLIP ViT-bigG)
         if 'time_ids' in added_cond_kwargs:
             time_ids = added_cond_kwargs['time_ids']
-            # Reshape time_ids to match text embedding dimensions
+            # Get text embedding dimensions for both encoders
+            batch_size = text_embeddings.size(0)
+            seq_len = text_embeddings.size(1) if text_embeddings.dim() > 2 else 1
+            hidden_dim = text_embeddings.size(-1)
+            
+            # Reshape time_ids to match concatenated embeddings
             if time_ids.dim() == 1:
-                time_ids = time_ids.view(-1, 1, 1, 1).expand(-1, text_embeddings.size(1), text_embeddings.size(2), -1)
+                # Single time embedding -> expand for both encoders
+                time_ids = time_ids.view(batch_size, 1)
+                time_ids = time_ids.unsqueeze(-1).expand(-1, seq_len, -1)
+            elif time_ids.dim() == 2:
+                # Already batch x sequence, ensure proper sequence length
+                if time_ids.size(1) == 1:
+                    time_ids = time_ids.expand(-1, seq_len)
+            elif time_ids.dim() == 4:
+                # Handle spatial time embeddings
+                time_ids = time_ids.view(batch_size, -1)
+                time_ids = time_ids.unsqueeze(1).expand(-1, seq_len, -1)
+            
             added_cond_kwargs['time_ids'] = time_ids
 
         # Use torch.no_grad for inference to reduce memory overhead
@@ -74,19 +96,25 @@ def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kw
             x_t = x_0 + noise * sigma.view(-1, 1, 1, 1)
             
             # Compute scaling factors with less overhead
-            c_out, c_in = v_prediction_scaling_factors(sigma, sigma_data)
+            c_skip, c_out, c_in = v_prediction_scaling_factors(sigma, sigma_data)
             
             # Predict with minimal overhead
             v_pred = model(x_t, sigma, text_embeddings, added_cond_kwargs=added_cond_kwargs).sample
             
             # Scale prediction and target more efficiently
-            scaled_output = c_out.view(-1, 1, 1, 1) * v_pred
+            scaled_output = c_skip.view(-1, 1, 1, 1) * x_t + c_out.view(-1, 1, 1, 1) * v_pred
             v_target = c_in.view(-1, 1, 1, 1) * noise
             
-            # Compute SNR with tensor operations
+            # Compute SNR with tensor operations (section 2.4)
             snr = (sigma_data / sigma) ** 2
-            min_snr_gamma = 5.0
-            loss_weight = torch.minimum(snr, torch.tensor(min_snr_gamma, device=device, dtype=dtype))
+            min_snr_gamma = 5.0  # As recommended in the paper
+            
+            # MinSNR loss weighting with better ZTSNR handling
+            loss_weight = torch.where(
+                snr > min_snr_gamma,
+                torch.ones_like(snr) * min_snr_gamma,
+                snr
+            )
             
             # Compute loss with reduced memory allocations
             mse_loss = F.mse_loss(scaled_output, v_target, reduction='none')
@@ -132,9 +160,7 @@ def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kw
             return loss, loss_metrics
 
     except Exception as e:
-        logger.error(f"Error in loss calculation: {str(e)}")
-        logger.error(f"Shapes: x_0={x_0.shape}, sigma={sigma.shape}")
-        logger.error(traceback.format_exc())
+        logger.error(f"Error in training_loss_v_prediction: {str(e)}\n{traceback.format_exc()}")
         raise
 
 class PerceptualLoss:

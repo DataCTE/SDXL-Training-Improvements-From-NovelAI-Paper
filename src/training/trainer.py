@@ -74,7 +74,7 @@ def train_one_epoch(
         sigma = torch.rand(latents.size(0), device=device, dtype=dtype) * 0.9 + 0.1
         
         # Forward pass and loss computation
-        with torch.cuda.amp.autocast(enabled=mixed_precision):
+        with torch.amp.autocast('cuda', enabled=mixed_precision):
             loss, metrics = training_loss_v_prediction(
                 model, 
                 latents, 
