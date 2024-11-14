@@ -283,10 +283,14 @@ def main(args):
         
         # Setup VAE finetuner if enabled
         if args.finetune_vae:
-            from training.vae_finetuner import VAEFinetuner
-            vae_finetuner = VAEFinetuner(
-                vae=models["vae"],
-                learning_rate=args.vae_learning_rate
+            from training.vae_finetuner import VAEFineTuner
+            vae_finetuner = VAEFineTuner(
+                models["vae"],
+                learning_rate=args.vae_learning_rate,
+                min_snr_gamma=args.min_snr_gamma,
+                use_8bit_adam=args.use_8bit_adam,
+                gradient_checkpointing=args.gradient_checkpointing,
+                mixed_precision="fp16" if args.mixed_precision else "no"
             )
         else:
             vae_finetuner = None
