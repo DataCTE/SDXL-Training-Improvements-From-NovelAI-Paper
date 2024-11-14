@@ -299,6 +299,9 @@ def main(args):
                 models["vae"],
                 learning_rate=args.vae_learning_rate,
                 min_snr_gamma=args.min_snr_gamma,
+                adaptive_loss_scale=args.adaptive_loss_scale,
+                kl_weight=args.kl_weight,
+                perceptual_weight=args.perceptual_weight,
                 use_8bit_adam=args.use_8bit_adam,
                 gradient_checkpointing=args.gradient_checkpointing,
                 mixed_precision="fp16" if args.mixed_precision else "no"
