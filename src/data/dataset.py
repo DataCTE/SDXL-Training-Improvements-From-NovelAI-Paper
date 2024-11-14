@@ -20,14 +20,31 @@ import gc
 logger = logging.getLogger(__name__)
 
 class CustomDataset(Dataset):
-    def __init__(self, data_dir, vae, tokenizer, tokenizer_2, text_encoder, text_encoder_2,
-                 cache_dir="latents_cache", no_caching_latents=False, all_ar=False, 
-                 max_dimension=2048, num_workers=None, prefetch_factor=2, 
-                 min_size=512, max_size=2048, resolution_type="square",
-                 enable_bucket_sampler=True, bucket_reso_steps=64,
-                 min_bucket_reso=256, max_bucket_reso=2048,
-                 token_dropout_rate=0.1, caption_dropout_rate=0.1,
-                 force_square=True, max_ar_error=4):
+    def __init__(
+        self,
+        data_dir,
+        vae=None,
+        tokenizer=None,
+        tokenizer_2=None,
+        text_encoder=None,
+        text_encoder_2=None,
+        cache_dir="latents_cache",
+        no_caching_latents=False,
+        all_ar=False, 
+        max_dimension=2048,
+        num_workers=None,
+        prefetch_factor=2, 
+        min_size=512,
+        max_size=2048,
+        resolution_type="square",
+        enable_bucket_sampler=True,
+        bucket_reso_steps=64,
+        min_bucket_reso=256,
+        max_bucket_reso=2048,
+        token_dropout_rate=0.1,
+        caption_dropout_rate=0.1,
+        **kwargs
+    ):
         """
         Enhanced dataset initialization with NovelAI improvements
         Args:
@@ -52,8 +69,6 @@ class CustomDataset(Dataset):
             max_bucket_reso: Maximum resolution for buckets
             token_dropout_rate: Rate for random token dropout
             caption_dropout_rate: Rate for entire caption dropout
-            force_square: Force all images to be square by center cropping
-            max_ar_error: Maximum aspect ratio error before forcing resize
         """
         
         # Basic initialization
@@ -115,10 +130,6 @@ class CustomDataset(Dataset):
         
         # Set collate function
         self.collate_fn = self.custom_collate
-        
-        # Additional parameters
-        self.force_square = force_square
-        self.max_ar_error = max_ar_error
 
     def __len__(self):
         """Return the total number of images in the dataset"""
@@ -640,45 +651,44 @@ class CustomDataset(Dataset):
         return stats
 
     def _get_target_size(self, width, height):
-        """
-        Get target size based on more permissive SDXL validation rules.
-        Only intervenes for extreme cases.
-        """
-        if self.force_square:
-            # Force square aspect ratio by taking the larger dimension
-            size = max(width, height)
-            return size, size
-            
-        # Calculate aspect ratio
-        ar = width / height
-        ar_error = max(ar, 1/ar)
+        """Calculate target size while preserving aspect ratio"""
+        aspect_ratio = width / height
         
-        if ar_error > self.max_ar_error:
-            # Aspect ratio is too extreme, force closer to square
-            if width > height:
-                new_width = int(height * self.max_ar_error)
-                return new_width, height
-            else:
-                new_height = int(width * self.max_ar_error)
-                return width, new_height
+        # Calculate target dimensions while preserving aspect ratio
+        if width >= height:
+            # Landscape or square
+            target_width = min(width, self.max_bucket_reso)
+            target_height = int(target_width / aspect_ratio)
+            # Ensure height doesn't exceed max
+            if target_height > self.max_bucket_reso:
+                target_height = self.max_bucket_reso
+                target_width = int(target_height * aspect_ratio)
+        else:
+            # Portrait
+            target_height = min(height, self.max_bucket_reso)
+            target_width = int(target_height * aspect_ratio)
+            # Ensure width doesn't exceed max
+            if target_width > self.max_bucket_reso:
+                target_width = self.max_bucket_reso
+                target_height = int(target_width / aspect_ratio)
         
-        # Keep original aspect ratio if within bounds
-        return width, height
+        # Round to nearest bucket resolution step
+        target_width = round(target_width / self.bucket_reso_steps) * self.bucket_reso_steps
+        target_height = round(target_height / self.bucket_reso_steps) * self.bucket_reso_steps
+        
+        # Ensure minimum dimensions
+        target_width = max(target_width, self.min_bucket_reso)
+        target_height = max(target_height, self.min_bucket_reso)
+        
+        return target_width, target_height
 
     def process_image_size(self, image, target_width, target_height):
-        """Process image size with advanced upscaling"""
+        """Process image size with advanced resizing"""
         width, height = image.size
         
         # Get target size considering aspect ratio constraints
         target_width, target_height = self._get_target_size(target_width, target_height)
         
-        if self.force_square:
-            # Center crop to square
-            min_dim = min(width, height)
-            left = (width - min_dim) // 2
-            top = (height - min_dim) // 2
-            image = image.crop((left, top, left + min_dim, top + min_dim))
-            
         # Resize to target size
         if width != target_width or height != target_height:
             if width * height < target_width * target_height:
@@ -1020,9 +1030,8 @@ class CustomDataset(Dataset):
         
         # Calculate target dimensions preserving aspect ratio
         aspect_ratio = width / height
-        target_aspect = target_width / target_height
         
-        if aspect_ratio > target_aspect:
+        if aspect_ratio > target_width / target_height:
             # Image is wider than target
             new_width = target_width
             new_height = int(target_width / aspect_ratio)
