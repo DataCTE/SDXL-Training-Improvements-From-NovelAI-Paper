@@ -1042,42 +1042,44 @@ class CustomDataset(Dataset):
         Handles variable size inputs and applies proper padding.
         
         Args:
-            batch: List of tuples (latent, text_ids, text_ids_2)
+            batch: List of samples from dataset __getitem__
             
         Returns:
             dict: Collated batch with proper padding
         """
+        # Filter out None values that might come from failed __getitem__ calls
+        batch = [item for item in batch if item is not None]
+        if not batch:
+            raise RuntimeError("Entire batch was None - check dataset items")
+            
+        # Stack latents
         latents = torch.stack([item["latents"] for item in batch])
-        input_ids = torch.stack([item["input_ids"] for item in batch])
-        input_ids_2 = torch.stack([item["input_ids_2"] for item in batch])
         
-        # Get original image sizes for proper scaling
-        original_sizes = torch.tensor([[item["original_size"][0], item["original_size"][1]] for item in batch])
-        target_sizes = torch.tensor([[item["target_size"][0], item["target_size"][1]] for item in batch])
+        # Stack text embeddings
+        text_embeddings = torch.stack([item["text_embeddings"] for item in batch])
+        text_embeddings_2 = torch.stack([item["text_embeddings_2"] for item in batch])
         
-        # Collate attention masks if present
-        attention_mask = None
-        if "attention_mask" in batch[0]:
-            attention_mask = torch.stack([item["attention_mask"] for item in batch])
+        # Collect added_cond_kwargs
+        text_embeds = torch.stack([item["added_cond_kwargs"]["text_embeds"] for item in batch])
+        time_ids = torch.stack([item["added_cond_kwargs"]["time_ids"] for item in batch])
         
-        attention_mask_2 = None
-        if "attention_mask_2" in batch[0]:
-            attention_mask_2 = torch.stack([item["attention_mask_2"] for item in batch])
-        
-        # Handle tag weights if present
-        tag_weights = None
-        if "tag_weights" in batch[0]:
-            tag_weights = torch.stack([item["tag_weights"] for item in batch])
+        # Get original and target sizes if available
+        original_sizes = None
+        target_sizes = None
+        if "original_size" in batch[0] and "target_size" in batch[0]:
+            original_sizes = torch.tensor([[item["original_size"][0], item["original_size"][1]] for item in batch])
+            target_sizes = torch.tensor([[item["target_size"][0], item["target_size"][1]] for item in batch])
         
         return {
             "latents": latents,
-            "input_ids": input_ids,
-            "input_ids_2": input_ids_2,
+            "text_embeddings": text_embeddings,
+            "text_embeddings_2": text_embeddings_2,
+            "added_cond_kwargs": {
+                "text_embeds": text_embeds,
+                "time_ids": time_ids
+            },
             "original_size": original_sizes,
-            "target_size": target_sizes,
-            "attention_mask": attention_mask,
-            "attention_mask_2": attention_mask_2,
-            "tag_weights": tag_weights
+            "target_size": target_sizes
         }
 
     def __getitem__(self, idx):
