@@ -211,12 +211,7 @@ def train(args, models, train_components, device, dtype):
             training_history.update(checkpoint_data['training_history'])
     
     logger.info(f"Starting training from epoch {start_epoch}")
-    
-    # Use the validator that was already initialized in train_components
-    validator = train_components["validator"]
-    
-    # Update UNet in validator to use training UNet
-    validator.pipeline.unet = models["unet"]
+ 
 
     # Training loop
     logger.info("\nStarting training loop...")
