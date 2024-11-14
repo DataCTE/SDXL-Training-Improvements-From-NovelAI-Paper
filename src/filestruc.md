@@ -8,28 +8,40 @@ This project implements a Stable Diffusion XL training pipeline with Zero Termin
 ```
 src/
 ├── data/
-│   └── dataset.py           # Custom dataset with efficient caching
+│   ├── __init__.py
+│   ├── dataset.py           # Custom dataset with efficient caching
+│   ├── tag_weighter.py      # Tag weighting implementation
+│   ├── ultimate_upscaler.py # High-resolution upscaling
+│   ├── usdu_patch.py       # USDU patching utilities
+│   └── utils.py            # Data processing utilities
+│
+├── inference/
+│   ├── __init__.py
+│   ├── text_to_image.py    # Inference pipeline
+│   └── Comfyui-zsnmode/    # ComfyUI integration
 │
 ├── models/
-│   ├── model_validator.py   # ZTSNR validation and testing
-│   ├── setup.py            # High-sigma model configuration
-│   ├── tag_weighter.py     # CLIP-based loss weighting
-│   └── vae_finetuner.py    # Adaptive VAE fine-tuning
+│   └── __init__.py         # Model definitions
 │
 ├── training/
-│   ├── loss.py             # ZTSNR loss implementation
-│   ├── setup.py            # Training configuration
-│   ├── trainer.py          # Main training loop
-│   └── utils.py            # Training utilities
+│   ├── __init__.py
+│   ├── _pycache_/
+│   ├── ema.py             # Exponential Moving Average
+│   ├── loss.py            # ZTSNR loss implementation
+│   ├── trainer.py         # Main training loop
+│   └── vae_finetuner.py   # Adaptive VAE fine-tuning
 │
 ├── utils/
-│   ├── checkpoint.py       # Model state management
-│   ├── device.py          # Memory optimization
-│   ├── hub.py             # Model publishing
-│   ├── logging.py         # Training monitoring
-│   └── model_card.py      # Documentation
+│   ├── __init__.py
+│   ├── checkpoint.py      # Model state management
+│   ├── device.py         # Memory optimization
+│   ├── hub.py            # Model publishing
+│   ├── logging.py        # Training monitoring
+│   ├── model_card.py     # Documentation
+│   ├── setup.py          # Configuration
+│   └── validation.py     # Model validation
 │
-└── main.py                 # Entry point
+└── main.py               # Entry point
 ```
 
 ## Component Details

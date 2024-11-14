@@ -203,7 +203,8 @@ def setup_training(args, models, device, dtype):
                 text_encoder_2=models["text_encoder_2"],
                 cache_dir=args.cache_dir,
                 no_caching_latents=args.no_caching_latents,
-                all_ar=True
+                all_ar=True,
+                num_workers=args.num_workers
             )
         else:
             # Validate dataset first
@@ -220,7 +221,8 @@ def setup_training(args, models, device, dtype):
                 text_encoder_2=models["text_encoder_2"],
                 cache_dir=args.cache_dir,
                 no_caching_latents=args.no_caching_latents,
-                all_ar=False
+                all_ar=False,
+                num_workers=args.num_workers
             )
         
         train_dataloader = DataLoader(

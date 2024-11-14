@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 class CustomDataset(Dataset):
     def __init__(self, data_dir, vae, tokenizer, tokenizer_2, text_encoder, text_encoder_2,
-                 cache_dir="latents_cache", no_caching_latents=False, all_ar=False, max_dimension=2048):
+                 cache_dir="latents_cache", no_caching_latents=False, all_ar=False, max_dimension=2048, num_workers=None):
         """Initialize dataset with image preprocessing"""
         super().__init__()
         self.data_dir = Path(data_dir)
@@ -31,6 +31,7 @@ class CustomDataset(Dataset):
         self.no_caching_latents = no_caching_latents
         self.all_ar = all_ar
         self.max_dimension = max_dimension
+        self.num_workers = num_workers or min(32, os.cpu_count() * 4)
         
         if not no_caching_latents:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
