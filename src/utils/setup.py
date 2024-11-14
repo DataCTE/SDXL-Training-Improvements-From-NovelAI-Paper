@@ -63,30 +63,13 @@ def setup_models(args, device, dtype):
                 dtype=dtype
             )
             
-            # Add architecture verification
+            # Update architecture verification to be informative rather than restrictive
             logger.info("Verifying model architecture...")
-            expected_keys = set(pipeline.unet.state_dict().keys())
-            
-            # Check if model_path is a local directory or HF model ID
-            if os.path.isdir(args.model_path):
-                # Local path
-                weights_path = os.path.join(args.model_path, "unet/diffusion_pytorch_model.safetensors")
-            else:
-                # For HF models, we'll compare against the loaded state dict
-                loaded_keys = expected_keys
-                logger.info("Using Hugging Face model - skipping local file verification")
-            
-            if 'loaded_keys' in locals():
-                missing_keys = expected_keys - loaded_keys
-                unexpected_keys = loaded_keys - expected_keys
-                
-                if missing_keys:
-                    logger.warning(f"Missing keys in checkpoint: {len(missing_keys)} keys")
-                    logger.debug(f"First few missing keys: {list(missing_keys)[:5]}")
-                
-                if unexpected_keys:
-                    logger.warning(f"Unexpected keys in checkpoint: {len(unexpected_keys)} keys")
-                    logger.debug(f"First few unexpected keys: {list(unexpected_keys)[:5]}")
+            model_shapes = {name: param.shape for name, param in pipeline.unet.named_parameters()}
+            logger.info(f"Loaded UNet with {len(model_shapes)} parameters")
+            logger.debug("Sample parameter shapes:")
+            for name in list(model_shapes.keys())[:5]:  # Log first 5 shapes as reference
+                logger.debug(f"  {name}: {model_shapes[name]}")
             
             pipeline.to(device)
             
