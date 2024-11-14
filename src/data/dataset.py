@@ -97,7 +97,11 @@ class CustomDataset(Dataset):
         
         # Set collate function
         self.collate_fn = self.custom_collate
-        
+
+    def __len__(self):
+        """Return the total number of images in the dataset"""
+        return len(self.image_paths)
+
     def _initialize_dataset(self):
         """Initialize dataset with improved image validation"""
         logger.info("Initializing dataset...")
