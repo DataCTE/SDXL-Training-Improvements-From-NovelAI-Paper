@@ -55,24 +55,11 @@ def setup_models(args, device, dtype):
             args.model_path,  
             torch_dtype=dtype,
             use_safetensors=True,
-            variant="fp16" if dtype == torch.float16 else None
+            variant="fp16" if dtype == torch.float16 else None,
+            local_files_only=False,
+            resume_download=True,
+            force_download=True
         )
-        
-        # Load checkpoint with strict=False to allow partial loading
-        if args.resume_from_checkpoint:
-            logger.info(f"Loading checkpoint from {args.resume_from_checkpoint}")
-            checkpoint = torch.load(args.resume_from_checkpoint, map_location="cpu")
-            
-            # Load state dict with strict=False and log results
-            logger.info("Loading UNet weights with strict=False...")
-            missing_keys, unexpected_keys = pipeline.unet.load_state_dict(
-                checkpoint["unet"], strict=False
-            )
-            
-            if missing_keys:
-                logger.warning(f"Missing keys when loading checkpoint: {missing_keys}")
-            if unexpected_keys:
-                logger.warning(f"Unexpected keys in checkpoint: {unexpected_keys}")
         
         logger.info(f"Moving pipeline to device: {device}")
         pipeline.to(device)
