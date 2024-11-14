@@ -58,57 +58,108 @@ def enable_gradient_checkpointing(model):
 
 def setup_models(args, device, dtype):
     """Initialize and configure all models"""
-    logger.info("Setting up models...")
+    logger.info("Starting model setup process...")
     
     try:
-        # Load UNet
-        logger.info("Loading UNet...")
-        unet = UNet2DConditionModel.from_pretrained(
-            args.model_path,
-            subfolder="unet",
-            torch_dtype=dtype
-        ).to(device)
+        models = {}
         
-        # Load VAE
-        logger.info("Loading VAE...")
-        vae = AutoencoderKL.from_pretrained(
-            args.model_path,
-            subfolder="vae",
-            torch_dtype=dtype
-        ).to(device)
-        vae.requires_grad_(False)
-        vae.eval()
+        # Step 1: Load UNet
+        logger.info("Step 1/5: Loading UNet...")
+        try:
+            unet = UNet2DConditionModel.from_pretrained(
+                args.model_path,
+                subfolder="unet",
+                torch_dtype=dtype
+            ).to(device)
+            logger.info(" UNet loaded successfully")
+            models["unet"] = unet
+        except Exception as e:
+            logger.error(" Failed to load UNet")
+            logger.error(f"Error details: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
         
-        # Load text encoders and tokenizers
-        logger.info("Loading text encoders and tokenizers...")
-        tokenizer = CLIPTokenizer.from_pretrained(
-            args.model_path, subfolder="tokenizer"
-        )
-        tokenizer_2 = CLIPTokenizer.from_pretrained(
-            args.model_path, subfolder="tokenizer_2"
-        )
-        text_encoder = CLIPTextModel.from_pretrained(
-            args.model_path, subfolder="text_encoder"
-        ).to(device)
-        text_encoder_2 = CLIPTextModel.from_pretrained(
-            args.model_path, subfolder="text_encoder_2"
-        ).to(device)
+        # Step 2: Load VAE
+        logger.info("Step 2/5: Loading VAE...")
+        try:
+            vae = AutoencoderKL.from_pretrained(
+                args.model_path,
+                subfolder="vae",
+                torch_dtype=dtype
+            ).to(device)
+            vae.requires_grad_(False)
+            vae.eval()
+            logger.info(" VAE loaded successfully and set to eval mode")
+            models["vae"] = vae
+        except Exception as e:
+            logger.error(" Failed to load VAE")
+            logger.error(f"Error details: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
         
-        # Enable gradient checkpointing if requested
+        # Step 3: Load Text Encoders and Tokenizers
+        logger.info("Step 3/5: Loading text encoders and tokenizers...")
+        try:
+            # Load tokenizers
+            logger.info("  Loading tokenizers...")
+            tokenizer = CLIPTokenizer.from_pretrained(
+                args.model_path, subfolder="tokenizer"
+            )
+            tokenizer_2 = CLIPTokenizer.from_pretrained(
+                args.model_path, subfolder="tokenizer_2"
+            )
+            logger.info("  Tokenizers loaded successfully")
+            
+            # Load text encoders
+            logger.info("  Loading text encoders...")
+            text_encoder = CLIPTextModel.from_pretrained(
+                args.model_path, subfolder="text_encoder"
+            ).to(device)
+            text_encoder_2 = CLIPTextModel.from_pretrained(
+                args.model_path, subfolder="text_encoder_2"
+            ).to(device)
+            logger.info("  Text encoders loaded successfully")
+            
+            models.update({
+                "tokenizer": tokenizer,
+                "tokenizer_2": tokenizer_2,
+                "text_encoder": text_encoder,
+                "text_encoder_2": text_encoder_2
+            })
+        except Exception as e:
+            logger.error(" Failed to load text encoders/tokenizers")
+            logger.error(f"Error details: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
+        
+        # Step 4: Setup Gradient Checkpointing
         if args.gradient_checkpointing:
-            logger.info("Enabling gradient checkpointing for models")
-            for model in [unet, text_encoder, text_encoder_2]:
-                enable_gradient_checkpointing(model)
-            logger.info("Gradient checkpointing enabled for all supported models")
+            logger.info("Step 4/5: Enabling gradient checkpointing...")
+            try:
+                for model_name in ["unet", "text_encoder", "text_encoder_2"]:
+                    if model_name in models:
+                        enable_gradient_checkpointing(models[model_name])
+                logger.info(" Gradient checkpointing enabled for all supported models")
+            except Exception as e:
+                logger.error(" Failed to enable gradient checkpointing")
+                logger.error(f"Error details: {str(e)}")
+                logger.error(traceback.format_exc())
+                raise
+        else:
+            logger.info("Step 4/5: Skipping gradient checkpointing (not enabled)")
         
-        # Initialize EMA if requested
-       # Initialize EMA if requested
-        ema_model = None
+        # Step 5: Initialize EMA
+        logger.info("Step 5/5: Setting up EMA...")
         if args.use_ema:
             try:
-                logger.info("Initializing EMA model...")
+                logger.info("  Initializing EMA model with parameters:")
+                logger.info(f"  - Base decay rate: {args.ema_decay}")
+                logger.info(f"  - Update after step: {args.ema_update_after_step}")
+                logger.info(f"  - Update frequency: {args.ema_update_every}")
+                logger.info(f"  - Warmup enabled: {args.use_ema_warmup}")
+                
                 ema_model = EMAModel(
-                    model=unet,
+                    model=models["unet"],
                     decay=args.ema_decay,
                     update_after_step=args.ema_update_after_step,
                     inv_gamma=args.ema_inv_gamma,
@@ -120,202 +171,253 @@ def setup_models(args, device, dtype):
                     use_ema_warmup=args.use_ema_warmup,
                     grad_scale_factor=args.ema_grad_scale_factor
                 )
+                logger.info("  EMA model initialized successfully")
+                models["ema_model"] = ema_model
             except Exception as e:
-                logger.error(f"Error initializing EMA model: {str(e)}")
+                logger.error("  Failed to initialize EMA model")
+                logger.error(f"  Error details: {str(e)}")
                 logger.error(traceback.format_exc())
                 raise
+        else:
+            logger.info("  Skipping EMA initialization (not enabled)")
+            models["ema_model"] = None
         
-        # Create models dictionary
-        models = {
-            "unet": unet,
-            "vae": vae,
-            "text_encoder": text_encoder,
-            "text_encoder_2": text_encoder_2,
-            "tokenizer": tokenizer,
-            "tokenizer_2": tokenizer_2,
-            "ema_model": ema_model
-        }
+        # Final verification
+        logger.info("Verifying model initialization...")
+        required_models = ["unet", "vae", "text_encoder", "text_encoder_2", "tokenizer", "tokenizer_2"]
+        missing_models = [model for model in required_models if model not in models]
         
+        if missing_models:
+            raise ValueError(f"Missing required models: {', '.join(missing_models)}")
+        
+        logger.info(" All models initialized successfully")
         logger.info("Model setup completed successfully")
         return models
         
     except Exception as e:
-        logger.error(f"Error during model setup: {str(e)}")
+        logger.error(" Model setup failed")
+        logger.error(f"Error details: {str(e)}")
         logger.error(traceback.format_exc())
         raise
 
 def setup_training(args, models, device, dtype):
     """Setup training components"""
-    logger.info("Setting up training components...")
+    logger.info("Starting training setup process...")
     
     try:
-        # Validate training arguments first
-        if not hasattr(args, 'num_workers'):
-            args.num_workers = min(8, torch.get_num_threads() or 1)  # Default to min(8, CPU cores)
-            logger.info(f"Using default num_workers: {args.num_workers}")
+        components = {}
+        
+        # Step 1: Validate and setup basic parameters
+        logger.info("Step 1/7: Validating training parameters...")
+        try:
+            if not hasattr(args, 'num_workers'):
+                args.num_workers = min(8, torch.get_num_threads() or 1)
+                logger.info(f"  Using default num_workers: {args.num_workers}")
+            logger.info("✓ Training parameters validated")
+        except Exception as e:
+            logger.error("✗ Failed to validate training parameters")
+            logger.error(f"Error details: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
 
-        # Initialize dataset without validation if all_ar is True
-        if args.all_ar:
-            dataset = CustomDataset(
-                data_dir=args.data_dir,
+        # Step 2: Initialize Dataset
+        logger.info("Step 2/7: Initializing dataset...")
+        try:
+            dataset_config = {
+                "data_dir": args.data_dir,
+                "vae": models["vae"],
+                "tokenizer": models["tokenizer"],
+                "tokenizer_2": models["tokenizer_2"],
+                "text_encoder": models["text_encoder"],
+                "text_encoder_2": models["text_encoder_2"],
+                "cache_dir": args.cache_dir,
+                "no_caching_latents": args.no_caching_latents,
+                "all_ar": args.all_ar,
+                "num_workers": args.num_workers
+            }
+            logger.info(f"  Dataset configuration:")
+            logger.info(f"  - Data directory: {args.data_dir}")
+            logger.info(f"  - Cache directory: {args.cache_dir}")
+            logger.info(f"  - All AR mode: {args.all_ar}")
+            logger.info(f"  - Num workers: {args.num_workers}")
+            
+            dataset = CustomDataset(**dataset_config)
+            components["dataset"] = dataset
+            logger.info("✓ Dataset initialized successfully")
+        except Exception as e:
+            logger.error("✗ Failed to initialize dataset")
+            logger.error(f"Error details: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
+
+        # Step 3: Setup DataLoader
+        logger.info("Step 3/7: Setting up data loader...")
+        try:
+            train_dataloader = DataLoader(
+                dataset,
+                batch_size=args.batch_size,
+                shuffle=True,
+                collate_fn=custom_collate,
+                num_workers=args.num_workers,
+                pin_memory=True
+            )
+            components["train_dataloader"] = train_dataloader
+            logger.info(f"  DataLoader configured with batch size: {args.batch_size}")
+            logger.info("✓ DataLoader setup complete")
+        except Exception as e:
+            logger.error("✗ Failed to setup data loader")
+            logger.error(f"Error details: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
+
+        # Step 4: Initialize Optimizer and Scheduler
+        logger.info("Step 4/7: Initializing optimizer and scheduler...")
+        try:
+            if args.use_adafactor:
+                logger.info("  Using Adafactor optimizer")
+                optimizer = Adafactor(
+                    models["unet"].parameters(),
+                    lr=args.learning_rate * args.batch_size,
+                    scale_parameter=True,
+                    relative_step=False,
+                    warmup_init=False
+                )
+            else:
+                logger.info("  Using AdamW8bit optimizer")
+                optimizer = AdamW8bit(
+                    models["unet"].parameters(),
+                    lr=args.learning_rate * args.batch_size,
+                    betas=(0.9, 0.999)
+                )
+            
+            num_update_steps_per_epoch = len(train_dataloader) // args.gradient_accumulation_steps
+            num_training_steps = args.num_epochs * num_update_steps_per_epoch
+            
+            logger.info("  Configuring learning rate scheduler...")
+            lr_scheduler = get_scheduler(
+                "cosine",
+                optimizer=optimizer,
+                num_warmup_steps=args.warmup_steps,
+                num_training_steps=num_training_steps
+            )
+            
+            components.update({
+                "optimizer": optimizer,
+                "lr_scheduler": lr_scheduler,
+                "num_update_steps_per_epoch": num_update_steps_per_epoch,
+                "num_training_steps": num_training_steps
+            })
+            logger.info(f"  Total training steps: {num_training_steps}")
+            logger.info("✓ Optimizer and scheduler initialized")
+        except Exception as e:
+            logger.error("✗ Failed to initialize optimizer and scheduler")
+            logger.error(f"Error details: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
+
+        # Step 5: Initialize VAE Finetuner (if enabled)
+        logger.info("Step 5/7: Setting up VAE finetuner...")
+        try:
+            if hasattr(args, 'vae_finetuning') and args.vae_finetuning:
+                logger.info("  Initializing VAE finetuner with parameters:")
+                vae_config = {
+                    'learning_rate': args.vae_learning_rate,
+                    'min_snr_gamma': args.min_snr_gamma,
+                    'adaptive_loss_scale': args.adaptive_loss_scale,
+                    'kl_weight': args.kl_weight,
+                    'perceptual_weight': args.perceptual_weight,
+                    'use_8bit_adam': args.use_8bit_adam,
+                    'gradient_checkpointing': args.gradient_checkpointing,
+                    'mixed_precision': args.mixed_precision,
+                    'use_channel_scaling': args.use_channel_scaling
+                }
+                for key, value in vae_config.items():
+                    logger.info(f"  - {key}: {value}")
+                
+                vae_finetuner = VAEFineTuner(models["vae"], **vae_config)
+                components["vae_finetuner"] = vae_finetuner
+                logger.info("✓ VAE finetuner initialized")
+            else:
+                logger.info("  Skipping VAE finetuner (not enabled)")
+                components["vae_finetuner"] = None
+        except Exception as e:
+            logger.error("✗ Failed to initialize VAE finetuner")
+            logger.error(f"Error details: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
+
+        # Step 6: Initialize Additional Components
+        logger.info("Step 6/7: Initializing additional components...")
+        try:
+            # Tag weighter
+            logger.info("  Setting up tag-based loss weighter...")
+            tag_weighter = TagBasedLossWeighter(
+                min_weight=args.min_tag_weight,
+                max_weight=args.max_tag_weight
+            )
+            components["tag_weighter"] = tag_weighter
+            
+            # Noise scheduler
+            logger.info("  Configuring noise scheduler...")
+            noise_scheduler = EulerDiscreteScheduler(
+                beta_start=0.00085,
+                beta_end=0.012,
+                beta_schedule="scaled_linear",
+                num_train_timesteps=1000,
+                use_karras_sigmas=True,
+                sigma_min=args.sigma_min,
+                sigma_max=160.0,
+                steps_offset=1,
+            )
+            logger.info("✓ Additional components initialized")
+        except Exception as e:
+            logger.error("✗ Failed to initialize additional components")
+            logger.error(f"Error details: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
+
+        # Step 7: Setup Validator
+        logger.info("Step 7/7: Setting up validator...")
+        try:
+            validator = SDXLInference(
+                model_path=args.model_path,
+                device=device,
+                dtype=dtype,
+                use_resolution_binning=True
+            )
+
+            validator.pipeline = StableDiffusionXLPipeline(
                 vae=models["vae"],
-                tokenizer=models["tokenizer"],
-                tokenizer_2=models["tokenizer_2"],
                 text_encoder=models["text_encoder"],
                 text_encoder_2=models["text_encoder_2"],
-                cache_dir=args.cache_dir,
-                no_caching_latents=args.no_caching_latents,
-                all_ar=True,
-                num_workers=args.num_workers
-            )
-        else:
-            dataset = CustomDataset(
-                data_dir=args.data_dir,
-                vae=models["vae"],
                 tokenizer=models["tokenizer"],
                 tokenizer_2=models["tokenizer_2"],
-                text_encoder=models["text_encoder"],
-                text_encoder_2=models["text_encoder_2"],
-                cache_dir=args.cache_dir,
-                no_caching_latents=args.no_caching_latents,
-                all_ar=False,
-                num_workers=args.num_workers
-            )
+                unet=models["unet"],
+                scheduler=noise_scheduler,
+            ).to(device)
             
-        # Setup VAE finetuner if enabled
-        if hasattr(args, 'vae_finetuning') and args.vae_finetuning:
-            vae_config = {
-                'learning_rate': args.vae_learning_rate,
-                'min_snr_gamma': args.min_snr_gamma,
-                'adaptive_loss_scale': args.adaptive_loss_scale,
-                'kl_weight': args.kl_weight,
-                'perceptual_weight': args.perceptual_weight,
-                'use_8bit_adam': args.use_8bit_adam,
-                'gradient_checkpointing': args.gradient_checkpointing,
-                'mixed_precision': args.mixed_precision,
-                'use_channel_scaling': args.use_channel_scaling
-            }
-            
-            vae_finetuner = VAEFineTuner(
-                models["vae"],
-                **vae_config
-            )
-            
-        # Setup EMA if enabled
-        if hasattr(args, 'use_ema') and args.use_ema:
-            ema_config = {
-                'decay': args.ema_decay,
-                'update_after_step': args.ema_update_after_step,
-                'inv_gamma': args.ema_inv_gamma,
-                'power': args.ema_power,
-                'min_decay': args.ema_min_decay,
-                'max_decay': args.ema_max_decay,
-                'update_every': args.ema_update_every,
-                'use_ema_warmup': args.use_ema_warmup,
-                'grad_scale_factor': args.ema_grad_scale_factor
-            }
-            
-            ema = EMAModel(
-                models["unet"],
-                **ema_config,
-                device=device
-            )
+            components["validator"] = validator
+            logger.info("✓ Validator setup complete")
+        except Exception as e:
+            logger.error("✗ Failed to setup validator")
+            logger.error(f"Error details: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
 
-        train_dataloader = DataLoader(
-            dataset,
-            batch_size=args.batch_size,
-            shuffle=True,
-            collate_fn=custom_collate,
-            num_workers=args.num_workers,
-            pin_memory=True
-        )
+        # Final verification
+        logger.info("Verifying training components...")
+        required_components = ["dataset", "train_dataloader", "optimizer", "lr_scheduler", "tag_weighter", "validator"]
+        missing_components = [comp for comp in required_components if comp not in components]
         
-        # Initialize optimizer
-        logger.info("Initializing optimizer...")
-        if args.use_adafactor:
-            optimizer = Adafactor(
-                models["unet"].parameters(),
-                lr=args.learning_rate * args.batch_size,
-                scale_parameter=True,
-                relative_step=False,
-                warmup_init=False
-            )
-        else:
-            optimizer = AdamW8bit(
-                models["unet"].parameters(),
-                lr=args.learning_rate * args.batch_size,
-                betas=(0.9, 0.999)
-            )
+        if missing_components:
+            raise ValueError(f"Missing required components: {', '.join(missing_components)}")
         
-        # Calculate training steps
-        num_update_steps_per_epoch = len(train_dataloader) // args.gradient_accumulation_steps
-        num_training_steps = args.num_epochs * num_update_steps_per_epoch
-        
-        # Initialize learning rate scheduler
-        logger.info("Setting up cosine learning rate scheduler...")
-        lr_scheduler = get_scheduler(
-            "cosine",
-            optimizer=optimizer,
-            num_warmup_steps=args.warmup_steps,
-            num_training_steps=num_training_steps
-        )
-        
-        # Initialize tag-based loss weighter
-        logger.info("Initializing tag-based loss weighter...")
-        tag_weighter = TagBasedLossWeighter(
-            min_weight=args.min_tag_weight,
-            max_weight=args.max_tag_weight
-        )
-        
-        # Create scheduler first
-        noise_scheduler = EulerDiscreteScheduler(
-            beta_start=0.00085,
-            beta_end=0.012,
-            beta_schedule="scaled_linear",
-            num_train_timesteps=1000,
-            use_karras_sigmas=True,
-            sigma_min=args.sigma_min,
-            sigma_max=160.0,
-            steps_offset=1,
-        )
-
-        # Create validator with pipeline
-        validator = SDXLInference(
-            model_path=args.model_path,
-            device=device,
-            dtype=dtype,
-            use_resolution_binning=True
-        )
-
-        # Update validator's pipeline with our models and scheduler
-        validator.pipeline = StableDiffusionXLPipeline(
-            vae=models["vae"],
-            text_encoder=models["text_encoder"],
-            text_encoder_2=models["text_encoder_2"],
-            tokenizer=models["tokenizer"],
-            tokenizer_2=models["tokenizer_2"],
-            unet=models["unet"],
-            scheduler=noise_scheduler,
-        ).to(device)
-
-        # Return all components
-        train_components = {
-            "dataset": dataset,
-            "train_dataloader": train_dataloader,
-            "optimizer": optimizer,
-            "lr_scheduler": lr_scheduler,
-            "tag_weighter": tag_weighter,
-            "vae_finetuner": vae_finetuner,
-            "num_update_steps_per_epoch": num_update_steps_per_epoch,
-            "num_training_steps": num_training_steps,
-            "ema_model": models.get("ema_model", None),
-            "validator": validator
-        }
-        
+        logger.info("✓ All training components initialized successfully")
         logger.info("Training setup completed successfully")
-        return train_components
+        return components
         
     except Exception as e:
-        logger.error(f"Error during training setup: {str(e)}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
+        logger.error("✗ Training setup failed")
+        logger.error(f"Error details: {str(e)}")
+        logger.error(traceback.format_exc())
         raise
