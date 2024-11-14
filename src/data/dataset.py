@@ -791,14 +791,13 @@ class CustomDataset(Dataset):
 
     def _initialize_buckets(self):
         """Initialize aspect ratio buckets according to NovelAI paper section 4.1.2"""
-        logger.info("Initializing aspect ratio buckets...")
         buckets = []
         
-        # Add landscape buckets
+        # Add landscape buckets with more granular steps
         width = self.max_bucket_reso
         while width >= self.min_bucket_reso:
             height = self.min_bucket_reso
-            while height * width <= 512 * 768 and height <= self.max_bucket_reso:
+            while height * width <= 1024 * 1024 and height <= self.max_bucket_reso:  # Increased max area
                 buckets.append((width, height))
                 height += self.bucket_reso_steps
             width -= self.bucket_reso_steps
@@ -807,19 +806,21 @@ class CustomDataset(Dataset):
         height = self.max_bucket_reso
         while height >= self.min_bucket_reso:
             width = self.min_bucket_reso
-            while height * width <= 512 * 768 and width <= self.max_bucket_reso:
+            while height * width <= 1024 * 1024 and width <= self.max_bucket_reso:  # Increased max area
                 if (width, height) not in buckets:
                     buckets.append((width, height))
                 width += self.bucket_reso_steps
             height -= self.bucket_reso_steps
         
-        # Add square bucket
-        buckets.append((512, 512))
+        # Add square buckets at different resolutions
+        for size in range(self.min_bucket_reso, self.max_bucket_reso + 1, self.bucket_reso_steps):
+            if (size, size) not in buckets:
+                buckets.append((size, size))
         
         # Store bucket info
-        self.buckets = buckets
+        self.buckets = sorted(buckets, key=lambda x: x[0] * x[1])  # Sort by area for efficiency
         self.bucket_data = {bucket: [] for bucket in buckets}
-        self.image_to_bucket = {}  # Map from image path to its bucket
+        self.image_to_bucket = {}
         
         # Assign images to buckets
         for img_path in self.image_paths:
@@ -827,9 +828,27 @@ class CustomDataset(Dataset):
             if bucket is not None:
                 self.bucket_data[bucket].append(img_path)
                 self.image_to_bucket[img_path] = bucket
+            else:
+                # If no suitable bucket found, create a new one
+                with Image.open(img_path) as img:
+                    width, height = img.size
+                    target_w, target_h = self._get_target_size(width, height)
+                    new_bucket = (target_w, target_h)
+                    if new_bucket not in self.buckets:
+                        self.buckets.append(new_bucket)
+                        self.bucket_data[new_bucket] = []
+                    self.bucket_data[new_bucket].append(img_path)
+                    self.image_to_bucket[img_path] = new_bucket
         
-        logger.info(f"Created {len(buckets)} aspect ratio buckets")
+        # Remove empty buckets
+        empty_buckets = [bucket for bucket, images in self.bucket_data.items() if not images]
+        for bucket in empty_buckets:
+            del self.bucket_data[bucket]
+            self.buckets.remove(bucket)
+        
+        logger.info(f"Created {len(self.buckets)} aspect ratio buckets")
         logger.info(f"Images assigned to buckets: {sum(len(samples) for samples in self.bucket_data.values())}")
+        logger.info(f"Bucket sizes: {[(w,h) for w,h in self.buckets]}")
 
     def _assign_to_bucket(self, img_path):
         """Assign an image to the most appropriate bucket"""
@@ -1032,47 +1051,56 @@ class CustomDataset(Dataset):
         """
         Custom collate function for DataLoader with advanced batch handling.
         Handles variable size inputs and applies proper padding.
-        
-        Args:
-            batch: List of samples from dataset __getitem__
-            
-        Returns:
-            dict: Collated batch with proper padding
         """
-        # Filter out None values that might come from failed __getitem__ calls
+        # Filter out None values from failed __getitem__ calls
         batch = [item for item in batch if item is not None]
         if not batch:
-            raise RuntimeError("Entire batch was None - check dataset items")
+            raise RuntimeError("Empty batch after filtering None values")
+        
+        # Get the target size for this batch from the first item's bucket
+        if self.enable_bucket_sampler:
+            target_size = batch[0].get('bucket_size')
+            if target_size is None:
+                raise ValueError("No bucket size found in batch item")
+            target_h, target_w = target_size
             
-        # Stack latents
-        latents = torch.stack([item["latents"] for item in batch])
+            # Verify all items in batch have same bucket size
+            for item in batch:
+                if item.get('bucket_size') != target_size:
+                    raise ValueError(f"Inconsistent bucket sizes in batch: {item.get('bucket_size')} vs {target_size}")
         
-        # Stack text embeddings
-        text_embeddings = torch.stack([item["text_embeddings"] for item in batch])
-        text_embeddings_2 = torch.stack([item["text_embeddings_2"] for item in batch])
-        
-        # Collect added_cond_kwargs
-        text_embeds = torch.stack([item["added_cond_kwargs"]["text_embeds"] for item in batch])
-        time_ids = torch.stack([item["added_cond_kwargs"]["time_ids"] for item in batch])
-        
-        # Get original and target sizes if available
-        original_sizes = None
-        target_sizes = None
-        if "original_size" in batch[0] and "target_size" in batch[0]:
-            original_sizes = torch.tensor([[item["original_size"][0], item["original_size"][1]] for item in batch])
-            target_sizes = torch.tensor([[item["target_size"][0], item["target_size"][1]] for item in batch])
-        
-        return {
-            "latents": latents,
-            "text_embeddings": text_embeddings,
-            "text_embeddings_2": text_embeddings_2,
-            "added_cond_kwargs": {
-                "text_embeds": text_embeds,
-                "time_ids": time_ids
-            },
-            "original_size": original_sizes,
-            "target_size": target_sizes
-        }
+        # Stack tensors with consistent sizes
+        try:
+            latents = torch.stack([item['latents'] for item in batch])
+            text_embeddings = torch.stack([item['text_embeddings'] for item in batch])
+            text_embeddings_2 = torch.stack([item['text_embeddings_2'] for item in batch])
+            
+            # Handle added_cond_kwargs
+            added_cond_kwargs = {}
+            if 'added_cond_kwargs' in batch[0]:
+                for key in batch[0]['added_cond_kwargs']:
+                    if torch.is_tensor(batch[0]['added_cond_kwargs'][key]):
+                        added_cond_kwargs[key] = torch.stack([
+                            item['added_cond_kwargs'][key] for item in batch
+                        ])
+                    else:
+                        added_cond_kwargs[key] = [
+                            item['added_cond_kwargs'][key] for item in batch
+                        ]
+            
+            return {
+                'latents': latents,
+                'text_embeddings': text_embeddings,
+                'text_embeddings_2': text_embeddings_2,
+                'added_cond_kwargs': added_cond_kwargs,
+                'bucket_size': target_size if self.enable_bucket_sampler else None
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in custom_collate: {str(e)}")
+            logger.error(f"Batch sizes: {[item['latents'].shape for item in batch]}")
+            logger.error(f"Bucket sizes: {[item.get('bucket_size') for item in batch]}")
+            raise
 
     def __getitem__(self, idx):
         """Get a single item with improved text augmentation and bucketing"""
