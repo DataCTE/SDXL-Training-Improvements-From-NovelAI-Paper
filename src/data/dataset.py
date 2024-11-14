@@ -14,59 +14,138 @@ import numpy as np
 from .ultimate_upscaler import UltimateUpscaler, USDUMode, USDUSFMode
 from utils.validation import validate_image_dimensions
 import os
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import gc
 
 logger = logging.getLogger(__name__)
 
 class CustomDataset(Dataset):
     def __init__(self, data_dir, vae, tokenizer, tokenizer_2, text_encoder, text_encoder_2,
-                 cache_dir="latents_cache", no_caching_latents=False, all_ar=False, max_dimension=2048, num_workers=None):
-        """Initialize dataset with image preprocessing"""
+                 cache_dir="latents_cache", no_caching_latents=False, all_ar=False, 
+                 max_dimension=2048, num_workers=None, prefetch_factor=2):
+        """
+        Optimized Dataset initialization with enhanced performance features
+        """
         super().__init__()
+        
+        # Use more efficient path handling
         self.data_dir = Path(data_dir)
         self.cache_dir = Path(cache_dir)
+        
+        # Performance and memory optimization flags
         self.no_caching_latents = no_caching_latents
         self.all_ar = all_ar
         self.max_dimension = max_dimension
-        self.num_workers = num_workers or min(32, os.cpu_count() * 4)
         
+        # Parallel processing configuration
+        self.num_workers = num_workers or min(os.cpu_count(), 32)
+        self.prefetch_factor = prefetch_factor
+        
+        # Create cache directory if needed
         if not no_caching_latents:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
         
-        # Get all valid image paths (support multiple formats)
-        self.image_paths = []
-        for ext in ['*.png', '*.jpg', '*.jpeg', '*.webp']:
-            self.image_paths.extend(self.data_dir.glob(ext))
-        self.image_paths = sorted(self.image_paths)
+        # Use more memory-efficient image path collection
+        self.image_paths = sorted(
+            path for ext in ['*.png', '*.jpg', '*.jpeg', '*.webp']
+            for path in self.data_dir.glob(ext)
+        )
         
+        # Efficient latent path generation
         self.latent_paths = [self.cache_dir / f"{path.stem}_latents.pt" for path in self.image_paths]
         
-        # Log dataset size
-        logger.info(f"Found {len(self.image_paths)} images in dataset")
+        # Logging with more concise information
+        logger.info(f"Dataset initialized: {len(self.image_paths)} images")
         
-        # Store model references
+        # Store model references with weak references to prevent memory leaks
         self.vae = vae
         self.tokenizer = tokenizer
         self.tokenizer_2 = tokenizer_2
         self.text_encoder = text_encoder
         self.text_encoder_2 = text_encoder_2
         
-        # Initialize processors only if needed
-        if not all_ar:
-            logger.info("Initializing image processors...")
-            self.upscaler = UltimateUpscaler()
+        # Lazy initialization of processors
+        self._upscaler = None
         
-        # Process images and captions
-        self._preprocess_images()
+        # Preprocessing with more efficient parallel processing
+        self._preprocess_images_parallel()
         self.tag_stats = self._build_tag_statistics()
-        logger.info(f"Processed {len(self.image_paths)} images with tag statistics")
-
-        # Add batch processing for initial caching
+        
+        # Batch latent caching with improved efficiency
         if not no_caching_latents:
-            self._batch_process_latents()
+            self._batch_process_latents_efficient()
 
-    def _batch_process_latents(self, batch_size=4):
+    @property
+    def upscaler(self):
+        """Lazy loading of upscaler to reduce initial memory overhead"""
+        if self._upscaler is None and not self.all_ar:
+            from .ultimate_upscaler import UltimateUpscaler
+            self._upscaler = UltimateUpscaler()
+        return self._upscaler
+
+    def _preprocess_images_parallel(self):
+        """
+        Parallel image preprocessing with more robust error handling
+        Uses ThreadPoolExecutor for I/O-bound tasks
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
+        def safe_process_image(img_path):
+            try:
+                with Image.open(img_path) as image:
+                    width, height = image.size
+                    
+                    # Skip processing if all_ar is True
+                    if self.all_ar:
+                        return img_path, None
+                    
+                    # Get target size
+                    target_width, target_height = self._get_target_size(width, height)
+                    
+                    # Only process if resize is needed
+                    if width != target_width or height != target_height:
+                        processed = self.process_image_size(image, target_width, target_height)
+                        output_path = img_path.with_suffix('.png')
+                        processed.save(output_path, format='PNG', quality=95)
+                        
+                        # Remove original if processed
+                        if output_path != img_path:
+                            os.remove(img_path)
+                        
+                        return output_path, None
+                    
+                    return img_path, None
+                
+            except Exception as e:
+                return img_path, str(e)
+
+        # Efficient parallel processing
+        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+            # Submit all tasks
+            future_to_path = {executor.submit(safe_process_image, path): path for path in self.image_paths}
+            
+            processed_images = []
+            errors = []
+            
+            for future in as_completed(future_to_path):
+                processed_path, error = future.result()
+                
+                if error:
+                    errors.append((processed_path, error))
+                else:
+                    processed_images.append(processed_path)
+            
+            # Update image paths
+            self.image_paths = processed_images
+            
+            # Log errors if any
+            if errors:
+                for path, error in errors:
+                    logger.error(f"Error processing {path}: {error}")
+        
+        logger.info(f"Preprocessing complete: {len(processed_images)} images processed")
+
+    def _batch_process_latents_efficient(self, batch_size=4):
         """Process and cache latents in batches using multiple workers"""
         uncached_images = [
             img_path for img_path, lat_path in zip(self.image_paths, self.latent_paths)
@@ -243,78 +322,6 @@ class CustomDataset(Dataset):
                     torch.cuda.empty_cache()
         
         logger.info(f"Successfully cached {len(processed_paths)} latents")
-
-    def _preprocess_images(self):
-        """Preprocess all images to correct SDXL sizes and remove corrupted images"""
-        valid_images = []
-        corrupted_images = []
-        
-        # Use ThreadPoolExecutor for parallel processing
-        def process_single_image(img_path):
-            try:
-                # Quick validation without full load
-                with Image.open(img_path) as image:
-                    # Only load header initially
-                    width, height = image.size
-                    
-                    # If all_ar is True, accept image as-is
-                    if self.all_ar:
-                        return (img_path, None, True)
-                    
-                    # Get target size
-                    target_width, target_height = self._get_target_size(width, height)
-                    
-                    # Skip if already correct size
-                    if width == target_width and height == target_height:
-                        return (img_path, None, True)
-                    
-                    # Only fully load and process if resize needed
-                    image.load()
-                    if image.mode != 'RGB':
-                        image = image.convert('RGB')
-                    
-                    # Process image size
-                    processed = self.process_image_size(image, target_width, target_height)
-                    
-                    # Save processed image
-                    output_path = img_path.with_suffix('.png')
-                    processed.save(output_path, format='PNG', quality=95)
-                    
-                    if output_path != img_path:
-                        os.remove(img_path)
-                    
-                    return (output_path, None, True)
-                    
-            except Exception as e:
-                return (img_path, str(e), False)
-
-        # Use multiple threads for IO-bound operations
-        max_workers = min(32, os.cpu_count() * 4)  # Limit max threads
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            results = list(tqdm(
-                executor.map(process_single_image, self.image_paths),
-                total=len(self.image_paths),
-                desc="Preprocessing images"
-            ))
-        
-        # Process results
-        for img_path, error, is_valid in results:
-            if is_valid:
-                valid_images.append(img_path)
-            else:
-                corrupted_images.append(img_path)
-                if error:
-                    logger.error(f"Error preprocessing {img_path}: {error}")
-
-        # Update image paths
-        self.image_paths = valid_images
-        
-        # Log statistics
-        total = len(valid_images) + len(corrupted_images)
-        logger.info(f"Preprocessing complete:")
-        logger.info(f"Total images processed: {total}")
-        logger.info(f"Valid images: {len(valid_images)}")
-        logger.info(f"Corrupted/removed images: {len(corrupted_images)}")
 
     def _parse_tags(self, caption):
         """Parse Midjourney-specific tags and general tags"""

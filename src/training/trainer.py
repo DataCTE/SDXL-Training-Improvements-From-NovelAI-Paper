@@ -12,240 +12,116 @@ from tqdm import tqdm
 
 from training import get_sigmas, training_loss_v_prediction
 from utils import save_checkpoint, load_checkpoint
-
+from src.utils.logging import log_metrics_batch
 
 logger = logging.getLogger(__name__)
 
-def train_one_epoch(
-    unet,
-    train_dataloader,
-    optimizer,
-    lr_scheduler,
-    ema_model,
-    tag_weighter,
-    vae_finetuner,
-    args,
-    device,
-    dtype,
-    epoch,
-    global_step,
-    models,
-):
-    """Single epoch training loop with detailed logging"""
-    try:
-        logger.debug(f"\n=== Starting epoch {epoch+1} ===")
-        logger.debug(f"DataLoader length: {len(train_dataloader)}")
-        
-        # Move wandb logging after ensuring global_step is at least 1
-        global_step = max(1, global_step)
-        if args.use_wandb:
-            wandb.log({
-                "epoch": epoch,
-                "epoch/learning_rate": lr_scheduler.get_last_lr()[0]
-            }, step=global_step)
-        
-        # Initialize metrics
-        window_size = 100
-        running_loss = 0.0
-        loss_history = []
-        grad_norm_value = 0.0
-        tag_metrics = defaultdict(list)
-        
-        logger.debug("Setting up progress bar...")
-        progress_bar = tqdm(
-            total=len(train_dataloader),
-            desc=f"Epoch {epoch+1}",
-            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] Loss: {postfix[0]:.4f}, LR: {postfix[1]:.2e}',
-            postfix=[0.0, lr_scheduler.get_last_lr()[0]]
-        )
-        
-        # Set training mode and ensure gradient checkpointing
-        logger.debug("Setting up model training mode...")
-        unet.train()
-        if args.gradient_checkpointing:
-            if hasattr(unet, "gradient_checkpointing_enable"):
-                unet.gradient_checkpointing_enable()
-            
-            for encoder in [models.get("text_encoder"), models.get("text_encoder_2")]:
-                if encoder is not None and encoder.training:
-                    if hasattr(encoder, "gradient_checkpointing_enable"):
-                        encoder.gradient_checkpointing_enable()
 
-        logger.debug("Starting batch iteration...")
-        for step, batch in enumerate(train_dataloader):
-            logger.debug(f"Processing batch {step}")
-            step_start = time.time()
-            
-            # Validate batch contents
-            required_keys = ["latents", "text_embeddings", "added_cond_kwargs", "tags", "special_tags", "tag_weights"]
-            missing_keys = [key for key in required_keys if key not in batch]
-            if missing_keys:
-                logger.error(f"Batch keys: {batch.keys()}")
-                raise ValueError(f"Batch missing required keys: {missing_keys}")
-            
-            # Log batch shapes for debugging
-            logger.debug(f"Latents shape: {batch['latents'].shape}")
-            logger.debug(f"Text embeddings shape: {batch['text_embeddings'].shape}")
-            
-            # Move batch to device - ensure we handle nested structures properly
-            latents = batch["latents"].to(device, dtype=dtype, non_blocking=True)
-            text_embeddings = batch["text_embeddings"].to(device, dtype=dtype, non_blocking=True)
-            added_cond_kwargs = {
-                k: v.to(device, dtype=dtype, non_blocking=True) if torch.is_tensor(v) else v
-                for k, v in batch["added_cond_kwargs"].items()
-            }
-            
-            # Get noise schedule with resolution-aware sigma scaling
-            _, _, height, width = latents.shape
-            sigmas = get_sigmas(
-                num_inference_steps=args.num_inference_steps,
-                sigma_min=0.0292,
-                height=height,
-                width=width
-            ).to(device, non_blocking=True)
-            sigma = sigmas[step % args.num_inference_steps].expand(latents.size(0))
-            
-            # Log sigma distribution periodically
-            if args.use_wandb and step % args.logging_steps == 0:
-                timestep_histogram = torch.histc(sigma, bins=20)
-                wandb.log({
-                    "training/sigma_histogram": wandb.Histogram(timestep_histogram.cpu().numpy()),
-                    "training/sigma_mean": sigma.mean().item(),
-                    "training/sigma_std": sigma.std().item(),
-                    "training/step": step,
-                }, step=global_step)
-            
-            # Calculate loss with tag weighting
-            loss, step_metrics = training_loss_v_prediction(
-                model=unet,
-                x_0=latents,
-                sigma=sigma,
-                text_embeddings=text_embeddings,
-                added_cond_kwargs=added_cond_kwargs,
-                tag_weighter=tag_weighter,
-                batch_tags={
-                    'tags': batch['tags'],
-                    'tag_weights': batch['tag_weights'],
-                    'special_tags': batch['special_tags']
-                }
-            )
-            
-            # Skip batch if loss is unstable
-            if torch.isnan(loss) or torch.isinf(loss) or loss > 1e5:
-                logger.warning(f"Skipping batch due to unstable loss: {loss.item()}")
-                continue
-            
-            # Backward pass with gradient accumulation
-            loss = loss / args.gradient_accumulation_steps
-            loss.backward()
-            
-            if (step + 1) % args.gradient_accumulation_steps == 0:
-                # Clip gradients
-                grad_norm_value = torch.nn.utils.clip_grad_norm_(
-                    unet.parameters(), 
-                    args.max_grad_norm
-                )
-                
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-                lr_scheduler.step()
-                
-                # Update EMA model if it exists
-                if ema_model is not None:
-                    ema_model.step(unet)
-                    
-                    # Log EMA metrics
-                    if args.use_wandb and step % args.logging_steps == 0:
-                        wandb.log({
-                            "ema/decay": ema_model.get_decay_value(),
-                            "ema/num_updates": ema_model.num_updates
-                        }, step=global_step)
-                
-                global_step += 1
-            
-            # Update metrics
-            running_loss = 0.9 * running_loss + 0.1 * loss.item() if step > 0 else loss.item()
-            loss_history.append(loss.item())
-            
-            # Update tag metrics
-            for key, value in step_metrics.items():
-                if key.startswith('tags/'):
-                    tag_metrics[key].append(value)
-            
-            # Calculate averages for progress bar
-            if len(loss_history) > window_size:
-                loss_history = loss_history[-window_size:]
-            average_loss = sum(loss_history) / len(loss_history)
-            
-            # Update progress bar
-            progress_bar.set_postfix([average_loss, lr_scheduler.get_last_lr()[0]])
-            progress_bar.update(1)
-            
-            # Detailed logging
-            if args.use_wandb and step % args.logging_steps == 0:
-                metrics = {
-                    "training/loss": average_loss,
-                    "training/running_loss": running_loss,
-                    "training/grad_norm": grad_norm_value,
-                    "training/learning_rate": lr_scheduler.get_last_lr()[0],
-                    "training/step_time": time.time() - step_start,
-                    # Tag metrics averages - ensure they're on CPU
-                    "tags/weight_mean": np.mean([x.cpu().item() if torch.is_tensor(x) else x 
-                                               for x in tag_metrics["tags/weight_mean"]]),
-                    "tags/niji_ratio": np.mean([x.cpu().item() if torch.is_tensor(x) else x 
-                                              for x in tag_metrics["tags/niji_count"]]) / args.batch_size,
-                    "tags/quality_6_ratio": np.mean([x.cpu().item() if torch.is_tensor(x) else x 
-                                                   for x in tag_metrics["tags/quality_6_count"]]) / args.batch_size,
-                    "tags/stylize_mean": np.mean([x.cpu().item() if torch.is_tensor(x) else x 
-                                                for x in tag_metrics["tags/stylize_mean"]]),
-                    "tags/chaos_mean": np.mean([x.cpu().item() if torch.is_tensor(x) else x 
-                                              for x in tag_metrics["tags/chaos_mean"]])
-                }
-                wandb.log(metrics, step=global_step)
+class AverageMeter(object):
+    """Computes and stores the average and current value"""
+    def __init__(self, name, fmt=':f'):
+        self.name = name
+        self.fmt = fmt
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
+    def __str__(self):
+        fmtstr = '{name} {val' + self.fmt + '} ({avg' + self.fmt + '})'
+        return fmtstr.format(**self.__dict__)
+
+
+def train_one_epoch(
+    model, optimizer, lr_scheduler, train_dataloader, 
+    tag_weighter, device, dtype, 
+    gradient_accumulation_steps=1, 
+    max_grad_norm=1.0, 
+    mixed_precision=True
+):
+    model.train()
+    total_loss = 0.0
+    batch_time = AverageMeter('Batch', ':6.3f')
+    data_time = AverageMeter('Data', ':6.3f')
+    losses = AverageMeter('Loss', ':.4e')
+    
+    end = time.time()
+    global_step = 0
+    
+    for batch_idx, batch in enumerate(train_dataloader):
+        # Measure data loading time
+        data_time.update(time.time() - end)
         
-        # End of epoch logging - ensure metrics are on CPU
-        epoch_metrics = {
-            "epoch/average_loss": np.mean([x.cpu().item() if torch.is_tensor(x) else x 
-                                         for x in loss_history]),
-            "epoch/final_lr": lr_scheduler.get_last_lr()[0],
-            "epoch/total_steps": step + 1,
-            "epoch/tag_stats": {
-                k: np.mean([x.cpu().item() if torch.is_tensor(x) else x for x in v])
-                for k, v in tag_metrics.items()
-            }
+        # Unpack batch with efficient unpacking
+        latents = batch['latents'].to(device, dtype=dtype, non_blocking=True)
+        text_embeddings = batch['text_embeddings'].to(device, dtype=dtype, non_blocking=True)
+        added_cond_kwargs = {
+            k: v.to(device, dtype=dtype, non_blocking=True) 
+            if torch.is_tensor(v) else v 
+            for k, v in batch['added_cond_kwargs'].items()
         }
         
-        if args.use_wandb:
-            wandb.log(epoch_metrics, step=global_step)
+        # Prepare sigma with efficient sampling
+        sigma = torch.rand(latents.size(0), device=device, dtype=dtype) * 0.9 + 0.1
         
-        return global_step
+        # Forward pass and loss computation
+        with torch.cuda.amp.autocast(enabled=mixed_precision):
+            loss, metrics = training_loss_v_prediction(
+                model, 
+                latents, 
+                sigma, 
+                text_embeddings, 
+                added_cond_kwargs=added_cond_kwargs,
+                tag_weighter=tag_weighter,
+                batch_tags=batch
+            )
+            
+            # Normalize loss for gradient accumulation
+            loss = loss / gradient_accumulation_steps
+        
+        # Backward pass
+        loss.backward()
+        
+        # Gradient accumulation and optimization
+        if (batch_idx + 1) % gradient_accumulation_steps == 0:
+            # Clip gradients
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            
+            # Optimizer step
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
+            
+            # Update tracking metrics
+            total_loss += loss.item() * gradient_accumulation_steps
+            losses.update(loss.item() * gradient_accumulation_steps)
+            
+            # Log metrics efficiently
+            if wandb.run:
+                log_metrics_batch({
+                    "train/loss": loss.item() * gradient_accumulation_steps,
+                    "train/lr": lr_scheduler.get_last_lr()[0],
+                    "performance/batch_time": batch_time.avg,
+                    "performance/data_time": data_time.avg
+                }, step=global_step)
+            
+            global_step += 1
+        
+        # Measure batch time
+        batch_time.update(time.time() - end)
+        end = time.time()
+    
+    return global_step
 
-    except Exception as e:
-        logger.error(f"Error in epoch {epoch+1}: {str(e)}")
-        logger.error(traceback.format_exc())
-        raise
-
-def get_cosine_schedule_with_warmup(
-    optimizer: torch.optim.Optimizer,
-    num_warmup_steps: int,
-    num_training_steps: int,
-    num_cycles: float = 0.5,
-    last_epoch: int = -1
-):
-    """
-    Create a schedule with a learning rate that decreases following the values of the cosine function between the
-    initial lr set in the optimizer to 0, after a warmup period during which it increases linearly between 0 and the
-    initial lr set in the optimizer.
-    """
-    def lr_lambda(current_step):
-        # Warmup
-        if current_step < num_warmup_steps:
-            return float(current_step) / float(max(1, num_warmup_steps))
-        # Cosine decay
-        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
-        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)))
-
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda, last_epoch)
 
 def train(args, models, train_components, device, dtype):
     """Main training loop"""
@@ -267,10 +143,10 @@ def train(args, models, train_components, device, dtype):
         logger.info(f"Cached: {torch.cuda.memory_reserved()/1e9:.2f}GB")
         
         if args.use_wandb:
-            wandb.log({
+            log_metrics_batch({
                 "memory/allocated_gb": torch.cuda.memory_allocated()/1e9,
                 "memory/cached_gb": torch.cuda.memory_reserved()/1e9
-            })
+            }, step=global_step)
     
     # Resume from checkpoint if specified
     if args.resume_from_checkpoint:
@@ -293,23 +169,20 @@ def train(args, models, train_components, device, dtype):
         # Log epoch start
         logger.info(f"\nStarting epoch {epoch+1}/{args.num_epochs}")
         if args.use_wandb:
-            wandb.log({"train/epoch": epoch}, step=global_step)
+            log_metrics_batch({"train/epoch": epoch}, step=global_step)
         
         # Run training epoch (moved outside of wandb condition)
         global_step = train_one_epoch(
-            unet=models["unet"],
-            train_dataloader=train_components["train_dataloader"],
+            model=models["unet"],
             optimizer=train_components["optimizer"],
             lr_scheduler=train_components["lr_scheduler"],
-            ema_model=train_components["ema_model"],
+            train_dataloader=train_components["train_dataloader"],
             tag_weighter=train_components["tag_weighter"],
-            vae_finetuner=train_components["vae_finetuner"],
-            args=args,
             device=device,
             dtype=dtype,
-            epoch=epoch,
-            global_step=global_step,
-            models=models
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            max_grad_norm=args.max_grad_norm,
+            mixed_precision=args.mixed_precision
         )
         
         # Run end-of-epoch validation
@@ -349,14 +222,14 @@ def train(args, models, train_components, device, dtype):
                 train_components["validator"].pipeline.unet = original_unet
                 
                 if args.use_wandb:
-                    wandb.log({
+                    log_metrics_batch({
                         "validation/epoch": epoch + 1,
-                        "validation/regular_metrics": validation_metrics,
+                        "validation/metrics": validation_metrics,
                         "validation/ema_metrics": ema_validation_metrics
                     }, step=global_step)
             else:
                 if args.use_wandb:
-                    wandb.log({
+                    log_metrics_batch({
                         "validation/epoch": epoch + 1,
                         "validation/metrics": validation_metrics
                     }, step=global_step)
@@ -380,3 +253,26 @@ def train(args, models, train_components, device, dtype):
             )
     
     return training_history
+
+
+def get_cosine_schedule_with_warmup(
+    optimizer: torch.optim.Optimizer,
+    num_warmup_steps: int,
+    num_training_steps: int,
+    num_cycles: float = 0.5,
+    last_epoch: int = -1
+):
+    """
+    Create a schedule with a learning rate that decreases following the values of the cosine function between the
+    initial lr set in the optimizer to 0, after a warmup period during which it increases linearly between 0 and the
+    initial lr set in the optimizer.
+    """
+    def lr_lambda(current_step):
+        # Warmup
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        # Cosine decay
+        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda, last_epoch)

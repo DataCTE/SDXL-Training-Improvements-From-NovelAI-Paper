@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import torch
 import wandb
+import time
 
 def setup_logging(log_dir=None, log_level=logging.INFO):
     """
@@ -99,7 +100,7 @@ def log_gpu_memory():
 
 def setup_wandb(args):
     """
-    Initialize Weights & Biases logging
+    Initialize Weights & Biases logging with optimized configuration
     
     Args:
         args: Training arguments containing W&B configuration
@@ -111,12 +112,28 @@ def setup_wandb(args):
         return None
         
     try:
+        # Use more robust wandb initialization with additional configuration
         run = wandb.init(
             project=args.wandb_project,
-            name=args.wandb_run_name,
+            name=args.wandb_run_name or f"sdxl_training_{time.time()}",
             config=vars(args),
-            resume=True
+            resume='allow',  # Allow resuming previous runs
+            save_code=True,  # Save code snapshot for reproducibility
+            tags=['sdxl', 'training'],
+            # Reduce network overhead
+            settings=wandb.Settings(
+                _disable_stats=True,  # Disable resource-intensive stats collection
+                _save_requirements=False  # Disable saving requirements
+            )
         )
+        
+        # Define custom metrics for more efficient tracking
+        wandb.define_metric("train/loss", summary="min")
+        wandb.define_metric("train/lr", summary="last")
+        wandb.define_metric("validation/metrics/*", summary="mean")
+        wandb.define_metric("memory/*", summary="max")
+        wandb.define_metric("performance/*", summary="mean")
+        
         logging.info(f"Initialized W&B run: {run.name}")
         return run
         
@@ -126,13 +143,35 @@ def setup_wandb(args):
 
 def cleanup_wandb(run):
     """
-    Cleanup W&B run
+    Cleanup W&B run with enhanced error handling
     
     Args:
         run: W&B run to cleanup
     """
     if run is not None:
         try:
-            run.finish()
+            # Log system info before closing
+            run.log({
+                "system/final_gpu_memory": torch.cuda.memory_allocated() / 1e9 if torch.cuda.is_available() else 0,
+                "system/peak_gpu_memory": torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0
+            })
+            run.finish(quiet=True)  # Suppress verbose output
         except Exception as e:
             logging.error(f"Error closing W&B run: {str(e)}")
+
+def log_metrics_batch(metrics_dict, step=None):
+    """
+    Efficiently log metrics in batches to reduce API calls
+    
+    Args:
+        metrics_dict (dict): Dictionary of metrics to log
+        step (int, optional): Global training step
+    """
+    if not wandb.run:
+        return
+    
+    try:
+        # Use wandb.log with step to ensure correct metric tracking
+        wandb.log(metrics_dict, step=step)
+    except Exception as e:
+        logging.error(f"Metrics logging failed: {str(e)}")

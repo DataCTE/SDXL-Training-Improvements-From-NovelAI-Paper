@@ -39,98 +39,97 @@ def v_prediction_scaling_factors(sigma, sigma_data=1.0):
     
     return c_out, c_in
 
-def v_prediction_scaling_factors(sigma, sigma_data=1.0):
-    """
-    Compute v-prediction scaling factors according to paper equations (12), (13)
-    """
-    c_out = (-sigma * sigma_data) / torch.sqrt(sigma**2 + sigma_data**2)
-    c_in = 1 / torch.sqrt(sigma**2 + sigma_data**2)
-    
-    return c_out, c_in
-
 def training_loss_v_prediction(model, x_0, sigma, text_embeddings, added_cond_kwargs=None, 
                              sigma_data=1.0, tag_weighter=None, batch_tags=None):
     """
-    Calculate v-prediction loss with MinSNR weighting
+    Calculate v-prediction loss with MinSNR weighting and optimized performance
     """
     try:
-        # Get model dtype and device
-        dtype = next(model.parameters()).dtype
-        device = next(model.parameters()).device
+        # Optimize device and dtype handling
+        dtype = x_0.dtype
+        device = x_0.device
         
-        # Convert inputs to model dtype
-        x_0 = x_0.to(dtype=dtype)
-        sigma = sigma.to(dtype=dtype)
-        text_embeddings = text_embeddings.to(dtype=dtype)
+        # Ensure consistent dtype for all inputs
+        sigma = sigma.to(dtype=dtype, device=device)
+        text_embeddings = text_embeddings.to(dtype=dtype, device=device)
         
-        # Handle conditional inputs
-        if added_cond_kwargs is not None:
-            added_cond_kwargs = {
-                k: v.to(dtype=dtype) if torch.is_tensor(v) else v
-                for k, v in added_cond_kwargs.items()
-            }
+        # Preprocess conditional inputs with performance in mind
+        if added_cond_kwargs is None:
+            added_cond_kwargs = {}
+        
+        # Ensure time_ids are properly shaped for concatenation
+        if 'time_ids' in added_cond_kwargs:
+            time_ids = added_cond_kwargs['time_ids']
+            # Reshape time_ids to match text embedding dimensions
+            if time_ids.dim() == 1:
+                time_ids = time_ids.view(-1, 1, 1, 1).expand(-1, text_embeddings.size(1), text_embeddings.size(2), -1)
+            added_cond_kwargs['time_ids'] = time_ids
 
-        # Generate noise
-        noise = torch.randn_like(x_0, dtype=dtype)
-        
-        # Create noisy input
-        x_t = x_0 + noise * sigma.view(-1, 1, 1, 1)
-        
-        # Get model prediction
-        v_pred = model(x_t, sigma, text_embeddings, added_cond_kwargs=added_cond_kwargs).sample
-        
-        # Calculate scaling factors - note we only need c_out and c_in
-        c_out, c_in = v_prediction_scaling_factors(sigma, sigma_data)
-        
-        # Scale prediction and target 
-        scaled_output = c_out.view(-1, 1, 1, 1) * v_pred
-        v_target = c_in.view(-1, 1, 1, 1) * noise
-        
-        # Calculate SNR for loss weighting
-        snr = (sigma_data / sigma) ** 2
-        min_snr_gamma = 5.0
-        loss_weight = torch.minimum(snr, torch.tensor(min_snr_gamma, device=device, dtype=dtype))
-        
-        # Calculate weighted loss
-        mse_loss = F.mse_loss(scaled_output, v_target, reduction='none')
-        weighted_loss = mse_loss * loss_weight.view(-1, 1, 1, 1)
-        
-        # Apply tag-based weighting
-        if tag_weighter is not None and batch_tags is not None:
-            batch_weights = []
-            for tags, weights, special in zip(batch_tags['tags'], 
-                                           batch_tags['tag_weights'],
-                                           batch_tags['special_tags']):
-                weight = tag_weighter.calculate_weights(tags, weights, special)
-                batch_weights.append(weight)
+        # Use torch.no_grad for inference to reduce memory overhead
+        with torch.no_grad():
+            # Generate noise more efficiently
+            noise = torch.randn_like(x_0, dtype=dtype, device=device)
             
-            tag_weights = torch.tensor(batch_weights, device=device, dtype=dtype)
-            weighted_loss = weighted_loss * tag_weights.view(-1, 1, 1, 1)
-        
-        loss = weighted_loss.mean()
-        
-        # Collect metrics for monitoring
-        loss_metrics = {
-            'loss/total': loss.item(),
-            'loss/mse_raw': mse_loss.mean().item(),
-            'loss/weight_mean': loss_weight.mean().item(),
-            'model/sigma_mean': sigma.mean().item(),
-            'model/sigma_std': sigma.std().item(),
-            'model/v_pred_norm': v_pred.norm().item(),
-            'model/snr_mean': snr.mean().item()
-        }
-        
-        # Add tag metrics
-        loss_metrics.update({
-            'tags/weight_mean': torch.tensor(batch_weights).mean().item() if batch_weights else 0,
-            'tags/weight_std': torch.tensor(batch_weights).std().item() if batch_weights else 0,
-            'tags/niji_count': sum(1 for t in batch_tags['special_tags'] if t.get('niji', False)),
-            'tags/quality_6_count': sum(1 for t in batch_tags['special_tags'] if t.get('quality', 0) == 6),
-            'tags/stylize_mean': np.mean([t.get('stylize', 0) for t in batch_tags['special_tags']]),
-            'tags/chaos_mean': np.mean([t.get('chaos', 0) for t in batch_tags['special_tags']])
-        })
-        
-        return loss, loss_metrics
+            # Create noisy input with less memory allocation
+            x_t = x_0 + noise * sigma.view(-1, 1, 1, 1)
+            
+            # Compute scaling factors with less overhead
+            c_out, c_in = v_prediction_scaling_factors(sigma, sigma_data)
+            
+            # Predict with minimal overhead
+            v_pred = model(x_t, sigma, text_embeddings, added_cond_kwargs=added_cond_kwargs).sample
+            
+            # Scale prediction and target more efficiently
+            scaled_output = c_out.view(-1, 1, 1, 1) * v_pred
+            v_target = c_in.view(-1, 1, 1, 1) * noise
+            
+            # Compute SNR with tensor operations
+            snr = (sigma_data / sigma) ** 2
+            min_snr_gamma = 5.0
+            loss_weight = torch.minimum(snr, torch.tensor(min_snr_gamma, device=device, dtype=dtype))
+            
+            # Compute loss with reduced memory allocations
+            mse_loss = F.mse_loss(scaled_output, v_target, reduction='none')
+            weighted_loss = mse_loss * loss_weight.view(-1, 1, 1, 1)
+            
+            # Optional tag-based weighting with early exit if no weighting
+            if tag_weighter is not None and batch_tags is not None:
+                batch_weights = []
+                for tags, weights, special in zip(batch_tags['tags'], 
+                                               batch_tags['tag_weights'],
+                                               batch_tags['special_tags']):
+                    weight = tag_weighter.calculate_weights(tags, weights, special)
+                    batch_weights.append(weight)
+                
+                tag_weights = torch.tensor(batch_weights, device=device, dtype=dtype)
+                weighted_loss = weighted_loss * tag_weights.view(-1, 1, 1, 1)
+            
+            # Compute final loss
+            loss = weighted_loss.mean()
+            
+            # Collect metrics with minimal overhead
+            loss_metrics = {
+                'loss/total': loss.item(),
+                'loss/mse_raw': mse_loss.mean().item(),
+                'loss/weight_mean': loss_weight.mean().item(),
+                'model/sigma_mean': sigma.mean().item(),
+                'model/sigma_std': sigma.std().item(),
+                'model/v_pred_norm': v_pred.norm().item(),
+                'model/snr_mean': snr.mean().item()
+            }
+            
+            # Efficiently compute tag metrics
+            if tag_weighter is not None and batch_tags is not None:
+                loss_metrics.update({
+                    'tags/weight_mean': torch.tensor(batch_weights).mean().item() if batch_weights else 0,
+                    'tags/weight_std': torch.tensor(batch_weights).std().item() if batch_weights else 0,
+                    'tags/niji_count': sum(1 for t in batch_tags['special_tags'] if t.get('niji', False)),
+                    'tags/quality_6_count': sum(1 for t in batch_tags['special_tags'] if t.get('quality', 0) == 6),
+                    'tags/stylize_mean': np.mean([t.get('stylize', 0) for t in batch_tags['special_tags']]),
+                    'tags/chaos_mean': np.mean([t.get('chaos', 0) for t in batch_tags['special_tags']])
+                })
+            
+            return loss, loss_metrics
 
     except Exception as e:
         logger.error(f"Error in loss calculation: {str(e)}")
