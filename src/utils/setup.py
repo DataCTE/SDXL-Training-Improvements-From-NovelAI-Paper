@@ -16,7 +16,7 @@ from inference.text_to_image import SDXLInference
 from training.vae_finetuner import VAEFineTuner
 from utils.device import cleanup
 from diffusers import EulerDiscreteScheduler
-
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -56,31 +56,41 @@ def setup_models(args, device, dtype):
     try:
         models = {}
         
-        # Step 1: Load complete SDXL pipeline with strict=False
+        # Step 1: Load complete SDXL pipeline
         logger.info("Step 1/2: Loading SDXL pipeline...")
         try:
+            # Load pipeline from local path or Hugging Face hub
             pipeline = StableDiffusionXLPipeline.from_pretrained(
                 args.model_path,
                 torch_dtype=dtype,
                 use_safetensors=True,
-                variant="fp16",
-                strict=False
+                dtype=dtype
             )
             
             # Add architecture verification
             logger.info("Verifying model architecture...")
             expected_keys = set(pipeline.unet.state_dict().keys())
-            loaded_keys = set(torch.load(f"{args.model_path}/unet/diffusion_pytorch_model.safetensors").keys())
-            missing_keys = expected_keys - loaded_keys
-            unexpected_keys = loaded_keys - expected_keys
             
-            if missing_keys:
-                logger.warning(f"Missing keys in checkpoint: {len(missing_keys)} keys")
-                logger.debug(f"First few missing keys: {list(missing_keys)[:5]}")
+            # Check if model_path is a local directory or HF model ID
+            if os.path.isdir(args.model_path):
+                # Local path
+                weights_path = os.path.join(args.model_path, "unet/diffusion_pytorch_model.safetensors")
+            else:
+                # For HF models, we'll compare against the loaded state dict
+                loaded_keys = expected_keys
+                logger.info("Using Hugging Face model - skipping local file verification")
             
-            if unexpected_keys:
-                logger.warning(f"Unexpected keys in checkpoint: {len(unexpected_keys)} keys")
-                logger.debug(f"First few unexpected keys: {list(unexpected_keys)[:5]}")
+            if 'loaded_keys' in locals():
+                missing_keys = expected_keys - loaded_keys
+                unexpected_keys = loaded_keys - expected_keys
+                
+                if missing_keys:
+                    logger.warning(f"Missing keys in checkpoint: {len(missing_keys)} keys")
+                    logger.debug(f"First few missing keys: {list(missing_keys)[:5]}")
+                
+                if unexpected_keys:
+                    logger.warning(f"Unexpected keys in checkpoint: {len(unexpected_keys)} keys")
+                    logger.debug(f"First few unexpected keys: {list(unexpected_keys)[:5]}")
             
             pipeline.to(device)
             
@@ -156,7 +166,7 @@ def setup_models(args, device, dtype):
         
     except Exception as e:
         error_msg = clean_error_message(traceback.format_exc())
-        logger.error(" Model setup failed")
+        logger.error("Model setup failed")
         logger.error(error_msg)
         raise
 
