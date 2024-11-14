@@ -67,7 +67,8 @@ def train_one_epoch(
         'loss': AverageMeter('Training Loss', ':.4e'),
         'vae_loss': AverageMeter('VAE Loss', ':.4e') if vae_finetuner else None,
         'grad_norm': AverageMeter('Gradient Norm', ':.4e'),
-        'lr': AverageMeter('Learning Rate', ':.2e')
+        'lr': AverageMeter('Learning Rate', ':.2e'),
+        'bucket_size': AverageMeter('Bucket Size', ':6.0f')  # Track bucket sizes
     }
     
     end = time.time()
@@ -75,11 +76,14 @@ def train_one_epoch(
     
     for batch_idx, batch in enumerate(train_dataloader):
         try:
-            # Log input tensor shapes
-            logger.info(f"\nBatch {batch_idx}/{len(train_dataloader)}:")
-            for k, v in batch.items():
-                if isinstance(v, torch.Tensor):
-                    logger.info(f"Input {k}: shape={v.shape}, dtype={v.dtype}")
+            # Log input tensor shapes and bucket information
+            if verbose:
+                logger.info(f"\nBatch {batch_idx}/{len(train_dataloader)}:")
+                bucket_size = batch.get('bucket_size', (None, None))
+                logger.info(f"Bucket size (h,w): {bucket_size}")
+                for k, v in batch.items():
+                    if isinstance(v, torch.Tensor):
+                        logger.info(f"Input {k}: shape={v.shape}, dtype={v.dtype}")
 
             metrics['data_time'].update(time.time() - end)
             
@@ -92,10 +96,17 @@ def train_one_epoch(
             
             # Resolution and sigma logging
             height, width = latents.shape[2:4]
-            logger.info(f"Resolution: {height*8}x{width*8} (latents: {height}x{width})")
+            if verbose:
+                logger.info(f"Resolution: {height*8}x{width*8} (latents: {height}x{width})")
+            
+            # Update bucket size metric
+            if 'bucket_size' in batch:
+                bucket_h, bucket_w = batch['bucket_size']
+                metrics['bucket_size'].update(bucket_h * bucket_w)
             
             sigma = get_sigmas(height=height*8, width=width*8)[0].to(device, dtype=dtype)
-            logger.info(f"Sigma: {sigma.item():.6f}")
+            if verbose:
+                logger.info(f"Sigma: {sigma.item():.6f}")
             
             with autocast(device_type='cuda', dtype=dtype, enabled=mixed_precision):
                 loss = training_loss_v_prediction(

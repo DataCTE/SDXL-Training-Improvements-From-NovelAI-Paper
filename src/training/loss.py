@@ -92,6 +92,18 @@ def training_loss_v_prediction(model: torch.nn.Module,
     """
     Calculate v-prediction loss with MinSNR weighting and SDXL architecture support.
     Implements NovelAI's v-prediction and MinSNR improvements (sections 2.1, 2.4).
+    
+    Args:
+        model: UNet model
+        x_0: Clean data (latents)
+        sigma: Noise level
+        text_embeddings: Text condition embeddings
+        added_cond_kwargs: Additional conditioning for SDXL (time_ids, etc.)
+        sigma_data: Data standard deviation (default: 1.0)
+        tag_weighter: Optional tag weighting module
+        batch_tags: Optional batch tag information
+        min_snr_gamma: MinSNR gamma parameter (default: 5.0)
+        verbose: Whether to log detailed information
     """
     try:
         # Add noise to input
@@ -104,47 +116,45 @@ def training_loss_v_prediction(model: torch.nn.Module,
         # Scale model input
         model_input = c_in.view(-1, 1, 1, 1) * noised
         
-        # Get model prediction
+        # Forward pass with proper conditioning
         model_output = model(
             model_input,
-            sigma,
+            sigma.view(-1, 1, 1, 1),
             encoder_hidden_states=text_embeddings,
             added_cond_kwargs=added_cond_kwargs
-        )
+        ).sample
         
-        # Calculate v target (eq. 27 from paper)
-        v_target = c_in.view(-1, 1, 1, 1) * noise
+        # Compute target
+        target = c_out.view(-1, 1, 1, 1) * noise
         
-        # Calculate base loss
-        loss = F.mse_loss(model_output, v_target, reduction="none")
-        loss = loss.mean(dim=(1, 2, 3))
+        # Calculate weighted MSE loss with MinSNR
+        snr = sigma_data**2 / sigma**2
+        mse = (model_output - target).pow(2).mean(dim=(1, 2, 3))
         
         # Apply MinSNR weighting (section 2.4)
-        snr = (sigma_data / sigma) ** 2
-        min_snr_gamma = torch.as_tensor(min_snr_gamma, device=snr.device)
-        loss_weights = (snr / min_snr_gamma).clamp(max=1.0)
+        snr_weight = (snr / min_snr_gamma).clamp(max=1.0)
+        loss = (mse * snr_weight).mean()
         
-        # Apply tag-based weighting if provided
+        # Apply tag weighting if provided
         if tag_weighter is not None and batch_tags is not None:
             tag_weights = tag_weighter(batch_tags)
-            loss_weights = loss_weights * tag_weights
-        
-        # Weight and reduce loss
-        loss = (loss * loss_weights).mean()
+            loss = loss * tag_weights.mean()
         
         if verbose:
-            with torch.no_grad():
-                logger.info(f"Loss components:")
-                logger.info(f"- Base MSE: {F.mse_loss(model_output, v_target).item():.4f}")
-                logger.info(f"- Average SNR weight: {loss_weights.mean().item():.4f}")
-                if tag_weighter is not None:
-                    logger.info(f"- Average tag weight: {tag_weights.mean().item():.4f}")
+            logger.info(f"Loss components:")
+            logger.info(f"- Base MSE: {mse.mean().item():.4e}")
+            logger.info(f"- SNR weight: {snr_weight.mean().item():.4f}")
+            if tag_weighter is not None:
+                logger.info(f"- Tag weight: {tag_weights.mean().item():.4f}")
+            logger.info(f"Final loss: {loss.item():.4e}")
         
         return loss
+        
     except Exception as e:
-        logger.error(f"Loss calculation failed: {str(e)}")
+        logger.error("Error in training_loss_v_prediction:")
+        logger.error(str(e))
         logger.error(traceback.format_exc())
-        return torch.tensor(0.0, device=x_0.device)
+        raise
 
 class PerceptualLoss:
     def __init__(self, device="cuda"):

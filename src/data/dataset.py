@@ -26,17 +26,35 @@ class CustomDataset(Dataset):
                  min_size=512, max_size=2048, resolution_type="square",
                  enable_bucket_sampler=True, bucket_reso_steps=64,
                  min_bucket_reso=256, max_bucket_reso=2048,
-                 token_dropout_rate=0.1, caption_dropout_rate=0.1):
+                 token_dropout_rate=0.1, caption_dropout_rate=0.1,
+                 force_square=True, max_ar_error=4):
         """
         Enhanced dataset initialization with NovelAI improvements
         Args:
-            resolution_type: One of ["square", "portrait", "landscape"] for aspect ratio handling
+            data_dir: Directory containing training images
+            vae: VAE model component
+            tokenizer: Primary tokenizer
+            tokenizer_2: Secondary tokenizer
+            text_encoder: Primary text encoder
+            text_encoder_2: Secondary text encoder
+            cache_dir: Directory to cache latents
+            no_caching_latents: If True, disable latent caching
+            all_ar: Accept all aspect ratios without resizing
+            max_dimension: Maximum dimension for any side
+            num_workers: Number of worker processes
+            prefetch_factor: Number of batches to prefetch
+            min_size: Minimum size for any side
+            max_size: Maximum size for any side
+            resolution_type: One of ["square", "portrait", "landscape"]
             enable_bucket_sampler: Use bucketing for efficient batching
-            bucket_reso_steps: Resolution steps for bucketing (64 recommended)
-            token_dropout_rate: Rate for random token dropout during training
+            bucket_reso_steps: Resolution steps for bucketing
+            min_bucket_reso: Minimum resolution for buckets
+            max_bucket_reso: Maximum resolution for buckets
+            token_dropout_rate: Rate for random token dropout
             caption_dropout_rate: Rate for entire caption dropout
+            force_square: Force all images to be square by center cropping
+            max_ar_error: Maximum aspect ratio error before forcing resize
         """
-        super().__init__()
         
         # Basic initialization
         self.data_dir = Path(data_dir)
@@ -97,6 +115,10 @@ class CustomDataset(Dataset):
         
         # Set collate function
         self.collate_fn = self.custom_collate
+        
+        # Additional parameters
+        self.force_square = force_square
+        self.max_ar_error = max_ar_error
 
     def __len__(self):
         """Return the total number of images in the dataset"""
@@ -622,87 +644,49 @@ class CustomDataset(Dataset):
         Get target size based on more permissive SDXL validation rules.
         Only intervenes for extreme cases.
         """
-        try:
-            # If all_ar is True, keep original size
-            if self.all_ar:
-                # Just round to multiples of 8 for VAE
-                width = ((width + 7) // 8) * 8
-                height = ((height + 7) // 8) * 8
-                return (width, height)
-                
-            # Basic validation - only check minimum size
-            if width < 256 or height < 256:
-                min_dim = min(width, height)
-                max_dim = max(width, height)
-                aspect_ratio = width / height
-                
-                # Scale up if both dimensions are too small
-                if width < 512 and height < 512:
-                    scale = 512 / min_dim
-                    width = int(width * scale)
-                    height = int(height * scale)
-                
-                # Fix extreme aspect ratios
-                elif aspect_ratio > 4.0:
-                    width = int(height * 4.0)
-                elif aspect_ratio < 0.25:
-                    height = int(width * 4.0)
-                
-                # Fix tiny dimension with normal/large other dimension
-                elif min_dim < 384 and max_dim > 768:
-                    scale = 384 / min_dim
-                    width = int(width * scale)
-                    height = int(height * scale)
+        if self.force_square:
+            # Force square aspect ratio by taking the larger dimension
+            size = max(width, height)
+            return size, size
             
-            # Round dimensions to multiples of 8
-            width = ((width + 7) // 8) * 8
-            height = ((height + 7) // 8) * 8
-            
-            return (width, height)
-
-        except Exception as e:
-            logger.error(f"Error calculating target size: {str(e)}")
-            # Return rounded dimensions even on error
-            width = ((width + 7) // 8) * 8
-            height = ((height + 7) // 8) * 8
-            return (width, height)
+        # Calculate aspect ratio
+        ar = width / height
+        ar_error = max(ar, 1/ar)
+        
+        if ar_error > self.max_ar_error:
+            # Aspect ratio is too extreme, force closer to square
+            if width > height:
+                new_width = int(height * self.max_ar_error)
+                return new_width, height
+            else:
+                new_height = int(width * self.max_ar_error)
+                return width, new_height
+        
+        # Keep original aspect ratio if within bounds
+        return width, height
 
     def process_image_size(self, image, target_width, target_height):
         """Process image size with advanced upscaling"""
-        # If all_ar is True, keep original size
-        if self.all_ar:
-            width, height = image.size
-            # Just round to multiples of 8 for VAE
-            width = ((width + 7) // 8) * 8
-            height = ((height + 7) // 8) * 8
-            if width == image.size[0] and height == image.size[1]:
-                return image
-            return image.resize((width, height), Image.LANCZOS)
-            
         width, height = image.size
         
-        if width == target_width and height == target_height:
-            return image
-
-        logger.info(f"Processing image from {width}x{height} to {target_width}x{target_height}")
+        # Get target size considering aspect ratio constraints
+        target_width, target_height = self._get_target_size(target_width, target_height)
         
-        scale_factor = max(target_width / width, target_height / height)
-        
-        try:
-            if scale_factor < 1:
-                # For downscaling, use high-quality downscaling
-                return self._downscale_image(image, target_width, target_height)
+        if self.force_square:
+            # Center crop to square
+            min_dim = min(width, height)
+            left = (width - min_dim) // 2
+            top = (height - min_dim) // 2
+            image = image.crop((left, top, left + min_dim, top + min_dim))
+            
+        # Resize to target size
+        if width != target_width or height != target_height:
+            if width * height < target_width * target_height:
+                image = self._upscale_image(image, target_width, target_height)
             else:
-                # For upscaling, use AI upscaling only if the image is too small
-                min_size = 768  # Minimum size before using AI upscaling
-                if width < min_size or height < min_size:
-                    return self._upscale_image(image, target_width, target_height)
-                else:
-                    # Use regular Lanczos upscaling for larger images
-                    return image.resize((target_width, target_height), Image.LANCZOS)
-        except Exception as e:
-            logger.error(f"Image processing failed: {str(e)}, falling back to basic resize")
-            return image.resize((target_width, target_height), Image.LANCZOS)
+                image = self._downscale_image(image, target_width, target_height)
+                
+        return image
 
     def _upscale_image(self, image, target_width, target_height):
         """Upscale image using Ultimate SD Upscaler"""
@@ -810,34 +794,42 @@ class CustomDataset(Dataset):
         logger.info("Initializing aspect ratio buckets...")
         buckets = []
         
-        # Generate buckets based on max dimensions
-        width = 256
-        while width <= self.max_bucket_reso:
-            # Find largest height that satisfies constraints
-            height = self.max_bucket_reso
-            while height * width > 512 * 768 or height > self.max_bucket_reso:
-                height -= 64
-            if height >= self.min_bucket_reso:
+        # Add landscape buckets
+        width = self.max_bucket_reso
+        while width >= self.min_bucket_reso:
+            height = self.min_bucket_reso
+            while height * width <= 512 * 768 and height <= self.max_bucket_reso:
                 buckets.append((width, height))
-            width += 64
-            
+                height += self.bucket_reso_steps
+            width -= self.bucket_reso_steps
+        
         # Add portrait buckets
-        width = 256
-        while width <= self.max_bucket_reso:
-            height = self.max_bucket_reso
-            while height * width > 512 * 768 or height > self.max_bucket_reso:
-                height -= 64
-            if height >= self.min_bucket_reso and (height, width) not in buckets:
-                buckets.append((height, width))
-            width += 64
-            
+        height = self.max_bucket_reso
+        while height >= self.min_bucket_reso:
+            width = self.min_bucket_reso
+            while height * width <= 512 * 768 and width <= self.max_bucket_reso:
+                if (width, height) not in buckets:
+                    buckets.append((width, height))
+                width += self.bucket_reso_steps
+            height -= self.bucket_reso_steps
+        
         # Add square bucket
         buckets.append((512, 512))
         
         # Store bucket info
         self.buckets = buckets
         self.bucket_data = {bucket: [] for bucket in buckets}
+        self.image_to_bucket = {}  # Map from image path to its bucket
+        
+        # Assign images to buckets
+        for img_path in self.image_paths:
+            img_path, bucket = self._assign_to_bucket(img_path)
+            if bucket is not None:
+                self.bucket_data[bucket].append(img_path)
+                self.image_to_bucket[img_path] = bucket
+        
         logger.info(f"Created {len(buckets)} aspect ratio buckets")
+        logger.info(f"Images assigned to buckets: {sum(len(samples) for samples in self.bucket_data.values())}")
 
     def _assign_to_bucket(self, img_path):
         """Assign an image to the most appropriate bucket"""
@@ -1085,63 +1077,157 @@ class CustomDataset(Dataset):
     def __getitem__(self, idx):
         """Get a single item with improved text augmentation and bucketing"""
         try:
+            # Get image path and caption path
             img_path = self.image_paths[idx]
             caption_path = Path(img_path).with_suffix('.txt')
             
+            # Get bucket dimensions if bucketing is enabled
+            if self.enable_bucket_sampler:
+                bucket = self.image_to_bucket.get(img_path)
+                if bucket is None:
+                    raise ValueError(f"No bucket found for image {img_path}")
+                bucket_h, bucket_w = bucket
+            else:
+                bucket_h = bucket_w = None
+            
+            # Load and process image
+            with Image.open(img_path) as image:
+                # Convert to RGB if needed
+                if image.mode != "RGB":
+                    image = image.convert("RGB")
+                
+                # Resize image according to bucket if bucketing is enabled
+                if self.enable_bucket_sampler:
+                    image = self._advanced_resize(image, bucket_w, bucket_h)
+                else:
+                    # Apply default resizing if no bucketing
+                    width, height = image.size
+                    target_w, target_h = self._get_target_size(width, height)
+                    image = self._advanced_resize(image, target_w, target_h)
+            
+            # Load and process caption
+            with open(caption_path, 'r', encoding='utf-8') as f:
+                caption = f.read().strip()
+            
+            # Apply text augmentation
+            caption = self._apply_text_transforms(caption)
+            
+            # Generate text embeddings
+            text_inputs = self.tokenizer(
+                caption,
+                padding="max_length",
+                max_length=self.tokenizer.model_max_length,
+                truncation=True,
+                return_tensors="pt"
+            ).to(self.text_encoder.device)
+            
+            text_inputs_2 = self.tokenizer_2(
+                caption,
+                padding="max_length",
+                max_length=self.tokenizer_2.model_max_length,
+                truncation=True,
+                return_tensors="pt"
+            ).to(self.text_encoder_2.device)
+            
+            with torch.no_grad():
+                text_embeddings = self.text_encoder(text_inputs.input_ids)[0]
+                text_embeddings_2 = self.text_encoder_2(
+                    text_inputs_2.input_ids,
+                    output_hidden_states=True
+                )
+                pooled_output = text_embeddings_2[0]
+                hidden_states = text_embeddings_2.hidden_states[-2]
+            
+            # Generate time embeddings
+            original_size = image.size
+            target_size = (bucket_w, bucket_h) if self.enable_bucket_sampler else (target_w, target_h)
+            crop_coords_top_left = (0, 0)
+            crop_coords_bottom_right = original_size
+            
+            add_time_ids = torch.tensor([
+                original_size[0],          # original width
+                original_size[1],          # original height
+                target_size[0],            # target width
+                target_size[1],            # target height
+                crop_coords_top_left[0],     # crop left
+                crop_coords_top_left[1],     # crop top
+                crop_coords_bottom_right[0], # crop right
+                crop_coords_bottom_right[1]  # crop bottom
+            ], dtype=torch.float32, device=self.vae.device)
+            
+            # Add batch dimension: [1, 6]
+            add_time_ids = add_time_ids.unsqueeze(0)
+            
+            # Prepare cache data
+            cache_data = {
+                'latents': None,
+                'text_embeddings': text_embeddings,
+                'text_embeddings_2': hidden_states,
+                'added_cond_kwargs': {
+                    'text_embeds': pooled_output.unsqueeze(1).unsqueeze(2),
+                    'time_ids': add_time_ids
+                },
+                'original_caption': caption,
+                'bucket_size': (bucket_h, bucket_w) if self.enable_bucket_sampler else (target_w, target_h)
+            }
+            
             # Load cached latents if available
             if not self.no_caching_latents and self.latent_paths[idx].exists():
-                cache_data = torch.load(self.latent_paths[idx])
-                
-                # Apply text augmentation
-                with open(caption_path, 'r', encoding='utf-8') as f:
-                    caption = f.read().strip()
-                caption = self._apply_text_transforms(caption)
-                
-                # Generate new text embeddings if caption changed
-                if caption != cache_data.get('original_caption', ''):
-                    text_inputs = self.tokenizer(
-                        caption,
-                        padding="max_length",
-                        max_length=self.tokenizer.model_max_length,
-                        truncation=True,
-                        return_tensors="pt"
-                    ).to(self.text_encoder.device)
-                    
-                    text_inputs_2 = self.tokenizer_2(
-                        caption,
-                        padding="max_length",
-                        max_length=self.tokenizer_2.model_max_length,
-                        truncation=True,
-                        return_tensors="pt"
-                    ).to(self.text_encoder_2.device)
-                    
-                    with torch.no_grad():
-                        text_embeddings = self.text_encoder(text_inputs.input_ids)[0]
-                        text_embeddings_2 = self.text_encoder_2(
-                            text_inputs_2.input_ids,
-                            output_hidden_states=True
-                        )
-                        pooled_output = text_embeddings_2[0]
-                        hidden_states = text_embeddings_2.hidden_states[-2]
-                        
-                    cache_data.update({
-                        'text_embeddings': text_embeddings,
-                        'text_embeddings_2': hidden_states,
-                        'added_cond_kwargs': {
-                            'text_embeds': pooled_output.unsqueeze(1).unsqueeze(2),
-                            'time_ids': cache_data['added_cond_kwargs']['time_ids']
-                        },
-                        'original_caption': caption
-                    })
-                
-                return cache_data
+                cache_data_latents = torch.load(self.latent_paths[idx])
+                cache_data['latents'] = cache_data_latents['latents']
             
-            # Process uncached item
-            return self._process_uncached_item(img_path, caption_path)
+            return cache_data
         
         except Exception as e:
             logger.error(f"Error getting item {idx}: {str(e)}")
             return None
+
+
+class BucketBatchSampler:
+    """Batch sampler that ensures samples in the same batch come from the same bucket"""
+    def __init__(self, dataset, batch_size, shuffle=True):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        
+        # Create bucket-based indices mapping
+        self.bucket_indices = {}
+        self.bucket_to_dataset_idx = {}  # Maps bucket indices to dataset indices
+        dataset_idx = 0
+        
+        for bucket, samples in dataset.bucket_data.items():
+            bucket_indices = []
+            for _ in samples:
+                bucket_indices.append(dataset_idx)
+                self.bucket_to_dataset_idx[dataset_idx] = bucket
+                dataset_idx += 1
+            self.bucket_indices[bucket] = bucket_indices
+    
+    def __iter__(self):
+        if self.shuffle:
+            # Shuffle indices within each bucket
+            for indices in self.bucket_indices.values():
+                random.shuffle(indices)
+        
+        # Create batches from each bucket
+        all_batches = []
+        for bucket, indices in self.bucket_indices.items():
+            for i in range(0, len(indices), self.batch_size):
+                batch = indices[i:i + self.batch_size]
+                if len(batch) == self.batch_size:  # Only use full batches
+                    all_batches.append(batch)
+        
+        if self.shuffle:
+            random.shuffle(all_batches)
+        
+        for batch in all_batches:
+            yield batch
+    
+    def __len__(self):
+        total = 0
+        for indices in self.bucket_indices.values():
+            total += len(indices) // self.batch_size
+        return total
 
 
 def create_dataloader(
@@ -1161,7 +1247,7 @@ def create_dataloader(
     persistent_workers: bool = True
 ):
     """
-    Create a DataLoader with the CustomDataset.
+    Create a DataLoader with the CustomDataset and bucket-aware batching.
     
     Args:
         data_dir (str): Directory containing the training images
@@ -1180,7 +1266,7 @@ def create_dataloader(
         persistent_workers (bool, optional): Keep worker processes alive between epochs
     
     Returns:
-        torch.utils.data.DataLoader: Configured data loader
+        torch.utils.data.DataLoader: Configured data loader with bucket-aware batching
     """
     try:
         # Initialize dataset
@@ -1196,20 +1282,36 @@ def create_dataloader(
             num_workers=num_workers
         )
         
-        # Create data loader
-        dataloader = torch.utils.data.DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=shuffle,
-            num_workers=num_workers if num_workers is not None else min(8, os.cpu_count() or 1),
-            pin_memory=pin_memory,
-            prefetch_factor=prefetch_factor if num_workers > 0 else None,
-            persistent_workers=persistent_workers if num_workers > 0 else False,
-            collate_fn=dataset.collate_fn
-        )
+        # Create bucket-aware batch sampler if bucketing is enabled
+        if dataset.enable_bucket_sampler:
+            batch_sampler = BucketBatchSampler(dataset, batch_size, shuffle=shuffle)
+            
+            # Create data loader with batch sampler
+            dataloader = torch.utils.data.DataLoader(
+                dataset,
+                batch_sampler=batch_sampler,
+                num_workers=num_workers if num_workers is not None else min(8, os.cpu_count() or 1),
+                pin_memory=pin_memory,
+                prefetch_factor=prefetch_factor if num_workers > 0 else None,
+                persistent_workers=persistent_workers if num_workers > 0 else False,
+                collate_fn=dataset.collate_fn
+            )
+        else:
+            # Fallback to regular batching if bucketing is disabled
+            dataloader = torch.utils.data.DataLoader(
+                dataset,
+                batch_size=batch_size,
+                shuffle=shuffle,
+                num_workers=num_workers if num_workers is not None else min(8, os.cpu_count() or 1),
+                pin_memory=pin_memory,
+                prefetch_factor=prefetch_factor if num_workers > 0 else None,
+                persistent_workers=persistent_workers if num_workers > 0 else False,
+                collate_fn=dataset.collate_fn
+            )
         
         logger.info(f"Created DataLoader with {len(dataset)} samples")
         logger.info(f"Batch size: {batch_size}, Num workers: {num_workers}")
+        logger.info(f"Bucketing enabled: {dataset.enable_bucket_sampler}")
         
         return dataloader
         
