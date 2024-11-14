@@ -53,6 +53,28 @@ def parse_args():
     parser.add_argument("--warmup_steps", type=int, default=1000,
                        help="Number of warmup steps for learning rate scheduler")
     
+    # EMA parameters
+    parser.add_argument("--use_ema", action="store_true", default=True,
+                       help="Use EMA model for training")
+    parser.add_argument("--ema_decay", type=float, default=0.9999,
+                       help="EMA decay rate")
+    parser.add_argument("--ema_update_after_step", type=int, default=100,
+                       help="Start EMA after this many steps")
+    parser.add_argument("--ema_inv_gamma", type=float, default=1.0,
+                       help="Inverse multiplicative factor of EMA warmup length")
+    parser.add_argument("--ema_power", type=float, default=0.6667,
+                       help="Power for decay rate schedule (default: 2/3)")
+    parser.add_argument("--ema_min_decay", type=float, default=0.0,
+                       help="Minimum EMA decay rate")
+    parser.add_argument("--ema_max_decay", type=float, default=0.9999,
+                       help="Maximum EMA decay rate")
+    parser.add_argument("--ema_update_every", type=int, default=1,
+                       help="Update EMA every N steps")
+    parser.add_argument("--use_ema_warmup", action="store_true", default=True,
+                       help="Use EMA warmup")
+    parser.add_argument("--ema_grad_scale_factor", type=float, default=0.5,
+                       help="Factor for gradient-based update weighting")
+    
     # V-prediction parameters
     parser.add_argument("--min_snr_gamma", type=float, default=5.0,
                       help="Minimum SNR value for loss weighting (default: 5.0)")
@@ -103,9 +125,6 @@ def parse_args():
                        help="Enable gradient checkpointing to save memory at the expense of speed")
     
     # EMA and VAE settings
-    parser.add_argument("--ema_decay", type=float, default=0.9999)
-    parser.add_argument("--use_ema", action="store_true",
-                       help="Enable Exponential Moving Average during training")
     parser.add_argument("--finetune_vae", action="store_true")
     parser.add_argument("--vae_learning_rate", type=float, default=1e-6)
     parser.add_argument("--vae_train_freq", type=int, default=10)
