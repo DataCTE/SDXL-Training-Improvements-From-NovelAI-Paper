@@ -417,7 +417,19 @@ def setup_training(args, models, device, dtype):
         return components
         
     except Exception as e:
-        logger.error("✗ Training setup failed")
-        logger.error(f"Error details: {str(e)}")
-        logger.error(traceback.format_exc())
+        error_msg = str(e)
+        error_traceback = traceback.format_exc()
+        error_lines = error_traceback.split('\n')
+        
+        # Write to file if error is longer than 3 lines
+        if len(error_lines) > 3:
+            with open('training_setup_error.log', 'w') as f:
+                f.write(error_traceback)
+            logger.error("✗ Training setup failed")
+            logger.error(f"Error details: {error_msg}")
+            logger.error(f"Full error traceback has been written to 'training_setup_error.log'")
+        else:
+            logger.error("✗ Training setup failed")
+            logger.error(f"Error details: {error_msg}")
+            logger.error(error_traceback)
         raise
