@@ -210,7 +210,10 @@ def main(args):
         for model_name, model in models.items():
             model.to(device=device, dtype=dtype)
             if args.gradient_checkpointing:
-                model.enable_gradient_checkpointing()
+                if hasattr(model, 'enable_gradient_checkpointing'):
+                    model.enable_gradient_checkpointing()
+                elif hasattr(model, 'gradient_checkpointing_enable'):
+                    model.gradient_checkpointing_enable()
         
         # Setup optimizer
         if args.use_adafactor:
