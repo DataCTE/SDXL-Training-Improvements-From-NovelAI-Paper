@@ -25,10 +25,10 @@ def validate_dataset(data_dir):
 def validate_image_dimensions(width, height):
     """Basic image dimension validation"""
     try:
-        if width <= 0 or height <= 0:
-            return False, None
-        if width > 2048 or height > 2048:
-            return False, None
-        return True, (width, height)
+        # only to small images
+        if width < 256 or height < 256:
+            return False, "Image is too small"
+            
+        return True, {"width": width, "height": height}
     except Exception as e:
-        return False, None
+        return False, str(e)

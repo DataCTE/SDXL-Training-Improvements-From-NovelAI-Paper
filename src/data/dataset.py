@@ -64,6 +64,13 @@ class CustomDataset(Dataset):
         self.text_encoder = text_encoder
         self.text_encoder_2 = text_encoder_2
         
+        # Initialize upscaler
+        self.upscaler = UltimateUpscaler(
+            model_path="Lykon/DreamShaper",
+            device=self.vae.device,
+            dtype=self.vae.dtype
+        )
+        
         # Performance optimization
         self.num_workers = num_workers or min(os.cpu_count(), 32)
         self.prefetch_factor = prefetch_factor
@@ -128,13 +135,12 @@ class CustomDataset(Dataset):
                 
                 # Basic validation
                 if width < self.min_size or height < self.min_size:
-                    logger.warning(f"Skipping {img_path}: Too small ({width}x{height})")
-                    return None
+                    # Instead of skipping, try to upscale
+                    target_width = max(width, self.min_size)
+                    target_height = max(height, self.min_size)
+                    img = self._upscale_image(img, target_width, target_height)
+                    width, height = img.size
                     
-                if width > self.max_size or height > self.max_size:
-                    logger.warning(f"Skipping {img_path}: Too large ({width}x{height})")
-                    return None
-                
                 # Aspect ratio validation
                 if not self.all_ar:
                     aspect_ratio = width / height
