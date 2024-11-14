@@ -363,6 +363,29 @@ def validate_model_components(models):
     except Exception as e:
         return False, f"Model validation failed: {str(e)}"
 
+def verify_unet_config(config):
+    """Basic verification of UNet configuration for SDXL architecture"""
+    try:
+        # Essential checks for SDXL architecture
+        required_config = {
+            'transformer_layers_per_block': [0, 2, 10],
+            'cross_attention_dim': 2048,
+            'use_linear_projection': True
+        }
+        
+        for key, expected_value in required_config.items():
+            if key not in config:
+                raise ValueError(f"Missing required config key: {key}")
+            if config[key] != expected_value:
+                logger.warning(f"Note: {key} differs from SDXL spec. Expected {expected_value}, got {config[key]}")
+        
+        logger.info("UNet configuration verification passed")
+        return True
+        
+    except Exception as e:
+        logger.error(f"UNet configuration verification failed: {str(e)}")
+        return False
+
 def validate_training_args(args):
     """
     Validate training arguments and configuration
