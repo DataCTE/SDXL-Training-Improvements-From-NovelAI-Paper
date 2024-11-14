@@ -21,6 +21,8 @@ from utils.logging import (
     log_model_gradients
 )
 from training.trainer import get_cosine_schedule_with_warmup
+
+
 logger = logging.getLogger(__name__)
 
 # Set up logging
@@ -216,6 +218,17 @@ def main(args):
                     elif hasattr(model, 'gradient_checkpointing_enable'):
                         model.gradient_checkpointing_enable()
         
+        # Setup data loader first since we need it for lr_scheduler
+        from training.data import create_dataloader
+        train_dataloader = create_dataloader(
+            data_dir=args.data_dir,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            all_ar=args.all_ar,
+            no_caching_latents=args.no_caching_latents,
+            cache_dir=args.cache_dir
+        )
+        
         # Setup optimizer
         if args.use_adafactor:
             from transformers import Adafactor
@@ -283,17 +296,6 @@ def main(args):
         else:
             vae_finetuner = None
         
-        # Setup data loader
-        from training.data import create_dataloader
-        train_dataloader = create_dataloader(
-            data_dir=args.data_dir,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            all_ar=args.all_ar,
-            no_caching_latents=args.no_caching_latents,
-            cache_dir=args.cache_dir
-        )
-        
         # Create components dictionary
         train_components = {
             "optimizer": optimizer,
@@ -332,7 +334,7 @@ def main(args):
                 }, step=global_step)
                 
                 # Log model gradients
-                log_model_gradients(models.unet, step=global_step)
+                log_model_gradients(models["unet"], step=global_step)
                 
                 # Log memory stats
                 log_memory_stats(step=global_step)
