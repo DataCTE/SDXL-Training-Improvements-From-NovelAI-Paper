@@ -102,14 +102,28 @@ def setup_models(args, device, dtype):
             logger.info("Gradient checkpointing enabled for all supported models")
         
         # Initialize EMA if requested
+       # Initialize EMA if requested
         ema_model = None
         if args.use_ema:
-            logger.info("Initializing EMA model...")
-            ema_model = EMAModel(
-                unet,
-                decay=args.ema_decay,
-                device=device
-            )
+            try:
+                logger.info("Initializing EMA model...")
+                ema_model = EMAModel(
+                    model=unet,
+                    decay=args.ema_decay,
+                    update_after_step=args.ema_update_after_step,
+                    inv_gamma=args.ema_inv_gamma,
+                    power=args.ema_power,
+                    min_decay=args.ema_min_decay,
+                    max_decay=args.ema_max_decay,
+                    device=device,
+                    update_every=args.ema_update_every,
+                    use_ema_warmup=args.use_ema_warmup,
+                    grad_scale_factor=args.ema_grad_scale_factor
+                )
+            except Exception as e:
+                logger.error(f"Error initializing EMA model: {str(e)}")
+                logger.error(traceback.format_exc())
+                raise
         
         # Create models dictionary
         models = {
