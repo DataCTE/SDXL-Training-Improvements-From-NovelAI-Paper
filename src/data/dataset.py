@@ -768,11 +768,15 @@ class CustomDataset(Dataset):
                 }
                 torch.save(cache_data, latent_path)
             
+            # Ensure all tensors are on CPU before returning
             return {
-                "latents": latents,
-                "text_embeddings": text_embeddings,
-                "text_embeddings_2": hidden_states,
-                "added_cond_kwargs": added_cond_kwargs,
+                "latents": latents.cpu(),
+                "text_embeddings": text_embeddings.cpu(),
+                "text_embeddings_2": hidden_states.cpu(),
+                "added_cond_kwargs": {
+                    k: v.cpu() if torch.is_tensor(v) else v
+                    for k, v in added_cond_kwargs.items()
+                },
                 "tags": tags,
                 "special_tags": special_tags,
                 "tag_weights": tag_weights
@@ -848,11 +852,11 @@ def custom_collate(batch):
 
     # Stack tensors
     batch_dict = {
-        "latents": torch.stack(resized_latents),
-        "text_embeddings": torch.stack([x["text_embeddings"] for x in valid_batch]),
-        "text_embeddings_2": torch.stack([x["text_embeddings_2"] for x in valid_batch]),
+        "latents": torch.stack(resized_latents).cpu(),
+        "text_embeddings": torch.stack([x["text_embeddings"] for x in valid_batch]).cpu(),
+        "text_embeddings_2": torch.stack([x["text_embeddings_2"] for x in valid_batch]).cpu(),
         "added_cond_kwargs": {
-            k: torch.stack([x["added_cond_kwargs"][k] for x in valid_batch])
+            k: torch.stack([x["added_cond_kwargs"][k] for x in valid_batch]).cpu()
             if torch.is_tensor(valid_batch[0]["added_cond_kwargs"][k])
             else [x["added_cond_kwargs"][k] for x in valid_batch]
             for k in valid_batch[0]["added_cond_kwargs"]

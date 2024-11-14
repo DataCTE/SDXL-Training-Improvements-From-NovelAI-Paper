@@ -87,11 +87,11 @@ def train_one_epoch(
             logger.debug(f"Latents shape: {batch['latents'].shape}")
             logger.debug(f"Text embeddings shape: {batch['text_embeddings'].shape}")
             
-            # Move batch to device
-            latents = batch["latents"].to(device, dtype=dtype)
-            text_embeddings = batch["text_embeddings"].to(device, dtype=dtype)
+            # Move batch to device - ensure we handle nested structures properly
+            latents = batch["latents"].to(device, dtype=dtype, non_blocking=True)
+            text_embeddings = batch["text_embeddings"].to(device, dtype=dtype, non_blocking=True)
             added_cond_kwargs = {
-                k: v.to(device, dtype=dtype) if torch.is_tensor(v) else v
+                k: v.to(device, dtype=dtype, non_blocking=True) if torch.is_tensor(v) else v
                 for k, v in batch["added_cond_kwargs"].items()
             }
             
@@ -102,7 +102,7 @@ def train_one_epoch(
                 sigma_min=0.0292,
                 height=height,
                 width=width
-            ).to(device)
+            ).to(device, non_blocking=True)
             sigma = sigmas[step % args.num_inference_steps].expand(latents.size(0))
             
             # Log sigma distribution periodically
@@ -189,22 +189,29 @@ def train_one_epoch(
                     "training/grad_norm": grad_norm_value,
                     "training/learning_rate": lr_scheduler.get_last_lr()[0],
                     "training/step_time": time.time() - step_start,
-                    # Tag metrics averages
-                    "tags/weight_mean": np.mean(tag_metrics["tags/weight_mean"]),
-                    "tags/niji_ratio": np.mean(tag_metrics["tags/niji_count"]) / args.batch_size,
-                    "tags/quality_6_ratio": np.mean(tag_metrics["tags/quality_6_count"]) / args.batch_size,
-                    "tags/stylize_mean": np.mean(tag_metrics["tags/stylize_mean"]),
-                    "tags/chaos_mean": np.mean(tag_metrics["tags/chaos_mean"])
+                    # Tag metrics averages - ensure they're on CPU
+                    "tags/weight_mean": np.mean([x.cpu().item() if torch.is_tensor(x) else x 
+                                               for x in tag_metrics["tags/weight_mean"]]),
+                    "tags/niji_ratio": np.mean([x.cpu().item() if torch.is_tensor(x) else x 
+                                              for x in tag_metrics["tags/niji_count"]]) / args.batch_size,
+                    "tags/quality_6_ratio": np.mean([x.cpu().item() if torch.is_tensor(x) else x 
+                                                   for x in tag_metrics["tags/quality_6_count"]]) / args.batch_size,
+                    "tags/stylize_mean": np.mean([x.cpu().item() if torch.is_tensor(x) else x 
+                                                for x in tag_metrics["tags/stylize_mean"]]),
+                    "tags/chaos_mean": np.mean([x.cpu().item() if torch.is_tensor(x) else x 
+                                              for x in tag_metrics["tags/chaos_mean"]])
                 }
                 wandb.log(metrics, step=global_step)
         
-        # End of epoch logging
+        # End of epoch logging - ensure metrics are on CPU
         epoch_metrics = {
-            "epoch/average_loss": np.mean(loss_history),
+            "epoch/average_loss": np.mean([x.cpu().item() if torch.is_tensor(x) else x 
+                                         for x in loss_history]),
             "epoch/final_lr": lr_scheduler.get_last_lr()[0],
             "epoch/total_steps": step + 1,
             "epoch/tag_stats": {
-                k: np.mean(v) for k, v in tag_metrics.items()
+                k: np.mean([x.cpu().item() if torch.is_tensor(x) else x for x in v])
+                for k, v in tag_metrics.items()
             }
         }
         
