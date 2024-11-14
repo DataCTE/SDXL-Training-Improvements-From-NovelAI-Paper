@@ -8,8 +8,8 @@ from diffusers.optimization import get_scheduler
 
 from training.ema import EMAModel
 from data.dataset import create_dataloader
-from validation.validator import Validator
-from training.tag_weighter import TagWeighter
+from utils.validation import Validator
+from data.tag_weighter import TagWeighter
 from training.vae_finetuner import VAEFinetuner
 
 logger = logging.getLogger(__name__)
