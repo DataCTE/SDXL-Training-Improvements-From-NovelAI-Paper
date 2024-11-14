@@ -59,41 +59,15 @@ def train_one_epoch(
     vae_train_freq: int = 10,
     verbose: bool = False
 ) -> Tuple[float, Dict[str, float]]:
-    """
-    Train one epoch with NovelAI improvements including v-prediction, ZTSNR, and MinSNR.
-    
-    Args:
-        model: SDXL UNet model
-        optimizer: Optimizer instance
-        lr_scheduler: Learning rate scheduler
-        train_dataloader: Training data loader with aspect ratio bucketing
-        tag_weighter: Optional tag weighting function
-        device: Training device
-        dtype: Training dtype (e.g., torch.float32, torch.bfloat16)
-        gradient_accumulation_steps: Number of steps for gradient accumulation
-        max_grad_norm: Maximum gradient norm for clipping
-        mixed_precision: Whether to use mixed precision training
-        min_snr_gamma: Minimum SNR gamma value for loss weighting
-        sigma_data: Data standard deviation (typically 1.0)
-        use_ztsnr: Whether to use Zero Terminal SNR
-        vae_finetuner: Optional VAE finetuner instance
-        vae_train_freq: Frequency of VAE training steps
-        verbose: Whether to log detailed training information
-    
-    Returns:
-        Tuple[float, Dict[str, float]]: Average loss and metrics dictionary
-    """
     model.train()
     scaler = GradScaler(enabled=mixed_precision)
-    
-    # Initialize metrics
     metrics = {
-        'batch_time': AverageMeter('Batch', ':6.3f'),
-        'data_time': AverageMeter('Data', ':6.3f'),
-        'loss': AverageMeter('Loss', ':.4e'),
+        'batch_time': AverageMeter('Batch Time', ':6.3f'),
+        'data_time': AverageMeter('Data Loading Time', ':6.3f'),
+        'loss': AverageMeter('Training Loss', ':.4e'),
         'vae_loss': AverageMeter('VAE Loss', ':.4e') if vae_finetuner else None,
-        'grad_norm': AverageMeter('Grad Norm', ':.4e'),
-        'lr': AverageMeter('LR', ':.2e')
+        'grad_norm': AverageMeter('Gradient Norm', ':.4e'),
+        'lr': AverageMeter('Learning Rate', ':.2e')
     }
     
     end = time.time()
@@ -101,29 +75,29 @@ def train_one_epoch(
     
     for batch_idx, batch in enumerate(train_dataloader):
         try:
-            # Measure data loading time
+            # Log input tensor shapes
+            logger.info(f"\nBatch {batch_idx}/{len(train_dataloader)}:")
+            for k, v in batch.items():
+                if isinstance(v, torch.Tensor):
+                    logger.info(f"Input {k}: shape={v.shape}, dtype={v.dtype}")
+
             metrics['data_time'].update(time.time() - end)
             
-            # Move data to device efficiently
+            # Device transfer with shape logging
             latents = batch['latents'].to(device, dtype=dtype, non_blocking=True)
             text_embeddings = batch['text_embeddings'].to(device, dtype=dtype, non_blocking=True)
-            added_cond_kwargs = {
-                k: v.to(device, dtype=dtype, non_blocking=True) 
-                if torch.is_tensor(v) else v 
-                for k, v in batch.get('added_cond_kwargs', {}).items()
-            }
+            added_cond_kwargs = {k: v.to(device, dtype=dtype, non_blocking=True) 
+                               if torch.is_tensor(v) else v 
+                               for k, v in batch.get('added_cond_kwargs', {}).items()}
             
-            # Get resolution-dependent sigma for ZTSNR
+            # Resolution and sigma logging
             height, width = latents.shape[2:4]
-            sigma = get_sigmas(
-                height=height * 8,  # Scale to pixel space
-                width=width * 8,
-                verbose=verbose
-            )[0].to(device, dtype=dtype)
+            logger.info(f"Resolution: {height*8}x{width*8} (latents: {height}x{width})")
             
-            # Forward pass with mixed precision
+            sigma = get_sigmas(height=height*8, width=width*8)[0].to(device, dtype=dtype)
+            logger.info(f"Sigma: {sigma.item():.6f}")
+            
             with autocast(device_type='cuda', dtype=dtype, enabled=mixed_precision):
-                # UNet training step
                 loss = training_loss_v_prediction(
                     model=model,
                     x_0=latents,
@@ -136,57 +110,61 @@ def train_one_epoch(
                     sigma_data=sigma_data,
                     verbose=verbose
                 )
-                
-                # Scale loss for gradient accumulation
                 loss = loss / gradient_accumulation_steps
             
-            # Backward pass with gradient scaling
+            if not torch.isfinite(loss):
+                logger.error(f"Loss is {loss.item()}")
+                continue
+                
             scaler.scale(loss).backward()
             
-            # VAE finetuning step if enabled
             if vae_finetuner and batch_idx % vae_train_freq == 0:
                 vae_loss = vae_finetuner.training_step(batch)
                 metrics['vae_loss'].update(vae_loss.item())
             
-            # Update weights if gradient accumulation complete
             if (batch_idx + 1) % gradient_accumulation_steps == 0:
-                # Unscale gradients for clipping
                 scaler.unscale_(optimizer)
                 
-                # Compute gradient norm for monitoring
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    model.parameters(),
-                    max_grad_norm
-                )
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                 metrics['grad_norm'].update(grad_norm.item())
+                logger.info(f"Gradient norm: {grad_norm.item():.6f}")
                 
-                # Optimizer step with gradient scaling
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
                 
-                # Update learning rate
                 lr_scheduler.step()
                 metrics['lr'].update(optimizer.param_groups[0]['lr'])
             
-            # Update metrics
             metrics['loss'].update(loss.item() * gradient_accumulation_steps)
             metrics['batch_time'].update(time.time() - end)
             
-            # Log progress
-            if verbose and batch_idx % 10 == 0:
-                logger.info(f'Batch: [{batch_idx}/{len(train_dataloader)}]')
+            if batch_idx % 10 == 0:
+                logger.info("Metrics:")
                 for name, meter in metrics.items():
                     if meter is not None:
-                        logger.info(f'  {name}: {meter}')
+                        logger.info(f"{name}: {meter}")
             
             end = time.time()
             
+        except RuntimeError as e:
+            if "size mismatch" in str(e):
+                logger.error("\nShape mismatch detected:")
+                err_msg = str(e)
+                param = err_msg.split('size mismatch for ')[1].split(':')[0] 
+                expected = err_msg.split('copying a param with shape ')[1].split(',')[0]
+                actual = err_msg.split('the shape in current model is ')[1]
+                logger.error(f"Parameter: {param}")
+                logger.error(f"Expected shape: {expected}")
+                logger.error(f"Actual shape: {actual}")
+            raise
+            
         except Exception as e:
-            logger.error(f"Error in training step: {str(e)}")
+            logger.error(f"Error in batch {batch_idx}:")
+            logger.error(str(e))
             logger.error(traceback.format_exc())
             continue
-    
+
     return metrics['loss'].avg, {k: v.avg if v is not None else 0.0 for k, v in metrics.items()}
 
 def train(args, models, train_components, device, dtype):

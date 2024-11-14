@@ -909,7 +909,10 @@ class CustomDataset(Dataset):
                 crop_coords_top_left[1],     # crop top
                 crop_coords_bottom_right[0], # crop right
                 crop_coords_bottom_right[1]  # crop bottom
-            ]).unsqueeze(0)
+            ], dtype=torch.float32, device=self.vae.device)
+            
+            # Add batch dimension: [1, 6]
+            add_time_ids = add_time_ids.unsqueeze(0)
             
             # Prepare cache data
             cache_data = {

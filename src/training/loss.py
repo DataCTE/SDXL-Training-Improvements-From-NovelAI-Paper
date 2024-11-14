@@ -112,6 +112,13 @@ def training_loss_v_prediction(model: torch.nn.Module,
         dtype = x_0.dtype
         device = x_0.device
         
+        # Log input shapes for debugging
+        if verbose:
+            logger.info(f"Input shapes:")
+            logger.info(f"x_0: {x_0.shape}, dtype: {x_0.dtype}")
+            logger.info(f"sigma: {sigma.shape}, dtype: {sigma.dtype}")
+            logger.info(f"text_embeddings: {text_embeddings.shape}, dtype: {text_embeddings.dtype}")
+        
         # Ensure consistent dtype and device
         sigma = sigma.to(dtype=dtype, device=device)
         text_embeddings = text_embeddings.to(dtype=dtype, device=device)
@@ -128,13 +135,36 @@ def training_loss_v_prediction(model: torch.nn.Module,
         # Scale model input for proper normalization
         model_input = c_in * x_noisy
         
-        # Forward pass through SDXL UNet
-        model_output = model(
-            model_input,
-            sigma,
-            text_embeddings,
-            added_cond_kwargs=added_cond_kwargs
-        )
+        # Forward pass through SDXL UNet with detailed error tracking
+        try:
+            model_output = model(
+                model_input,
+                sigma,
+                text_embeddings,
+                added_cond_kwargs=added_cond_kwargs
+            )
+        except Exception as model_error:
+            logger.error("Error during model forward pass:")
+            logger.error(f"Error type: {type(model_error).__name__}")
+            logger.error(f"Error message: {str(model_error)}")
+            
+            # Print shapes of all inputs
+            logger.error("\nInput tensor shapes:")
+            logger.error(f"model_input: {model_input.shape}")
+            logger.error(f"sigma: {sigma.shape}")
+            logger.error(f"text_embeddings: {text_embeddings.shape}")
+            if added_cond_kwargs:
+                for key, value in added_cond_kwargs.items():
+                    if hasattr(value, 'shape'):
+                        logger.error(f"{key}: {value.shape}")
+            
+            # Print full traceback
+            tb = traceback.format_exc()
+            logger.error("\nFull traceback:")
+            for line in tb.split('\n'):
+                logger.error(line)
+            
+            raise RuntimeError("Model forward pass failed - see logs for details") from model_error
         
         # Calculate target
         target = c_in * x_0
@@ -144,8 +174,14 @@ def training_loss_v_prediction(model: torch.nn.Module,
         min_snr = torch.full_like(snr, min_snr_gamma)
         loss_weights = (snr / min_snr).clamp(max=1.0)
         
-        # Calculate weighted MSE loss
+        # Calculate weighted MSE loss with nan/inf checking
         loss = F.mse_loss(model_output, target, reduction='none')
+        if torch.isnan(loss).any() or torch.isinf(loss).any():
+            logger.error("NaN or Inf detected in loss computation")
+            logger.error(f"model_output stats: min={model_output.min()}, max={model_output.max()}, mean={model_output.mean()}")
+            logger.error(f"target stats: min={target.min()}, max={target.max()}, mean={target.mean()}")
+            raise ValueError("NaN or Inf values detected in loss computation")
+            
         loss = loss.mean(dim=(1, 2, 3))
         loss = (loss * loss_weights).mean()
         
@@ -165,9 +201,30 @@ def training_loss_v_prediction(model: torch.nn.Module,
         return loss
         
     except Exception as e:
-        logger.error(f"Error in v-prediction loss calculation: {str(e)}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        raise
+        logger.error("\nUnexpected error in loss calculation:")
+        logger.error(f"Error type: {type(e).__name__}")
+        logger.error(f"Error message: {str(e)}")
+        
+        # Get the full stack trace
+        tb = traceback.format_exc()
+        logger.error("\nFull traceback:")
+        for line in tb.split('\n'):
+            logger.error(line)
+            
+        # Log tensor states
+        logger.error("\nTensor states at error:")
+        try:
+            logger.error(f"x_0: shape={x_0.shape}, dtype={x_0.dtype}, device={x_0.device}")
+            logger.error(f"sigma: shape={sigma.shape}, dtype={sigma.dtype}, device={sigma.device}")
+            logger.error(f"text_embeddings: shape={text_embeddings.shape}, dtype={text_embeddings.dtype}, device={text_embeddings.device}")
+            if 'model_output' in locals():
+                logger.error(f"model_output: shape={model_output.shape}, dtype={model_output.dtype}, device={model_output.device}")
+            if 'target' in locals():
+                logger.error(f"target: shape={target.shape}, dtype={target.dtype}, device={target.device}")
+        except Exception as debug_error:
+            logger.error(f"Error while logging tensor states: {str(debug_error)}")
+        
+        raise RuntimeError("Loss calculation failed - see logs for details") from e
 
 class PerceptualLoss:
     def __init__(self, device="cuda"):
