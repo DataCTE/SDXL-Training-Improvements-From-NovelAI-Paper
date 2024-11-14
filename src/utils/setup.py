@@ -83,6 +83,8 @@ def setup_models(args, device, dtype):
         models["vae"] = pipeline.vae
         models["text_encoder"] = pipeline.text_encoder
         models["text_encoder_2"] = pipeline.text_encoder_2
+        models["tokenizer"] = pipeline.tokenizer
+        models["tokenizer_2"] = pipeline.tokenizer_2
         
         logger.info("Model setup completed successfully")
         return models
