@@ -294,7 +294,7 @@ def setup_training(args, models, device, dtype):
                 ema_model = EMAModel(
                     models["unet"],
                     decay=args.ema_decay,
-                    update_after_step=args.ema_start_step,
+                    update_after_step=args.ema_update_after_step,
                     device=device
                 )
                 models["ema"] = ema_model
