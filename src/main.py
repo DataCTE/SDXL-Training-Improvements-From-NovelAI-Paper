@@ -269,14 +269,15 @@ def main(args):
         if args.use_ema:
             from training.ema import EMAModel
             ema = EMAModel(
-                model_path=args.model_path,
-                update_after_step=args.ema_update_after_step,
-                update_every=args.ema_update_every,
-                decay=args.ema_decay,
-                power=args.ema_power,
-                min_decay=args.ema_min_decay,
-                max_decay=args.ema_max_decay,
-                use_ema_warmup=args.use_ema_warmup
+            model=models["unet"],  # Add the required model argument
+            model_path=args.model_path,
+            update_after_step=args.ema_update_after_step,
+            update_every=args.ema_update_every,
+            decay=args.ema_decay,
+            power=args.ema_power,
+            min_decay=args.ema_min_decay,
+            max_decay=args.ema_max_decay,
+            use_ema_warmup=args.use_ema_warmup
             )
             ema.to(device=device, dtype=dtype)
             models["ema"] = ema
@@ -316,7 +317,8 @@ def main(args):
             "lr_scheduler": lr_scheduler,
             "train_dataloader": train_dataloader,
             "tag_weighter": tag_weighter,
-            "vae_finetuner": vae_finetuner
+            "vae_finetuner": vae_finetuner,
+            "ema": ema if args.use_ema else None  # Add EMA to components
         }
         
         # Log training setup and initial system state
