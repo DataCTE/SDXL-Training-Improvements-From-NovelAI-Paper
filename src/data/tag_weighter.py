@@ -135,6 +135,60 @@ class TagBasedLossWeighter:
         return max(TagBasedLossWeighter.min_weight, 
                   min(TagBasedLossWeighter.max_weight, base_weight))
 
+    @staticmethod
+    def format_caption(caption: str) -> str:
+        """
+        Static method to format caption text with standardized formatting.
+        
+        Args:
+            caption (str): Raw caption text
+            
+        Returns:
+            str: Formatted caption text
+        """
+        if not caption:
+            return ""
+            
+        try:
+            # Split into tags
+            tags = [t.strip() for t in caption.split(',')]
+            
+            # Remove empty tags
+            tags = [t for t in tags if t]
+            
+            # Basic cleanup for each tag
+            formatted_tags = []
+            for tag in tags:
+                # Convert to lowercase
+                tag = tag.lower()
+                
+                # Remove extra spaces
+                tag = ' '.join(tag.split())
+                
+                # Remove articles from start
+                if tag.startswith(('a ', 'an ', 'the ')):
+                    tag = ' '.join(tag.split()[1:])
+                
+                # Handle special formatting for quality tags
+                if any(q in tag for q in ['masterpiece', 'best quality', 'high quality']):
+                    formatted_tags.insert(0, tag)  # Move to front
+                    continue
+                    
+                # Handle special formatting for negative tags
+                if tag.startswith(('no ', 'bad ', 'worst ')):
+                    if not any(neg in tag for neg in ['negative space', 'negative prompt']):
+                        tag = tag.replace('no ', '').replace('bad ', '').replace('worst ', '')
+                        tag = f"lowquality {tag}"
+                
+                formatted_tags.append(tag)
+            
+            # Join tags with standardized separator
+            return ', '.join(formatted_tags)
+            
+        except Exception as e:
+            logger.error(f"Caption formatting error: {str(e)}")
+            return caption  # Return original if formatting fails
+
     def __init__(
         self,
         tag_classes: Optional[Dict[str, Set[str]]] = None,
