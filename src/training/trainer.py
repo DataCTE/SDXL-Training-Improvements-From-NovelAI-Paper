@@ -416,6 +416,26 @@ class AverageMeter:
         return self._count
         # Lock will be recreated when needed via _get_lock()
 
+class MetricsManager:
+    """Fully process-safe metrics manager."""
+    def __init__(self):
+        self._manager = Manager()
+        self._metrics = self._manager.dict()
+    
+    def get_metric(self, name: str) -> AverageMeter:
+        if name not in self._metrics:
+            self._metrics[name] = AverageMeter(name=name)
+        return self._metrics[name]
+    
+    def update_metric(self, name: str, value: float, n: int = 1) -> None:
+        metric = self.get_metric(name)
+        metric.update(value, n)
+        self._metrics[name] = metric  # Update in shared dict
+    
+    def get_all_metrics(self) -> Dict[str, float]:
+        return {name: meter.avg for name, meter in dict(self._metrics).items()}
+
+
 def _log_optimizer_config(args):
     """Log optimizer configuration details."""
     logger.info(f"Optimizer settings:")
@@ -489,13 +509,23 @@ def initialize_training_components(args, device, dtype, models):
         # Create process-safe copies of models for the dataloader
         dataloader_models = {}
         for key in required_models:
-            if hasattr(models[key], 'state_dict'):
-                # For torch models, create a new instance
-                dataloader_models[key] = type(models[key])(**models[key].config)
-                dataloader_models[key].load_state_dict(models[key].state_dict())
+            model = models[key]
+            if hasattr(model, 'state_dict'):
+                if hasattr(model, 'config'):
+                    # Handle transformers models (like CLIPTextModel)
+                    if 'CLIPTextModel' in model.__class__.__name__:
+                        dataloader_models[key] = type(model)(config=model.config)
+                    # Handle VAE and other custom models
+                    else:
+                        dataloader_models[key] = type(model)(model.config)
+                else:
+                    # Handle models without config
+                    dataloader_models[key] = type(model)()
+                # Load state dict for all model types
+                dataloader_models[key].load_state_dict(model.state_dict())
             else:
                 # For tokenizers and other objects that don't need special handling
-                dataloader_models[key] = models[key]
+                dataloader_models[key] = model
             
         components["train_dataloader"] = create_dataloader(
             data_dir=args.data_dir,
@@ -604,25 +634,6 @@ def train_epoch(epoch: int, args, models, components, device, dtype, wandb_run, 
         # Clear cache after each epoch
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-
-class MetricsManager:
-    """Fully process-safe metrics manager."""
-    def __init__(self):
-        self._manager = Manager()
-        self._metrics = self._manager.dict()
-    
-    def get_metric(self, name: str) -> AverageMeter:
-        if name not in self._metrics:
-            self._metrics[name] = AverageMeter(name=name)
-        return self._metrics[name]
-    
-    def update_metric(self, name: str, value: float, n: int = 1) -> None:
-        metric = self.get_metric(name)
-        metric.update(value, n)
-        self._metrics[name] = metric  # Update in shared dict
-    
-    def get_all_metrics(self) -> Dict[str, float]:
-        return {name: meter.avg for name, meter in dict(self._metrics).items()}
 
 def train(args, models, components, device, dtype) -> Dict[str, float]:
     """Execute training steps with proper error handling."""
