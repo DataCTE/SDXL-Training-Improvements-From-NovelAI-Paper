@@ -7,6 +7,8 @@ from collections import defaultdict
 import numpy as np
 import re
 import math
+from concurrent.futures import ThreadPoolExecutor
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +22,8 @@ class TagBasedLossWeighter:
         emphasis_factor: float = 1.1,
         rarity_factor: float = 0.9,
         quality_bonus: float = 0.2,
-        character_emphasis: float = 1.2
+        character_emphasis: float = 1.2,
+        num_workers: Optional[int] = None
     ):
         """
         Initialize the tag-based loss weighting system with NovelAI improvements.
@@ -34,6 +37,7 @@ class TagBasedLossWeighter:
             rarity_factor (float): Multiplier for rare tags
             quality_bonus (float): Additional weight for high-quality images
             character_emphasis (float): Special multiplier for character tags
+            num_workers (int, optional): Number of worker threads for parallel processing
         """
         self.tag_classes = tag_classes or {
             'character': set(),  # Character-specific tags
@@ -69,6 +73,10 @@ class TagBasedLossWeighter:
         self.calculate_tag_weights = lru_cache(maxsize=cache_size)(self._calculate_tag_weights)
         self._tag_rarity_scores = {}
         self._tag_importance_scores = {}
+        
+        # Initialize worker pool
+        self.num_workers = num_workers if num_workers is not None else min(8, os.cpu_count() or 1)
+        self.executor = ThreadPoolExecutor(max_workers=self.num_workers)
     
     def _initialize_mappings(self):
         """Initialize tag mappings and importance scores"""
@@ -93,27 +101,69 @@ class TagBasedLossWeighter:
     def update_tag_statistics(self, batch_tags: List[List[str]]):
         """
         Update tag statistics with a batch of tags, including co-occurrence.
+        Uses parallel processing for large batches.
         
         Args:
             batch_tags (List[List[str]]): List of tag lists from a batch of images
         """
-        for tags in batch_tags:
+        def process_tag_list(tags):
+            result = {
+                'frequencies': defaultdict(lambda: defaultdict(int)),
+                'class_counts': defaultdict(int),
+                'cooccurrence': defaultdict(lambda: defaultdict(int))
+            }
+            
             # Update individual tag frequencies
             for tag in tags:
                 class_name = self._classify_tag(tag)
                 if class_name:
-                    self.tag_frequencies[class_name][tag] += 1
-                    self.class_total_counts[class_name] += 1
+                    result['frequencies'][class_name][tag] += 1
+                    result['class_counts'][class_name] += 1
             
             # Update co-occurrence matrix
             for i, tag1 in enumerate(tags):
                 for tag2 in tags[i+1:]:
-                    self.tag_cooccurrence[tag1][tag2] += 1
-                    self.tag_cooccurrence[tag2][tag1] += 1
+                    result['cooccurrence'][tag1][tag2] += 1
+                    result['cooccurrence'][tag2][tag1] += 1
+                    
+            return result
+
+        # Process tags in parallel for large batches
+        if len(batch_tags) > 100:  # Only parallelize for large batches
+            futures = []
+            chunk_size = max(1, len(batch_tags) // self.num_workers)
+            
+            for i in range(0, len(batch_tags), chunk_size):
+                chunk = batch_tags[i:i + chunk_size]
+                futures.extend([self.executor.submit(process_tag_list, tags) for tags in chunk])
+            
+            # Combine results
+            for future in futures:
+                result = future.result()
+                for class_name, tags in result['frequencies'].items():
+                    for tag, count in tags.items():
+                        self.tag_frequencies[class_name][tag] += count
+                for class_name, count in result['class_counts'].items():
+                    self.class_total_counts[class_name] += count
+                for tag1, coocs in result['cooccurrence'].items():
+                    for tag2, count in coocs.items():
+                        self.tag_cooccurrence[tag1][tag2] += count
+        else:
+            # Process sequentially for small batches
+            for tags in batch_tags:
+                result = process_tag_list(tags)
+                for class_name, tags in result['frequencies'].items():
+                    for tag, count in tags.items():
+                        self.tag_frequencies[class_name][tag] += count
+                for class_name, count in result['class_counts'].items():
+                    self.class_total_counts[class_name] += count
+                for tag1, coocs in result['cooccurrence'].items():
+                    for tag2, count in coocs.items():
+                        self.tag_cooccurrence[tag1][tag2] += count
         
         # Recalculate rarity scores
         self._update_rarity_scores()
-    
+
     def _update_rarity_scores(self):
         """Update tag rarity scores based on frequency distribution"""
         total_images = max(sum(self.class_total_counts.values()), 1)
@@ -198,6 +248,22 @@ class TagBasedLossWeighter:
             logger.error(f"Tag weight calculation failed: {str(e)}")
             return 1.0
     
+    def _calculate_batch_weights(self, batch_tags: List[List[str]]) -> List[float]:
+        """
+        Calculate weights for a batch of tag lists in parallel.
+        
+        Args:
+            batch_tags (List[List[str]]): List of tag lists to process
+            
+        Returns:
+            List[float]: List of calculated weights
+        """
+        if len(batch_tags) > 50:  # Only parallelize for larger batches
+            futures = [self.executor.submit(self._calculate_tag_weights, tuple(tags)) for tags in batch_tags]
+            return [future.result() for future in futures]
+        else:
+            return [self._calculate_tag_weights(tuple(tags)) for tags in batch_tags]
+
     def parse_tags(self, caption: str) -> Tuple[List[str], Dict[str, any]]:
         """
         Parse caption into tags and special tags with improved Midjourney compatibility.
@@ -428,3 +494,8 @@ class TagBasedLossWeighter:
         # Clear caches
         self.calculate_tag_weights.cache_clear()
         self._classify_tag.cache_clear()
+
+    def __del__(self):
+        """Cleanup worker pool on deletion"""
+        if hasattr(self, 'executor'):
+            self.executor.shutdown(wait=True)

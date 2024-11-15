@@ -19,6 +19,8 @@ import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import gc
 from .tag_weighter import TagBasedLossWeighter
+from multiprocessing import Process, Queue
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -34,23 +36,18 @@ class CustomDataset(Dataset):
                  finetune_vae=False, vae_learning_rate=1e-6, vae_train_freq=10,
                  adaptive_loss_scale=False, kl_weight=0.0, perceptual_weight=0.0,
                  **kwargs):
-        """
-        Enhanced dataset initialization with NovelAI improvements and all command line parameters
-
-        Args:
-            min_size (int): Minimum allowed image dimension (height or width)
-            max_size (int): Maximum allowed image dimension (height or width)
-            bucket_reso_steps (int): Resolution step size for bucket creation
-                                   Buckets will be created at intervals of this value
-                                   between min_size and max_size
-        """
         super().__init__()
         
         # Basic initialization
-        self.data_dir = Path(data_dir)
-        self.cache_dir = Path(cache_dir)
+        self.data_dir = data_dir
+        self.vae = vae
+        self.cache_dir = cache_dir
         self.no_caching_latents = no_caching_latents
         self.all_ar = all_ar
+        
+        # Use provided num_workers or system default
+        self.num_workers = num_workers if num_workers is not None else min(8, os.cpu_count() or 1)
+        self.batch_size = 32  # Process images in batches
         
         # Resolution and bucketing parameters
         self.min_size = min_size
@@ -77,7 +74,6 @@ class CustomDataset(Dataset):
         self.caption_dropout_rate = caption_dropout_rate
         
         # Model components
-        self.vae = vae
         self.tokenizer = tokenizer
         self.tokenizer_2 = tokenizer_2
         self.text_encoder = text_encoder
@@ -95,7 +91,6 @@ class CustomDataset(Dataset):
             logger.info("Skipping upscaler initialization since all_ar is enabled")
         
         # Performance optimization
-        self.num_workers = num_workers if num_workers is not None else min(8, os.cpu_count() or 1)
         self.prefetch_factor = prefetch_factor
         
         # Create cache directory
@@ -122,7 +117,132 @@ class CustomDataset(Dataset):
             min_weight=min_tag_weight,
             max_weight=max_tag_weight
         )
+        
+        # Initialize multiprocessing components
+        self.process_pool = None
+        self.task_queue = None
+        self.result_queue = None
+        self.workers = []
+        self.cache_lock = threading.Lock()
+        self.latent_cache = {}
+        
+        # Start worker processes
+        self._initialize_workers()
+        
+    def _initialize_workers(self):
+        """Initialize worker processes for parallel processing"""
+        if self.process_pool is not None:
+            return
+            
+        logger.info(f"Initializing {self.num_workers} worker processes for latent validation")
+            
+        # Create queues for task distribution
+        self.task_queue = Queue()
+        self.result_queue = Queue()
+        
+        # Start worker processes
+        self.process_pool = []
+        for _ in range(self.num_workers):
+            p = Process(target=self._worker_process, 
+                       args=(self.task_queue, self.result_queue))
+            p.daemon = True
+            p.start()
+            self.process_pool.append(p)
+            
+    def _worker_process(self, task_queue, result_queue):
+        """Worker process function for parallel processing"""
+        try:
+            # Initialize worker's VAE copy
+            if torch.cuda.is_available():
+                device = f'cuda:{torch.cuda.current_device()}'
+            else:
+                device = 'cpu'
+                
+            while True:
+                try:
+                    # Get batch of images to process
+                    batch_paths = task_queue.get()
+                    if batch_paths is None:  # Poison pill
+                        break
+                        
+                    batch_results = {}
+                    batch_images = []
+                    
+                    # Load images
+                    for path in batch_paths:
+                        try:
+                            image = self.load_and_transform_image(path)
+                            if image is not None:
+                                batch_images.append((path, image))
+                        except Exception as e:
+                            logger.warning(f"Worker failed to load {path}: {str(e)}")
+                    
+                    if not batch_images:
+                        continue
+                    
+                    # Process batch through VAE
+                    try:
+                        with torch.no_grad():
+                            batch_tensor = torch.stack([img for _, img in batch_images])
+                            batch_tensor = batch_tensor.to(device)
+                            
+                            with torch.cuda.amp.autocast(enabled=True):
+                                latents = self.vae.encode(batch_tensor).latent_dist.sample()
+                            
+                            # Store results
+                            for idx, (path, _) in enumerate(batch_images):
+                                if idx < len(latents):
+                                    batch_results[path] = latents[idx].shape
+                                    
+                    except Exception as e:
+                        logger.warning(f"Worker batch processing failed: {str(e)}")
+                        
+                    # Send results back
+                    result_queue.put(batch_results)
+                    
+                except Exception as e:
+                    logger.error(f"Worker process error: {str(e)}")
+                    continue
+                    
+        except Exception as e:
+            logger.error(f"Fatal worker error: {str(e)}")
+            logger.error(traceback.format_exc())
 
+    def validate_and_cache_latents(self, image_paths):
+        """Validate latent dimensions for a batch of images using multiple workers"""
+        uncached_paths = [p for p in image_paths if p not in self.latent_cache]
+        if not uncached_paths:
+            return
+            
+        # Split work into batches
+        batches = [uncached_paths[i:i + self.batch_size] 
+                  for i in range(0, len(uncached_paths), self.batch_size)]
+        
+        # Submit batches to workers
+        for batch in batches:
+            self.task_queue.put(batch)
+            
+        # Collect results
+        results = {}
+        for _ in range(len(batches)):
+            batch_results = self.result_queue.get()
+            with self.cache_lock:
+                self.latent_cache.update(batch_results)
+                
+        # Clear GPU memory
+        torch.cuda.empty_cache()
+        
+    def __del__(self):
+        """Cleanup worker processes"""
+        if self.process_pool:
+            # Send poison pills to workers
+            for _ in range(self.num_workers):
+                self.task_queue.put(None)
+            
+            # Wait for workers to finish
+            for p in self.process_pool:
+                p.join()
+                
     def __len__(self):
         """Return the total number of images in the dataset"""
         return len(self.image_paths)
@@ -205,8 +325,7 @@ class CustomDataset(Dataset):
         Parallel image preprocessing with more robust error handling
         Uses ThreadPoolExecutor for I/O-bound tasks
         """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        
+        from concurrent.futures import ThreadPoolExecutor
         def safe_process_image(img_path):
             try:
                 with Image.open(img_path) as image:
@@ -262,78 +381,8 @@ class CustomDataset(Dataset):
         
         logger.info(f"Preprocessing complete: {len(processed_images)} images processed")
 
-    def _validate_cached_latent(self, latent_path, img_path):
-        """Validate cached latent file integrity and correctness"""
-        try:
-            if not latent_path.exists():
-                return False
-                
-            # Quick size check first (faster than loading)
-            if latent_path.stat().st_size < 1000:  # Minimum expected size
-                logger.warning(f"Cached latent too small for {img_path}, will regenerate")
-                return False
-            
-            # Load and validate cache structure
-            cache_data = torch.load(latent_path, map_location="cpu")
-            
-            # Check required keys
-            required_keys = ["latents", "text_embeddings", "text_embeddings_2", "added_cond_kwargs"]
-            if not all(k in cache_data for k in required_keys):
-                logger.warning(f"Cached latent missing required keys for {img_path}, will regenerate")
-                return False
-                
-            # Validate shapes
-            latents = cache_data["latents"]
-            if not isinstance(latents, torch.Tensor):
-                logger.warning(f"Invalid latent type for {img_path}, will regenerate")
-                return False
-                
-            if len(latents.shape) != 3 or latents.shape[0] != 4:  # SDXL latent shape
-                logger.warning(f"Invalid latent shape for {img_path}, will regenerate")
-                return False
-                
-            # Check if the cached latent matches current image
-            with Image.open(img_path) as img:
-                width, height = img.size
-                expected_latent_height = ((height + 7) // 8)
-                expected_latent_width = ((width + 7) // 8)
-                
-                if latents.shape[1:] != (expected_latent_height, expected_latent_width):
-                    logger.warning(f"Latent dimensions mismatch for {img_path}, will regenerate")
-                    return False
-            
-            # Validate text embeddings
-            if not isinstance(cache_data["text_embeddings"], torch.Tensor):
-                logger.warning(f"Invalid text embeddings type for {img_path}, will regenerate")
-                return False
-                
-            # Check if caption has changed
-            caption_path = Path(img_path).with_suffix('.txt')
-            with open(caption_path, 'r', encoding='utf-8') as f:
-                current_caption = f.read().strip()
-            
-            # Tokenize current caption
-            current_tokens = self.tokenizer(
-                current_caption,
-                padding="max_length",
-                max_length=self.tokenizer.model_max_length,
-                truncation=True,
-                return_tensors="pt"
-            ).input_ids
-            
-            # Compare with cached embeddings shape
-            if cache_data["text_embeddings"].shape[1] != current_tokens.shape[1]:
-                logger.warning(f"Caption length mismatch for {img_path}, will regenerate")
-                return False
-            
-            return True
-            
-        except Exception as e:
-            logger.warning(f"Error validating cached latent for {img_path}: {str(e)}")
-            return False
-
     def _batch_process_latents_efficient(self, batch_size=32):
-        """Process and cache latents in batches using multiple workers and memory-efficient processing"""
+        """Process and cache latents in batches using multiple workers"""
         # First validate all cached latents
         uncached_images = []
         for img_path, lat_path in zip(self.image_paths, self.latent_paths):
@@ -544,6 +593,72 @@ class CustomDataset(Dataset):
         except Exception as e:
             logger.error(f"Batch processing error: {str(e)}")
             logger.error(traceback.format_exc())
+
+    def validate_and_cache_latents(self, image_paths):
+        """Validate latent dimensions for a batch of images efficiently"""
+        uncached_paths = [p for p in image_paths if p not in self.latent_cache]
+        if not uncached_paths:
+            return
+            
+        # Process in batches
+        for i in range(0, len(uncached_paths), self.batch_size):
+            batch_paths = uncached_paths[i:i + self.batch_size]
+            batch_images = []
+            
+            # Load images in parallel using ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+                batch_images = list(executor.map(self.load_and_transform_image, batch_paths))
+            
+            # Process batch through VAE encoder
+            with torch.no_grad():
+                batch_tensor = torch.stack([img for img in batch_images if img is not None])
+                if len(batch_tensor) == 0:
+                    continue
+                    
+                batch_tensor = batch_tensor.to(self.vae.device)
+                try:
+                    # Encode in mixed precision if available
+                    with torch.cuda.amp.autocast(enabled=True):
+                        latents = self.vae.encode(batch_tensor).latent_dist.sample()
+                    
+                    # Cache results
+                    for idx, path in enumerate(batch_paths):
+                        if idx < len(latents):
+                            self.latent_cache[path] = latents[idx].shape
+                            
+                except Exception as e:
+                    logger.warning(f"Batch encoding failed: {str(e)}")
+                    # Fall back to individual processing
+                    for path, img in zip(batch_paths, batch_images):
+                        if img is not None:
+                            try:
+                                with torch.cuda.amp.autocast(enabled=True):
+                                    latent = self.vae.encode(img.unsqueeze(0).to(self.vae.device)).latent_dist.sample()
+                                self.latent_cache[path] = latent.shape
+                            except Exception as e:
+                                logger.warning(f"Failed to process {path}: {str(e)}")
+                                
+                # Clear GPU memory
+                torch.cuda.empty_cache()
+                
+    def check_latent_dimensions(self, image_path):
+        """Check if image has correct latent dimensions using cache"""
+        if image_path in self.latent_cache:
+            return self.latent_cache[image_path] == self.expected_latent_shape
+            
+        # If not in cache, queue for batch processing
+        self.validate_and_cache_latents([image_path])
+        return self.latent_cache.get(image_path, None) == self.expected_latent_shape
+
+    def load_and_transform_image(self, image_path):
+        """Load and transform image for VAE encoding"""
+        try:
+            image = Image.open(image_path).convert('RGB')
+            image = self.transform(image)
+            return image
+        except Exception as e:
+            logger.warning(f"Failed to load image {image_path}: {str(e)}")
+            return None
 
     def _parse_tags(self, caption):
         """Parse tags using tag weighter"""
