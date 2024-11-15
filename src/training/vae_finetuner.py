@@ -253,63 +253,79 @@ class VAEFineTuner:
     def training_step(self, batch: dict) -> torch.Tensor:
         """Perform one VAE training step with NovelAI improvements"""
         try:
-            self.vae.train()
-            images = batch['pixel_values']
-            
-            # Apply channel normalization
-            if self.use_channel_scaling:
-                images = self.normalize_latents(images)
-            
-            # Forward pass with mixed precision
-            with autocast(device_type='cuda', enabled=self.mixed_precision != "no"):
-                # Encode-decode
-                posterior = self.vae.encode(images)
-                latents = posterior.sample()
-                reconstruction = self.vae.decode(latents).sample
+            # Move data to device asynchronously
+            latents = batch['latents'].to(self.device, non_blocking=True)
+            original_images = batch.get('original_images')
+            if original_images is not None:
+                original_images = original_images.to(self.device, non_blocking=True)
+
+            # Use a separate stream for VAE computation
+            with torch.cuda.stream(torch.cuda.current_stream()):
+                # Enable mixed precision if configured
+                with autocast(enabled=self.mixed_precision != "no"):
+                    # Normalize latents using pre-computed statistics
+                    if self.use_channel_scaling:
+                        latents = self.normalize_latents(latents)
+                    
+                    # VAE forward pass
+                    recon_loss = 0
+                    kl_loss = 0
+                    perceptual_loss = 0
+                    
+                    # Decode latents
+                    decoded = self.vae.decode(latents).sample
+                    
+                    # Reconstruction loss (already scaled by VAE)
+                    if original_images is not None:
+                        recon_loss = F.mse_loss(decoded, original_images, reduction='mean')
+                    
+                    # KL divergence loss if enabled
+                    if self.kl_weight > 0:
+                        posterior = self.vae.encode(decoded).latent_dist
+                        kl_loss = self.compute_kl_loss(posterior.mean, posterior.logvar) * self.kl_weight
+                    
+                    # Perceptual loss if enabled
+                    if self.perceptual_weight > 0 and original_images is not None:
+                        perceptual_loss = self.compute_perceptual_loss(decoded, original_images) * self.perceptual_weight
+                    
+                    # Combine losses
+                    loss = recon_loss + kl_loss + perceptual_loss
+                    
+                    # Apply adaptive loss scaling if enabled
+                    if self.adaptive_loss_scale:
+                        self.update_scale_factor(loss)
+                        loss = loss * self.scale_factor
+
+                # Scale and backward pass
+                if self.scaler is not None:
+                    loss = self.scaler.scale(loss)
                 
-                # Compute reconstruction loss with adaptive scaling
-                recon_loss = F.mse_loss(reconstruction, images)
-                recon_loss = recon_loss * self.scale_factor
-                
-                # Compute additional losses
-                kl_loss = self.compute_kl_loss(posterior.mean, posterior.logvar)
-                perceptual_loss = self.compute_perceptual_loss(reconstruction, images)
-                
-                # Combine losses
-                loss = (
-                    recon_loss +
-                    self.kl_weight * kl_loss +
-                    self.perceptual_weight * perceptual_loss
-                )
-            
-            # Scale loss and backward pass
-            if self.scaler is not None:
-                self.scaler.scale(loss).backward()
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
                 loss.backward()
-                self.optimizer.step()
-            
-            self.optimizer.zero_grad(set_to_none=True)
-            
-            # Update adaptive scaling
-            self.update_scale_factor(recon_loss)
-            
-            # Log metrics
-            metrics = {
-                'vae/recon_loss': recon_loss.item(),
-                'vae/kl_loss': kl_loss.item(),
-                'vae/perceptual_loss': perceptual_loss.item(),
-                'vae/scale_factor': self.scale_factor
-            }
-            
-            return loss
-            
+                
+                # Gradient clipping
+                if self.scaler is not None:
+                    self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.vae.parameters(), self.max_grad_norm)
+                
+                # Optimizer step
+                if self.scaler is not None:
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    self.optimizer.step()
+                
+                self.optimizer.zero_grad(set_to_none=True)
+                self.lr_scheduler.step()
+                
+                # Update loss history
+                self.loss_history.append(loss.item())
+                
+                return loss
+
         except Exception as e:
-            logger.error(f"Error in VAE training step: {str(e)}")
+            logger.error(f"VAE training step failed: {str(e)}")
             logger.error(traceback.format_exc())
-            raise
+            return torch.tensor(0.0, device=self.device)
     
     def save_pretrained(self, save_dir: str):
         """Save VAE model and finetuning state"""

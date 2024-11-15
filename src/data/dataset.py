@@ -24,10 +24,11 @@ logger = logging.getLogger(__name__)
 
 class CustomDataset(Dataset):
     def __init__(self, data_dir, vae=None, tokenizer=None, tokenizer_2=None, text_encoder=None, text_encoder_2=None,
-                 cache_dir="latents_cache", no_caching_latents=False, all_ar=False, max_dimension=2048,
-                 num_workers=None, prefetch_factor=2, min_size=512, max_size=2048,
+                 cache_dir="latents_cache", no_caching_latents=False, all_ar=False,
+                 num_workers=None, prefetch_factor=2,
                  resolution_type="square", enable_bucket_sampler=True,
-                 bucket_reso_steps=64, min_bucket_reso=256, max_bucket_reso=2048,
+                 min_size=512, max_size=2048,  # Global min/max image dimensions
+                 bucket_reso_steps=64,  # Resolution steps for bucketing
                  token_dropout_rate=0.1, caption_dropout_rate=0.1,
                  min_tag_weight=0.1, max_tag_weight=3.0, use_tag_weighting=True,
                  finetune_vae=False, vae_learning_rate=1e-6, vae_train_freq=10,
@@ -35,6 +36,13 @@ class CustomDataset(Dataset):
                  **kwargs):
         """
         Enhanced dataset initialization with NovelAI improvements and all command line parameters
+
+        Args:
+            min_size (int): Minimum allowed image dimension (height or width)
+            max_size (int): Maximum allowed image dimension (height or width)
+            bucket_reso_steps (int): Resolution step size for bucket creation
+                                   Buckets will be created at intervals of this value
+                                   between min_size and max_size
         """
         super().__init__()
         
@@ -50,8 +58,6 @@ class CustomDataset(Dataset):
         self.resolution_type = resolution_type
         self.enable_bucket_sampler = enable_bucket_sampler
         self.bucket_reso_steps = bucket_reso_steps
-        self.min_bucket_reso = min_bucket_reso
-        self.max_bucket_reso = max_bucket_reso
         
         # Tag weighting parameters
         self.min_tag_weight = min_tag_weight
@@ -819,11 +825,11 @@ class CustomDataset(Dataset):
             
             # Round to nearest step while preserving aspect ratio
             if h > w:
-                bucket_w = max(self.min_bucket_reso, round(w / w_step) * w_step)
-                bucket_h = max(self.min_bucket_reso, round(h / h_step) * h_step)
+                bucket_w = max(self.min_size, round(w / w_step) * w_step)
+                bucket_h = max(self.min_size, round(h / h_step) * h_step)
             else:
-                bucket_h = max(self.min_bucket_reso, round(h / h_step) * h_step)
-                bucket_w = max(self.min_bucket_reso, round(w / w_step) * w_step)
+                bucket_h = max(self.min_size, round(h / h_step) * h_step)
+                bucket_w = max(self.min_size, round(w / w_step) * w_step)
             
             size_groups[(bucket_h, bucket_w)].append((h, w))
         

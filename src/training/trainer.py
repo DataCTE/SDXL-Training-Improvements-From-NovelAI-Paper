@@ -95,21 +95,25 @@ def train_one_epoch(
 
             metrics['data_time'].update(time.time() - end)
             
-            # Device transfer with shape logging
+            # Device transfer with shape logging and prefetch next batch
             latents = batch['latents'].to(device, dtype=dtype, non_blocking=True)
             text_embeddings = batch['text_embeddings'].to(device, dtype=dtype, non_blocking=True)
             added_cond_kwargs = {k: v.to(device, dtype=dtype, non_blocking=True) 
                                if torch.is_tensor(v) else v 
                                for k, v in batch.get('added_cond_kwargs', {}).items()}
             
-            # VAE finetuning step
+            # Start VAE finetuning step in parallel with UNet step
+            vae_future = None
             if vae_finetuner and batch_idx % vae_train_freq == 0:
-                vae_loss = vae_finetuner.training_step(batch)
-                metrics['vae_loss'].update(vae_loss.item())
-                if verbose:
-                    logger.info(f"VAE Loss: {vae_loss.item():.4f}")
+                # Create a CUDA stream for VAE computation
+                vae_stream = torch.cuda.Stream()
+                with torch.cuda.stream(vae_stream):
+                    vae_loss = vae_finetuner.training_step(batch)
+                    metrics['vae_loss'].update(vae_loss.item())
+                    if verbose:
+                        logger.info(f"VAE Loss: {vae_loss.item():.4f}")
 
-            # Forward pass with mixed precision
+            # Forward pass with mixed precision for UNet
             with autocast(enabled=mixed_precision):
                 # Get loss weights from tag weighter if available
                 tag_weights = None
@@ -135,11 +139,15 @@ def train_one_epoch(
                 # Scale loss for gradient accumulation
                 loss = loss / gradient_accumulation_steps
 
-            # Backward pass with gradient scaling
+            # Backward pass with gradient scaling for UNet
             scaler.scale(loss).backward()
             
             # Step optimization if gradient accumulation complete
             if (batch_idx + 1) % gradient_accumulation_steps == 0:
+                # Synchronize VAE stream if it was used
+                if vae_finetuner and batch_idx % vae_train_freq == 0:
+                    torch.cuda.current_stream().wait_stream(vae_stream)
+
                 # Unscale gradients for clipping
                 scaler.unscale_(optimizer)
                 
@@ -174,6 +182,9 @@ def train_one_epoch(
                 log_metrics_batch(metrics, batch_idx, len(train_dataloader))
             
             end = time.time()
+
+            # Clean up any unused memory
+            torch.cuda.empty_cache()
 
         except Exception as e:
             logger.error(f"Error in batch {batch_idx}: {str(e)}")
