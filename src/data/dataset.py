@@ -422,24 +422,28 @@ class CustomDataset(CustomDatasetBase):
             logger.info(f"Created {len(bucket_data)} unique size buckets for all_ar mode")
 
     def _validate_and_process_chunk(self, image_paths, process_ar=False, cache_latents=True):
-        """Validate and process a chunk of images"""
+        """Validate and process a chunk of images using multiple threads"""
+        from concurrent.futures import ThreadPoolExecutor
+        from functools import partial
+        
         valid_paths = []
         bucket_data = defaultdict(list) if process_ar else None
         
-        for path in image_paths:
+        def validate_single_image(path, process_ar=False):
+            """Process a single image with all validation checks"""
             try:
-                # Check if caption file exists
+                # Check caption file
                 caption_path = path.with_suffix('.txt')
                 if not caption_path.exists():
                     logger.warning(f"Skipping {path}: No caption file")
-                    continue
+                    return None
                     
                 # Validate image
                 with Image.open(path) as img:
                     # Check image mode
                     if img.mode not in ['RGB', 'RGBA']:
                         logger.warning(f"Skipping {path}: Invalid mode {img.mode}")
-                        continue
+                        return None
                         
                     # Get dimensions
                     width, height = img.size
@@ -448,57 +452,75 @@ class CustomDataset(CustomDatasetBase):
                     if self.all_ar:
                         if width < 256 or height < 256:
                             logger.warning(f"Skipping {path}: Image too small ({width}x{height})")
-                            continue
+                            return None
                     else:
                         # Regular validation for non-all_ar mode
                         if width < 256 or height < 256:
                             logger.warning(f"Skipping {path}: Image too small ({width}x{height})")
-                            continue
+                            return None
                         if width > 4096 or height > 4096:
                             logger.warning(f"Skipping {path}: Image too large ({width}x{height})")
-                            continue
+                            return None
                         
                     # Check if image is corrupted
                     try:
                         img.load()
                     except Exception as e:
                         logger.warning(f"Skipping {path}: Corrupted image - {str(e)}")
-                        continue
+                        return None
                     
-                    # Process for all_ar if enabled
+                    # Return validation result
                     if process_ar:
-                        bucket = (height, width)
-                        bucket_data[bucket].append(path)
-                        
-                    # Create latent cache if enabled
-                    if cache_latents:
-                        cache_path = Path(str(path).replace(str(self.data_dir), str(self.cache_dir)))
-                        cache_path = cache_path.with_suffix('.pt')
-                        cache_path.parent.mkdir(parents=True, exist_ok=True)
-                
-                # All checks passed
-                valid_paths.append(path)
-                
+                        return (path, (height, width))
+                    return path
+                    
             except Exception as e:
                 logger.warning(f"Skipping {path}: {str(e)}")
-                continue
+                return None
+        
+        # Calculate optimal chunk size and number of workers
+        chunk_size = max(1, len(image_paths) // (self.num_workers * 4))
+        num_workers = min(self.num_workers, len(image_paths))
+        
+        # Process images in parallel
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            # Create partial function with fixed arguments
+            validate_fn = partial(validate_single_image, 
+                                process_ar=process_ar)
+            
+            # Process all images
+            results = list(executor.map(validate_fn, image_paths, chunksize=chunk_size))
+            
+            # Filter out None results and organize data
+            for result in results:
+                if result is not None:
+                    if process_ar:
+                        path, bucket = result
+                        valid_paths.append(path)
+                        bucket_data[bucket].append(path)
+                    else:
+                        valid_paths.append(result)
         
         if process_ar:
             return valid_paths, bucket_data
         return valid_paths
-        
+
     def _validate_image_chunk(self, img_paths):
-        """Validate a chunk of images with improved error handling and flag support"""
+        """Validate a chunk of images with multi-threading support"""
+        from concurrent.futures import ThreadPoolExecutor
+        from functools import partial
+        
         valid_paths = []
         bucket_data = defaultdict(list) if self.all_ar else None
         
-        for img_path in img_paths:
+        def validate_single_image(img_path):
+            """Process a single image with all validation checks"""
             try:
                 # Check caption file
                 caption_path = img_path.with_suffix('.txt')
                 if not caption_path.exists():
                     logger.warning(f"Skipping {img_path}: No caption file")
-                    continue
+                    return None
                     
                 # Validate image
                 with Image.open(img_path) as img:
@@ -510,10 +532,7 @@ class CustomDataset(CustomDatasetBase):
                     
                     # If all_ar is True, store in bucket and accept all sizes
                     if self.all_ar:
-                        bucket = (height, width)
-                        bucket_data[bucket].append(img_path)
-                        valid_paths.append(img_path)
-                        continue
+                        return (img_path, (height, width))
                     
                     # Basic validation
                     if width < self.min_size or height < self.min_size:
@@ -527,33 +546,50 @@ class CustomDataset(CustomDatasetBase):
                     aspect_ratio = width / height
                     if self.resolution_type == "square" and not 0.95 <= aspect_ratio <= 1.05:
                         logger.warning(f"Skipping {img_path}: Not square ({aspect_ratio:.2f})")
-                        continue
+                        return None
                     elif self.resolution_type == "portrait" and aspect_ratio >= 1:
                         logger.warning(f"Skipping {img_path}: Not portrait ({aspect_ratio:.2f})")
-                        continue
+                        return None
                     elif self.resolution_type == "landscape" and aspect_ratio <= 1:
                         logger.warning(f"Skipping {img_path}: Not landscape ({aspect_ratio:.2f})")
-                        continue
+                        return None
                     
-                    # Create latent cache if enabled
+                    # Handle latent caching
                     if not self.no_caching_latents:
                         cache_path = Path(str(img_path).replace(str(self.data_dir), str(self.cache_dir)))
                         cache_path = cache_path.with_suffix('.pt')
                         cache_path.parent.mkdir(parents=True, exist_ok=True)
                         
-                        # Pre-compute latents if not exists
                         if not cache_path.exists() and hasattr(self, 'vae'):
                             try:
                                 self._precompute_latents(img_path, cache_path, img)
                             except Exception as e:
                                 logger.warning(f"Failed to precompute latents for {img_path}: {str(e)}")
-                                # Continue anyway as we can compute latents on-the-fly
                     
-                    valid_paths.append(img_path)
+                    return img_path
                     
             except Exception as e:
                 logger.warning(f"Skipping {img_path}: {str(e)}")
-                continue
+                return None
+        
+        # Calculate optimal chunk size and number of workers
+        chunk_size = max(1, len(img_paths) // (self.num_workers * 4))
+        num_workers = min(self.num_workers, len(img_paths))
+        
+        # Process images in parallel
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            # Process all images
+            results = list(executor.map(validate_single_image, img_paths, chunksize=chunk_size))
+            
+            # Filter out None results and organize data
+            for result in results:
+                if result is not None:
+                    if self.all_ar:
+                        path, bucket = result
+                        valid_paths.append(path)
+                        bucket_data[bucket].append(path)
+                    else:
+                        valid_paths.append(result)
         
         if self.all_ar:
             return valid_paths, bucket_data
