@@ -18,7 +18,7 @@ from utils.validation import validate_image_dimensions
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import gc
-from tag_weighter import TagBasedLossWeighter
+from .tag_weighter import TagBasedLossWeighter
 
 logger = logging.getLogger(__name__)
 
