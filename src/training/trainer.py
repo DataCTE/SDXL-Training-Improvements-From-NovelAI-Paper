@@ -124,7 +124,6 @@ def train_one_epoch(
                                for k, v in batch.get('added_cond_kwargs', {}).items()}
             
             # Start VAE finetuning step in parallel with UNet step
-            vae_future = None
             if vae_finetuner and batch_idx % vae_train_freq == 0:
                 # Create a CUDA stream for VAE computation
                 vae_stream = torch.cuda.Stream()
