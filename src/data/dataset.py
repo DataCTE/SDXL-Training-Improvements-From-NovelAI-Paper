@@ -328,7 +328,7 @@ class CustomDataset(CustomDatasetBase):
             self.task_queue.put(batch)
             
         # Collect results
-        results = {}
+       
         for _ in range(len(batches)):
             batch_results = self.result_queue.get()
             with self.cache_lock:
@@ -925,43 +925,53 @@ class CustomDataset(CustomDatasetBase):
         return stats
 
     def _get_target_size(self, width, height):
-        """Calculate target size preserving aspect ratio without upper limits"""
-        aspect_ratio = height / width
+        """Calculate target size preserving aspect ratio with all_ar support"""
+        if self.all_ar:
+            # In all_ar mode, just round to bucket steps if needed
+            if self.bucket_reso_steps > 1:
+                target_width = int(round(width / self.bucket_reso_steps) * self.bucket_reso_steps)
+                target_height = int(round(height / self.bucket_reso_steps) * self.bucket_reso_steps)
+                return max(target_width, self.min_size), max(target_height, self.min_size)
+            return width, height
 
-        # For extreme aspect ratios, we'll preserve them while keeping reasonable dimensions
+        # Standard processing for non-all_ar mode
+        aspect_ratio = height / width
         if aspect_ratio > 1:  # Portrait
-            # Start with target width and calculate height to maintain AR
-            target_width = 1024  # Base width for portrait
+            target_width = 1024
             target_height = int(round(target_width * aspect_ratio / self.bucket_reso_steps) * self.bucket_reso_steps)
         else:  # Landscape
-            # Start with target height and calculate width to maintain AR
-            target_height = 1024  # Base height for landscape
+            target_height = 1024
             target_width = int(round(target_height / aspect_ratio / self.bucket_reso_steps) * self.bucket_reso_steps)
 
-        # Scale down if needed while preserving AR
+        # Scale down if needed
         max_dim = max(target_width, target_height)
-        if max_dim > 2048:  # Only scale down if absolutely necessary
+        if max_dim > 2048:
             scale = 2048 / max_dim
             target_width = int(round(target_width * scale / self.bucket_reso_steps) * self.bucket_reso_steps)
             target_height = int(round(target_height * scale / self.bucket_reso_steps) * self.bucket_reso_steps)
 
-        # Ensure minimum dimensions
-        target_width = max(target_width, self.min_size)
-        target_height = max(target_height, self.min_size)
-
-        return target_width, target_height
+        return max(target_width, self.min_size), max(target_height, self.min_size)
 
     def process_image_size(self, image, target_width, target_height):
-        """Process image size with advanced resizing"""
+        """Multi-threaded image processing with all_ar support"""
         width, height = image.size
         
-        # Get target size considering aspect ratio constraints
+        if self.all_ar:
+            # Minimal processing for all_ar mode
+            if width < self.min_size or height < self.min_size:
+                scale = max(self.min_size / width, self.min_size / height)
+                new_width = int(round(width * scale / self.bucket_reso_steps) * self.bucket_reso_steps)
+                new_height = int(round(height * scale / self.bucket_reso_steps) * self.bucket_reso_steps)
+                return image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            return image
+
+        # Get target size for non-all_ar mode
         target_width, target_height = self._get_target_size(width, height)
         
-        # Resize to target size using LANCZOS resampling for better quality
+        # Only resize if dimensions differ
         if width != target_width or height != target_height:
-            image = image.resize((target_width, target_height), Image.Resampling.LANCZOS)
-                
+            return image.resize((target_width, target_height), Image.Resampling.LANCZOS)
+        
         return image
 
     def _upscale_image(self, image, target_width, target_height):
