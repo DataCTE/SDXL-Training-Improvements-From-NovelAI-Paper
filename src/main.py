@@ -225,12 +225,7 @@ def main(args):
                 model.to(device=device, dtype=dtype)
                 # Only enable gradient checkpointing for UNet
                 if args.gradient_checkpointing and model_name == "unet":
-                    if hasattr(model, 'enable_gradient_checkpointing'):
-                        model.enable_gradient_checkpointing()
-                    else:
-                        # For newer diffusers versions
-                        model.enable_gradient_checkpointing()
-                        model.set_gradient_checkpointing(value=True)
+                    model.enable_gradient_checkpointing()
         
         # Setup data loader first since we need it for lr_scheduler
         train_dataloader = create_dataloader(

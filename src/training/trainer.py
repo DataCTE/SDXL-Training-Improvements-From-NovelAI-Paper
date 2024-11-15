@@ -74,9 +74,7 @@ def train_one_epoch(
     
     # Enable gradient checkpointing if requested
     if use_gradient_checkpointing:
-        model.gradient_checkpointing_enable()
-    else:
-        model.gradient_checkpointing_disable()
+        model.enable_gradient_checkpointing()
     
     # Use passed scaler or create new one if none provided
     if scaler is None and mixed_precision:
