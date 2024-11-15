@@ -46,12 +46,12 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     lr_scheduler: torch.optim.lr_scheduler._LRScheduler,
     train_dataloader: torch.utils.data.DataLoader,
+    device: torch.device,
+    dtype: torch.dtype,
+    tag_weighter: Optional[Any],
     use_gradient_checkpointing: bool = True,
     use_amp: bool = True,
     use_cpu_offload: bool = False,
-    tag_weighter: Optional[Any],
-    device: torch.device,
-    dtype: torch.dtype,
     gradient_accumulation_steps: int = 1,
     max_grad_norm: float = 1.0,
     mixed_precision: bool = True,
@@ -70,7 +70,21 @@ def train_one_epoch(
 ) -> Tuple[float, Dict[str, float]]:
     """Train the model for one epoch with improved v-prediction, ZTSNR, VAE finetuning and EMA support"""
     model.train()
-    scaler = GradScaler(enabled=mixed_precision)
+    
+    # Enable gradient checkpointing if requested
+    if use_gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+    else:
+        model.gradient_checkpointing_disable()
+    
+    # Initialize scaler based on amp setting
+    scaler = GradScaler(enabled=use_amp and mixed_precision)
+    
+    # Handle CPU offload if enabled
+    if use_cpu_offload:
+        model.to('cpu')
+        optimizer.to('cpu')
+    
     metrics = {
         'batch_time': AverageMeter('Batch Time', ':6.3f'),
         'data_time': AverageMeter('Data Loading Time', ':6.3f'),
@@ -87,6 +101,10 @@ def train_one_epoch(
     
     for batch_idx, batch in enumerate(train_dataloader):
         try:
+            # Move model to device for current batch if using CPU offload
+            if use_cpu_offload:
+                model.to(device)
+                
             # Log input tensor shapes and bucket information
             if verbose:
                 logger.info(f"\nBatch {batch_idx}/{len(train_dataloader)}:")
@@ -188,6 +206,10 @@ def train_one_epoch(
 
             # Clean up any unused memory
             torch.cuda.empty_cache()
+
+            # Move model back to CPU if using CPU offload
+            if use_cpu_offload:
+                model.to('cpu')
 
         except Exception as e:
             logger.error(f"Error in batch {batch_idx}: {str(e)}")

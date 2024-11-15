@@ -12,6 +12,10 @@ import os
 
 logger = logging.getLogger(__name__)
 
+def _default_zero():
+    """Default function to return 0 for defaultdict"""
+    return 0
+
 class TagBasedLossWeighter:
     def __init__(
         self,
@@ -57,9 +61,9 @@ class TagBasedLossWeighter:
         self.character_emphasis = character_emphasis
         
         # Initialize frequency tracking with defaultdict
-        self.tag_frequencies = defaultdict(lambda: defaultdict(int))
-        self.class_total_counts = defaultdict(int)
-        self.tag_cooccurrence = defaultdict(lambda: defaultdict(int))
+        self.tag_frequencies = defaultdict(lambda: defaultdict(_default_zero))
+        self.class_total_counts = defaultdict(_default_zero)
+        self.tag_cooccurrence = defaultdict(lambda: defaultdict(_default_zero))
         
         # Precompute mappings
         self._initialize_mappings()
@@ -108,9 +112,9 @@ class TagBasedLossWeighter:
         """
         def process_tag_list(tags):
             result = {
-                'frequencies': defaultdict(lambda: defaultdict(int)),
-                'class_counts': defaultdict(int),
-                'cooccurrence': defaultdict(lambda: defaultdict(int))
+                'frequencies': defaultdict(lambda: defaultdict(_default_zero)),
+                'class_counts': defaultdict(_default_zero),
+                'cooccurrence': defaultdict(lambda: defaultdict(_default_zero))
             }
             
             # Update individual tag frequencies
