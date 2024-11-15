@@ -71,30 +71,23 @@ def parse_args():
     parser.add_argument("--use_ema_warmup", action="store_true", default=True,
                        help="Use EMA warmup")
     
-    # V-prediction parameters
+    # Training configuration
+    parser.add_argument("--training_mode", type=str, default="v_prediction",
+                      choices=["v_prediction", "epsilon"],
+                      help="Training parameterization mode")
     parser.add_argument("--min_snr_gamma", type=float, default=5.0,
-                      help="Minimum SNR value for loss weighting (default: 5.0)")
+                      help="Minimum SNR value for loss weighting")
     parser.add_argument("--sigma_data", type=float, default=1.0,
-                      help="Data standard deviation for v-prediction (default: 1.0)")
+                      help="Data standard deviation")
     parser.add_argument("--sigma_min", type=float, default=0.029,
-                      help="Minimum sigma value for ZTSNR schedule")
-    parser.add_argument("--rescale_multiplier", type=float, default=0.7,
-                      help="Multiplier for CFG rescaling")
-    
-    # Training mode flags
-    parser.add_argument("--use_ztsnr", action="store_true", default=True,
-                      help="Enable Zero Terminal SNR training")
-    parser.add_argument("--zsnr", action="store_true", default=True,
-                      help="[DEPRECATED] Use --use_ztsnr instead")
-    parser.add_argument("--v_prediction", action="store_true", default=True,
-                      help="Enable v-prediction parameterization")
-    parser.add_argument("--resolution_scaling", action="store_true", default=True,
-                      help="Enable resolution-dependent sigma scaling")
-    parser.add_argument("--rescale_cfg", action="store_true", default=True,
-                      help="Enable CFG rescaling")
+                      help="Minimum sigma value")
+    parser.add_argument("--sigma_max", type=float, default=160.0,
+                      help="Maximum sigma value")
     parser.add_argument("--scale_method", type=str, default="karras",
                       choices=["karras", "simple"],
-                      help="Method for CFG rescaling (karras or simple)")
+                      help="Method for resolution and CFG scaling")
+    parser.add_argument("--scale_factor", type=float, default=0.7,
+                      help="Global scaling factor")
     
     # AdamW optimizer arguments
     parser.add_argument("--adam_beta1", type=float, default=0.9,
@@ -202,11 +195,6 @@ def main(args):
     """Main training pipeline"""
     wandb_run = None
     try:
-        # Handle deprecated zsnr argument
-        if hasattr(args, 'zsnr') and args.zsnr and not hasattr(args, 'use_ztsnr'):
-            logger.warning("The --zsnr argument is deprecated. Please use --use_ztsnr instead.")
-            args.use_ztsnr = args.zsnr
-            
         # Set up logging
         setup_logging(os.path.join("logs", args.wandb_run_name) if args.wandb_run_name else "logs")
         log_system_info()
@@ -321,14 +309,23 @@ def main(args):
         else:
             vae_finetuner = None
         
-        # Create components dictionary
+        # Create components dictionary with training configuration
         train_components = {
             "optimizer": optimizer,
             "lr_scheduler": lr_scheduler,
             "train_dataloader": train_dataloader,
             "tag_weighter": tag_weighter,
             "vae_finetuner": vae_finetuner,
-            "ema": ema if args.use_ema else None  # Add EMA to components
+            "ema": ema if args.use_ema else None,
+            "training_config": {
+                "mode": args.training_mode,
+                "min_snr_gamma": args.min_snr_gamma,
+                "sigma_data": args.sigma_data,
+                "sigma_min": args.sigma_min,
+                "sigma_max": args.sigma_max,
+                "scale_method": args.scale_method,
+                "scale_factor": args.scale_factor
+            }
         }
         
         # Log training setup and initial system state
