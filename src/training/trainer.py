@@ -190,49 +190,61 @@ def _get_ema_config(
     decay: float = 0.9999,
     update_every: int = 10,
     device: str = 'auto',
-    update_after_step: int = 0,
-    use_warmup: bool = True,
-    warmup_steps: int = 2000,
-    inv_gamma: float = 1.0,
-    power: float = 3/4,
     min_value: float = 0.0
 ) -> Dict[str, Any]:
-    """Get EMA configuration with proper parameter handling"""
+    """Get basic EMA configuration."""
     return {
         'decay': decay,
         'update_every': update_every,
         'device': device,
-        'update_after_step': update_after_step,
-        'use_ema_warmup': use_warmup,
-        'warmup_steps': warmup_steps,
-        'inv_gamma': inv_gamma,
-        'power': power,
         'min_value': min_value
     }
+
+def _validate_ema_params(decay: float, min_value: float) -> None:
+    """Validate EMA parameters."""
+    if not 0.0 <= decay <= 1.0:
+        raise ValueError(f"EMA decay must be between 0 and 1, got {decay}")
+    if not 0.0 <= min_value <= 1.0:
+        raise ValueError(f"EMA min_value must be between 0 and 1, got {min_value}")
 
 def setup_ema(args, model, device=None):
     """Setup EMA model with proper error handling"""
     try:
-        # Get EMA config safely
+        # Validate device
+        if device is None:
+            device = getattr(args, 'ema_device', 'auto')
+        if isinstance(device, str) and device != 'auto':
+            device = torch.device(device)
+            
+        decay = getattr(args, 'ema_decay', 0.9999)
+        min_value = getattr(args, 'ema_min_value', 0.0)
+        
+        # Validate parameters
+        _validate_ema_params(decay, min_value)
+        
         ema_config = _get_ema_config(
-            decay=getattr(args, 'ema_decay', 0.9999),
+            decay=decay,
             update_every=getattr(args, 'ema_update_every', 10),
-            device=getattr(args, 'ema_device', 'auto') if device is None else device,
-            update_after_step=getattr(args, 'ema_update_after_step', 0),
-            use_warmup=getattr(args, 'ema_use_warmup', True),
-            warmup_steps=getattr(args, 'ema_warmup_steps', 2000),
-            inv_gamma=getattr(args, 'ema_inv_gamma', 1.0),
-            power=getattr(args, 'ema_power', 3/4),
-            min_value=getattr(args, 'ema_min_value', 0.0)
+            device=device,
+            min_value=min_value
         )
         
-        # Create EMA model
         if args.use_ema:
             logger.info("Creating EMA model...")
+            logger.debug(f"EMA config: {ema_config}")  # Add debug logging
+            
             ema = EMAModel(
                 model,
                 **ema_config
             )
+            
+            # Configure warmup after creation if supported
+            if hasattr(ema, 'set_warmup') and getattr(args, 'ema_use_warmup', False):
+                ema.set_warmup(
+                    warmup_steps=getattr(args, 'ema_warmup_steps', 2000),
+                    update_after_step=getattr(args, 'ema_update_after_step', 0)
+                )
+            
             logger.info("EMA model created successfully")
             return ema
         return None
