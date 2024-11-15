@@ -94,14 +94,19 @@ class CustomDataset(Dataset):
         else:
             self.tag_weighter = None
             
-        # Initialize multiprocessing components
-        if not self.no_caching_latents:
+        # Initialize multiprocessing components only if caching is enabled
+        if not no_caching_latents:
             self.process_pool = None
             self.task_queue = None
             self.result_queue = None
             self.workers = []
             self.cache_lock = threading.Lock()
             self.latent_cache = {}
+            
+            # Initialize workers and process latents
+            if self.num_workers > 0:
+                self._initialize_workers()
+                self._batch_process_latents_efficient()
         else:
             logger.info("Latent caching disabled - will process images on-the-fly")
             self.latent_cache = {}
@@ -113,11 +118,6 @@ class CustomDataset(Dataset):
         # Initialize bucketing if enabled
         if self.enable_bucket_sampler:
             self._initialize_buckets()
-            
-        # Initialize workers and process latents if caching is enabled
-        if not self.no_caching_latents and self.num_workers > 0:
-            self._initialize_workers()
-            self._batch_process_latents_efficient()
             
         # Build tag statistics
         self.tag_stats = self._build_tag_statistics()
@@ -153,6 +153,7 @@ class CustomDataset(Dataset):
     def _initialize_workers(self):
         """Initialize worker processes with proper error handling"""
         if self.no_caching_latents:
+            logger.info("Skipping worker initialization - caching disabled")
             return
             
         try:
@@ -1331,14 +1332,9 @@ class CustomDataset(Dataset):
             }
             
             # Handle latents based on caching mode
-            if not self.no_caching_latents and self.latent_paths[idx].exists():
-                # Load cached latents
-                cache_data_latents = torch.load(self.latent_paths[idx], map_location='cpu')
-                cache_data['latents'] = cache_data_latents['latents'].float().cpu()
-            else:
-                # Generate latents on-the-fly if caching is disabled
+            if self.no_caching_latents:
+                # Always generate latents on-the-fly if caching is disabled
                 with torch.no_grad():
-                    # Convert image to tensor
                     transform = transforms.Compose([
                         transforms.ToTensor(),
                         transforms.Normalize([0.5], [0.5])
@@ -1346,10 +1342,31 @@ class CustomDataset(Dataset):
                     image_tensor = transform(image).unsqueeze(0)
                     image_tensor = image_tensor.to(self.vae.device, dtype=self.vae.dtype)
                     
-                    # Generate latents
                     latents = self.vae.encode(image_tensor).latent_dist.sample()
                     latents = latents * self.vae.config.scaling_factor
                     cache_data['latents'] = latents.squeeze(0).cpu()
+            else:
+                # Only use cached latents if caching is enabled
+                if self.latent_paths[idx].exists():
+                    cache_data_latents = torch.load(self.latent_paths[idx], map_location='cpu')
+                    cache_data['latents'] = cache_data_latents['latents'].float().cpu()
+                else:
+                    # Generate and cache if file doesn't exist
+                    with torch.no_grad():
+                        # Convert image to tensor
+                        transform = transforms.Compose([
+                            transforms.ToTensor(),
+                            transforms.Normalize([0.5], [0.5])
+                        ])
+                        image_tensor = transform(image).unsqueeze(0)
+                        image_tensor = image_tensor.to(self.vae.device, dtype=self.vae.dtype)
+                        
+                        # Generate latents
+                        latents = self.vae.encode(image_tensor).latent_dist.sample()
+                        latents = latents * self.vae.config.scaling_factor
+                        cache_data['latents'] = latents.squeeze(0).cpu()
+                        if not self.no_caching_latents:  # Only save if caching is enabled
+                            torch.save({'latents': cache_data['latents']}, self.latent_paths[idx])
             
             return cache_data
         
@@ -1485,6 +1502,7 @@ def create_dataloader(
     text_encoder_2=None,
     vae=None,
     enable_bucket_sampler=True,
+    no_caching_latents=False,
     **kwargs
 ):
     """Create a DataLoader with bucketing support"""
@@ -1498,6 +1516,7 @@ def create_dataloader(
         vae=vae,
         num_workers=num_workers,  # Pass through num_workers
         enable_bucket_sampler=enable_bucket_sampler,
+        no_caching_latents=no_caching_latents,
         **kwargs
     )
 
