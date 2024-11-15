@@ -361,3 +361,129 @@ def get_cosine_schedule_with_warmup(
         logger.error(f"Failed to create cosine schedule: {str(e)}")
         logger.error(traceback.format_exc())
         raise
+
+class PerceptualLoss(torch.nn.Module):
+    """Perceptual loss using VGG16 features with improved memory efficiency."""
+    def __init__(
+        self,
+        resize: bool = True,
+        normalize: bool = True,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None
+    ):
+        super().__init__()
+        self.resize = resize
+        self.normalize = normalize
+        
+        try:
+            # Initialize VGG with optimizations
+            vgg = models.vgg16(pretrained=True).features
+            vgg.eval()
+            vgg.requires_grad_(False)
+            
+            if device is not None:
+                vgg = vgg.to(device)
+            if dtype is not None:
+                vgg = vgg.to(dtype)
+            
+            # Cache feature layers
+            self.layers = {
+                '3': 'relu1_2',
+                '8': 'relu2_2',
+                '15': 'relu3_3',
+                '22': 'relu4_3'
+            }
+            
+            self.blocks = torch.nn.ModuleList([])
+            curr_block = []
+            
+            # Build feature extraction blocks
+            for name, layer in vgg.named_children():
+                curr_block.append(layer)
+                if name in self.layers:
+                    self.blocks.append(torch.nn.Sequential(*curr_block))
+                    curr_block = []
+            
+            # Register preprocessing
+            if self.normalize:
+                self.register_buffer(
+                    'mean', 
+                    torch.tensor([0.485, 0.456, 0.406]).view(1, -1, 1, 1)
+                )
+                self.register_buffer(
+                    'std', 
+                    torch.tensor([0.229, 0.224, 0.225]).view(1, -1, 1, 1)
+                )
+            
+            logger.info("Perceptual loss initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize perceptual loss: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
+    
+    def preprocess(self, x: torch.Tensor) -> torch.Tensor:
+        """Preprocess input images."""
+        try:
+            if self.resize:
+                x = F.interpolate(x, size=(224, 224), mode='bilinear', align_corners=False)
+            
+            if self.normalize:
+                x = (x - self.mean) / self.std
+                
+            return x
+            
+        except Exception as e:
+            logger.error(f"Preprocessing failed: {str(e)}")
+            raise
+    
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """
+        Compute perceptual loss between x and y.
+        
+        Args:
+            x: Input tensor
+            y: Target tensor
+            
+        Returns:
+            Perceptual loss value
+        """
+        try:
+            if x.shape != y.shape:
+                raise ValueError(f"Input shapes must match: {x.shape} vs {y.shape}")
+            
+            # Preprocess inputs
+            x = self.preprocess(x)
+            y = self.preprocess(y)
+            
+            # Compute features and loss
+            loss = 0.0
+            for block in self.blocks:
+                with torch.cuda.amp.autocast(enabled=False):
+                    x = block(x.float())
+                    y = block(y.float())
+                    loss = loss + F.mse_loss(x, y)
+            
+            return loss
+            
+        except Exception as e:
+            logger.error(f"Forward pass failed: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
+    
+    def get_features(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Extract features from input tensor."""
+        try:
+            x = self.preprocess(x)
+            features = {}
+            
+            for i, block in enumerate(self.blocks):
+                with torch.cuda.amp.autocast(enabled=False):
+                    x = block(x.float())
+                    features[self.layers[str(i*7 + 3)]] = x
+            
+            return features
+            
+        except Exception as e:
+            logger.error(f"Feature extraction failed: {str(e)}")
+            raise
