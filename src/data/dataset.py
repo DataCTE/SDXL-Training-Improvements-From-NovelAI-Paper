@@ -16,12 +16,13 @@ from collections import defaultdict
 from .ultimate_upscaler import UltimateUpscaler, USDUMode, USDUSFMode
 from utils.validation import validate_image_dimensions
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, ProcessPoolExecutor
 import gc
 from .tag_weighter import TagBasedLossWeighter
 from multiprocessing import Process, Queue
 import threading
 import psutil
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -384,245 +385,129 @@ class CustomDataset(Dataset):
 
     def _batch_process_latents_efficient(self, batch_size=32):
         """Process and cache latents in batches using multiple workers with resource management"""
-        # Get list of uncached images
-        uncached_images = []
+        logger.info(f"Caching latents for {len(self.image_paths)} images in batches")
+        
+        # Reduce worker count and chunk size to prevent resource exhaustion
+        num_workers = min(8, (os.cpu_count() or 1))  # Limit max workers
+        chunk_size = 1000  # Smaller chunk size
+        logger.info(f"Using {num_workers} workers with chunk size {chunk_size}")
+        
+        # Group images by size first to reduce memory fragmentation
+        size_groups = {}
         for img_path in self.image_paths:
-            latent_path = self.cache_dir / f"{Path(img_path).stem}.pt"
-            if not latent_path.exists():
-                uncached_images.append(img_path)
-
-        if not uncached_images:
-            logger.info("All latents are already cached")
-            return
-
-        logger.info(f"Caching latents for {len(uncached_images)} images in batches")
+            try:
+                with Image.open(img_path) as img:
+                    size_key = f"{img.size[0]}x{img.size[1]}"
+                    if size_key not in size_groups:
+                        size_groups[size_key] = []
+                    size_groups[size_key].append(img_path)
+            except Exception as e:
+                logger.error(f"Error reading image {img_path}: {str(e)}")
+                continue
         
-        # Calculate optimal chunk size and worker count
-        total_images = len(uncached_images)
-        # Limit concurrent workers based on system memory
-        available_memory = psutil.virtual_memory().available
-        estimated_memory_per_worker = 2 * 1024 * 1024 * 1024  # 2GB per worker estimate
-        max_concurrent_workers = max(1, min(
-            self.num_workers,
-            int(available_memory / estimated_memory_per_worker)
-        ))
-        
-        # Process in smaller chunks to avoid memory issues
-        chunk_size = min(10000, total_images)  # Process max 10k images at a time
-        
-        logger.info(f"Using {max_concurrent_workers} workers with chunk size {chunk_size}")
-        
-        for chunk_start in range(0, total_images, chunk_size):
-            chunk_end = min(chunk_start + chunk_size, total_images)
-            current_chunk = uncached_images[chunk_start:chunk_end]
+        # Process each size group separately
+        for size_key, paths in size_groups.items():
+            logger.info(f"Processing {len(paths)} images of size {size_key}")
             
-            # Group images by size within the current chunk
-            size_groups = defaultdict(list)
-            
-            def group_image_by_size(img_path):
-                try:
-                    caption_path = Path(img_path).with_suffix('.txt')
-                    if not caption_path.exists():
-                        return None
+            # Process in smaller chunks
+            for i in range(0, len(paths), chunk_size):
+                chunk = paths[i:i + chunk_size]
+                
+                # Create a new process pool for each chunk to prevent resource leaks
+                with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                    try:
+                        # Process chunk in parallel
+                        futures = []
+                        for j in range(0, len(chunk), batch_size):
+                            batch = chunk[j:j + batch_size]
+                            future = executor.submit(self.process_batch_with_vae, batch)
+                            futures.append(future)
                         
-                    with Image.open(img_path) as img:
-                        width, height = img.size
-                        target_h, target_w = self._get_target_size(width, height)
-                        return img_path, f"{target_w}x{target_h}"
-                except Exception as e:
-                    logger.error(f"Error reading image {img_path}: {str(e)}")
-                    return None
-
-            # Group images in the current chunk
-            with ThreadPoolExecutor(max_workers=max_concurrent_workers) as executor:
-                futures = []
-                for img_path in current_chunk:
-                    futures.append(executor.submit(group_image_by_size, img_path))
+                        # Wait for all futures to complete
+                        for future in as_completed(futures):
+                            try:
+                                future.result()  # Get result to catch any exceptions
+                            except Exception as e:
+                                logger.error(f"Batch processing error: {str(e)}")
+                                logger.error(f"Traceback: {traceback.format_exc()}")
+                    
+                    except Exception as e:
+                        logger.error(f"Error processing chunk: {str(e)}")
+                        continue
                 
-                for future in tqdm(as_completed(futures), 
-                                 total=len(futures), 
-                                 desc=f"Grouping images (chunk {chunk_start//chunk_size + 1}/{(total_images-1)//chunk_size + 1})"):
-                    result = future.result()
-                    if result:
-                        img_path, size_key = result
-                        size_groups[size_key].append(img_path)
-
-            # Process each size group
-            def process_size_group(size_key, paths):
-                try:
-                    processed = 0
-                    # Process in smaller batches to manage memory
-                    for i in range(0, len(paths), batch_size):
-                        batch_paths = paths[i:i + batch_size]
-                        self.process_batch_with_vae(batch_paths)
-                        processed += len(batch_paths)
-                        # Release memory explicitly
-                        torch.cuda.empty_cache()
-                        gc.collect()
-                    return processed
-                except Exception as e:
-                    logger.error(f"Error processing size group {size_key}: {str(e)}")
-                    return 0
-
-            # Process size groups with limited concurrency
-            total_processed = 0
-            max_group_workers = min(len(size_groups), max_concurrent_workers)
-            
-            with ThreadPoolExecutor(max_workers=max_group_workers) as executor:
-                futures = []
-                for size_key, paths in size_groups.items():
-                    futures.append(executor.submit(process_size_group, size_key, paths))
+                # Force garbage collection after each chunk
+                gc.collect()
+                torch.cuda.empty_cache()
                 
-                for future in tqdm(as_completed(futures), 
-                                 total=len(futures), 
-                                 desc=f"Processing groups (chunk {chunk_start//chunk_size + 1}/{(total_images-1)//chunk_size + 1})"):
-                    total_processed += future.result()
-            
-            # Clean up after each chunk
-            torch.cuda.empty_cache()
-            gc.collect()
-            
-            logger.info(f"Completed chunk {chunk_start//chunk_size + 1}/{(total_images-1)//chunk_size + 1}: "
-                       f"Processed {total_processed} images")
+                # Small delay to allow system resources to stabilize
+                time.sleep(0.1)
 
-        logger.info(f"Successfully processed and cached all latents")
-        
     def process_batch_with_vae(self, batch_paths):
         """Process a batch of images through VAE with optimized memory usage"""
         if not batch_paths:
             return
-        
-        try:
-            # Process images in parallel
-            def load_and_transform_image(path):
-                try:
-                    with Image.open(path) as img:
-                        if img.mode != 'RGB':
-                            img = img.convert('RGB')
-                        
-                        width, height = img.size
-                        
-                        # Get target size considering aspect ratio constraints
-                        target_w, target_h = self._get_target_size(width, height)
-                        
-                        # Resize to target size
-                        if width != target_w or height != target_h:
-                            if width * height < target_w * target_h:
-                                img = self._upscale_image(img, target_w, target_h)
-                            else:
-                                img = self._downscale_image(img, target_w, target_h)
-                        
-                        # Transform to tensor
-                        image_tensor = transforms.ToTensor()(img)
-                        image_tensor = transforms.Normalize([0.5], [0.5])(image_tensor)
-                        return image_tensor, None
-                except Exception as e:
-                    return None, str(e)
-
-            # Load images in parallel
-            with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-                results = list(executor.map(load_and_transform_image, batch_paths))
             
-            # Filter valid results
+        try:
+            # Load and transform images
             valid_tensors = []
             valid_paths = []
-            for path, (tensor, error) in zip(batch_paths, results):
-                if tensor is not None:
-                    valid_tensors.append(tensor)
-                    valid_paths.append(path)
-                elif error:
-                    logger.error(f"Error processing {path}: {error}")
+            
+            transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize([0.5], [0.5])
+            ])
+            
+            # Process images one at a time to avoid memory spikes
+            for img_path in batch_paths:
+                try:
+                    with Image.open(img_path) as img:
+                        if img.mode != "RGB":
+                            img = img.convert("RGB")
+                        tensor = transform(img)
+                        valid_tensors.append(tensor)
+                        valid_paths.append(img_path)
+                except Exception as e:
+                    logger.error(f"Error processing image {img_path}: {str(e)}")
+                    continue
 
             if not valid_tensors:
                 return
 
-            # Process through VAE in chunks to manage memory
-            chunk_size = 8  # Smaller chunks for better memory management
+            # Process through VAE in very small chunks to manage memory
+            chunk_size = 4  # Smaller chunks for better memory management
             for i in range(0, len(valid_tensors), chunk_size):
                 chunk_tensors = valid_tensors[i:i + chunk_size]
                 chunk_paths = valid_paths[i:i + chunk_size]
                 
-                # Generate latents
-                with torch.no_grad():
-                    image_tensor = torch.stack(chunk_tensors).to(self.vae.device, dtype=self.vae.dtype)
-                    latents = self.vae.encode(image_tensor).latent_dist.sample()
-                    latents = latents * self.vae.config.scaling_factor
-
-                # Process text embeddings in parallel
-                def process_text_embeddings(path):
-                    try:
-                        caption_path = Path(path).with_suffix('.txt')
-                        with open(caption_path, 'r', encoding='utf-8') as f:
-                            caption = f.read().strip()
-                        
-                        # Generate embeddings
-                        text_inputs = self.tokenizer(
-                            caption,
-                            padding="max_length",
-                            max_length=self.tokenizer.model_max_length,
-                            truncation=True,
-                            return_tensors="pt"
-                        ).to(self.text_encoder.device)
-                        
-                        text_inputs_2 = self.tokenizer_2(
-                            caption,
-                            padding="max_length",
-                            max_length=self.tokenizer_2.model_max_length,
-                            truncation=True,
-                            return_tensors="pt"
-                        ).to(self.text_encoder_2.device)
-                        
+                try:
+                    # Move tensors to device and generate latents
+                    with torch.cuda.amp.autocast():
                         with torch.no_grad():
-                            text_embeddings = self.text_encoder(text_inputs.input_ids)[0]
-                            text_embeddings_2 = self.text_encoder_2(
-                                text_inputs_2.input_ids,
-                                output_hidden_states=True
-                            )
-                            pooled_output = text_embeddings_2[0]
-                            hidden_states = text_embeddings_2.hidden_states[-2]
-                            
-                            # Reshape pooled output
-                            pooled_output = pooled_output.unsqueeze(1).unsqueeze(2)
-                            
-                            return {
-                                "text_embeddings": text_embeddings,
-                                "text_embeddings_2": hidden_states,
-                                "pooled_output": pooled_output
-                            }
-                    except Exception as e:
-                        logger.error(f"Error processing text for {path}: {str(e)}")
-                        return None
+                            image_tensor = torch.stack(chunk_tensors).to(self.vae.device, dtype=self.vae.dtype)
+                            latents = self.vae.encode(image_tensor).latent_dist.sample()
+                            latents = latents * self.vae.config.scaling_factor
 
-                # Process text embeddings in parallel
-                with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-                    embedding_results = list(executor.map(process_text_embeddings, chunk_paths))
-
-                # Save results
-                for idx, (path, embeddings) in enumerate(zip(chunk_paths, embedding_results)):
-                    if embeddings is not None:
-                        cache_path = self.cache_dir / f"{Path(path).stem}_latents.pt"
-                        try:
-                            torch.save({
-                                "latents": latents[idx].cpu(),
-                                "text_embeddings": embeddings["text_embeddings"].cpu(),
-                                "text_embeddings_2": embeddings["text_embeddings_2"].cpu(),
-                                "added_cond_kwargs": {
-                                    "text_embeds": embeddings["pooled_output"].cpu(),
-                                    "time_ids": self._get_add_time_ids(image_tensor[idx:idx+1]).cpu()
-                                }
-                            }, cache_path)
-                        except Exception as e:
-                            logger.error(f"Error saving cache for {path}: {str(e)}")
-
-                # Clear GPU memory
-                del image_tensor, latents
-                torch.cuda.empty_cache()
-                gc.collect()
-
+                    # Save latents to disk immediately and free memory
+                    for j, latent in enumerate(latents):
+                        latent_path = self.cache_dir / f"{Path(chunk_paths[j]).stem}.pt"
+                        torch.save(latent.cpu(), latent_path)
+                        del latent
+                    
+                    # Clean up GPU memory
+                    del image_tensor, latents
+                    torch.cuda.empty_cache()
+                
+                except Exception as e:
+                    logger.error(f"Error in VAE processing: {str(e)}")
+                    continue
+                
+                # Small delay between chunks
+                time.sleep(0.05)
+            
         except Exception as e:
             logger.error(f"Batch processing error: {str(e)}")
-            logger.error(traceback.format_exc())
-
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            
     def validate_and_cache_latents(self, image_paths):
         """Validate latent dimensions for a batch of images efficiently"""
         uncached_paths = [p for p in image_paths if p not in self.latent_cache]
