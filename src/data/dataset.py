@@ -427,14 +427,8 @@ class CustomDataset(Dataset):
                         
                     with Image.open(img_path) as img:
                         width, height = img.size
-                        if self.all_ar:
-                            width = ((width + 7) // 8) * 8
-                            height = ((height + 7) // 8) * 8
-                        elif max(width, height) > 2048:
-                            scale = 2048 / max(width, height)
-                            width = int(width * scale)
-                            height = int(height * scale)
-                        return img_path, f"{width}x{height}"
+                        target_h, target_w = self._get_target_size(width, height)
+                        return img_path, f"{target_w}x{target_h}"
                 except Exception as e:
                     logger.error(f"Error reading image {img_path}: {str(e)}")
                     return None
@@ -759,34 +753,35 @@ class CustomDataset(Dataset):
         if aspect_ratio > 1:  # Portrait
             # Start with target width and calculate height to maintain AR
             target_width = 1024  # Base width for portrait
-            target_height = int(target_width * aspect_ratio)
+            target_height = int(round(target_width * aspect_ratio / self.bucket_reso_steps) * self.bucket_reso_steps)
         else:  # Landscape
             # Start with target height and calculate width to maintain AR
             target_height = 1024  # Base height for landscape
-            target_width = int(target_height / aspect_ratio)
+            target_width = int(round(target_height / aspect_ratio / self.bucket_reso_steps) * self.bucket_reso_steps)
 
         # Scale down if needed while preserving AR
         max_dim = max(target_width, target_height)
         if max_dim > 2048:  # Only scale down if absolutely necessary
             scale = 2048 / max_dim
-            target_width = int(target_width * scale)
-            target_height = int(target_height * scale)
+            target_width = int(round(target_width * scale / self.bucket_reso_steps) * self.bucket_reso_steps)
+            target_height = int(round(target_height * scale / self.bucket_reso_steps) * self.bucket_reso_steps)
 
-        return target_height, target_width
+        # Ensure minimum dimensions
+        target_width = max(target_width, self.min_size)
+        target_height = max(target_height, self.min_size)
+
+        return target_width, target_height
 
     def process_image_size(self, image, target_width, target_height):
         """Process image size with advanced resizing"""
         width, height = image.size
         
         # Get target size considering aspect ratio constraints
-        target_width, target_height = self._get_target_size(target_width, target_height)
+        target_width, target_height = self._get_target_size(width, height)
         
-        # Resize to target size
+        # Resize to target size using LANCZOS resampling for better quality
         if width != target_width or height != target_height:
-            if width * height < target_width * target_height:
-                image = self._upscale_image(image, target_width, target_height)
-            else:
-                image = self._downscale_image(image, target_width, target_height)
+            image = image.resize((target_width, target_height), Image.Resampling.LANCZOS)
                 
         return image
 
@@ -1442,15 +1437,28 @@ class BucketSampler(Sampler):
         # Store (bucket, index) pairs for all valid samples
         self.samples = []
         for bucket, img_paths in dataset.bucket_data.items():
-            for img_path in img_paths:
-                idx = dataset.image_paths.index(img_path)
-                self.samples.append((bucket, idx))
+            # Validate that all images in this bucket have the exact same dimensions
+            if len(img_paths) > 0:
+                first_img = Image.open(img_paths[0])
+                bucket_width, bucket_height = first_img.size
+                first_img.close()
                 
+                valid_paths = []
+                for img_path in img_paths:
+                    with Image.open(img_path) as img:
+                        width, height = img.size
+                        if width == bucket_width and height == bucket_height:
+                            valid_paths.append(img_path)
+                        else:
+                            logger.warning(f"Image {img_path} dimensions ({width}x{height}) don't match bucket dimensions ({bucket_width}x{bucket_height})")
+                
+                # Only use images with matching dimensions
+                for img_path in valid_paths:
+                    idx = dataset.image_paths.index(img_path)
+                    self.samples.append((bucket, idx))
+            
         if not self.samples:
             raise ValueError("No valid samples found in dataset buckets")
-        
-        # Pre-validate all buckets
-        self._validate_buckets(dataset)
     
     def _validate_buckets(self, dataset):
         """Validate bucket configurations to prevent runtime errors"""
