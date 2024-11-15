@@ -541,7 +541,7 @@ class CustomDataset(CustomDatasetBase):
                         # Instead of skipping, try to upscale
                         target_width = max(width, self.min_size)
                         target_height = max(height, self.min_size)
-                        img = self._upscale_image(img, target_width, target_height)
+                        img = self.process_image_size([img])[0]
                         width, height = img.size
                         
                     # Aspect ratio validation for non-all_ar mode
@@ -1557,7 +1557,7 @@ class CustomDataset(CustomDatasetBase):
                 
                 # Resize image according to bucket if bucketing is enabled
                 if self.enable_bucket_sampler:
-                    image = self._advanced_resize(image, bucket_w, bucket_h)
+                    image = self.process_image_size([image])[0]
                 else:
                     # Apply default resizing if no bucketing
                     width, height = image.size
