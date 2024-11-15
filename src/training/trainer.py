@@ -350,16 +350,25 @@ class AverageMeter:
     fmt: str = ':f'
     window_size: Optional[int] = None
     
-    _val: float = field(default=0, init=False)
-    _sum: float = field(default=0, init=False)
-    _count: int = field(default=0, init=False)
-    _avg: float = field(default=0, init=False)
-    _history: List[float] = field(default_factory=list, init=False)
-    _lock: Lock = field(default_factory=Lock, init=False)
+    def __post_init__(self):
+        """Initialize non-pickleable objects after instance creation."""
+        self._val: float = 0
+        self._sum: float = 0
+        self._count: int = 0
+        self._avg: float = 0
+        self._history: List[float] = []
+        # Create lock only when needed, not as a class attribute
+        self._lock = None
+    
+    def _get_lock(self):
+        """Lazy initialization of lock object."""
+        if self._lock is None:
+            self._lock = Lock()
+        return self._lock
     
     def reset(self) -> None:
         """Reset all metrics."""
-        with self._lock:
+        with self._get_lock():
             self._val = 0
             self._sum = 0
             self._count = 0
@@ -371,7 +380,7 @@ class AverageMeter:
         if isinstance(val, (torch.Tensor, np.ndarray)):
             val = float(val.detach().cpu().item() if torch.is_tensor(val) else val.item())
             
-        with self._lock:
+        with self._get_lock():
             self._val = val
             self._sum += val * n
             self._count += n
@@ -386,26 +395,38 @@ class AverageMeter:
     @property
     def val(self) -> float:
         """Current value."""
-        with self._lock:
+        with self._get_lock():
             return self._val
     
     @property
     def avg(self) -> float:
         """Running average."""
-        with self._lock:
+        with self._get_lock():
             return self._avg
     
     @property
     def sum(self) -> float:
         """Total sum."""
-        with self._lock:
+        with self._get_lock():
             return self._sum
     
     @property
     def count(self) -> int:
         """Number of updates."""
-        with self._lock:
+        with self._get_lock():
             return self._count
+            
+    def __getstate__(self):
+        """Custom state getter for pickling."""
+        state = self.__dict__.copy()
+        # Don't pickle the lock
+        state['_lock'] = None
+        return state
+    
+    def __setstate__(self, state):
+        """Custom state setter for unpickling."""
+        self.__dict__.update(state)
+        # Lock will be recreated when needed via _get_lock()
 
 def _log_optimizer_config(args):
     """Log optimizer configuration details."""
