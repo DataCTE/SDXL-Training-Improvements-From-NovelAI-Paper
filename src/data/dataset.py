@@ -23,6 +23,7 @@ from multiprocessing import Process, Queue
 import threading
 import psutil
 import time
+import multiprocessing as mp
 
 logger = logging.getLogger(__name__)
 
@@ -31,8 +32,8 @@ class CustomDataset(Dataset):
                  cache_dir="latents_cache", no_caching_latents=False, all_ar=False,
                  num_workers=None, prefetch_factor=2,
                  resolution_type="square", enable_bucket_sampler=True,
-                 min_size=512, max_size=2048,  # Global min/max image dimensions
-                 bucket_reso_steps=64,  # Resolution steps for bucketing
+                 min_size=512, max_size=2048,
+                 bucket_reso_steps=64,
                  token_dropout_rate=0.1, caption_dropout_rate=0.1,
                  min_tag_weight=0.1, max_tag_weight=3.0, use_tag_weighting=True,
                  finetune_vae=False, vae_learning_rate=1e-6, vae_train_freq=10,
@@ -40,30 +41,41 @@ class CustomDataset(Dataset):
                  **kwargs):
         super().__init__()
         
-        # Basic initialization
+        # Data directory and paths
         self.data_dir = Path(data_dir)
-        self.vae = vae
         self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(exist_ok=True)
+        
+        # Models and tokenizers
+        self.vae = vae
+        self.tokenizer = tokenizer
+        self.tokenizer_2 = tokenizer_2
+        self.text_encoder = text_encoder
+        self.text_encoder_2 = text_encoder_2
+        
+        # Processing settings
         self.no_caching_latents = no_caching_latents
         self.all_ar = all_ar
+        self.num_workers = num_workers or min(8, os.cpu_count() or 1)
+        self.prefetch_factor = prefetch_factor
         
-        # Use provided num_workers or system default
-        self.num_workers = num_workers if num_workers is not None else (os.cpu_count() or 1)
-        self.batch_size = 32  # Process images in batches
-        
-        # Resolution and bucketing parameters
-        self.min_size = min_size
-        self.max_size = max_size
+        # Resolution and bucketing settings
         self.resolution_type = resolution_type
         self.enable_bucket_sampler = enable_bucket_sampler
+        self.min_size = min_size
+        self.max_size = max_size
         self.bucket_reso_steps = bucket_reso_steps
         
-        # Tag weighting parameters
+        # Text augmentation settings
+        self.token_dropout_rate = token_dropout_rate
+        self.caption_dropout_rate = caption_dropout_rate
+        
+        # Tag weighting settings
+        self.use_tag_weighting = use_tag_weighting
         self.min_tag_weight = min_tag_weight
         self.max_tag_weight = max_tag_weight
-        self.use_tag_weighting = use_tag_weighting
         
-        # VAE parameters
+        # VAE finetuning settings
         self.finetune_vae = finetune_vae
         self.vae_learning_rate = vae_learning_rate
         self.vae_train_freq = vae_train_freq
@@ -71,89 +83,96 @@ class CustomDataset(Dataset):
         self.kl_weight = kl_weight
         self.perceptual_weight = perceptual_weight
         
-        # Text augmentation parameters
-        self.token_dropout_rate = token_dropout_rate
-        self.caption_dropout_rate = caption_dropout_rate
-        
-        # Model components
-        self.tokenizer = tokenizer
-        self.tokenizer_2 = tokenizer_2
-        self.text_encoder = text_encoder
-        self.text_encoder_2 = text_encoder_2
-        
-        # Initialize upscaler only if needed
-        if not all_ar:
-            self.upscaler = UltimateUpscaler(
-                model_path="Lykon/DreamShaper",
-                device=self.vae.device if self.vae else "cuda",
-                dtype=self.vae.dtype if self.vae else torch.float32
-            )
+        # Initialize tag weighter as a static class to avoid pickling issues
+        if self.use_tag_weighting:
+            TagBasedLossWeighter.min_weight = self.min_tag_weight
+            TagBasedLossWeighter.max_weight = self.max_tag_weight
+            self.tag_weighter = TagBasedLossWeighter
         else:
-            self.upscaler = None
-            logger.info("Skipping upscaler initialization since all_ar is enabled")
+            self.tag_weighter = None
+            
+        # Initialize multiprocessing components
+        if not self.no_caching_latents:
+            self.process_pool = None
+            self.task_queue = None
+            self.result_queue = None
+            self.workers = []
+            self.cache_lock = threading.Lock()
+            self.latent_cache = {}
+        else:
+            logger.info("Latent caching disabled - will process images on-the-fly")
+            self.latent_cache = {}
+            self.cache_lock = threading.Lock()
         
-        # Performance optimization
-        self.prefetch_factor = prefetch_factor
-        
-        # Create cache directory if caching is enabled
-        if not no_caching_latents:
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Initialize tag weighter before processing images
-        self.tag_weighter = TagBasedLossWeighter(
-            min_weight=min_tag_weight,
-            max_weight=max_tag_weight
-        )
-        
-        # Initialize image paths
+        # Initialize dataset structure
         self._initialize_dataset()
         
-        # Initialize bucketing
+        # Initialize bucketing if enabled
         if self.enable_bucket_sampler:
             self._initialize_buckets()
             
-        # Process latents if caching is enabled
-        if not no_caching_latents:
+        # Initialize workers and process latents if caching is enabled
+        if not self.no_caching_latents and self.num_workers > 0:
+            self._initialize_workers()
             self._batch_process_latents_efficient()
-        else:
-            logger.info("Latent caching disabled - will process images on-the-fly")
             
+        # Build tag statistics
         self.tag_stats = self._build_tag_statistics()
         
         # Set collate function
         self.collate_fn = self.custom_collate
-        
-        # Initialize multiprocessing components
-        self.process_pool = None
-        self.task_queue = None
-        self.result_queue = None
-        self.workers = []
-        self.cache_lock = threading.Lock()
-        self.latent_cache = {}
-        
-        # Start worker processes
-        self._initialize_workers()
-        
+
+    def _parse_tags(self, caption):
+        """Parse tags using tag weighter class method"""
+        if self.tag_weighter:
+            return self.tag_weighter.parse_tags(caption)
+        return [], {}
+
+    def _format_caption(self, caption):
+        """Format caption using tag weighter class method"""
+        if self.tag_weighter:
+            return self.tag_weighter.format_caption(caption)
+        return caption
+
+    def _calculate_tag_weights(self, tags, special_tags):
+        """Calculate tag weights using tag weighter class method"""
+        if self.tag_weighter:
+            return self.tag_weighter.calculate_weights(tags, special_tags)
+        return 1.0
+
     def _initialize_workers(self):
-        """Initialize worker processes for parallel processing"""
-        if self.process_pool is not None:
+        """Initialize worker processes with proper error handling"""
+        if self.no_caching_latents:
             return
             
-        logger.info(f"Initializing {self.num_workers} worker processes for latent validation")
+        try:
+            self.task_queue = mp.Queue()
+            self.result_queue = mp.Queue()
             
-        # Create queues for task distribution
-        self.task_queue = Queue()
-        self.result_queue = Queue()
-        
-        # Start worker processes
-        self.process_pool = []
-        for _ in range(self.num_workers):
-            p = Process(target=self._worker_process, 
-                       args=(self.task_queue, self.result_queue))
-            p.daemon = True
-            p.start()
-            self.process_pool.append(p)
+            logger.info(f"Initializing {self.num_workers} worker processes for latent validation")
             
+            # Create a copy of necessary attributes for workers
+            worker_args = (
+                self.task_queue,
+                self.result_queue,
+                self.vae,
+                self.cache_dir
+            )
+            
+            for _ in range(self.num_workers):
+                p = mp.Process(
+                    target=self._worker_process,
+                    args=worker_args
+                )
+                p.daemon = True  # Ensure process cleanup
+                p.start()
+                self.workers.append(p)
+                
+        except Exception as e:
+            logger.error(f"Failed to initialize workers: {str(e)}")
+            self.cleanup_workers()
+            raise
+
     def _worker_process(self, task_queue, result_queue):
         """Worker process function for parallel processing"""
         try:
@@ -576,18 +595,6 @@ class CustomDataset(Dataset):
         except Exception as e:
             logger.warning(f"Failed to load image {image_path}: {str(e)}")
             return None
-
-    def _parse_tags(self, caption):
-        """Parse tags using tag weighter"""
-        return self.tag_weighter.parse_tags(caption)
-
-    def _format_caption(self, caption):
-        """Format caption using tag weighter"""
-        return self.tag_weighter.format_caption(caption)
-
-    def _calculate_tag_weights(self, tags, special_tags):
-        """Calculate tag weights using tag weighter"""
-        return self.tag_weighter.calculate_weights(tags, special_tags)
 
     def _build_tag_statistics(self):
         """Build dataset-wide tag statistics and format captions"""
