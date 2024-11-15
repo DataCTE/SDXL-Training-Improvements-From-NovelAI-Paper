@@ -14,6 +14,7 @@ import numpy as np
 from tqdm import tqdm
 from torch.cuda.amp import autocast, GradScaler
 from transformers import Adafactor
+from torch.optim.lr_scheduler import LambdaLR
 
 from .vae_finetuner import VAEFineTuner
 from .ema import EMAModel
@@ -209,6 +210,37 @@ def _log_ema_config(args):
     logger.info(f"- Update every: {args.ema_update_every}")
     logger.info(f"- Power: {args.ema_power}")
     logger.info(f"- Min/Max decay: {args.ema_min_decay}/{args.ema_max_decay}")
+
+def get_cosine_schedule_with_warmup(
+    optimizer: torch.optim.Optimizer,
+    num_warmup_steps: int,
+    num_training_steps: int,
+    num_cycles: float = 0.5,
+    last_epoch: int = -1
+) -> LambdaLR:
+    """
+    Create a schedule with a learning rate that decreases following the values of the cosine function between the
+    initial lr set in the optimizer to 0, after a warmup period during which it increases linearly between 0 and the
+    initial lr set in the optimizer.
+
+    Args:
+        optimizer: The optimizer for which to schedule the learning rate
+        num_warmup_steps: The number of steps for the warmup phase
+        num_training_steps: The total number of training steps
+        num_cycles: The number of cosine cycles (default: 0.5)
+        last_epoch: The index of the last epoch when resuming training
+
+    Returns:
+        `torch.optim.lr_scheduler.LambdaLR` with the appropriate schedule
+    """
+
+    def lr_lambda(current_step: int):
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)))
+
+    return LambdaLR(optimizer, lr_lambda, last_epoch)
 
 @dataclass
 class AverageMeter:
