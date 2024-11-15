@@ -58,7 +58,7 @@ def get_sigmas(num_inference_steps: int = 28,
     inv_rho = 1.0 / rho
     
     # Log-space interpolation with sigma conversion
-    sigmas = (sigma_max ** (1/rho) + t * (sigma_min ** (1/rho) - sigma_max ** (1/rho))) ** rho
+    sigmas = (sigma_max ** inv_rho + t * (sigma_min ** inv_rho - sigma_max ** inv_rho)) ** rho
     
     if verbose:
         logger.info(f"- Schedule steps: {num_inference_steps}")
