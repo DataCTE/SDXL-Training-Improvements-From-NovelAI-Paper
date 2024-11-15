@@ -21,6 +21,7 @@ import gc
 from .tag_weighter import TagBasedLossWeighter
 from multiprocessing import Process, Queue
 import threading
+import psutil
 
 logger = logging.getLogger(__name__)
 
@@ -382,7 +383,7 @@ class CustomDataset(Dataset):
         logger.info(f"Preprocessing complete: {len(processed_images)} images processed")
 
     def _batch_process_latents_efficient(self, batch_size=32):
-        """Process and cache latents in batches using multiple workers"""
+        """Process and cache latents in batches using multiple workers with resource management"""
         # Get list of uncached images
         uncached_images = []
         for img_path in self.image_paths:
@@ -396,66 +397,102 @@ class CustomDataset(Dataset):
 
         logger.info(f"Caching latents for {len(uncached_images)} images in batches")
         
-        # Group images by size for more efficient batching
-        size_groups = defaultdict(list)
+        # Calculate optimal chunk size and worker count
+        total_images = len(uncached_images)
+        # Limit concurrent workers based on system memory
+        available_memory = psutil.virtual_memory().available
+        estimated_memory_per_worker = 2 * 1024 * 1024 * 1024  # 2GB per worker estimate
+        max_concurrent_workers = max(1, min(
+            self.num_workers,
+            int(available_memory / estimated_memory_per_worker)
+        ))
         
-        def group_image_by_size(img_path):
-            try:
-                caption_path = Path(img_path).with_suffix('.txt')
-                if not caption_path.exists():
+        # Process in smaller chunks to avoid memory issues
+        chunk_size = min(10000, total_images)  # Process max 10k images at a time
+        
+        logger.info(f"Using {max_concurrent_workers} workers with chunk size {chunk_size}")
+        
+        for chunk_start in range(0, total_images, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, total_images)
+            current_chunk = uncached_images[chunk_start:chunk_end]
+            
+            # Group images by size within the current chunk
+            size_groups = defaultdict(list)
+            
+            def group_image_by_size(img_path):
+                try:
+                    caption_path = Path(img_path).with_suffix('.txt')
+                    if not caption_path.exists():
+                        return None
+                        
+                    with Image.open(img_path) as img:
+                        width, height = img.size
+                        if self.all_ar:
+                            width = ((width + 7) // 8) * 8
+                            height = ((height + 7) // 8) * 8
+                        elif max(width, height) > 2048:
+                            scale = 2048 / max(width, height)
+                            width = int(width * scale)
+                            height = int(height * scale)
+                        return img_path, f"{width}x{height}"
+                except Exception as e:
+                    logger.error(f"Error reading image {img_path}: {str(e)}")
                     return None
-                    
-                with Image.open(img_path) as img:
-                    width, height = img.size
-                    if self.all_ar:
-                        width = ((width + 7) // 8) * 8
-                        height = ((height + 7) // 8) * 8
-                    elif max(width, height) > 2048:
-                        scale = 2048 / max(width, height)
-                        width = int(width * scale)
-                        height = int(height * scale)
-                    return img_path, f"{width}x{height}"
-            except Exception as e:
-                logger.error(f"Error reading image {img_path}: {str(e)}")
-                return None
 
-        # Process images in parallel for size grouping
-        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-            futures = []
-            for img_path in uncached_images:
-                futures.append(executor.submit(group_image_by_size, img_path))
+            # Group images in the current chunk
+            with ThreadPoolExecutor(max_workers=max_concurrent_workers) as executor:
+                futures = []
+                for img_path in current_chunk:
+                    futures.append(executor.submit(group_image_by_size, img_path))
+                
+                for future in tqdm(as_completed(futures), 
+                                 total=len(futures), 
+                                 desc=f"Grouping images (chunk {chunk_start//chunk_size + 1}/{(total_images-1)//chunk_size + 1})"):
+                    result = future.result()
+                    if result:
+                        img_path, size_key = result
+                        size_groups[size_key].append(img_path)
+
+            # Process each size group
+            def process_size_group(size_key, paths):
+                try:
+                    processed = 0
+                    # Process in smaller batches to manage memory
+                    for i in range(0, len(paths), batch_size):
+                        batch_paths = paths[i:i + batch_size]
+                        self.process_batch_with_vae(batch_paths)
+                        processed += len(batch_paths)
+                        # Release memory explicitly
+                        torch.cuda.empty_cache()
+                        gc.collect()
+                    return processed
+                except Exception as e:
+                    logger.error(f"Error processing size group {size_key}: {str(e)}")
+                    return 0
+
+            # Process size groups with limited concurrency
+            total_processed = 0
+            max_group_workers = min(len(size_groups), max_concurrent_workers)
             
-            for future in tqdm(as_completed(futures), total=len(futures), desc="Grouping images"):
-                result = future.result()
-                if result:
-                    img_path, size_key = result
-                    size_groups[size_key].append(img_path)
+            with ThreadPoolExecutor(max_workers=max_group_workers) as executor:
+                futures = []
+                for size_key, paths in size_groups.items():
+                    futures.append(executor.submit(process_size_group, size_key, paths))
+                
+                for future in tqdm(as_completed(futures), 
+                                 total=len(futures), 
+                                 desc=f"Processing groups (chunk {chunk_start//chunk_size + 1}/{(total_images-1)//chunk_size + 1})"):
+                    total_processed += future.result()
+            
+            # Clean up after each chunk
+            torch.cuda.empty_cache()
+            gc.collect()
+            
+            logger.info(f"Completed chunk {chunk_start//chunk_size + 1}/{(total_images-1)//chunk_size + 1}: "
+                       f"Processed {total_processed} images")
 
-        # Process each size group in parallel
-        def process_size_group(size_key, paths):
-            try:
-                for i in range(0, len(paths), batch_size):
-                    batch_paths = paths[i:i + batch_size]
-                    self.process_batch_with_vae(batch_paths)
-                return len(paths)
-            except Exception as e:
-                logger.error(f"Error processing size group {size_key}: {str(e)}")
-                return 0
-
-        # Use num_workers for size group processing, but don't exceed group count
-        max_workers = min(len(size_groups), self.num_workers)
-        total_processed = 0
+        logger.info(f"Successfully processed and cached all latents")
         
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = []
-            for size_key, paths in size_groups.items():
-                futures.append(executor.submit(process_size_group, size_key, paths))
-            
-            for future in tqdm(as_completed(futures), total=len(futures), desc="Processing size groups"):
-                total_processed += future.result()
-
-        logger.info(f"Successfully processed and cached latents for {total_processed} images")
-
     def process_batch_with_vae(self, batch_paths):
         """Process a batch of images through VAE with optimized memory usage"""
         if not batch_paths:
@@ -972,24 +1009,22 @@ class CustomDataset(Dataset):
                         
                         # Calculate target size first
                         target_h, target_w = get_cached_target_size(width, height)
-                        target_area = target_h * target_w
                         
-                        # Vectorized bucket matching
-                        target_ar = target_h / target_w
-                        area_scores = np.abs(bucket_areas - target_area) / target_area
+                        # Find the best fitting bucket using area-based comparison
+                        best_bucket = None
+                        min_area_diff = float('inf')
                         
-                        # Combined score with more weight on aspect ratio
-                        scores = np.abs(np.log(bucket_ars / target_ar))  # Log scale for better AR comparison
-                        
-                        # Find best bucket that's large enough
-                        valid_buckets = (bucket_arrays[:, 0] >= target_h) & (bucket_arrays[:, 1] >= target_w)
-                        if not np.any(valid_buckets):
-                            continue
+                        for bucket_h, bucket_w in self.buckets:
+                            # Skip if bucket is too small
+                            if bucket_h < target_h or bucket_w < target_w:
+                                continue
                             
-                        scores[~valid_buckets] = np.inf
-                        best_idx = np.argmin(scores)
-                        best_bucket = self.buckets[best_idx]
-                        
+                            # Calculate area difference
+                            area_diff = abs((bucket_h * bucket_w) - (target_h * target_w))
+                            if area_diff < min_area_diff:
+                                min_area_diff = area_diff
+                                best_bucket = (bucket_h, bucket_w)
+                    
                         results.append((img_path, best_bucket))
                 except Exception as e:
                     logger.error(f"Error processing {img_path}: {str(e)}")
