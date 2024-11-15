@@ -195,6 +195,7 @@ class TagBasedLossWeighter:
         min_weight: float = 0.1,
         max_weight: float = 3.0,
         cache_size: int = 1024,
+        no_cache: bool = False,
         emphasis_factor: float = 1.1,
         rarity_factor: float = 0.9,
         quality_bonus: float = 0.2,
@@ -209,6 +210,7 @@ class TagBasedLossWeighter:
             min_weight (float): Minimum weight multiplier for any image
             max_weight (float): Maximum weight multiplier for any image
             cache_size (int): Size of LRU cache for tag classification and weight calculation
+            no_cache (bool): Flag to disable caching
             emphasis_factor (float): Multiplier for emphasized tags
             rarity_factor (float): Multiplier for rare tags
             quality_bonus (float): Additional weight for high-quality images
@@ -245,8 +247,16 @@ class TagBasedLossWeighter:
         self.max_weight = max_weight
         self.cache_size = cache_size
         
+        # Modify caching behavior based on no_cache flag
+        self.no_cache = no_cache
+        if no_cache:
+            # Don't use caching when no_cache is True
+            self.calculate_tag_weights = self._calculate_tag_weights
+        else:
+            # Use LRU cache when caching is enabled
+            self.calculate_tag_weights = lru_cache(maxsize=cache_size)(self._calculate_tag_weights)
+        
         # Initialize caches
-        self.calculate_tag_weights = lru_cache(maxsize=cache_size)(self._calculate_tag_weights)
         self._tag_rarity_scores = {}
         self._tag_importance_scores = {}
         
@@ -441,23 +451,23 @@ class TagBasedLossWeighter:
             return [self._calculate_tag_weights(tuple(tags)) for tags in batch_tags]
 
     def calculate_weights(self, tags: List[str], special_tags: Dict[str, any] = None) -> Dict[str, float]:
-        """
-        Calculate weights for tags with improved weighting scheme.
-        
-        Args:
-            tags (List[str]): List of tags
-            special_tags (Dict): Special tag parameters
-            
-        Returns:
-            Dict[str, float]: Tag weights
-        """
+        """Calculate weights with proper no_cache handling"""
+        if self.no_cache:
+            # Calculate weights directly without caching
+            return self._calculate_weights_no_cache(tags, special_tags)
+        else:
+            # Use cached calculation
+            return self._calculate_weights_cached(tags, special_tags)
+
+    def _calculate_weights_no_cache(self, tags: List[str], special_tags: Dict[str, any] = None) -> Dict[str, float]:
+        """Direct weight calculation without caching"""
         if special_tags is None:
             special_tags = {}
             
         weights = {}
         base_weight = 1.0
         
-        # Apply special modifiers
+        # Apply modifiers directly without caching
         if 'masterpiece' in tags:
             base_weight *= 1.3
         if special_tags.get('niji', False):
@@ -493,6 +503,12 @@ class TagBasedLossWeighter:
             weights[tag] = max(self.min_weight, min(self.max_weight, final_weight))
             
         return weights
+
+    def _calculate_weights_cached(self, tags: List[str], special_tags: Dict[str, any] = None) -> Dict[str, float]:
+        """Cached weight calculation"""
+        # Convert tags to tuple for caching
+        tags_tuple = tuple(sorted(tags))
+        return self.calculate_tag_weights(tags_tuple, frozenset(special_tags.items()) if special_tags else None)
 
     def calculate_weights(self, tags: List[str]) -> torch.Tensor:
         """

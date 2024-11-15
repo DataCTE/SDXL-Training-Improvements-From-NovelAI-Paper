@@ -84,17 +84,13 @@ class CustomDataset(Dataset):
         self.kl_weight = kl_weight
         self.perceptual_weight = perceptual_weight
         
-        # Initialize tag weighter
+        # Initialize tag weighter with proper no_cache handling
         if use_tag_weighting:
-            if no_caching_latents:
-                # Use class directly for static method access
-                self.tag_weighter = TagBasedLossWeighter
-            else:
-                # Use instance as before
-                self.tag_weighter = TagBasedLossWeighter(
-                    min_weight=min_tag_weight,
-                    max_weight=max_tag_weight
-                )
+            self.tag_weighter = TagBasedLossWeighter(
+                min_weight=min_tag_weight,
+                max_weight=max_tag_weight,
+                no_cache=no_caching_latents
+            )
         else:
             self.tag_weighter = None
             
@@ -132,23 +128,16 @@ class CustomDataset(Dataset):
     def _parse_tags(self, caption):
         """Parse tags using tag weighter class method"""
         if self.tag_weighter:
-            if self.no_caching_latents:
-                # Use static method when no caching
-                return TagBasedLossWeighter.parse_tags(caption)
-            # Use instance method when caching
+            # Always use instance method - static method not needed
             return self.tag_weighter.parse_tags(caption)
         return [], {}
 
     def _format_caption(self, caption):
-        """Format caption using appropriate tag weighter method"""
+        """Format caption using tag weighter instance method"""
         if not caption:
             return ""
         if self.tag_weighter:
             try:
-                if self.no_caching_latents:
-                    logger.debug(f"Using static format_caption with {type(self.tag_weighter)}")
-                    return self.tag_weighter.format_caption(caption)
-                logger.debug(f"Using instance format_caption with {type(self.tag_weighter)}")
                 return self.tag_weighter.format_caption(caption)
             except Exception as e:
                 logger.error(f"Caption formatting failed: {str(e)}")
@@ -156,13 +145,9 @@ class CustomDataset(Dataset):
         return caption
 
     def _calculate_tag_weights(self, tags, special_tags):
-        """Calculate tag weights using appropriate tag weighter method"""
+        """Calculate tag weights using tag weighter instance method"""
         if self.tag_weighter:
-            if self.no_caching_latents:
-                # Use static method when no caching
-                return TagBasedLossWeighter.calculate_static_weights(tags, special_tags)
-            # Use instance method when caching
-            return self.tag_weighter.calculate_weights(tags)
+            return self.tag_weighter.calculate_weights(tags, special_tags)
         return 1.0
 
     def _initialize_workers(self):
