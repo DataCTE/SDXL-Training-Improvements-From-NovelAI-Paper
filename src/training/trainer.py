@@ -16,6 +16,7 @@ from collections import defaultdict
 import time
 from tqdm import tqdm
 from data.dataset import create_dataloader
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -723,3 +724,93 @@ def get_grad_norm(model: torch.nn.Module) -> float:
     except Exception as e:
         logger.error(f"Failed to calculate gradient norm: {str(e)}")
         return 0.0
+
+def run_validation(
+    args,
+    models,
+    components,
+    device,
+    dtype,
+    global_step: int
+) -> Dict[str, float]:
+    """Run validation with proper error handling and metrics tracking."""
+    try:
+        # Initialize inference pipeline if not already in components
+        if "inference" not in components:
+            from inference.text_to_image import SDXLInference
+            
+            components["inference"] = SDXLInference(
+                device=device,
+                dtype=dtype,
+                use_v_prediction=args.training_mode == "v_prediction",
+                use_resolution_binning=True,
+                use_zero_terminal_snr=args.use_ztsnr,
+                sigma_min=args.sigma_min,
+                sigma_max=args.sigma_max,
+                sigma_data=args.sigma_data,
+                min_snr_gamma=args.min_snr_gamma,
+                noise_offset=args.noise_offset
+            )
+            
+            # Set models from training
+            components["inference"].pipeline.unet = models["unet"]
+            components["inference"].pipeline.vae = models["vae"]
+            components["inference"].pipeline.text_encoder = models["text_encoder"]
+            components["inference"].pipeline.text_encoder_2 = models["text_encoder_2"]
+            components["inference"].pipeline.tokenizer = models["tokenizer"]
+            components["inference"].pipeline.tokenizer_2 = models["tokenizer_2"]
+
+        # Set models to eval mode
+        for model in models.values():
+            if isinstance(model, torch.nn.Module):
+                model.eval()
+
+        try:
+            with torch.no_grad():
+                # Run validation using configured prompts
+                validation_metrics = components["inference"].run_validation(
+                    prompts=args.validation_prompts,
+                    output_dir=os.path.join(args.output_dir, f"validation_{global_step}"),
+                    log_to_wandb=args.use_wandb,
+                    guidance_scale=args.validation_guidance_scale,
+                    num_inference_steps=args.validation_num_steps,
+                    height=args.validation_height,
+                    width=args.validation_width,
+                    num_images_per_prompt=args.validation_images_per_prompt,
+                    seed=args.validation_seed,
+                    rescale_cfg=args.rescale_cfg,
+                    scale_method=args.scale_method,
+                    rescale_multiplier=args.rescale_multiplier
+                )
+
+                # Add EMA metrics if enabled
+                if components.get("ema"):
+                    validation_metrics["validation/ema_decay"] = components["ema"].cur_decay_value
+
+                # Log validation results
+                logger.info(
+                    "Validation Results: " +
+                    ", ".join(f"{k}: {v:.4f}" for k, v in validation_metrics.items())
+                )
+
+                return validation_metrics
+
+        except Exception as e:
+            logger.error(f"Validation inference failed: {str(e)}")
+            logger.error(traceback.format_exc())
+            return {}
+
+    except Exception as e:
+        logger.error(f"Validation setup failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        return {}
+
+    finally:
+        # Set models back to train mode
+        for model in models.values():
+            if isinstance(model, torch.nn.Module):
+                model.train()
+        
+        # Clear CUDA cache
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
