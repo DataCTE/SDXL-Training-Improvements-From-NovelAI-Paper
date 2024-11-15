@@ -2124,12 +2124,15 @@ class CustomDataset(CustomDatasetBase):
             return image.resize((target_width, target_height), Image.LANCZOS)
 
     def custom_collate(self, batch):
-        """Ultra-optimized collate function with parallel processing and memory optimization"""
-        from concurrent.futures import ThreadPoolExecutor
-        import numpy as np
-        from functools import partial
+        """Collate function with better error handling"""
+        # Filter out None values
+        valid_items = [item for item in batch if item is not None]
         
-        @staticmethod
+        if not valid_items:
+            logger.warning("Batch contained all None values, retrying with new batch")
+            return None
+
+        # Define helper functions at class level or outside
         def fast_stack_tensors(tensors, dim=0):
             """Optimized tensor stacking with pre-allocation"""
             if not tensors:
@@ -2160,11 +2163,12 @@ class CustomDataset(CustomDatasetBase):
         
         try:
             # Optimized batch filtering
-            valid_batch = [item for item in batch if item is not None]
-            if not valid_batch:
-                raise RuntimeError("Empty batch after filtering")
-            
+            valid_batch = valid_items  # We already filtered above
             batch_size = len(valid_batch)
+            
+            if batch_size == 0:
+                raise RuntimeError("Empty batch after filtering")
+                
             if batch_size == 1:
                 # Fast path for single item batches
                 return {
@@ -2235,8 +2239,8 @@ class CustomDataset(CustomDatasetBase):
             return result
             
         except Exception as e:
-            logger.error(f"Collate error: {str(e)}")
-            raise
+            logger.error(f"Collation error: {str(e)}")
+            return None
 
     def __getitem__(self, idx):
         """Optimized item retrieval with caching and efficient processing"""
@@ -2746,25 +2750,35 @@ class CustomDataLoader(CustomDataLoaderBase):
         return self
 
     def __next__(self):
-        """Get next batch of data"""
-        try:
-            if self.num_workers > 0:
-                # Get prefetched batch
-                future = self.prefetch_queue.get()
-                if future is None:
-                    raise StopIteration
+        """Get next batch of data with retry logic"""
+        max_retries = 3
+        for _ in range(max_retries):
+            try:
+                if self.num_workers > 0:
+                    # Get prefetched batch
+                    future = self.prefetch_queue.get()
+                    if future is None:
+                        raise StopIteration
+                        
+                    batch = future.result()
+                    collated = self.dataset.collate_fn(batch)
+                    if collated is not None:
+                        return collated
+                else:
+                    # Single-threaded processing
+                    indices = next(self._iterator)
+                    batch = self.dataset.get_batch(indices)
+                    collated = self.dataset.collate_fn(batch)
+                    if collated is not None:
+                        return collated
                     
-                batch = future.result()
-                return self.dataset.collate_fn(batch)
-            else:
-                # Single-threaded processing
-                indices = next(self._iterator)
-                batch = self.dataset.get_batch(indices)
-                return self.dataset.collate_fn(batch)
+            except StopIteration:
+                self._stop_event.set()
+                raise
                 
-        except StopIteration:
-            self._stop_event.set()
-            raise
+        # If we get here, we've failed all retries
+        logger.error("Failed to get valid batch after maximum retries")
+        raise RuntimeError("Failed to get valid batch after maximum retries")
 
     def __len__(self):
         """Return the number of batches in the dataloader"""
