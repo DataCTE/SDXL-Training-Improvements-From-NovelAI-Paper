@@ -1809,7 +1809,8 @@ class CustomDataset(CustomDatasetBase):
             }
             
         except Exception as e:
-            logger.error(f"Error processing uncached item {
+            logger.error(f"Error processing uncached item {img_path}: {str(e)}")
+            return None
     
     def _get_bucket_size(self, image_size):
         """Fast bucket size calculation using numpy vectorization"""
