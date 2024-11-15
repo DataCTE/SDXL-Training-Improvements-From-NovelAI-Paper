@@ -55,10 +55,17 @@ def train_one_epoch(
     min_snr_gamma: float = 5.0,
     sigma_data: float = 1.0,
     use_ztsnr: bool = True,
+    rescale_cfg: bool = True,
+    rescale_multiplier: float = 0.7,
+    scale_method: str = "karras",
+    resolution_scaling: bool = True,
+    use_tag_weighting: bool = True,
     vae_finetuner: Optional[Any] = None,
     vae_train_freq: int = 10,
+    ema_model: Optional[Any] = None,
     verbose: bool = False
 ) -> Tuple[float, Dict[str, float]]:
+    """Train the model for one epoch with improved v-prediction, ZTSNR, VAE finetuning and EMA support"""
     model.train()
     scaler = GradScaler(enabled=mixed_precision)
     metrics = {
@@ -68,7 +75,8 @@ def train_one_epoch(
         'vae_loss': AverageMeter('VAE Loss', ':.4e') if vae_finetuner else None,
         'grad_norm': AverageMeter('Gradient Norm', ':.4e'),
         'lr': AverageMeter('Learning Rate', ':.2e'),
-        'bucket_size': AverageMeter('Bucket Size', ':6.0f')  # Track bucket sizes
+        'bucket_size': AverageMeter('Bucket Size', ':6.0f'),
+        'ema_decay': AverageMeter('EMA Decay', ':.4e') if ema_model else None
     }
     
     end = time.time()
@@ -94,101 +102,117 @@ def train_one_epoch(
                                if torch.is_tensor(v) else v 
                                for k, v in batch.get('added_cond_kwargs', {}).items()}
             
-            # Resolution and sigma logging
-            height, width = latents.shape[2:4]
-            if verbose:
-                logger.info(f"Resolution: {height*8}x{width*8} (latents: {height}x{width})")
-            
-            # Update bucket size metric
-            if 'bucket_size' in batch:
-                bucket_h, bucket_w = batch['bucket_size']
-                metrics['bucket_size'].update(bucket_h * bucket_w)
-            
-            sigma = get_sigmas(height=height*8, width=width*8)[0].to(device, dtype=dtype)
-            if verbose:
-                logger.info(f"Sigma: {sigma.item():.6f}")
-            
-            with autocast(device_type='cuda', dtype=dtype, enabled=mixed_precision):
-                loss = training_loss_v_prediction(
-                    model=model,
-                    x_0=latents,
-                    sigma=sigma,
-                    text_embeddings=text_embeddings,
-                    added_cond_kwargs=added_cond_kwargs,
-                    tag_weighter=tag_weighter,
-                    batch_tags=batch,
-                    min_snr_gamma=min_snr_gamma,
-                    sigma_data=sigma_data,
-                    verbose=verbose
-                )
-                loss = loss / gradient_accumulation_steps
-            
-            if not torch.isfinite(loss):
-                logger.error(f"Loss is {loss.item()}")
-                continue
-                
-            scaler.scale(loss).backward()
-            
+            # VAE finetuning step
             if vae_finetuner and batch_idx % vae_train_freq == 0:
                 vae_loss = vae_finetuner.training_step(batch)
                 metrics['vae_loss'].update(vae_loss.item())
+                if verbose:
+                    logger.info(f"VAE Loss: {vae_loss.item():.4f}")
+
+            # Forward pass with mixed precision
+            with autocast(enabled=mixed_precision):
+                # Get loss weights from tag weighter if available
+                tag_weights = None
+                if use_tag_weighting and tag_weighter is not None:
+                    tag_weights = tag_weighter.get_weights(batch.get('tags', None))
+
+                # Calculate training loss with all improvements
+                loss = training_loss_v_prediction(
+                    model=model,
+                    x=latents,
+                    text_embeddings=text_embeddings,
+                    added_cond_kwargs=added_cond_kwargs,
+                    min_snr_gamma=min_snr_gamma,
+                    sigma_data=sigma_data,
+                    use_ztsnr=use_ztsnr,
+                    rescale_cfg=rescale_cfg,
+                    rescale_multiplier=rescale_multiplier,
+                    scale_method=scale_method,
+                    resolution_scaling=resolution_scaling,
+                    tag_weights=tag_weights
+                )
+                
+                # Scale loss for gradient accumulation
+                loss = loss / gradient_accumulation_steps
+
+            # Backward pass with gradient scaling
+            scaler.scale(loss).backward()
             
+            # Step optimization if gradient accumulation complete
             if (batch_idx + 1) % gradient_accumulation_steps == 0:
+                # Unscale gradients for clipping
                 scaler.unscale_(optimizer)
                 
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                # Gradient clipping
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), 
+                    max_grad_norm
+                )
                 metrics['grad_norm'].update(grad_norm.item())
-                logger.info(f"Gradient norm: {grad_norm.item():.6f}")
-                
+
+                # Optimizer and scheduler steps
                 scaler.step(optimizer)
                 scaler.update()
+                lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 
-                lr_scheduler.step()
-                metrics['lr'].update(optimizer.param_groups[0]['lr'])
-            
+                # Update EMA model if available
+                if ema_model is not None:
+                    ema_model.step(model)
+                    if metrics['ema_decay'] is not None:
+                        metrics['ema_decay'].update(ema_model._get_decay_rate())
+
+            # Update metrics
             metrics['loss'].update(loss.item() * gradient_accumulation_steps)
+            metrics['lr'].update(optimizer.param_groups[0]['lr'])
+            if 'bucket_size' in batch:
+                metrics['bucket_size'].update(np.prod(batch['bucket_size']))
             metrics['batch_time'].update(time.time() - end)
             
-            if batch_idx % 10 == 0:
-                logger.info("Metrics:")
-                for name, meter in metrics.items():
-                    if meter is not None:
-                        logger.info(f"{name}: {meter}")
+            # Log progress
+            if verbose and (batch_idx + 1) % 10 == 0:
+                log_metrics_batch(metrics, batch_idx, len(train_dataloader))
             
             end = time.time()
-            
-        except RuntimeError as e:
-            if "size mismatch" in str(e):
-                logger.error("\nShape mismatch detected:")
-                err_msg = str(e)
-                param = err_msg.split('size mismatch for ')[1].split(':')[0] 
-                expected = err_msg.split('copying a param with shape ')[1].split(',')[0]
-                actual = err_msg.split('the shape in current model is ')[1]
-                logger.error(f"Parameter: {param}")
-                logger.error(f"Expected shape: {expected}")
-                logger.error(f"Actual shape: {actual}")
-            raise
-            
+
         except Exception as e:
-            logger.error(f"Error in batch {batch_idx}:")
-            logger.error(str(e))
+            logger.error(f"Error in batch {batch_idx}: {str(e)}")
             logger.error(traceback.format_exc())
             continue
 
-    return metrics['loss'].avg, {k: v.avg if v is not None else 0.0 for k, v in metrics.items()}
+    return metrics['loss'].avg, {k: v.avg for k, v in metrics.items() if v is not None}
 
 def train(args, models, train_components, device, dtype):
-    """Main training loop with improved v-prediction and ZTSNR support"""
+    """Main training loop with improved v-prediction, ZTSNR, VAE finetuning and EMA support"""
+    # Model setup
     model = models["unet"]
     if args.use_ema:
-        ema_model = models["ema"]
+        ema_model = models.get("ema")
+        if ema_model:
+            ema_model.to(device=device, dtype=dtype)
+            logger.info("EMA model initialized and moved to device")
+            if args.ema_decay:
+                ema_model.decay = args.ema_decay
+            if args.ema_update_after_step:
+                ema_model.update_after_step = args.ema_update_after_step
+            if args.ema_power:
+                ema_model.power = args.ema_power
+            if args.ema_min_decay:
+                ema_model.min_decay = args.ema_min_decay
+            if args.ema_max_decay:
+                ema_model.max_decay = args.ema_max_decay
+            if args.ema_update_every:
+                ema_model.update_every = args.ema_update_every
+            if args.use_ema_warmup:
+                ema_model.use_warmup = True
     
+    # Optimizer and components setup
     optimizer = train_components["optimizer"]
     lr_scheduler = train_components["lr_scheduler"]
     train_dataloader = train_components["train_dataloader"]
     tag_weighter = train_components["tag_weighter"]
     
+    # Initialize training history
     training_history = {
         'loss_history': [],
         'validation_scores': [],
@@ -200,17 +224,25 @@ def train(args, models, train_components, device, dtype):
     global_step = 0
     start_epoch = 0
     
-    # Monitor memory usage with gradient checkpointing
-    if args.gradient_checkpointing and torch.cuda.is_available():
-        logger.info("\nInitial memory usage with gradient checkpointing:")
-        logger.info(f"Allocated: {torch.cuda.memory_allocated()/1e9:.2f}GB")
-        logger.info(f"Cached: {torch.cuda.memory_reserved()/1e9:.2f}GB")
-        
-        if args.use_wandb:
-            log_metrics_batch({
-                "memory/allocated_gb": torch.cuda.memory_allocated()/1e9,
-                "memory/cached_gb": torch.cuda.memory_reserved()/1e9
-            }, step=global_step)
+    # Set up mixed precision training
+    scaler = None
+    if args.mixed_precision:
+        scaler = GradScaler()
+    
+    # Enable gradient checkpointing if requested
+    if args.gradient_checkpointing:
+        model.enable_gradient_checkpointing()
+        logger.info("\nGradient checkpointing enabled")
+        if torch.cuda.is_available():
+            logger.info("Initial memory usage with gradient checkpointing:")
+            logger.info(f"Allocated: {torch.cuda.memory_allocated()/1e9:.2f}GB")
+            logger.info(f"Cached: {torch.cuda.memory_reserved()/1e9:.2f}GB")
+            
+            if args.use_wandb:
+                log_metrics_batch({
+                    "memory/allocated_gb": torch.cuda.memory_allocated()/1e9,
+                    "memory/cached_gb": torch.cuda.memory_reserved()/1e9
+                }, step=global_step)
     
     # Resume from checkpoint if specified
     if args.resume_from_checkpoint:
@@ -222,8 +254,12 @@ def train(args, models, train_components, device, dtype):
             training_history.update(checkpoint_data['training_history'])
     
     logger.info(f"Starting training from epoch {start_epoch}")
- 
-
+    
+    # Enable model compilation if requested
+    if args.enable_compile:
+        logger.info(f"Compiling model with mode: {args.compile_mode}")
+        model = torch.compile(model, mode=args.compile_mode)
+    
     # Training loop
     logger.info("\nStarting training loop...")
     for epoch in range(start_epoch, args.num_epochs):
@@ -247,8 +283,14 @@ def train(args, models, train_components, device, dtype):
             min_snr_gamma=args.min_snr_gamma,
             sigma_data=args.sigma_data,
             use_ztsnr=args.use_ztsnr,
+            rescale_cfg=args.rescale_cfg,
+            rescale_multiplier=args.rescale_multiplier,
+            scale_method=args.scale_method,
+            resolution_scaling=args.resolution_scaling,
+            use_tag_weighting=args.use_tag_weighting,
             vae_finetuner=train_components.get("vae_finetuner"),
             vae_train_freq=args.vae_train_freq,
+            ema_model=ema_model,
             verbose=args.verbose
         )
         
@@ -256,67 +298,71 @@ def train(args, models, train_components, device, dtype):
         if not args.skip_validation and (epoch + 1) % args.validation_frequency == 0:
             logger.info("\nRunning end-of-epoch validation...")
             
-            # Regular model validation (using training model)
+            # Regular model validation
             validation_metrics = train_components["validator"].run_validation(
                 prompts=args.validation_prompts,
                 output_dir=os.path.join(args.output_dir, f"validation_epoch_{epoch+1}"),
                 log_to_wandb=args.use_wandb,
                 num_images_per_prompt=1,
-                guidance_scale=5.0,
-                num_inference_steps=28,
+                guidance_scale=args.guidance_scale if hasattr(args, 'guidance_scale') else 5.0,
+                num_inference_steps=args.num_inference_steps,
                 height=1024,
                 width=1024
             )
             
             # EMA validation if enabled
-            if train_components["ema_model"] is not None:
+            if args.use_ema and ema_model is not None:
                 # Temporarily swap UNet with EMA model
                 original_unet = train_components["validator"].pipeline.unet
-                train_components["validator"].pipeline.unet = train_components["ema_model"].averaged_model
+                train_components["validator"].pipeline.unet = ema_model.averaged_model
                 
                 ema_validation_metrics = train_components["validator"].run_validation(
                     prompts=args.validation_prompts,
                     output_dir=os.path.join(args.output_dir, f"ema_validation_epoch_{epoch+1}"),
                     log_to_wandb=args.use_wandb,
                     num_images_per_prompt=1,
-                    guidance_scale=5.0,
-                    num_inference_steps=28,
+                    guidance_scale=args.guidance_scale if hasattr(args, 'guidance_scale') else 5.0,
+                    num_inference_steps=args.num_inference_steps,
                     height=1024,
-                    width=1024
+                    width=1024,
+                    prefix="ema_"
                 )
                 
                 # Restore original UNet
                 train_components["validator"].pipeline.unet = original_unet
-                
-                if args.use_wandb:
-                    log_metrics_batch({
-                        "validation/epoch": epoch + 1,
-                        "validation/metrics": validation_metrics,
-                        "validation/ema_metrics": ema_validation_metrics
-                    }, step=global_step)
-            else:
-                if args.use_wandb:
-                    log_metrics_batch({
-                        "validation/epoch": epoch + 1,
-                        "validation/metrics": validation_metrics
-                    }, step=global_step)
-            
-            # Update training history
-            training_history['validation_scores'].append(validation_metrics)
-            if train_components["ema_model"] is not None:
-                training_history['ema_validation_scores'].append(ema_validation_metrics)
         
-        # Save checkpoint at epoch end if requested
+        # Save checkpoint
         if args.save_checkpoints and (epoch + 1) % args.save_epochs == 0:
-            checkpoint_dir = os.path.join(args.output_dir, f"checkpoint-epoch-{epoch+1}")
+            checkpoint_path = os.path.join(args.output_dir, f"checkpoint_epoch_{epoch+1}.pt")
             save_checkpoint(
+                checkpoint_path,
+                epoch=epoch,
                 models=models,
                 train_components=train_components,
-                args=args,
-                epoch=epoch,
-                global_step=global_step,
                 training_history=training_history,
-                output_dir=checkpoint_dir
+                global_step=global_step
+            )
+            logger.info(f"Saved checkpoint: {checkpoint_path}")
+        
+        # Update global step
+        global_step += len(train_dataloader)
+        
+        # Push to hub if requested
+        if args.push_to_hub and (epoch + 1) % args.save_epochs == 0:
+            logger.info("\nPushing to Hub...")
+            save_model_card(
+                repo_id=args.hub_model_id,
+                images=None,  # Add sample images if desired
+                base_model=args.model_path,
+                train_text_encoder=True,
+                prompt=args.validation_prompts[0],
+                repo_folder=args.output_dir,
+            )
+            push_to_hub(
+                repo_id=args.hub_model_id,
+                output_dir=args.output_dir,
+                commit_message=f"Epoch {epoch+1}",
+                private=args.hub_private
             )
     
     return training_history

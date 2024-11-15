@@ -12,6 +12,8 @@ def get_sigmas(num_inference_steps: int = 28,
                sigma_min: float = 0.0292, 
                height: int = 1024, 
                width: int = 1024,
+               resolution_scaling: bool = True,
+               scale_method: str = "karras",
                verbose: bool = True) -> torch.Tensor:
     """
     Generate sigmas for ZTSNR with resolution-dependent scaling using 28-step native schedule.
@@ -22,6 +24,8 @@ def get_sigmas(num_inference_steps: int = 28,
         sigma_min: Minimum sigma value (default: 0.0292 from SDXL paper)
         height: Image height for resolution scaling
         width: Image width for resolution scaling
+        resolution_scaling: Whether to apply resolution-dependent scaling
+        scale_method: Method for sigma scaling ("karras" or "simple")
         verbose: Whether to log sigma schedule details
     
     Returns:
@@ -30,7 +34,14 @@ def get_sigmas(num_inference_steps: int = 28,
     # Calculate resolution-dependent sigma_max with quadratic scaling
     base_res = 1024 * 1024
     current_res = height * width
-    scale_factor = (current_res / base_res)  # Quadratic scaling for redundant signal
+    
+    if resolution_scaling:
+        if scale_method == "karras":
+            scale_factor = (current_res / base_res)  # Quadratic scaling for redundant signal
+        else:  # simple
+            scale_factor = np.sqrt(current_res / base_res)  # Linear scaling
+    else:
+        scale_factor = 1.0
     
     # Use 20000 as practical infinity approximation for ZTSNR (appendix A.2)
     sigma_max = 20000.0 * scale_factor
@@ -38,6 +49,7 @@ def get_sigmas(num_inference_steps: int = 28,
     if verbose:
         logger.info(f"Generating sigma schedule:")
         logger.info(f"- Resolution: {width}x{height} (scale factor: {scale_factor:.3f})")
+        logger.info(f"- Scaling method: {scale_method}")
         logger.info(f"- Sigma range: {sigma_min:.4f} to {sigma_max:.1f}")
     
     # Use non-linear spacing with EDM-style karras schedule
@@ -88,6 +100,10 @@ def training_loss_v_prediction(model: torch.nn.Module,
                              tag_weighter: Optional[Any] = None,
                              batch_tags: Optional[Any] = None,
                              min_snr_gamma: float = 5.0,
+                             rescale_cfg: bool = True,
+                             rescale_multiplier: float = 0.7,
+                             scale_method: str = "karras",
+                             use_tag_weighting: bool = True,
                              verbose: bool = False) -> torch.Tensor:
     """
     Calculate v-prediction loss with MinSNR weighting and SDXL architecture support.
@@ -103,6 +119,10 @@ def training_loss_v_prediction(model: torch.nn.Module,
         tag_weighter: Optional tag weighting module
         batch_tags: Optional batch tag information
         min_snr_gamma: MinSNR gamma parameter (default: 5.0)
+        rescale_cfg: Whether to apply CFG rescaling
+        rescale_multiplier: Multiplier for CFG rescaling
+        scale_method: Method for CFG rescaling ("karras" or "simple")
+        use_tag_weighting: Whether to apply tag weighting
         verbose: Whether to log detailed information
     """
     try:
@@ -135,8 +155,16 @@ def training_loss_v_prediction(model: torch.nn.Module,
         snr_weight = (snr / min_snr_gamma).clamp(max=1.0)
         loss = (mse * snr_weight).mean()
         
-        # Apply tag weighting if provided
-        if tag_weighter is not None and batch_tags is not None:
+        # Apply CFG rescaling if enabled
+        if rescale_cfg:
+            if scale_method == "karras":
+                cfg_scale = rescale_multiplier * torch.sqrt(1 + snr)
+            else:  # simple
+                cfg_scale = rescale_multiplier * (1 + snr)
+            loss = loss * cfg_scale.mean()
+        
+        # Apply tag weighting if provided and enabled
+        if use_tag_weighting and tag_weighter is not None and batch_tags is not None:
             tag_weights = tag_weighter(batch_tags)
             loss = loss * tag_weights.mean()
         
@@ -144,7 +172,9 @@ def training_loss_v_prediction(model: torch.nn.Module,
             logger.info(f"Loss components:")
             logger.info(f"- Base MSE: {mse.mean().item():.4e}")
             logger.info(f"- SNR weight: {snr_weight.mean().item():.4f}")
-            if tag_weighter is not None:
+            if rescale_cfg:
+                logger.info(f"- CFG scale ({scale_method}): {cfg_scale.mean().item():.4f}")
+            if use_tag_weighting and tag_weighter is not None:
                 logger.info(f"- Tag weight: {tag_weights.mean().item():.4f}")
             logger.info(f"Final loss: {loss.item():.4e}")
         

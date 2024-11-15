@@ -18,6 +18,7 @@ from utils.validation import validate_image_dimensions
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import gc
+from .tag_based_loss_weighter import TagBasedLossWeighter
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +110,12 @@ class CustomDataset(Dataset):
         
         # Set collate function
         self.collate_fn = self.custom_collate
+        
+        # Initialize tag weighter
+        self.tag_weighter = TagBasedLossWeighter(
+            min_weight=min_tag_weight,
+            max_weight=max_tag_weight
+        )
 
     def __len__(self):
         """Return the total number of images in the dataset"""
@@ -249,120 +256,222 @@ class CustomDataset(Dataset):
         
         logger.info(f"Preprocessing complete: {len(processed_images)} images processed")
 
-    def _batch_process_latents_efficient(self, batch_size=4):
-        """Process and cache latents in batches using multiple workers"""
-        uncached_images = [
-            img_path for img_path, lat_path in zip(self.image_paths, self.latent_paths)
-            if not lat_path.exists()
-        ]
+    def _validate_cached_latent(self, latent_path, img_path):
+        """Validate cached latent file integrity and correctness"""
+        try:
+            if not latent_path.exists():
+                return False
+                
+            # Quick size check first (faster than loading)
+            if latent_path.stat().st_size < 1000:  # Minimum expected size
+                logger.warning(f"Cached latent too small for {img_path}, will regenerate")
+                return False
+            
+            # Load and validate cache structure
+            cache_data = torch.load(latent_path, map_location="cpu")
+            
+            # Check required keys
+            required_keys = ["latents", "text_embeddings", "text_embeddings_2", "added_cond_kwargs"]
+            if not all(k in cache_data for k in required_keys):
+                logger.warning(f"Cached latent missing required keys for {img_path}, will regenerate")
+                return False
+                
+            # Validate shapes
+            latents = cache_data["latents"]
+            if not isinstance(latents, torch.Tensor):
+                logger.warning(f"Invalid latent type for {img_path}, will regenerate")
+                return False
+                
+            if len(latents.shape) != 3 or latents.shape[0] != 4:  # SDXL latent shape
+                logger.warning(f"Invalid latent shape for {img_path}, will regenerate")
+                return False
+                
+            # Check if the cached latent matches current image
+            with Image.open(img_path) as img:
+                width, height = img.size
+                expected_latent_height = ((height + 7) // 8)
+                expected_latent_width = ((width + 7) // 8)
+                
+                if latents.shape[1:] != (expected_latent_height, expected_latent_width):
+                    logger.warning(f"Latent dimensions mismatch for {img_path}, will regenerate")
+                    return False
+            
+            # Validate text embeddings
+            if not isinstance(cache_data["text_embeddings"], torch.Tensor):
+                logger.warning(f"Invalid text embeddings type for {img_path}, will regenerate")
+                return False
+                
+            # Check if caption has changed
+            caption_path = Path(img_path).with_suffix('.txt')
+            with open(caption_path, 'r', encoding='utf-8') as f:
+                current_caption = f.read().strip()
+                
+            # Tokenize current caption
+            current_tokens = self.tokenizer(
+                current_caption,
+                padding="max_length",
+                max_length=self.tokenizer.model_max_length,
+                truncation=True,
+                return_tensors="pt"
+            ).input_ids
+            
+            # Compare with cached embeddings shape
+            if cache_data["text_embeddings"].shape[1] != current_tokens.shape[1]:
+                logger.warning(f"Caption length mismatch for {img_path}, will regenerate")
+                return False
+            
+            return True
+            
+        except Exception as e:
+            logger.warning(f"Error validating cached latent for {img_path}: {str(e)}")
+            return False
+
+    def _batch_process_latents_efficient(self, batch_size=32):
+        """Process and cache latents in batches using multiple workers and memory-efficient processing"""
+        # First validate all cached latents
+        uncached_images = []
+        for img_path, lat_path in zip(self.image_paths, self.latent_paths):
+            if not self._validate_cached_latent(lat_path, img_path):
+                uncached_images.append(img_path)
+                # Remove invalid cache if it exists
+                if lat_path.exists():
+                    try:
+                        lat_path.unlink()
+                    except Exception as e:
+                        logger.error(f"Error removing invalid cache {lat_path}: {str(e)}")
         
         if not uncached_images:
-            logger.info("All latents are already cached")
+            logger.info("All latents are valid and cached")
             return
 
         logger.info(f"Caching latents for {len(uncached_images)} images in batches")
         
-        # Group images by size using parallel processing
+        # Group images by size for more efficient batching
+        size_groups = defaultdict(list)
+        
         def group_image_by_size(img_path):
             try:
-                # First check if caption file exists
                 caption_path = Path(img_path).with_suffix('.txt')
                 if not caption_path.exists():
-                    logger.warning(f"Skipping {img_path}: No caption file found")
                     return None
                     
                 with Image.open(img_path) as img:
-                    # Get dimensions
                     width, height = img.size
-                    
-                    # If all_ar is True, just round to multiples of 8
                     if self.all_ar:
                         width = ((width + 7) // 8) * 8
                         height = ((height + 7) // 8) * 8
-                    # Otherwise limit maximum dimension while preserving aspect ratio
                     elif max(width, height) > 2048:
                         scale = 2048 / max(width, height)
                         width = int(width * scale)
                         height = int(height * scale)
-                        
-                    return (img_path, f"{width}x{height}")
+                    return img_path, f"{width}x{height}"
             except Exception as e:
                 logger.error(f"Error reading image {img_path}: {str(e)}")
                 return None
 
-        # Use ThreadPoolExecutor for I/O-bound size checking
-        size_groups = {}
-        valid_images = []
+        # Process images in parallel for size grouping
         with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-            for result in tqdm(
-                executor.map(group_image_by_size, uncached_images),
-                total=len(uncached_images),
-                desc="Grouping images by size"
-            ):
+            futures = []
+            for img_path in uncached_images:
+                futures.append(executor.submit(group_image_by_size, img_path))
+            
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Grouping images"):
+                result = future.result()
                 if result:
                     img_path, size_key = result
-                    if size_key not in size_groups:
-                        size_groups[size_key] = []
                     size_groups[size_key].append(img_path)
-                    valid_images.append(img_path)
 
-        def process_batch_with_vae(batch_paths):
-            """Process a batch of images through VAE and generate embeddings"""
-            if not batch_paths:
-                return []
-            
-            batch_results = []
+        # Process each size group in parallel
+        def process_size_group(size_key, paths):
             try:
-                # Process images in batch
-                images = []
-                valid_paths = []
-                for path in batch_paths:
-                    try:
-                        with Image.open(path) as img:
-                            width, height = img.size
-                            
-                            # If all_ar is True, just round to multiples of 8
-                            if self.all_ar:
-                                width = ((width + 7) // 8) * 8
-                                height = ((height + 7) // 8) * 8
-                                if width != img.size[0] or height != img.size[1]:
-                                    img = img.resize((width, height), Image.LANCZOS)
-                            # Otherwise scale down if needed while preserving aspect ratio
-                            elif max(width, height) > 2048:
-                                scale = 2048 / max(width, height)
-                                new_width = int(width * scale)
-                                new_height = int(height * scale)
-                                img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-                            
-                            if img.mode != 'RGB':
-                                img = img.convert('RGB')
-                            
-                            # Transform image
-                            image_tensor = transforms.ToTensor()(img)
-                            image_tensor = transforms.Normalize([0.5], [0.5])(image_tensor)
-                            images.append(image_tensor)
-                            valid_paths.append(path)
-                    except Exception as e:
-                        logger.error(f"Error processing image {path}: {str(e)}")
-                        continue
+                for i in range(0, len(paths), batch_size):
+                    batch_paths = paths[i:i + batch_size]
+                    self.process_batch_with_vae(batch_paths)
+                return len(paths)
+            except Exception as e:
+                logger.error(f"Error processing size group {size_key}: {str(e)}")
+                return 0
 
-                if not images:
-                    return []
+        total_processed = 0
+        with ThreadPoolExecutor(max_workers=min(len(size_groups), self.num_workers)) as executor:
+            futures = []
+            for size_key, paths in size_groups.items():
+                futures.append(executor.submit(process_size_group, size_key, paths))
+            
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Processing size groups"):
+                total_processed += future.result()
 
-                # Stack images and process through VAE
+        logger.info(f"Successfully cached latents for {total_processed} images")
+
+    def process_batch_with_vae(self, batch_paths):
+        """Process a batch of images through VAE with optimized memory usage"""
+        if not batch_paths:
+            return
+        
+        try:
+            # Process images in parallel
+            def load_and_transform_image(path):
+                try:
+                    with Image.open(path) as img:
+                        if img.mode != 'RGB':
+                            img = img.convert('RGB')
+                        
+                        width, height = img.size
+                        
+                        # Get target size considering aspect ratio constraints
+                        target_w, target_h = self._get_target_size(width, height)
+                        
+                        # Resize to target size
+                        if width != target_w or height != target_h:
+                            if width * height < target_w * target_h:
+                                img = self._upscale_image(img, target_w, target_h)
+                            else:
+                                img = self._downscale_image(img, target_w, target_h)
+                        
+                        # Transform to tensor
+                        image_tensor = transforms.ToTensor()(img)
+                        image_tensor = transforms.Normalize([0.5], [0.5])(image_tensor)
+                        return image_tensor, None
+                except Exception as e:
+                    return None, str(e)
+
+            # Load images in parallel
+            with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+                results = list(executor.map(load_and_transform_image, batch_paths))
+            
+            # Filter valid results
+            valid_tensors = []
+            valid_paths = []
+            for path, (tensor, error) in zip(batch_paths, results):
+                if tensor is not None:
+                    valid_tensors.append(tensor)
+                    valid_paths.append(path)
+                elif error:
+                    logger.error(f"Error processing {path}: {error}")
+
+            if not valid_tensors:
+                return
+
+            # Process through VAE in chunks to manage memory
+            chunk_size = 8  # Smaller chunks for better memory management
+            for i in range(0, len(valid_tensors), chunk_size):
+                chunk_tensors = valid_tensors[i:i + chunk_size]
+                chunk_paths = valid_paths[i:i + chunk_size]
+                
+                # Generate latents
                 with torch.no_grad():
-                    image_tensor = torch.stack(images).to(self.vae.device, dtype=self.vae.dtype)
+                    image_tensor = torch.stack(chunk_tensors).to(self.vae.device, dtype=self.vae.dtype)
                     latents = self.vae.encode(image_tensor).latent_dist.sample()
                     latents = latents * self.vae.config.scaling_factor
 
-                # Process each result
-                for idx, img_path in enumerate(valid_paths):
+                # Process text embeddings in parallel
+                def process_text_embeddings(path):
                     try:
-                        caption_path = Path(img_path).with_suffix('.txt')
+                        caption_path = Path(path).with_suffix('.txt')
                         with open(caption_path, 'r', encoding='utf-8') as f:
                             caption = f.read().strip()
                         
-                        # Generate text embeddings
+                        # Generate embeddings
                         text_inputs = self.tokenizer(
                             caption,
                             padding="max_length",
@@ -387,203 +496,60 @@ class CustomDataset(Dataset):
                             )
                             pooled_output = text_embeddings_2[0]
                             hidden_states = text_embeddings_2.hidden_states[-2]
-                        
-                        # Reshape pooled output to match hidden states dimensions
-                        pooled_output = pooled_output.unsqueeze(1).unsqueeze(2).expand(-1, hidden_states.size(1), hidden_states.size(2), -1)
-                        
-                        # Save cache data
-                        cache_data = {
-                            "latents": latents[idx],
-                            "text_embeddings": text_embeddings,
-                            "text_embeddings_2": hidden_states,
-                            "added_cond_kwargs": {
-                                "text_embeds": pooled_output,
-                                "time_ids": self._get_add_time_ids(image_tensor[idx:idx+1])
+                            
+                            # Reshape pooled output
+                            pooled_output = pooled_output.unsqueeze(1).unsqueeze(2)
+                            
+                            return {
+                                "text_embeddings": text_embeddings,
+                                "text_embeddings_2": hidden_states,
+                                "pooled_output": pooled_output
                             }
-                        }
-                        
-                        latent_path = self.cache_dir / f"{Path(img_path).stem}_latents.pt"
-                        torch.save(cache_data, latent_path)
-                        batch_results.append(latent_path)
-                        
                     except Exception as e:
-                        logger.error(f"Error processing {img_path}: {str(e)}")
-                        continue
+                        logger.error(f"Error processing text for {path}: {str(e)}")
+                        return None
 
-                # Clear memory
+                # Process text embeddings in parallel
+                with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+                    embedding_results = list(executor.map(process_text_embeddings, chunk_paths))
+
+                # Save results
+                for idx, (path, embeddings) in enumerate(zip(chunk_paths, embedding_results)):
+                    if embeddings is not None:
+                        cache_path = self.cache_dir / f"{Path(path).stem}_latents.pt"
+                        try:
+                            torch.save({
+                                "latents": latents[idx].cpu(),
+                                "text_embeddings": embeddings["text_embeddings"].cpu(),
+                                "text_embeddings_2": embeddings["text_embeddings_2"].cpu(),
+                                "added_cond_kwargs": {
+                                    "text_embeds": embeddings["pooled_output"].cpu(),
+                                    "time_ids": self._get_add_time_ids(image_tensor[idx:idx+1]).cpu()
+                                }
+                            }, cache_path)
+                        except Exception as e:
+                            logger.error(f"Error saving cache for {path}: {str(e)}")
+
+                # Clear GPU memory
                 del image_tensor, latents
                 torch.cuda.empty_cache()
-                
-            except Exception as e:
-                logger.error(f"Error in batch processing: {str(e)}")
-            
-            return batch_results
+                gc.collect()
 
-        # Process each size group
-        processed_paths = []
-        total_images = sum(len(group) for group in size_groups.values())
-        
-        with tqdm(total=total_images, desc="Caching latents") as pbar:
-            for size, group_paths in size_groups.items():
-                logger.info(f"Processing size group {size} ({len(group_paths)} images)")
-                
-                # Process images in chunks
-                for chunk_start in range(0, len(group_paths), batch_size):
-                    chunk_paths = group_paths[chunk_start:chunk_start + batch_size]
-                    results = process_batch_with_vae(chunk_paths)
-                    processed_paths.extend(results)
-                    pbar.update(len(chunk_paths))
-                    
-                    # Cleanup
-                    gc.collect()
-                    torch.cuda.empty_cache()
-        
-        logger.info(f"Successfully cached {len(processed_paths)} latents")
+        except Exception as e:
+            logger.error(f"Batch processing error: {str(e)}")
+            logger.error(traceback.format_exc())
 
     def _parse_tags(self, caption):
-        """Parse Midjourney-specific tags and general tags"""
-        tags = []
-        special_tags = {}
-        
-        # Split and process tags
-        raw_tags = [t.strip() for t in caption.split(',')]
-        
-        # Only handle MJ-specific tags if they exist
-        has_mj_tags = any('niji' in t.lower() or t.strip() in ['4', '5', '6'] for t in raw_tags)
-        
-        if has_mj_tags:
-            # Handle anime style/niji at start
-            if raw_tags and ('anime style' in raw_tags[0].lower() or 'niji' in raw_tags[0].lower()):
-                special_tags['niji'] = True
-                raw_tags = raw_tags[1:]
-                
-            # Handle version number - add masterpiece tag for any version
-            if raw_tags and raw_tags[-1].strip() in ['4', '5', '6']:
-                raw_tags = raw_tags[:-1]
-                tags.append('masterpiece')  # Add masterpiece instead of version number
-        
-        for tag in raw_tags:
-            tag = tag.lower().strip()
-            
-            # Skip empty tags
-            if not tag:
-                continue
-            
-            # Handle compound tags with weights (format: "tag::weight")
-            if '::' in tag:
-                parts = tag.split('::')
-                tag = parts[0].strip()
-                try:
-                    weight = float(parts[1])
-                    special_tags[f'{tag}_weight'] = weight
-                except: pass
-
-            # Handle style references
-            if 'sref' in tag:
-                refs = re.findall(r'[a-f0-9]{8}|https?://[^\s>]+', tag)
-                if refs:
-                    special_tags['sref'] = refs
-                    continue  # Skip adding sref to regular tags
-
-            # Handle MJ style parameters only if MJ tags exist
-            if has_mj_tags:
-                is_param = False
-                for param in ['stylize', 'chaos', 'sw', 'sv']:
-                    if param in tag:
-                        try:
-                            value = float(re.search(r'[\d.]+', tag).group())
-                            special_tags[param] = value
-                            is_param = True
-                        except: continue
-                if is_param:
-                    continue  # Skip adding style parameters to regular tags
-
-            # Handle general tags
-            if tag.startswith(('a ', 'an ', 'the ')):  # Remove articles
-                tag = ' '.join(tag.split()[1:])
-            
-            # Add to regular tags if it's not a special parameter
-            if tag:
-                tags.append(tag)
-        
-        return tags, special_tags
-
-    def _calculate_tag_weights(self, tags, special_tags):
-        """Calculate weights for tags"""
-        weights = {}
-        base_weight = 1.0
-        
-        # Apply special tag modifiers
-        if 'masterpiece' in tags:  # Changed from version/quality check to masterpiece
-            base_weight *= 1.3
-        if special_tags.get('niji', False):
-            base_weight *= 1.2
-        if 'stylize' in special_tags:
-            stylize_value = special_tags['stylize']
-            stylize_weight = 1.0 + (math.log10(stylize_value) / 3.0)
-            base_weight *= stylize_weight
-        if 'chaos' in special_tags:
-            chaos_value = special_tags['chaos']
-            chaos_factor = 1.0 + (chaos_value / 200.0)
-            base_weight *= chaos_factor
-            
-        # Calculate individual tag weights
-        for i, tag in enumerate(tags):
-            position_weight = 1.0 - (i * 0.05)
-            weights[tag] = base_weight * max(0.5, position_weight)
-            
-        return weights
+        """Parse tags using tag weighter"""
+        return self.tag_weighter.parse_tags(caption)
 
     def _format_caption(self, caption):
-        """Format caption by cleaning and standardizing tags"""
-        # Remove extra whitespace and normalize separators
-        caption = re.sub(r'\s+', ' ', caption.strip())
-        caption = re.sub(r'\s*,\s*', ', ', caption)
-        
-        # Split into tags
-        tags = [t.strip().lower() for t in caption.split(',')]
-        
-        # Process tags
-        formatted_tags = []
-        special_params = []
-        
-        # Check if it has MJ-specific tags
-        has_mj_tags = any('niji' in t.lower() or t.strip() in ['4', '5', '6'] for t in tags)
-        
-        for tag in tags:
-            # Skip empty tags
-            if not tag:
-                continue
-                
-            # Handle special parameters (like --ar, etc)
-            if tag.startswith('--'):
-                special_params.append(tag)
-                continue
-                
-            # Handle version numbers - convert to masterpiece (only if MJ tags present)
-            if has_mj_tags and tag in ['4', '5', '6']:
-                if 'masterpiece' not in formatted_tags:
-                    formatted_tags.append('masterpiece')
-                continue
-                
-            # Handle style parameters (only if MJ tags present)
-            if has_mj_tags and any(param in tag for param in ['stylize', 'chaos', 'quality', 'niji']):
-                special_params.append(tag)
-                continue
-                
-            # Clean up regular tags
-            tag = tag.strip()
-            if tag.startswith(('a ', 'an ', 'the ')):  # Remove articles
-                tag = ' '.join(tag.split()[1:])
-            
-            formatted_tags.append(tag)
-        
-        # Combine tags and parameters
-        formatted_caption = ', '.join(formatted_tags)
-        if special_params:
-            formatted_caption += ', ' + ', '.join(special_params)
-            
-        return formatted_caption
+        """Format caption using tag weighter"""
+        return self.tag_weighter.format_caption(caption)
+
+    def _calculate_tag_weights(self, tags, special_tags):
+        """Calculate tag weights using tag weighter"""
+        return self.tag_weighter.calculate_weights(tags, special_tags)
 
     def _build_tag_statistics(self):
         """Build dataset-wide tag statistics and format captions"""
@@ -810,13 +776,11 @@ class CustomDataset(Dataset):
         
         # Process images in batches
         with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-            futures = []
-            for i in range(0, total_images, batch_size):
-                batch = self.image_paths[i:i + batch_size]
-                futures.append(executor.submit(analyze_image_batch, batch))
+            # Submit all tasks
+            future_to_path = {executor.submit(analyze_image_batch, self.image_paths[i:i + batch_size]): i for i in range(0, total_images, batch_size)}
             
             # Collect results
-            for i, future in enumerate(futures):
+            for i, future in enumerate(future_to_path):
                 try:
                     batch_results = future.result()
                     image_sizes.extend(batch_results)

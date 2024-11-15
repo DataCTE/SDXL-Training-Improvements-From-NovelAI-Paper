@@ -24,6 +24,9 @@ class EMAModel:
         power: float = 2/3,
         min_decay: float = 0.0,
         max_decay: float = 0.9999,
+        mixed_precision: str = "bf16",
+        jit_compile: bool = False,
+        gradient_checkpointing: bool = True,
     ):
         """
         Initialize EMA model by loading a fresh SDXL instance.
@@ -39,6 +42,9 @@ class EMAModel:
             power: Power for decay rate schedule during warmup
             min_decay: Minimum decay rate
             max_decay: Maximum decay rate
+            mixed_precision: Mixed precision type ("no", "fp16", "bf16")
+            jit_compile: Whether to JIT compile the model
+            gradient_checkpointing: Whether to use gradient checkpointing
         """
         self.decay = decay
         self.update_after_step = update_after_step
@@ -48,21 +54,37 @@ class EMAModel:
         self.min_decay = min_decay
         self.max_decay = max_decay
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.mixed_precision = mixed_precision
         
         # Load a fresh SDXL pipeline for EMA
         logger.info(f"Loading EMA model from {model_path}")
         try:
+            dtype = torch.float16 if mixed_precision == "fp16" else torch.bfloat16 if mixed_precision == "bf16" else torch.float32
             pipeline = StableDiffusionXLPipeline.from_pretrained(
                 model_path,
-                torch_dtype=torch.float16 if str(self.device).startswith("cuda") else torch.float32
+                torch_dtype=dtype if str(self.device).startswith("cuda") else torch.float32
             )
             self.ema_model = pipeline.unet
             self.ema_model.to(self.device)
             self.ema_model.eval()
             self.ema_model.requires_grad_(False)
             
+            # Enable optimizations
+            if hasattr(self.ema_model, 'enable_xformers_memory_efficient_attention'):
+                self.ema_model.enable_xformers_memory_efficient_attention()
+            if gradient_checkpointing and hasattr(self.ema_model, 'enable_gradient_checkpointing'):
+                self.ema_model.enable_gradient_checkpointing()
+            
+            # JIT compile if requested
+            if jit_compile and torch.cuda.is_available():
+                logger.info("JIT compiling EMA model...")
+                self.ema_model = torch.compile(self.ema_model)
+            
             # Initialize EMA weights from the input model
             self.copy_from(model)
+            
+            # Log configuration
+            self._log_config()
             
         except Exception as e:
             logger.error(f"Failed to load EMA model: {str(e)}")
@@ -155,3 +177,14 @@ class EMAModel:
     def get_model(self) -> torch.nn.Module:
         """Get the EMA model."""
         return self.ema_model
+
+    def _log_config(self):
+        """Log the current configuration"""
+        logger.info("\nEMA Model Configuration:")
+        logger.info(f"- Device: {self.device}")
+        logger.info(f"- Mixed Precision: {self.mixed_precision}")
+        logger.info(f"- Base Decay Rate: {self.decay}")
+        logger.info(f"- Update After Step: {self.update_after_step}")
+        logger.info(f"- Update Every: {self.update_every}")
+        logger.info(f"- EMA Warmup: {self.use_ema_warmup}")
+        logger.info(f"- Min/Max Decay: {self.min_decay}/{self.max_decay}")

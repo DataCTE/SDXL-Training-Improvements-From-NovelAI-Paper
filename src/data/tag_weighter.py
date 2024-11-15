@@ -5,6 +5,8 @@ from typing import Dict, Set, Optional, List, Tuple
 from functools import lru_cache
 from collections import defaultdict
 import numpy as np
+import re
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -196,6 +198,187 @@ class TagBasedLossWeighter:
             logger.error(f"Tag weight calculation failed: {str(e)}")
             return 1.0
     
+    def parse_tags(self, caption: str) -> Tuple[List[str], Dict[str, any]]:
+        """
+        Parse caption into tags and special tags with improved Midjourney compatibility.
+        
+        Args:
+            caption (str): Raw caption text
+            
+        Returns:
+            Tuple[List[str], Dict]: Regular tags and special tag parameters
+        """
+        tags = []
+        special_tags = {}
+        
+        # Split and process tags
+        raw_tags = [t.strip() for t in caption.split(',')]
+        
+        # Check for MJ-specific tags
+        has_mj_tags = any('niji' in t.lower() or t.strip() in ['4', '5', '6'] for t in raw_tags)
+        
+        if has_mj_tags:
+            # Handle anime style/niji at start
+            if raw_tags and ('anime style' in raw_tags[0].lower() or 'niji' in raw_tags[0].lower()):
+                special_tags['niji'] = True
+                raw_tags = raw_tags[1:]
+                
+            # Handle version number
+            if raw_tags and raw_tags[-1].strip() in ['4', '5', '6']:
+                raw_tags = raw_tags[:-1]
+                tags.append('masterpiece')
+        
+        for tag in raw_tags:
+            tag = tag.lower().strip()
+            
+            if not tag:
+                continue
+            
+            # Handle compound tags with weights
+            if '::' in tag:
+                parts = tag.split('::')
+                tag = parts[0].strip()
+                try:
+                    weight = float(parts[1])
+                    special_tags[f'{tag}_weight'] = weight
+                except:
+                    pass
+
+            # Handle style references
+            if 'sref' in tag:
+                refs = re.findall(r'[a-f0-9]{8}|https?://[^\s>]+', tag)
+                if refs:
+                    special_tags['sref'] = refs
+                    continue
+
+            # Handle MJ style parameters
+            if has_mj_tags:
+                is_param = False
+                for param in ['stylize', 'chaos', 'sw', 'sv']:
+                    if param in tag:
+                        try:
+                            value = float(re.search(r'[\d.]+', tag).group())
+                            special_tags[param] = value
+                            is_param = True
+                        except:
+                            continue
+                if is_param:
+                    continue
+
+            # Clean up tag
+            if tag.startswith(('a ', 'an ', 'the ')):
+                tag = ' '.join(tag.split()[1:])
+            
+            if tag:
+                tags.append(tag)
+        
+        return tags, special_tags
+
+    def format_caption(self, caption: str) -> str:
+        """
+        Format and standardize caption text.
+        
+        Args:
+            caption (str): Raw caption text
+            
+        Returns:
+            str: Formatted caption
+        """
+        # Remove extra whitespace and normalize separators
+        caption = re.sub(r'\s+', ' ', caption.strip())
+        caption = re.sub(r'\s*,\s*', ', ', caption)
+        
+        # Split into tags
+        tags = [t.strip().lower() for t in caption.split(',')]
+        
+        formatted_tags = []
+        special_params = []
+        
+        has_mj_tags = any('niji' in t.lower() or t.strip() in ['4', '5', '6'] for t in tags)
+        
+        for tag in tags:
+            if not tag:
+                continue
+                
+            if tag.startswith('--'):
+                special_params.append(tag)
+                continue
+                
+            if has_mj_tags and tag in ['4', '5', '6']:
+                if 'masterpiece' not in formatted_tags:
+                    formatted_tags.append('masterpiece')
+                continue
+                
+            if has_mj_tags and any(param in tag for param in ['stylize', 'chaos', 'quality', 'niji']):
+                special_params.append(tag)
+                continue
+                
+            tag = tag.strip()
+            if tag.startswith(('a ', 'an ', 'the ')):
+                tag = ' '.join(tag.split()[1:])
+            
+            formatted_tags.append(tag)
+        
+        formatted_caption = ', '.join(formatted_tags)
+        if special_params:
+            formatted_caption += ', ' + ', '.join(special_params)
+            
+        return formatted_caption
+
+    def calculate_weights(self, tags: List[str], special_tags: Dict[str, any] = None) -> Dict[str, float]:
+        """
+        Calculate weights for tags with improved weighting scheme.
+        
+        Args:
+            tags (List[str]): List of tags
+            special_tags (Dict): Special tag parameters
+            
+        Returns:
+            Dict[str, float]: Tag weights
+        """
+        if special_tags is None:
+            special_tags = {}
+            
+        weights = {}
+        base_weight = 1.0
+        
+        # Apply special modifiers
+        if 'masterpiece' in tags:
+            base_weight *= 1.3
+        if special_tags.get('niji', False):
+            base_weight *= 1.2
+        if 'stylize' in special_tags:
+            stylize_value = special_tags['stylize']
+            stylize_weight = 1.0 + (math.log10(stylize_value) / 3.0)
+            base_weight *= stylize_weight
+        if 'chaos' in special_tags:
+            chaos_value = special_tags['chaos']
+            chaos_factor = 1.0 + (chaos_value / 200.0)
+            base_weight *= chaos_factor
+            
+        # Calculate individual weights
+        for i, tag in enumerate(tags):
+            # Get tag class importance
+            class_name = self._classify_tag(tag)
+            class_weight = self.class_base_weights.get(class_name, 1.0)
+            
+            # Apply position decay
+            position_weight = 1.0 - (i * 0.05)
+            
+            # Apply rarity bonus
+            rarity_score = self._tag_rarity_scores.get(tag, 1.0)
+            
+            # Combine all factors
+            final_weight = base_weight * class_weight * position_weight * rarity_score
+            
+            # Apply any explicit tag weights
+            if f'{tag}_weight' in special_tags:
+                final_weight *= special_tags[f'{tag}_weight']
+            
+            weights[tag] = max(self.min_weight, min(self.max_weight, final_weight))
+            
+        return weights
+
     def calculate_weights(self, tags: List[str]) -> torch.Tensor:
         """
         Calculate tag weights with efficient caching and error handling.

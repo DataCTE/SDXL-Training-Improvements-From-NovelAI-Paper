@@ -7,6 +7,7 @@ from bitsandbytes.optim import AdamW8bit
 from torch.cuda.amp import autocast, GradScaler
 from collections import deque
 import numpy as np
+from transformers import get_cosine_schedule_with_warmup
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +23,15 @@ class VAEFineTuner:
         use_8bit_adam=True,
         gradient_checkpointing=True,
         mixed_precision="bf16",
-        use_channel_scaling=True  # Enable per-channel scale-and-shift
+        use_channel_scaling=True,  # Enable per-channel scale-and-shift
+        adam_beta1=0.9,
+        adam_beta2=0.999,
+        adam_weight_decay=0.01,
+        adam_epsilon=1e-8,
+        max_grad_norm=1.0,
+        warmup_steps=1000,
+        scale_factor=1.0,
+        device=None
     ):
         """
         Initialize VAE finetuner with NovelAI improvements.
@@ -38,23 +47,42 @@ class VAEFineTuner:
             gradient_checkpointing: Whether to use gradient checkpointing
             mixed_precision: Mixed precision type ("no", "fp16", "bf16")
             use_channel_scaling: Whether to use per-channel scale-and-shift normalization
+            adam_beta1: Beta1 parameter for Adam optimizer
+            adam_beta2: Beta2 parameter for Adam optimizer
+            adam_weight_decay: Weight decay for Adam optimizer
+            adam_epsilon: Epsilon parameter for Adam optimizer
+            max_grad_norm: Maximum gradient norm for clipping
+            warmup_steps: Number of warmup steps for learning rate
+            scale_factor: Initial scale factor for loss scaling
+            device: Device to place model on
         """
         try:
-            self.vae = vae
+            self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.vae = vae.to(self.device)
             self.min_snr_gamma = min_snr_gamma
             self.adaptive_loss_scale = adaptive_loss_scale
             self.kl_weight = kl_weight
             self.perceptual_weight = perceptual_weight
             self.mixed_precision = mixed_precision
             self.use_channel_scaling = use_channel_scaling
+            self.max_grad_norm = max_grad_norm
+            self.scale_factor = scale_factor
             
-            # Initialize optimizer
+            # Initialize optimizer with configurable parameters
             optim_cls = AdamW8bit if use_8bit_adam else torch.optim.AdamW
             self.optimizer = optim_cls(
                 vae.parameters(),
                 lr=learning_rate,
-                betas=(0.9, 0.999),
-                weight_decay=0.01
+                betas=(adam_beta1, adam_beta2),
+                weight_decay=adam_weight_decay,
+                eps=adam_epsilon
+            )
+            
+            # Initialize learning rate scheduler
+            self.lr_scheduler = get_cosine_schedule_with_warmup(
+                self.optimizer,
+                num_warmup_steps=warmup_steps,
+                num_training_steps=10000  # Approximate, will be adjusted during training
             )
             
             # Initialize mixed precision training
@@ -70,8 +98,9 @@ class VAEFineTuner:
             self.register_vae_statistics()
             
             # Enable memory optimizations
-            self.vae.enable_xformers_memory_efficient_attention()
-            if gradient_checkpointing:
+            if hasattr(self.vae, 'enable_xformers_memory_efficient_attention'):
+                self.vae.enable_xformers_memory_efficient_attention()
+            if gradient_checkpointing and hasattr(self.vae, 'enable_gradient_checkpointing'):
                 self.vae.enable_gradient_checkpointing()
             
             # Initialize statistics tracking
@@ -79,18 +108,30 @@ class VAEFineTuner:
             self.latent_means = None
             self.latent_m2 = None
             self.loss_history = deque(maxlen=100)
-            self.scale_factor = 1.0
             
             # Initialize perceptual loss if needed
             if self.perceptual_weight > 0:
                 self._initialize_perceptual_loss()
             
             logger.info("VAEFineTuner initialized successfully")
+            self._log_config()
             
         except Exception as e:
             logger.error(f"VAEFineTuner initialization failed: {str(e)}")
             logger.error(f"Initialization traceback: {traceback.format_exc()}")
             raise
+
+    def _log_config(self):
+        """Log the current configuration"""
+        logger.info("\nVAE Finetuner Configuration:")
+        logger.info(f"- Device: {self.device}")
+        logger.info(f"- Mixed Precision: {self.mixed_precision}")
+        logger.info(f"- Channel Scaling: {self.use_channel_scaling}")
+        logger.info(f"- Adaptive Loss Scale: {self.adaptive_loss_scale}")
+        logger.info(f"- KL Weight: {self.kl_weight}")
+        logger.info(f"- Perceptual Weight: {self.perceptual_weight}")
+        logger.info(f"- Min SNR Gamma: {self.min_snr_gamma}")
+        logger.info(f"- Initial Scale Factor: {self.scale_factor}")
 
     def register_vae_statistics(self):
         """Register VAE channel statistics as buffers for scale-and-shift normalization"""
@@ -100,8 +141,8 @@ class VAEFineTuner:
             stds = torch.tensor([9.9181, 6.2753, 7.5978, 5.9956])
             
             # Register as buffers with correct device and dtype
-            self.vae.register_buffer('latent_means', means.to(device=self.vae.device, dtype=self.vae.dtype))
-            self.vae.register_buffer('latent_stds', stds.to(device=self.vae.device, dtype=self.vae.dtype))
+            self.vae.register_buffer('latent_means', means.to(device=self.device, dtype=self.vae.dtype))
+            self.vae.register_buffer('latent_stds', stds.to(device=self.device, dtype=self.vae.dtype))
         except Exception as e:
             logger.warning(f"Failed to register VAE statistics: {e}")
 
