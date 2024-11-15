@@ -1476,8 +1476,8 @@ class CustomDataset(CustomDatasetBase):
                 # Minimal processing for all_ar mode
                 if width < self.min_size or height < self.min_size:
                     scale = max(self.min_size / width, self.min_size / height)
-                    new_width = int(round(width * scale / self.bucket_reso_steps) * self.bucket_reso_steps)
-                    new_height = int(round(height * scale / self.bucket_reso_steps) * self.bucket_reso_steps)
+                    new_width = int(round(width * scale / self.bucket_reso_steps) * self.bucket_reso_steps
+                    new_height = int(round(height * scale / self.bucket_reso_steps) * self.bucket_reso_steps
                     return image.resize((new_width, new_height), Image.Resampling.LANCZOS)
                 return image
 
@@ -2024,7 +2024,6 @@ class CustomDataset(CustomDatasetBase):
             exact_match = np.where(
                 (buckets_array[:, 0] == height) & 
                 (buckets_array[:, 1] == width)
-            )[0]
             if exact_match.size:
                 return tuple(buckets_array[exact_match[0]])
             
@@ -2683,12 +2682,43 @@ class CustomDataLoader(CustomDataLoaderBase):
             persistent_workers=persistent_workers
         )
         
-        # Initialize additional attributes
+        # Store attributes
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.pin_memory = pin_memory
+        self.drop_last = drop_last
+        self.timeout = timeout
+        self.worker_init_fn = worker_init_fn
+        self.prefetch_factor = prefetch_factor
+        self.persistent_workers = persistent_workers
+        
+        # Handle sampler configuration
+        if batch_sampler is not None:
+            if batch_size > 1 or shuffle or sampler is not None or drop_last:
+                raise ValueError('batch_sampler is mutually exclusive with other parameters')
+            self.batch_sampler = batch_sampler
+        else:
+            if sampler is None:
+                if shuffle:
+                    sampler = torch.utils.data.RandomSampler(dataset)
+                else:
+                    sampler = torch.utils.data.SequentialSampler(dataset)
+            
+            self.sampler = sampler
+            self.batch_sampler = torch.utils.data.BatchSampler(
+                self.sampler,
+                batch_size,
+                drop_last
+            )
+        
+        # Initialize worker components
         self.worker_pool = None
         self.prefetch_queue = None
         self.batch_queue = None
         self._stop_event = threading.Event()
         self._prefetch_thread = None
+        self._iterator = None
         
         # Initialize workers if needed
         if num_workers > 0:
@@ -2708,13 +2738,11 @@ class CustomDataLoader(CustomDataLoaderBase):
     def _prefetch_worker(self):
         """Background thread for prefetching data"""
         try:
+            batch_sampler_iter = iter(self.batch_sampler)
             while not self._stop_event.is_set():
                 try:
                     # Get next batch of indices
-                    if self.batch_sampler is not None:
-                        indices = next(self.batch_sampler)
-                    else:
-                        indices = [next(self.sampler) for _ in range(self.batch_size)]
+                    indices = next(batch_sampler_iter)
                     
                     # Submit batch processing to worker pool
                     future = self.worker_pool.submit(
@@ -2740,7 +2768,7 @@ class CustomDataLoader(CustomDataLoaderBase):
         self._stop_event.clear()
         
         # Initialize iteration state
-        self._iterator = iter(self.sampler)
+        self._iterator = iter(self.batch_sampler)
         
         return self
 
@@ -2757,13 +2785,17 @@ class CustomDataLoader(CustomDataLoaderBase):
                 return self.dataset.collate_fn(batch)
             else:
                 # Single-threaded processing
-                indices = [next(self._iterator) for _ in range(self.batch_size)]
+                indices = next(self._iterator)
                 batch = self.dataset.get_batch(indices)
                 return self.dataset.collate_fn(batch)
                 
         except StopIteration:
             self._stop_event.set()
             raise
+
+    def __len__(self):
+        """Return the number of batches in the dataloader"""
+        return len(self.batch_sampler)
 
     def __del__(self):
         """Cleanup resources"""
