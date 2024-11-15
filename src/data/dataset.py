@@ -46,7 +46,7 @@ class CustomDataset(Dataset):
         self.all_ar = all_ar
         
         # Use provided num_workers or system default
-        self.num_workers = num_workers if num_workers is not None else min(8, os.cpu_count() or 1)
+        self.num_workers = num_workers if num_workers is not None else (os.cpu_count() or 1)
         self.batch_size = 32  # Process images in batches
         
         # Resolution and bucketing parameters
@@ -383,20 +383,15 @@ class CustomDataset(Dataset):
 
     def _batch_process_latents_efficient(self, batch_size=32):
         """Process and cache latents in batches using multiple workers"""
-        # First validate all cached latents
+        # Get list of uncached images
         uncached_images = []
-        for img_path, lat_path in zip(self.image_paths, self.latent_paths):
-            if not self._validate_cached_latent(lat_path, img_path):
+        for img_path in self.image_paths:
+            latent_path = self.cache_dir / f"{Path(img_path).stem}.pt"
+            if not latent_path.exists():
                 uncached_images.append(img_path)
-                # Remove invalid cache if it exists
-                if lat_path.exists():
-                    try:
-                        lat_path.unlink()
-                    except Exception as e:
-                        logger.error(f"Error removing invalid cache {lat_path}: {str(e)}")
-        
+
         if not uncached_images:
-            logger.info("All latents are valid and cached")
+            logger.info("All latents are already cached")
             return
 
         logger.info(f"Caching latents for {len(uncached_images)} images in batches")
@@ -447,8 +442,11 @@ class CustomDataset(Dataset):
                 logger.error(f"Error processing size group {size_key}: {str(e)}")
                 return 0
 
+        # Use num_workers for size group processing, but don't exceed group count
+        max_workers = min(len(size_groups), self.num_workers)
         total_processed = 0
-        with ThreadPoolExecutor(max_workers=min(len(size_groups), self.num_workers)) as executor:
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = []
             for size_key, paths in size_groups.items():
                 futures.append(executor.submit(process_size_group, size_key, paths))
@@ -456,7 +454,7 @@ class CustomDataset(Dataset):
             for future in tqdm(as_completed(futures), total=len(futures), desc="Processing size groups"):
                 total_processed += future.result()
 
-        logger.info(f"Successfully cached latents for {total_processed} images")
+        logger.info(f"Successfully processed and cached latents for {total_processed} images")
 
     def process_batch_with_vae(self, batch_paths):
         """Process a batch of images through VAE with optimized memory usage"""
@@ -1498,43 +1496,34 @@ def create_dataloader(
     **kwargs
 ):
     """Create a DataLoader with bucketing support"""
+    # Initialize dataset
     dataset = CustomDataset(
         data_dir=data_dir,
-        vae=vae,
         tokenizer=tokenizer,
         text_encoder=text_encoder,
         tokenizer_2=tokenizer_2,
         text_encoder_2=text_encoder_2,
+        vae=vae,
+        num_workers=num_workers,  # Pass through num_workers
         enable_bucket_sampler=enable_bucket_sampler,
         **kwargs
     )
-    
-    if enable_bucket_sampler:
-        # Create bucket-aware sampler
-        sampler = BucketSampler(
-            dataset,
-            batch_size=batch_size,
-            drop_last=True
-        )
+
+    if enable_bucket_sampler and hasattr(dataset, 'bucket_data'):
+        sampler = BucketSampler(dataset, batch_size)
+        shuffle = False  # Bucket sampler handles shuffling
     else:
         sampler = None
-    
-    # Create DataLoader with custom sampler
-    dataloader = DataLoader(
+        shuffle = True
+
+    # Create DataLoader with the same num_workers as dataset
+    return DataLoader(
         dataset,
-        batch_size=batch_size if not enable_bucket_sampler else 1,  # Batch size handled by sampler
-        shuffle=not enable_bucket_sampler,  # Don't shuffle if using bucket sampler
-        num_workers=num_workers if num_workers is not None else 0,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=dataset.num_workers,  # Use dataset's num_workers for consistency
         sampler=sampler,
         collate_fn=dataset.collate_fn,
         pin_memory=True,
-        drop_last=True,
-        persistent_workers=True if num_workers > 0 else False,
-        prefetch_factor=2
+        drop_last=True
     )
-    
-    logger.info(f"Created DataLoader with {len(dataset)} samples")
-    logger.info(f"Batch size: {batch_size}, Num workers: {num_workers}")
-    logger.info(f"Bucketing enabled: {enable_bucket_sampler}")
-    
-    return dataloader
