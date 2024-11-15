@@ -277,15 +277,15 @@ def _get_tag_weighter_config(
 def setup_tag_weighter(args) -> Optional[Any]:
     """Initialize tag weighting system."""
     try:
-        if not args.use_tag_weighting:
+        if not getattr(args, 'use_tag_weighting', False):
             return None
             
         logger.info("Initializing tag weighter")
         weighter_config = _get_tag_weighter_config(
-            base_weight=args.tag_base_weight,
-            min_weight=args.tag_min_weight,
-            max_weight=args.tag_max_weight,
-            window_size=args.tag_window_size,
+            base_weight=getattr(args, 'tag_base_weight', 1.0),
+            min_weight=getattr(args, 'min_tag_weight', 0.1),
+            max_weight=getattr(args, 'max_tag_weight', 3.0),
+            window_size=getattr(args, 'tag_window_size', 100),
             no_cache=getattr(args, 'no_caching', False)
         )
         weighter = TagBasedLossWeighter(config=weighter_config)
