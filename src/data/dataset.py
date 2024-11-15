@@ -952,27 +952,38 @@ class CustomDataset(CustomDatasetBase):
 
         return max(target_width, self.min_size), max(target_height, self.min_size)
 
-    def process_image_size(self, image, target_width, target_height):
-        """Multi-threaded image processing with all_ar support"""
-        width, height = image.size
-        
-        if self.all_ar:
-            # Minimal processing for all_ar mode
-            if width < self.min_size or height < self.min_size:
-                scale = max(self.min_size / width, self.min_size / height)
-                new_width = int(round(width * scale / self.bucket_reso_steps) * self.bucket_reso_steps)
-                new_height = int(round(height * scale / self.bucket_reso_steps) * self.bucket_reso_steps)
-                return image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+    def process_image_size(self, images):
+        """Multi-threaded image processing using num_workers"""
+        from concurrent.futures import ThreadPoolExecutor
+        from functools import partial
+
+        def process_single_image(image):
+            width, height = image.size
+            
+            if self.all_ar:
+                # Minimal processing for all_ar mode
+                if width < self.min_size or height < self.min_size:
+                    scale = max(self.min_size / width, self.min_size / height)
+                    new_width = int(round(width * scale / self.bucket_reso_steps) * self.bucket_reso_steps)
+                    new_height = int(round(height * scale / self.bucket_reso_steps) * self.bucket_reso_steps)
+                    return image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                return image
+
+            # Get target size for non-all_ar mode
+            target_width, target_height = self._get_target_size(width, height)
+            
+            # Only resize if dimensions differ
+            if width != target_width or height != target_height:
+                return image.resize((target_width, target_height), Image.Resampling.LANCZOS)
+            
             return image
 
-        # Get target size for non-all_ar mode
-        target_width, target_height = self._get_target_size(width, height)
-        
-        # Only resize if dimensions differ
-        if width != target_width or height != target_height:
-            return image.resize((target_width, target_height), Image.Resampling.LANCZOS)
-        
-        return image
+        # Process images in parallel using ThreadPoolExecutor
+        num_workers = min(self.num_workers, len(images))
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            processed_images = list(executor.map(process_single_image, images))
+
+        return processed_images
 
     def _upscale_image(self, image, target_width, target_height):
         """Upscale image using Ultimate SD Upscaler"""
