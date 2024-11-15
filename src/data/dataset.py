@@ -351,29 +351,135 @@ class CustomDataset(CustomDatasetBase):
         return len(self.image_paths)
 
     def _initialize_dataset(self):
-        """Initialize dataset with improved image validation"""
+        """Initialize dataset with improved image validation and AR/caching handling"""
         logger.info("Initializing dataset...")
         
         # Collect image paths
         image_paths = []
         for ext in ['*.png', '*.jpg', '*.jpeg', '*.webp']:
             image_paths.extend(self.data_dir.glob(ext))
+            
+        # Calculate optimal chunk size based on num_workers
+        chunk_size = max(1, len(image_paths) // (self.num_workers * 4))
+        chunks = [image_paths[i:i + chunk_size] for i in range(0, len(image_paths), chunk_size)]
         
-        # Validate images in parallel
+        logger.info(f"Processing {len(image_paths)} images using {self.num_workers} workers")
+        
+        # Initialize storage for valid paths and bucket data
         valid_paths = []
+        bucket_data = defaultdict(list) if self.all_ar else None
+        
+        # Validate images in parallel with chunking
         with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
             futures = []
-            for path in image_paths:
-                futures.append(executor.submit(self._validate_image, path))
             
-            for future in tqdm(as_completed(futures), total=len(futures), desc="Validating images"):
-                result = future.result()
-                if result is not None:
-                    valid_paths.append(result)
+            # Process chunks of images
+            for chunk in chunks:
+                futures.append(
+                    executor.submit(
+                        self._validate_and_process_chunk, 
+                        chunk,
+                        self.all_ar,
+                        not self.no_caching_latents
+                    )
+                )
+            
+            # Use tqdm to show progress
+            pbar = tqdm(total=len(image_paths), desc="Validating images")
+            
+            for future in as_completed(futures):
+                try:
+                    chunk_results = future.result()
+                    if self.all_ar:
+                        chunk_valid_paths, chunk_buckets = chunk_results
+                        valid_paths.extend(chunk_valid_paths)
+                        # Merge bucket data
+                        for bucket, paths in chunk_buckets.items():
+                            bucket_data[bucket].extend(paths)
+                    else:
+                        valid_paths.extend(chunk_results)
+                    pbar.update(chunk_size)
+                except Exception as e:
+                    logger.error(f"Error processing chunk: {str(e)}")
+                    
+            pbar.close()
         
         self.image_paths = sorted(valid_paths)
-        self.latent_paths = [self.cache_dir / f"{path.stem}_latents.pt" for path in self.image_paths]
+        
+        # Handle latent caching paths if enabled
+        if not self.no_caching_latents:
+            self.latent_paths = [self.cache_dir / f"{path.stem}_latents.pt" for path in self.image_paths]
+            logger.info(f"Latent cache paths created for {len(self.image_paths)} images")
+        else:
+            logger.info("Latent caching disabled - will process images on-the-fly")
+            
         logger.info(f"Found {len(self.image_paths)} valid images")
+        
+        # Handle all_ar bucket data
+        if self.all_ar:
+            logger.info("all_ar enabled - creating individual buckets for each image size")
+            self.bucket_data = bucket_data
+            logger.info(f"Created {len(bucket_data)} unique size buckets for all_ar mode")
+
+    def _validate_and_process_chunk(self, image_paths, process_ar=False, cache_latents=True):
+        """Validate and process a chunk of images"""
+        valid_paths = []
+        bucket_data = defaultdict(list) if process_ar else None
+        
+        for path in image_paths:
+            try:
+                # Check if caption file exists
+                caption_path = path.with_suffix('.txt')
+                if not caption_path.exists():
+                    logger.warning(f"Skipping {path}: No caption file")
+                    continue
+                    
+                # Validate image
+                with Image.open(path) as img:
+                    # Check image mode
+                    if img.mode not in ['RGB', 'RGBA']:
+                        logger.warning(f"Skipping {path}: Invalid mode {img.mode}")
+                        continue
+                        
+                    # Get dimensions
+                    width, height = img.size
+                    
+                    # Check dimensions
+                    if width < 256 or height < 256:
+                        logger.warning(f"Skipping {path}: Image too small ({width}x{height})")
+                        continue
+                    if width > 4096 or height > 4096:
+                        logger.warning(f"Skipping {path}: Image too large ({width}x{height})")
+                        continue
+                        
+                    # Check if image is corrupted
+                    try:
+                        img.load()
+                    except Exception as e:
+                        logger.warning(f"Skipping {path}: Corrupted image - {str(e)}")
+                        continue
+                    
+                    # Process for all_ar if enabled
+                    if process_ar:
+                        bucket = (height, width)
+                        bucket_data[bucket].append(path)
+                        
+                    # Create latent cache if enabled
+                    if cache_latents:
+                        cache_path = Path(str(path).replace(str(self.data_dir), str(self.cache_dir)))
+                        cache_path = cache_path.with_suffix('.pt')
+                        cache_path.parent.mkdir(parents=True, exist_ok=True)
+                
+                # All checks passed
+                valid_paths.append(path)
+                
+            except Exception as e:
+                logger.warning(f"Skipping {path}: {str(e)}")
+                continue
+        
+        if process_ar:
+            return valid_paths, bucket_data
+        return valid_paths
         
     def _validate_image(self, img_path):
         """Validate single image with improved error handling"""
