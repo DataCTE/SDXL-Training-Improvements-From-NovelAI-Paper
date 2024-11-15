@@ -22,6 +22,7 @@ import itertools
 from abc import ABC, abstractmethod
 from typing import Any, Iterator, Optional, Sequence, Union, Dict
 from torch.utils.data import Dataset, Sampler, DataLoader
+from queue import Queue
 
 logger = logging.getLogger(__name__)
 
@@ -2645,181 +2646,148 @@ class BucketSampler(CustomSamplerBase):
 class CustomDataLoader(CustomDataLoaderBase):
     """Optimized data loader with advanced batching and parallel processing"""
     
-    def __init__(self, dataset, batch_size, sampler=None, num_workers=0,
-                 pin_memory=False, drop_last=False, timeout=0,
-                 worker_init_fn=None, prefetch_factor=2):
-        super().__init__()
-        from queue import Queue
-        import numpy as np
+    def __init__(self, 
+                 dataset: CustomDataset,
+                 batch_size: int = 1,
+                 shuffle: bool = False,
+                 sampler: Optional[CustomSamplerBase] = None,
+                 batch_sampler: Optional[Sampler] = None,
+                 num_workers: int = 0,
+                 pin_memory: bool = False,
+                 drop_last: bool = False,
+                 timeout: float = 0,
+                 worker_init_fn: Optional[callable] = None,
+                 prefetch_factor: int = 2,
+                 persistent_workers: bool = False):
         
-        self.dataset = dataset
-        self.batch_size = batch_size
-        self.sampler = sampler
-        self.num_workers = min(32, num_workers if num_workers > 0 else 0)
-        self.pin_memory = pin_memory
-        self.drop_last = drop_last
-        self.timeout = timeout
-        self.worker_init_fn = worker_init_fn
-        self.prefetch_factor = max(1, min(10, prefetch_factor))
-        
-        # Optimize worker count based on system
-        if self.num_workers > 0:
-            self.num_workers = min(self.num_workers, (os.cpu_count() or 1) + 4)
-            self.worker_pool = ThreadPoolExecutor(
-                max_workers=self.num_workers,
-                thread_name_prefix="DataLoader"
-            )
-            # Initialize prefetch queue
-            self.prefetch_queue = Queue(maxsize=self.prefetch_factor * self.num_workers)
-        else:
-            self.worker_pool = None
-            self.prefetch_queue = None
-            
-        # Cache length calculation
-        self._length = self._calculate_length()
-    
-    def _calculate_length(self):
-        """Cache dataset length calculation"""
-        dataset_len = len(self.dataset)
-        if self.drop_last:
-            return dataset_len // self.batch_size
-        return (dataset_len + self.batch_size - 1) // self.batch_size
-    
-    def _create_batches(self, indices):
-        """Efficiently create batches using numpy"""
-        import numpy as np
-        
-        # Convert to numpy array for faster operations
-        indices = np.array(list(indices))
-        
-        # Calculate number of full batches
-        num_full_batches = len(indices) // self.batch_size
-        
-        # Split into batches efficiently
-        batches = np.array_split(
-            indices[:num_full_batches * self.batch_size],
-            num_full_batches
+        # Initialize base class first
+        super().__init__(
+            dataset=dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            sampler=sampler,
+            batch_sampler=batch_sampler,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            drop_last=drop_last,
+            timeout=timeout,
+            worker_init_fn=worker_init_fn,
+            prefetch_factor=prefetch_factor,
+            persistent_workers=persistent_workers
         )
         
-        # Handle remaining items if not dropping last batch
-        if not self.drop_last and len(indices) > num_full_batches * self.batch_size:
-            batches.append(indices[num_full_batches * self.batch_size:])
+        # Initialize additional attributes
+        self.worker_pool = None
+        self.prefetch_queue = None
+        self.batch_queue = None
+        self._stop_event = threading.Event()
+        self._prefetch_thread = None
+        
+        # Initialize workers if needed
+        if num_workers > 0:
+            self._initialize_workers()
+
+    def _initialize_workers(self):
+        """Initialize worker processes for parallel data loading"""
+        if self.num_workers > 0:
+            self.worker_pool = ProcessPoolExecutor(max_workers=self.num_workers)
+            self.prefetch_queue = Queue(maxsize=self.prefetch_factor * self.num_workers)
+            self.batch_queue = Queue(maxsize=self.prefetch_factor)
             
-        return batches
-    
-    def _process_batch(self, batch_indices):
-        """Process a single batch with optimized error handling"""
+            # Start prefetch thread
+            self._prefetch_thread = Thread(target=self._prefetch_worker, daemon=True)
+            self._prefetch_thread.start()
+
+    def _prefetch_worker(self):
+        """Background thread for prefetching data"""
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    # Get next batch of indices
+                    if self.batch_sampler is not None:
+                        indices = next(self.batch_sampler)
+                    else:
+                        indices = [next(self.sampler) for _ in range(self.batch_size)]
+                    
+                    # Submit batch processing to worker pool
+                    future = self.worker_pool.submit(
+                        self.dataset.get_batch, indices
+                    )
+                    self.prefetch_queue.put(future)
+                    
+                except StopIteration:
+                    break
+                except Exception as e:
+                    logger.error(f"Prefetch worker error: {str(e)}")
+                    break
+        finally:
+            # Signal end of iteration
+            self.prefetch_queue.put(None)
+
+    def __iter__(self):
+        """Return iterator over the dataset"""
+        if not self._initialized:
+            self.initialize()
+            
+        # Reset stop event
+        self._stop_event.clear()
+        
+        # Initialize iteration state
+        self._iterator = iter(self.sampler)
+        
+        return self
+
+    def __next__(self):
+        """Get next batch of data"""
         try:
             if self.num_workers > 0:
-                # Parallel processing with futures
-                with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-                    futures = [
-                        executor.submit(self.dataset.__getitem__, idx)
-                        for idx in batch_indices
-                    ]
-                    batch_data = [
-                        future.result(timeout=self.timeout)
-                        for future in futures
-                    ]
-            else:
-                # Efficient sequential processing
-                batch_data = [
-                    self.dataset[idx] 
-                    for idx in batch_indices
-                ]
-            
-            # Filter None values efficiently
-            batch_data = [item for item in batch_data if item is not None]
-            
-            if not batch_data:
-                return None
-                
-            # Collate if available
-            if hasattr(self.dataset, 'custom_collate'):
-                return self.dataset.custom_collate(batch_data)
-            return batch_data
-            
-        except Exception as e:
-            logger.error(f"Batch processing error: {str(e)}")
-            return None
-    
-    def _prefetch_worker(self, batches, start_idx):
-        """Prefetch worker for async loading"""
-        try:
-            for batch_indices in batches[start_idx::self.num_workers]:
-                result = self._process_batch(batch_indices)
-                if result is not None:
-                    self.prefetch_queue.put(result)
-        except Exception as e:
-            logger.error(f"Prefetch worker error: {str(e)}")
-    
-    def __iter__(self):
-        # Get indices
-        indices = range(len(self.dataset)) if self.sampler is None else self.sampler
-        
-        # Create batches efficiently
-        batches = self._create_batches(indices)
-        
-        if not batches:
-            return iter([])
-        
-        # Setup progress tracking
-        from tqdm import tqdm
-        pbar = tqdm(total=len(batches), desc="Processing batches",
-                   position=0, leave=True)
-        
-        if self.num_workers > 0 and len(batches) > self.num_workers:
-            # Start prefetch workers
-            workers = [
-                Thread(
-                    target=self._prefetch_worker,
-                    args=(batches, i),
-                    daemon=True
-                ) for i in range(self.num_workers)
-            ]
-            for w in workers:
-                w.start()
-            
-            # Yield from prefetch queue
-            completed = 0
-            while completed < len(batches):
-                try:
-                    batch = self.prefetch_queue.get(timeout=self.timeout)
-                    if batch is not None:
-                        yield batch
-                    completed += 1
-                    pbar.update(1)
-                except Exception as e:
-                    logger.error(f"Queue error: {str(e)}")
-                    break
+                # Get prefetched batch
+                future = self.prefetch_queue.get()
+                if future is None:
+                    raise StopIteration
                     
-            # Cleanup workers
-            for w in workers:
-                w.join(timeout=1.0)
-        else:
-            # Process batches sequentially
-            for batch_indices in batches:
-                result = self._process_batch(batch_indices)
-                if result is not None:
-                    yield result
-                pbar.update(1)
-        
-        pbar.close()
-    
-    def __len__(self):
-        return self._length
-    
+                batch = future.result()
+                return self.dataset.collate_fn(batch)
+            else:
+                # Single-threaded processing
+                indices = [next(self._iterator) for _ in range(self.batch_size)]
+                batch = self.dataset.get_batch(indices)
+                return self.dataset.collate_fn(batch)
+                
+        except StopIteration:
+            self._stop_event.set()
+            raise
+
     def __del__(self):
         """Cleanup resources"""
-        if self.worker_pool is not None:
-            self.worker_pool.shutdown(wait=False)
+        self._stop_event.set()
+        
+        if hasattr(self, '_prefetch_thread') and self._prefetch_thread is not None:
+            self._prefetch_thread.join(timeout=1.0)
+            
+        if hasattr(self, 'worker_pool') and self.worker_pool is not None:
+            self.worker_pool.shutdown(wait=True)
             self.worker_pool = None
+            
         if hasattr(self, 'prefetch_queue'):
             while not self.prefetch_queue.empty():
                 try:
                     self.prefetch_queue.get_nowait()
                 except:
-                    break
+                    pass
+            self.prefetch_queue = None
+            
+        if hasattr(self, 'batch_queue'):
+            while not self.batch_queue.empty():
+                try:
+                    self.batch_queue.get_nowait()
+                except:
+                    pass
+            self.batch_queue = None
+
+    def cleanup(self):
+        """Explicit cleanup method"""
+        self.__del__()
 
 def create_dataloader(
     data_dir,
