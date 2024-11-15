@@ -481,53 +481,108 @@ class CustomDataset(CustomDatasetBase):
             return valid_paths, bucket_data
         return valid_paths
         
-    def _validate_image(self, img_path):
-        """Validate single image with improved error handling"""
-        try:
-            # Check caption file
-            caption_path = img_path.with_suffix('.txt')
-            if not caption_path.exists():
-                logger.warning(f"Skipping {img_path}: No caption file")
-                return None
-                
-            # Validate image
-            with Image.open(img_path) as img:
-                if img.mode not in ['RGB', 'RGBA']:
-                    img = img.convert('RGB')
-                
-                # Get dimensions
-                width, height = img.size
-                
-                # If all_ar is True, accept all sizes
-                if self.all_ar:
-                    return img_path
-                
-                # Basic validation
-                if width < self.min_size or height < self.min_size:
-                    # Instead of skipping, try to upscale
-                    target_width = max(width, self.min_size)
-                    target_height = max(height, self.min_size)
-                    img = self._upscale_image(img, target_width, target_height)
+    def _validate_image_chunk(self, img_paths):
+        """Validate a chunk of images with improved error handling and flag support"""
+        valid_paths = []
+        bucket_data = defaultdict(list) if self.all_ar else None
+        
+        for img_path in img_paths:
+            try:
+                # Check caption file
+                caption_path = img_path.with_suffix('.txt')
+                if not caption_path.exists():
+                    logger.warning(f"Skipping {img_path}: No caption file")
+                    continue
+                    
+                # Validate image
+                with Image.open(img_path) as img:
+                    if img.mode not in ['RGB', 'RGBA']:
+                        img = img.convert('RGB')
+                    
+                    # Get dimensions
                     width, height = img.size
                     
-                # Aspect ratio validation
-                if not self.all_ar:
+                    # If all_ar is True, store in bucket and accept all sizes
+                    if self.all_ar:
+                        bucket = (height, width)
+                        bucket_data[bucket].append(img_path)
+                        valid_paths.append(img_path)
+                        continue
+                    
+                    # Basic validation
+                    if width < self.min_size or height < self.min_size:
+                        # Instead of skipping, try to upscale
+                        target_width = max(width, self.min_size)
+                        target_height = max(height, self.min_size)
+                        img = self._upscale_image(img, target_width, target_height)
+                        width, height = img.size
+                        
+                    # Aspect ratio validation for non-all_ar mode
                     aspect_ratio = width / height
                     if self.resolution_type == "square" and not 0.95 <= aspect_ratio <= 1.05:
                         logger.warning(f"Skipping {img_path}: Not square ({aspect_ratio:.2f})")
-                        return None
+                        continue
                     elif self.resolution_type == "portrait" and aspect_ratio >= 1:
                         logger.warning(f"Skipping {img_path}: Not portrait ({aspect_ratio:.2f})")
-                        return None
+                        continue
                     elif self.resolution_type == "landscape" and aspect_ratio <= 1:
                         logger.warning(f"Skipping {img_path}: Not landscape ({aspect_ratio:.2f})")
-                        return None
-                
-                return img_path
-                
-        except Exception as e:
-            logger.error(f"Error validating {img_path}: {str(e)}")
-            return None
+                        continue
+                    
+                    # Create latent cache if enabled
+                    if not self.no_caching_latents:
+                        cache_path = Path(str(img_path).replace(str(self.data_dir), str(self.cache_dir)))
+                        cache_path = cache_path.with_suffix('.pt')
+                        cache_path.parent.mkdir(parents=True, exist_ok=True)
+                        
+                        # Pre-compute latents if not exists
+                        if not cache_path.exists() and hasattr(self, 'vae'):
+                            try:
+                                self._precompute_latents(img_path, cache_path, img)
+                            except Exception as e:
+                                logger.warning(f"Failed to precompute latents for {img_path}: {str(e)}")
+                                # Continue anyway as we can compute latents on-the-fly
+                    
+                    valid_paths.append(img_path)
+                    
+            except Exception as e:
+                logger.warning(f"Skipping {img_path}: {str(e)}")
+                continue
+        
+        if self.all_ar:
+            return valid_paths, bucket_data
+        return valid_paths
+
+    def _precompute_latents(self, img_path, cache_path, img=None):
+        """Precompute and cache latents for an image"""
+        if img is None:
+            img = Image.open(img_path)
+            if img.mode not in ['RGB', 'RGBA']:
+                img = img.convert('RGB')
+        
+        # Transform image
+        pixel_values = self.image_transforms(img)
+        if len(pixel_values.shape) == 3:
+            pixel_values = pixel_values.unsqueeze(0)
+            
+        # Move to device temporarily
+        self.vae = self.vae.to(self.device)
+        pixel_values = pixel_values.to(self.device)
+        
+        # Compute latents
+        with torch.no_grad():
+            latents = self.vae.encode(pixel_values).latent_dist.sample()
+            latents = latents * self.vae.config.scaling_factor
+            
+        # Save latents
+        torch.save(latents.cpu(), cache_path)
+        
+        # Move VAE back to CPU if needed
+        self.vae = self.vae.cpu()
+
+    def _upscale_image(self, img, target_width, target_height):
+        """Upscale image to target dimensions"""
+        return img.resize((target_width, target_height), Image.Resampling.LANCZOS)
 
     def _preprocess_images_parallel(self):
         """
