@@ -1217,7 +1217,8 @@ class CustomDataset(Dataset):
             # Load cached latents if available
             if not self.no_caching_latents and self.latent_paths[idx].exists():
                 cache_data_latents = torch.load(self.latent_paths[idx], map_location='cpu')  # Load to CPU first
-                cache_data['latents'] = cache_data_latents['latents']
+                # Ensure tensors are on CPU and in float32
+                cache_data['latents'] = cache_data_latents['latents'].float().cpu()
             
             return cache_data
         
