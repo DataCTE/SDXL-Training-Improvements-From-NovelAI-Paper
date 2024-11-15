@@ -1,7 +1,7 @@
 # Project Structure Documentation
 
 ## Overview
-This project implements a Stable Diffusion XL training pipeline with Zero Terminal SNR (ZTSNR), high-resolution coherence enhancements, and VAE improvements from NovelAI research.
+This project implements a Stable Diffusion XL training pipeline with Zero Terminal SNR (ZTSNR), high-resolution coherence enhancements, and VAE improvements from NovelAI research. The codebase is organized for maximum efficiency, modularity, and extensibility.
 
 ## Directory Structure
 
@@ -9,173 +9,149 @@ This project implements a Stable Diffusion XL training pipeline with Zero Termin
 src/
 ├── data/
 │   ├── __init__.py
-│   ├── dataset.py           # Custom dataset with efficient caching
-│   ├── tag_weighter.py      # Tag weighting implementation
-│   ├── ultimate_upscaler.py # High-resolution upscaling
-│   ├── usdu_patch.py       # USDU patching utilities
-│   └── utils.py            # Data processing utilities
+│   ├── dataset.py           # Advanced dataset with caching and dynamic resolution
+│   ├── tag_weighter.py      # CLIP-based dynamic tag weighting
+│   ├── ultimate_upscaler.py # High-resolution upscaling with coherence
+│   ├── usdu_patch.py        # Ultimate SD Upscaler integration
+│   └── utils.py            # Data processing and augmentation utilities
 │
 ├── inference/
 │   ├── __init__.py
-│   ├── text_to_image.py    # Inference pipeline
-│   └── Comfyui-zsnmode/    # ComfyUI integration
+│   ├── text_to_image.py    # Optimized inference pipeline
+│   ├── img2img.py          # Image-to-image pipeline
+│   └── Comfyui-zsnmode/    # ComfyUI integration nodes
 │
 ├── models/
-│   └── __init__.py         # Model definitions
+│   ├── __init__.py
+│   ├── architecture.py     # Model architecture definitions
+│   ├── attention.py        # Memory-efficient attention implementations
+│   └── vae.py             # Enhanced VAE components
 │
 ├── training/
 │   ├── __init__.py
-│   ├── _pycache_/
-│   ├── ema.py             # Exponential Moving Average
-│   ├── loss.py            # ZTSNR loss implementation
-│   ├── trainer.py         # Main training loop
-│   └── vae_finetuner.py   # Adaptive VAE fine-tuning
+│   ├── ema.py             # Enhanced EMA with momentum scheduling
+│   ├── loss.py            # ZTSNR and perceptual loss implementations
+│   ├── trainer.py         # Memory-efficient training loop
+│   └── vae_finetuner.py   # Advanced VAE fine-tuning
 │
 ├── utils/
 │   ├── __init__.py
-│   ├── checkpoint.py      # Model state management
-│   ├── device.py         # Memory optimization
-│   ├── hub.py            # Model publishing
-│   ├── logging.py        # Training monitoring
-│   ├── model_card.py     # Documentation
-│   ├── setup.py          # Configuration
-│   └── validation.py     # Model validation
+│   ├── checkpoint.py      # Robust model state management
+│   ├── device.py         # Memory and device optimization
+│   ├── hub.py            # HuggingFace integration
+│   ├── logging.py        # Comprehensive training monitoring
+│   ├── model_card.py     # Automated documentation
+│   ├── setup.py          # Advanced configuration
+│   └── validation.py     # Extensive model validation
 │
-└── main.py               # Entry point
+└── main.py               # Entry point with CLI
 ```
 
 ## Component Details
 
 ### Data Module
 - `dataset.py`: Advanced dataset implementation
+  - Multi-resolution image handling
   - Efficient latent caching system
-  - Resolution-adaptive bucketing
-  - CLIP embedding preprocessing
-  - Memory-efficient batch processing
-  - Dynamic tag processing
-  - Automatic statistics tracking
+  - Dynamic batch composition
+  - Automatic augmentation pipeline
+  - Memory-mapped storage
+  - Streaming capabilities
+  - Multi-worker data loading
+
+- `tag_weighter.py`: Dynamic tag weighting
+  - CLIP embedding analysis
+  - Frequency-based normalization
+  - Category-specific weighting
+  - Tag correlation analysis
+  - Dropout regularization
+  - Cache management
+  - Real-time weight updates
 
 ### Models Module
-- `model_validator.py`: ZTSNR validation system
-  - Black image generation testing
-  - High-resolution coherence validation
-  - Noise schedule visualization
-  - Progressive denoising validation
-  - Statistical metrics tracking
-
-- `setup.py`: Enhanced model initialization
-  - High-sigma noise scheduling
-  - Cross-attention optimization
-  - Resolution-adaptive configurations
-  - Memory-efficient model loading
-
-- `tag_weighter.py`: Advanced loss weighting
-  - CLIP-based tag analysis
-  - Dynamic weight adjustment
-  - Category-based weighting
-  - Frequency normalization
-  - Cached embedding system
-
-- `vae_finetuner.py`: Improved VAE training
-  - Welford algorithm implementation
-  - Adaptive statistics normalization
-  - Progressive batch processing
+- `architecture.py`: Enhanced SDXL architecture
   - Memory-efficient attention
-  - Real-time stability monitoring
+  - Gradient checkpointing
+  - Custom scaling rules
+  - Dynamic resolution handling
+  - Feature pyramid networks
+  - Skip connections
+
+- `attention.py`: Optimized attention mechanisms
+  - Sparse attention patterns
+  - Memory-efficient implementation
+  - Dynamic head pruning
+  - Cross-frame attention
+  - Flash attention support
+  - Xformers integration
 
 ### Training Module
-- `loss.py`: Advanced loss calculations
-  - ZTSNR loss implementation
-  - High-resolution coherence loss
+- `loss.py`: Comprehensive loss system
+  - ZTSNR implementation
   - Perceptual loss components
-  - Dynamic weight scaling
-  - Statistical normalization
+  - Dynamic weighting
+  - Gradient scaling
+  - Feature matching
+  - Style transfer loss
 
-- `setup.py`: Training configuration
-  - Optimizer selection (AdamW8bit/Adafactor)
-  - Learning rate scheduling
+- `trainer.py`: Advanced training loop
   - Gradient accumulation
-  - Memory optimization
-  - Device management
-
-- `trainer.py`: Enhanced training loop
-  - Progressive denoising steps
+  - Mixed precision training
   - Dynamic batch sizing
-  - Automatic validation
-  - Statistics tracking
-  - Emergency checkpointing
-
-- `utils.py`: Training utilities
-  - Memory monitoring
-  - Performance profiling
-  - Error handling
-  - Device optimization
-  - Cache management
+  - Memory optimization
+  - Distributed training
+  - Checkpoint management
+  - Progress tracking
 
 ### Utils Module
-- `checkpoint.py`: State management
-  - Efficient state saving
-  - Safe loading mechanisms
-  - Emergency backup system
-  - Validation on load
-  - Partial state updates
+- `checkpoint.py`: Robust state management
+  - Safe state saving/loading
+  - Incremental updates
+  - Emergency recovery
+  - Version control
+  - Metadata tracking
 
 - `device.py`: Resource optimization
   - Memory tracking
-  - Device allocation
-  - Cache clearing
-  - Gradient optimization
+  - CUDA optimization
+  - Cache management
+  - Automatic mixed precision
   - Memory defragmentation
-
-- `hub.py`: Model distribution
-  - HuggingFace integration
-  - Safe upload system
-  - Version management
-  - Documentation updates
-  - Access control
-
-- `logging.py`: Monitoring system
-  - W&B integration
-  - Performance tracking
-  - Error logging
-  - Statistics visualization
-  - Progress monitoring
-
-- `model_card.py`: Documentation
-  - Automatic card generation
-  - Training details logging
-  - Performance metrics
-  - Configuration recording
-  - Usage instructions
+  - Device assignment
 
 ## Implementation Notes
-
-### ZTSNR Features
-- Implements σ_max ≈ 20000.0
-- Progressive noise reduction
-- Resolution-adaptive steps
-- Color fidelity improvements
-- Composition stability
 
 ### Memory Management
 - Automatic garbage collection
 - Gradient checkpointing
-- Efficient attention mechanisms
-- Dynamic batch sizing
+- Efficient attention
+- Dynamic batching
 - Cache optimization
+- Memory-mapped data
+- Streaming processing
 
-### Validation System
-- Automated testing suite
-- Performance metrics
-- Quality assessments
-- Statistical analysis
-- Progress tracking
+### Training Features
+- Multi-resolution support
+- Dynamic tag weighting
+- Adaptive learning rates
+- Progressive training
+- Validation pipeline
+- Automated logging
+- Emergency recovery
+
+### Performance Optimizations
+- Mixed precision training
+- Memory-efficient attention
+- Gradient accumulation
+- Efficient data loading
+- Caching strategies
+- Device optimization
 
 ## Usage Guidelines
 
-See main README.md for:
-- Installation instructions
-- Training commands
-- Configuration options
-- Performance tips
-- Troubleshooting
+Refer to main README.md for:
+- Detailed installation steps
+- Training configurations
+- Performance optimization
+- Troubleshooting guide
+- Best practices
