@@ -13,6 +13,7 @@ import re
 
 logger = logging.getLogger(__name__)
 
+
 @dataclass
 class TagStats:
     """Thread-safe container for tag statistics."""

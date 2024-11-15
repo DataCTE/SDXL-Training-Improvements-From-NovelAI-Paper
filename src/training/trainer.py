@@ -17,7 +17,7 @@ from transformers import Adafactor
 
 from .vae_finetuner import VAEFineTuner
 from .ema import EMAModel
-from data.tag_weighter import TagWeighter
+from data.tag_weighter import TagBasedLossWeighter
 
 logger = logging.getLogger(__name__)
 
@@ -163,13 +163,15 @@ def setup_tag_weighter(args) -> Optional[Any]:
             return None
             
         logger.info("Initializing tag weighter")
-        from data.tag_weighter import TagWeighter
         
-        weighter = TagWeighter(
-            base_weight=args.tag_base_weight,
-            min_weight=args.tag_min_weight,
-            max_weight=args.tag_max_weight,
-            window_size=args.tag_window_size
+        weighter = TagBasedLossWeighter(
+            config={
+                'base_weight': args.tag_base_weight,
+                'min_weight': args.tag_min_weight,
+                'max_weight': args.tag_max_weight,
+                'window_size': args.tag_window_size,
+                'no_cache': getattr(args, 'no_caching', False)
+            }
         )
         
         return weighter
