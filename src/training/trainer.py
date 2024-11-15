@@ -441,37 +441,26 @@ def _log_ema_config(args):
     logger.info(f"- Power: {args.ema_power}")
     logger.info(f"- Min/Max decay: {args.ema_min_decay}/{args.ema_max_decay}")
 
-def _get_training_config_impl(args_tuple: tuple) -> Dict[str, Any]:
-    """Implementation of training config that takes a hashable tuple."""
-    # Convert tuple back to dict for easy access
-    args_dict = dict(args_tuple)
-    return {
-        "mode": args_dict['training_mode'],
-        "min_snr_gamma": args_dict['min_snr_gamma'],
-        "sigma_data": args_dict['sigma_data'],
-        "sigma_min": args_dict['sigma_min'],
-        "sigma_max": args_dict['sigma_max'],
-        "scale_method": args_dict['scale_method'],
-        "scale_factor": args_dict['scale_factor']
-    }
-
 @lru_cache(maxsize=1)
-def _get_training_config(args) -> Dict[str, Any]:
+def _get_training_config(
+    training_mode: str,
+    min_snr_gamma: float,
+    sigma_data: float,
+    sigma_min: float,
+    sigma_max: float,
+    scale_method: str,
+    scale_factor: float
+) -> Dict[str, Any]:
     """Cache training configuration."""
-    # Convert Namespace to hashable tuple of (key, value) pairs
-    args_tuple = tuple(sorted(
-        (k, v) for k, v in vars(args).items()
-        if k in {
-            'training_mode',
-            'min_snr_gamma',
-            'sigma_data',
-            'sigma_min',
-            'sigma_max',
-            'scale_method',
-            'scale_factor'
-        }
-    ))
-    return _get_training_config_impl(args_tuple)
+    return {
+        "mode": training_mode,
+        "min_snr_gamma": min_snr_gamma,
+        "sigma_data": sigma_data,
+        "sigma_min": sigma_min,
+        "sigma_max": sigma_max,
+        "scale_method": scale_method,
+        "scale_factor": scale_factor
+    }
 
 def initialize_training_components(args, device, dtype, models):
     """Initialize all training components with proper error handling"""
@@ -523,7 +512,15 @@ def initialize_training_components(args, device, dtype, models):
         })
         
         # Cache and set training configuration
-        components["training_config"] = _get_training_config(args)
+        components["training_config"] = _get_training_config(
+            training_mode=getattr(args, 'training_mode', 'v_prediction'),
+            min_snr_gamma=getattr(args, 'min_snr_gamma', 5.0),
+            sigma_data=getattr(args, 'sigma_data', 1.0),
+            sigma_min=getattr(args, 'sigma_min', 0.002),
+            sigma_max=getattr(args, 'sigma_max', 80.0),
+            scale_method=getattr(args, 'scale_method', 'v'),
+            scale_factor=getattr(args, 'scale_factor', 1.0)
+        )
         
         # Validate components
         _validate_components(components)
