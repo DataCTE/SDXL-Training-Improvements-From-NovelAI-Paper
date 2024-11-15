@@ -22,13 +22,19 @@ def load_checkpoint(args):
         # Extract models
         models = {
             "unet": pipeline.unet,
-            "vae": pipeline.vae,
+            "vae": pipeline.vae if not args.vae_path else StableDiffusionXLPipeline.from_pretrained(
+                args.vae_path,
+                torch_dtype=torch.float16
+            ).vae,
             "text_encoder": pipeline.text_encoder,
             "text_encoder_2": pipeline.text_encoder_2,
             "tokenizer": pipeline.tokenizer,
             "tokenizer_2": pipeline.tokenizer_2,
             "scheduler": pipeline.scheduler
         }
+        
+        if args.vae_path:
+            logger.info(f"Using custom VAE from {args.vae_path}")
         
         # Initialize training components
         train_components = {}

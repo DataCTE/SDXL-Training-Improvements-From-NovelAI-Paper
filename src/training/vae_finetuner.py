@@ -84,17 +84,24 @@ class VAEFineTuner:
         """Initialize base configuration parameters."""
         self.device = config.get('device') or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.min_snr_gamma = config.get('min_snr_gamma', 5.0)
-        self.adaptive_loss_scale = config.get('adaptive_loss_scale', True)
-        self.use_channel_scaling = config.get('use_channel_scaling', True)
+        
+        # VAE specific parameters
+        self.adaptive_loss_scale = config.get('vae_adaptive_loss_scale', True)
+        self.use_channel_scaling = config.get('vae_use_channel_scaling', True)
+        self.initial_scale_factor = config.get('vae_initial_scale_factor', 1.0)
+        self.decay = config.get('vae_decay', 0.9999)
+        self.update_after_step = config.get('vae_update_after_step', 100)
+        
+        # Training parameters
         self.mixed_precision = config.get('mixed_precision', 'bf16')
         self.use_amp = config.get('use_amp', True)
         self.max_grad_norm = config.get('max_grad_norm', 1.0)
         self.gradient_checkpointing = config.get('gradient_checkpointing', False)
         
-        # Initialize loss weights
-        self.kl_weight = config.get('kl_weight', 0.0)
-        self.perceptual_weight = config.get('perceptual_weight', 0.0)
-        self.scale_factor = config.get('scale_factor', 1.0)
+        # Loss weights
+        self.kl_weight = config.get('vae_kl_weight', 0.0)
+        self.perceptual_weight = config.get('vae_perceptual_weight', 0.0)
+        self.scale_factor = self.initial_scale_factor
 
     def _init_model(self, vae: torch.nn.Module) -> None:
         """Initialize and configure VAE model."""
@@ -111,6 +118,11 @@ class VAEFineTuner:
             self.vae.enable_xformers_memory_efficient_attention()
         if self.gradient_checkpointing and hasattr(self.vae, 'enable_gradient_checkpointing'):
             self.vae.enable_gradient_checkpointing()
+
+        # Initialize adaptive scaling
+        if self.adaptive_loss_scale:
+            self.scale_factor = self.initial_scale_factor
+            self.current_step = 0
 
     def _init_optimizer(self, config: Dict[str, Any]) -> None:
         """Initialize optimizer and related components."""
@@ -167,6 +179,22 @@ class VAEFineTuner:
                 device=self.device,
                 dtype=self.vae.dtype
             )
+
+    def update_scale_factor(self, loss: torch.Tensor) -> None:
+        """Update the adaptive loss scale factor."""
+        if self.current_step >= self.update_after_step:
+            # Update scale factor using exponential moving average
+            with torch.no_grad():
+                loss_value = loss.item()
+                if not torch.isnan(loss).any() and not torch.isinf(loss).any():
+                    target_scale = 1.0 / loss_value if loss_value > 0 else 1.0
+                    self.scale_factor = (
+                        self.scale_factor * self.decay + 
+                        target_scale * (1 - self.decay)
+                    )
+                    # Clamp to reasonable range
+                    self.scale_factor = max(min(self.scale_factor, 1e6), 1e-6)
+        self.current_step += 1
 
     @torch.cuda.amp.autocast()
     def _forward_vae(self, latents: torch.Tensor) -> torch.Tensor:
@@ -228,7 +256,7 @@ class VAEFineTuner:
 
             # Fast path for cached results
             if self.use_cache:
-                cache_key = hash(latents.cpu().numpy().tobytes())
+                cache_key = self._get_cache_key(latents)
                 if cache_key in self.cache:
                     return self.cache[cache_key]
 
@@ -243,23 +271,29 @@ class VAEFineTuner:
                 # Compute losses efficiently
                 loss = torch.zeros_like(self.loss_buffer)
                 
+                # Reconstruction loss (always computed)
                 if original_images is not None:
-                    loss += F.mse_loss(decoded, original_images)
+                    recon_loss = F.mse_loss(decoded, original_images)
+                    loss += recon_loss
                 
+                # KL divergence loss (if enabled)
                 if self.kl_weight > 0:
                     posterior = self.vae.encode(decoded).latent_dist
-                    loss += _compute_kl_loss(
+                    kl_loss = _compute_kl_loss(
                         posterior.mean,
                         posterior.logvar
-                    ) * self.kl_weight
+                    )
+                    loss += kl_loss * self.kl_weight
                 
+                # Perceptual loss (if enabled)
                 if self.perceptual_weight > 0 and original_images is not None:
-                    loss += self._compute_perceptual(
+                    perceptual_loss = self._compute_perceptual(
                         decoded,
                         original_images
-                    ) * self.perceptual_weight
+                    )
+                    loss += perceptual_loss * self.perceptual_weight
                 
-                # Scale loss
+                # Apply adaptive loss scaling
                 if self.adaptive_loss_scale:
                     self.update_scale_factor(loss)
                     loss *= self.scale_factor
@@ -286,19 +320,20 @@ class VAEFineTuner:
             self.optimizer.zero_grad(set_to_none=True)
             self.lr_scheduler.step()
             
-            # Update tracking
+            # Update tracking metrics
             self.loss_meter.update(loss.item())
             
-            # Cache result
+            # Cache result if enabled
             if self.use_cache:
-                self.cache[cache_key] = loss.item()
-
+                self.cache[cache_key] = loss.detach()
+            
             return loss
 
         except Exception as e:
-            logger.error(f"VAE training step failed: {str(e)}")
-            return torch.zeros_like(self.loss_buffer)
-    
+            logger.error(f"Error in training step: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
+
     def save_pretrained(self, save_dir: str):
         """Save VAE model and finetuning state"""
         os.makedirs(save_dir, exist_ok=True)

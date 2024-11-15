@@ -160,7 +160,10 @@ def _get_vae_config(
     kl_weight: float = 0.0,
     perceptual_weight: float = 0.0,
     min_snr_gamma: float = 5.0,
-    initial_scale_factor: float = 1.0
+    initial_scale_factor: float = 1.0,
+    decay: float = 0.9999,
+    update_after_step: int = 100,
+    model_path: Optional[str] = None
 ) -> Dict[str, Any]:
     """Cache VAE configuration."""
     return {
@@ -180,7 +183,10 @@ def _get_vae_config(
         'kl_weight': kl_weight,
         'perceptual_weight': perceptual_weight,
         'min_snr_gamma': min_snr_gamma,
-        'initial_scale_factor': initial_scale_factor
+        'initial_scale_factor': initial_scale_factor,
+        'decay': decay,
+        'update_after_step': update_after_step,
+        'model_path': model_path
     }
 
 def setup_vae_finetuner(args, models) -> Optional[VAEFineTuner]:
@@ -207,7 +213,10 @@ def setup_vae_finetuner(args, models) -> Optional[VAEFineTuner]:
             kl_weight=getattr(args, 'vae_kl_weight', 0.0),
             perceptual_weight=getattr(args, 'vae_perceptual_weight', 0.0),
             min_snr_gamma=getattr(args, 'min_snr_gamma', 5.0),
-            initial_scale_factor=getattr(args, 'vae_initial_scale_factor', 1.0)
+            initial_scale_factor=getattr(args, 'vae_initial_scale_factor', 1.0),
+            decay=getattr(args, 'vae_decay', 0.9999),
+            update_after_step=getattr(args, 'vae_update_after_step', 100),
+            model_path=getattr(args, 'vae_model_path', None)
         )
         vae_finetuner = VAEFineTuner(
             vae=models["vae"],
@@ -411,12 +420,17 @@ def _log_optimizer_config(args):
 def _log_vae_config(args):
     """Log VAE configuration details."""
     logger.info(f"VAE Finetuner settings:")
+    logger.info(f"- VAE enabled: {args.use_vae}")
+    if args.vae_path:
+        logger.info(f"- VAE path: {args.vae_path}")
     logger.info(f"- Learning rate: {args.vae_learning_rate}")
     logger.info(f"- Channel scaling: {args.vae_use_channel_scaling}")
     logger.info(f"- Adaptive loss scale: {args.vae_adaptive_loss_scale}")
     logger.info(f"- KL weight: {args.vae_kl_weight}")
     logger.info(f"- Perceptual weight: {args.vae_perceptual_weight}")
     logger.info(f"- Initial scale factor: {args.vae_initial_scale_factor}")
+    logger.info(f"- Decay rate: {args.vae_decay}")
+    logger.info(f"- Update after step: {args.vae_update_after_step}")
 
 def _log_ema_config(args):
     """Log EMA configuration details."""

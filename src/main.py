@@ -87,6 +87,32 @@ def parse_args():
                        help="Update EMA every N steps")
     parser.add_argument("--use_ema_warmup", action="store_true", default=True,
                        help="Use EMA warmup")
+
+    # VAE parameters """ --vae_use_channel_scaling --vae_adaptive_loss_scale  --vae_kl_weight --vae_perceptual_weight -vae_initial_scale_factor """
+    parser.add_argument("--vae_use_channel_scaling", action="store_true", default=True,
+                       help="Use channel scaling in VAE")
+
+    parser.add_argument("--vae_adaptive_loss_scale", action="store_true", default=True,
+                       help="Use adaptive loss scale in VAE")
+
+    parser.add_argument("--vae_kl_weight", type=float, default=0.0,
+                       help="Weight for KL loss in VAE")
+
+    parser.add_argument("--vae_perceptual_weight", type=float, default=0.0,
+                       help="Weight for perceptual loss in VAE")
+
+    parser.add_argument("--vae_initial_scale_factor", type=float, default=1.0,
+                       help="Initial scale factor for VAE")
+
+
+    parser.add_argument("--use_vae", action="store_true", default=True,
+                       help="Use VAE for training")
+    parser.add_argument("--vae_path", type=str, default=None,
+                       help="Path to VAE checkpoint")
+    parser.add_argument("--vae_decay", type=float, default=0.9999,
+                       help="VAE decay rate")
+    parser.add_argument("--vae_update_after_step", type=int, default=100,
+                       help="Start VAE after this many steps")
     
     # Training configuration
     parser.add_argument("--training_mode", type=str, default="v_prediction",
