@@ -258,14 +258,20 @@ def setup_validator(args, models, device, dtype) -> Optional[Any]:
         raise
 
 @lru_cache(maxsize=32)
-def _get_tag_weighter_config(args) -> Dict[str, Any]:
+def _get_tag_weighter_config(
+    base_weight: float,
+    min_weight: float,
+    max_weight: float,
+    window_size: int,
+    no_cache: bool = False
+) -> Dict[str, Any]:
     """Cache tag weighter configuration."""
     return {
-        'base_weight': args.tag_base_weight,
-        'min_weight': args.tag_min_weight,
-        'max_weight': args.tag_max_weight,
-        'window_size': args.tag_window_size,
-        'no_cache': getattr(args, 'no_caching', False)
+        'base_weight': base_weight,
+        'min_weight': min_weight,
+        'max_weight': max_weight,
+        'window_size': window_size,
+        'no_cache': no_cache
     }
 
 def setup_tag_weighter(args) -> Optional[Any]:
@@ -275,7 +281,13 @@ def setup_tag_weighter(args) -> Optional[Any]:
             return None
             
         logger.info("Initializing tag weighter")
-        weighter_config = _get_tag_weighter_config(args)
+        weighter_config = _get_tag_weighter_config(
+            base_weight=args.tag_base_weight,
+            min_weight=args.tag_min_weight,
+            max_weight=args.tag_max_weight,
+            window_size=args.tag_window_size,
+            no_cache=getattr(args, 'no_caching', False)
+        )
         weighter = TagBasedLossWeighter(config=weighter_config)
         
         return weighter
@@ -378,7 +390,7 @@ def _log_ema_config(args):
     logger.info(f"- Power: {args.ema_power}")
     logger.info(f"- Min/Max decay: {args.ema_min_decay}/{args.ema_max_decay}")
 
-@lru_cache(maxsize=32)
+@lru_cache(maxsize=1)
 def _get_training_config(args) -> Dict[str, Any]:
     """Cache training configuration."""
     return {
