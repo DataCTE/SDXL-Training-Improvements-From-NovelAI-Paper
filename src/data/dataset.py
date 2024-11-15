@@ -18,6 +18,7 @@ import threading
 import time
 import multiprocessing as mp
 from functools import lru_cache
+import itertools
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +156,42 @@ class CustomDataset(CustomDatasetBase):
         
         # Set collate function
         self.collate_fn = self.custom_collate
+
+        # Convert image paths to strings once
+        self.image_paths = [str(p) for p in Path(data_dir).glob("*.png")]
+        
+        # Pre-compute bucket data efficiently
+        if self.all_ar:
+            logger.info("Pre-computing bucket data...")
+            from concurrent.futures import ThreadPoolExecutor
+            
+            def process_image_batch(paths):
+                results = {}
+                for path in paths:
+                    try:
+                        with Image.open(path) as img:
+                            width, height = img.size
+                            bucket = (height, width)
+                            if bucket not in results:
+                                results[bucket] = []
+                            results[bucket].append(path)
+                    except Exception as e:
+                        logger.error(f"Error processing {path}: {str(e)}")
+                return results
+            
+            # Process in parallel
+            chunk_size = max(1, len(self.image_paths) // (self.num_workers * 4))
+            with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+                futures = []
+                for i in range(0, len(self.image_paths), chunk_size):
+                    chunk = self.image_paths[i:i + chunk_size]
+                    futures.append(executor.submit(process_image_batch, chunk))
+                
+                # Combine results
+                self.bucket_data = defaultdict(list)
+                for future in futures:
+                    for bucket, paths in future.result().items():
+                        self.bucket_data[bucket].extend(paths)
 
     def _parse_tags(self, caption):
         """Parse tags using tag weighter class method"""
@@ -1472,7 +1509,11 @@ class BucketSampler(CustomSamplerBase):
         self.batch_size = batch_size
         self.drop_last = drop_last
         self.all_ar = dataset.all_ar
-        self.num_workers = dataset.num_workers  # Get num_workers from dataset
+        self.num_workers = dataset.num_workers
+
+        # Create a lookup dictionary for faster index access
+        logger.info("Creating image path lookup table...")
+        self.path_to_idx = {str(path): idx for idx, path in enumerate(dataset.image_paths)}
         
         # Store (bucket, index) pairs for all valid samples
         self.samples = []
@@ -1482,139 +1523,112 @@ class BucketSampler(CustomSamplerBase):
             from tqdm import tqdm
             from concurrent.futures import ThreadPoolExecutor, as_completed
             
-            # Process buckets in parallel
+            # Process buckets in larger chunks for better efficiency
+            chunk_size = max(1, len(dataset.bucket_data) // (self.num_workers * 4))
+            bucket_chunks = [
+                list(chunk) for chunk in self._chunks(
+                    dataset.bucket_data.items(), 
+                    chunk_size
+                )
+            ]
+            
+            # Process chunks in parallel
             with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-                # Create progress bar
+                futures = []
                 pbar = tqdm(total=len(dataset.bucket_data), desc="Processing buckets")
                 
-                # Submit tasks for each bucket
-                future_to_bucket = {
-                    executor.submit(self._process_bucket, bucket, img_paths, dataset): bucket 
-                    for bucket, img_paths in dataset.bucket_data.items()
-                }
+                # Submit chunks of buckets
+                for chunk in bucket_chunks:
+                    future = executor.submit(
+                        self._process_bucket_chunk, 
+                        chunk, 
+                        len(chunk)
+                    )
+                    futures.append(future)
                 
-                # Process completed tasks
-                for future in as_completed(future_to_bucket):
-                    bucket = future_to_bucket[future]
+                # Process completed chunks
+                for future in as_completed(futures):
                     try:
-                        bucket_samples = future.result()
-                        self.samples.extend(bucket_samples)
-                        pbar.update(1)
+                        chunk_samples = future.result()
+                        self.samples.extend(chunk_samples)
+                        pbar.update(len(chunk_samples))
                     except Exception as e:
-                        logger.error(f"Error processing bucket {bucket}: {str(e)}")
+                        logger.error(f"Error processing chunk: {str(e)}")
                 
                 pbar.close()
             
             logger.info(f"Processed {len(self.samples)} samples for all_ar mode")
-        else:
-            # Original bucket validation logic with progress bar
-            logger.info("Processing standard buckets...")
-            from tqdm import tqdm
-            for bucket, img_paths in tqdm(dataset.bucket_data.items(),
-                                        desc="Processing buckets",
-                                        total=len(dataset.bucket_data)):
-                bucket_h, bucket_w = bucket
-                
-                # Skip invalid buckets
-                if bucket_h < dataset.min_size or bucket_w < dataset.min_size:
-                    logger.warning(f"Skipping bucket {bucket} - dimensions too small")
-                    continue
-                    
-                if dataset.max_size and (bucket_h > dataset.max_size or bucket_w > dataset.max_size):
-                    logger.warning(f"Skipping bucket {bucket} - dimensions exceed max_size")
-                    continue
-                
-                # Get indices for images in this bucket
+        
+        logger.info(f"BucketSampler initialized with {len(self.samples)} samples")
+
+    @staticmethod
+    def _chunks(iterable, size):
+        """Helper to split iterable into chunks"""
+        it = iter(iterable)
+        return iter(lambda: list(itertools.islice(it, size)), [])
+
+    def _process_bucket_chunk(self, bucket_items, chunk_size):
+        """Process a chunk of buckets efficiently"""
+        chunk_samples = []
+        for bucket, img_paths in bucket_items:
+            try:
+                # Process all images in this bucket
                 for img_path in img_paths:
                     try:
-                        idx = dataset.image_paths.index(img_path)
-                        self.samples.append((bucket, idx))
-                    except ValueError:
-                        logger.warning(f"Image {img_path} not found in dataset paths")
+                        idx = self.path_to_idx[str(img_path)]
+                        chunk_samples.append((bucket, idx))
+                    except KeyError:
                         continue
-                
-                # Log bucket statistics
-                if len(img_paths) > 0:
-                    logger.debug(f"Bucket {bucket}: {len(img_paths)} images")
-            
-            logger.info(f"Processed {len(self.samples)} samples across {len(dataset.bucket_data)} buckets")
-            
-            # Verify we have valid samples
-            if not self.samples:
-                raise ValueError("No valid samples found after bucket validation")
-                
-            # Sort samples by bucket size for potentially better memory usage
-            self.samples.sort(key=lambda x: x[0][0] * x[0][1])
-            
-        logger.info(f"BucketSampler initialized with {len(self.samples)} samples")
-    
-    def _process_bucket(self, bucket, img_paths, dataset):
-        """Process a single bucket in a separate thread"""
-        bucket_samples = []
-        try:
-            for img_path in img_paths:
-                try:
-                    idx = dataset.image_paths.index(img_path)
-                    bucket_samples.append((bucket, idx))
-                except ValueError:
-                    logger.warning(f"Image {img_path} not found in dataset paths")
-                    continue
-        except Exception as e:
-            logger.error(f"Error processing bucket {bucket}: {str(e)}")
-        
-        return bucket_samples
-    
+            except Exception as e:
+                logger.error(f"Error processing bucket {bucket}: {str(e)}")
+        return chunk_samples
+
     def __iter__(self):
         if not self.samples:
             raise RuntimeError("No samples available for iteration")
             
         if self.all_ar:
-            # In all_ar mode, we can shuffle all samples
-            indices = [idx for _, idx in self.samples]
-            random.shuffle(indices)
+            # Use numpy for faster shuffling
+            import numpy as np
+            indices = np.array([idx for _, idx in self.samples])
+            np.random.shuffle(indices)
             
-            # Create batches (they may have different sizes)
-            batches = []
-            for i in range(0, len(indices), self.batch_size):
-                batch = indices[i:i + self.batch_size]
-                if len(batch) == self.batch_size or not self.drop_last:
-                    batches.append(batch)
+            # Create batches efficiently
+            batches = [
+                indices[i:i + self.batch_size] 
+                for i in range(0, len(indices), self.batch_size)
+                if len(indices[i:i + self.batch_size]) == self.batch_size or not self.drop_last
+            ]
             
             # Shuffle batches
-            random.shuffle(batches)
+            np.random.shuffle(batches)
             
-            # Flatten batches
-            return iter([idx for batch in batches for idx in batch])
+            # Flatten batches efficiently
+            return iter(np.concatenate(batches))
         else:
-            # Original iteration logic for non-all_ar mode
             # Group samples by bucket
             bucket_groups = defaultdict(list)
             for bucket, idx in self.samples:
                 bucket_groups[bucket].append(idx)
             
-            # Create batches for each bucket
+            # Create batches within each bucket
             batches = []
-            for bucket, indices in bucket_groups.items():
-                # Shuffle indices within each bucket
-                indices = indices.copy()
-                random.shuffle(indices)
+            for bucket_indices in bucket_groups.values():
+                # Shuffle indices within bucket
+                np.random.shuffle(bucket_indices)
                 
-                # Create batches of the specified size
-                for i in range(0, len(indices), self.batch_size):
-                    batch = indices[i:i + self.batch_size]
+                # Create batches from this bucket
+                for i in range(0, len(bucket_indices), self.batch_size):
+                    batch = bucket_indices[i:i + self.batch_size]
                     if len(batch) == self.batch_size or not self.drop_last:
                         batches.append(batch)
             
-            # Shuffle the batches themselves
-            random.shuffle(batches)
+            # Shuffle all batches
+            np.random.shuffle(batches)
             
-            # Flatten batches into a single list of indices
-            indices = []
-            for batch in batches:
-                indices.extend(batch)
-            
-            return iter(indices)
-    
+            # Flatten batches into single list of indices
+            return iter(np.concatenate(batches))
+
     def __len__(self):
         if self.drop_last:
             return len(self.samples) - (len(self.samples) % self.batch_size)
