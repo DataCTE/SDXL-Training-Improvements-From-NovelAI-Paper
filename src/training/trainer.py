@@ -17,7 +17,7 @@ import time
 from tqdm import tqdm
 from data.dataset import create_dataloader
 import os
-from ema import EMAModel
+from .ema import EMAModel
 
 logger = logging.getLogger(__name__)
 
@@ -186,33 +186,45 @@ def setup_vae_finetuner(args, models) -> Optional[VAEFineTuner]:
         raise
 
 @lru_cache(maxsize=1)
-def _get_ema_config(args):
-    """Get EMA configuration with proper handling of Namespace objects"""
-    # Convert Namespace to dict if needed
-    if hasattr(args, '__dict__'):
-        args = vars(args)
-    
-    # Create a hashable key for caching
-    config_key = tuple(sorted((k, v) for k, v in args.items() 
-                     if k.startswith('ema_')))
-    
+def _get_ema_config(
+    decay: float = 0.9999,
+    update_interval: int = 10,
+    device: str = 'auto',
+    update_after_step: int = 0,
+    use_warmup: bool = True,
+    warmup_steps: int = 2000,
+    inv_gamma: float = 1.0,
+    power: float = 3/4,
+    min_value: float = 0.0
+) -> Dict[str, Any]:
+    """Get EMA configuration with proper parameter handling"""
     return {
-        'decay': args.get('ema_decay', 0.9999),
-        'update_interval': args.get('ema_update_interval', 10),
-        'device': args.get('ema_device', 'auto'),
-        'update_after_step': args.get('ema_update_after_step', 0),
-        'use_ema_warmup': args.get('ema_use_warmup', True),
-        'warmup_steps': args.get('ema_warmup_steps', 2000),
-        'inv_gamma': args.get('ema_inv_gamma', 1.0),
-        'power': args.get('ema_power', 3/4),
-        'min_value': args.get('ema_min_value', 0.0)
+        'decay': decay,
+        'update_interval': update_interval,
+        'device': device,
+        'update_after_step': update_after_step,
+        'use_ema_warmup': use_warmup,
+        'warmup_steps': warmup_steps,
+        'inv_gamma': inv_gamma,
+        'power': power,
+        'min_value': min_value
     }
 
 def setup_ema(args, model):
     """Setup EMA model with proper error handling"""
     try:
         # Get EMA config safely
-        ema_config = _get_ema_config(args)
+        ema_config = _get_ema_config(
+            decay=getattr(args, 'ema_decay', 0.9999),
+            update_interval=getattr(args, 'ema_update_interval', 10),
+            device=getattr(args, 'ema_device', 'auto'),
+            update_after_step=getattr(args, 'ema_update_after_step', 0),
+            use_warmup=getattr(args, 'ema_use_warmup', True),
+            warmup_steps=getattr(args, 'ema_warmup_steps', 2000),
+            inv_gamma=getattr(args, 'ema_inv_gamma', 1.0),
+            power=getattr(args, 'ema_power', 3/4),
+            min_value=getattr(args, 'ema_min_value', 0.0)
+        )
         
         # Create EMA model
         if args.use_ema:
