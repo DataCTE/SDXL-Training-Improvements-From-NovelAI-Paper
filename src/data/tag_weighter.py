@@ -17,6 +17,55 @@ def _default_zero():
     return 0
 
 class TagBasedLossWeighter:
+    min_weight = 0.1
+    max_weight = 3.0
+    
+    @staticmethod
+    def format_caption(caption: str) -> str:
+        """Static method for caption formatting to support multiprocessing"""
+        if not caption:
+            return ""
+            
+        # Remove extra whitespace and normalize separators
+        caption = re.sub(r'\s+', ' ', caption.strip())
+        caption = re.sub(r'\s*,\s*', ', ', caption)
+        
+        # Split into tags
+        tags = [t.strip().lower() for t in caption.split(',')]
+        formatted_tags = []
+        special_params = []
+        
+        has_mj_tags = any('niji' in t.lower() or t.strip() in ['4', '5', '6'] for t in tags)
+        
+        for tag in tags:
+            if not tag:
+                continue
+                
+            if tag.startswith('--'):
+                special_params.append(tag)
+                continue
+                
+            if has_mj_tags and tag in ['4', '5', '6']:
+                if 'masterpiece' not in formatted_tags:
+                    formatted_tags.append('masterpiece')
+                continue
+                
+            if has_mj_tags and any(param in tag for param in ['stylize', 'chaos', 'quality', 'niji']):
+                special_params.append(tag)
+                continue
+                
+            tag = tag.strip()
+            if tag.startswith(('a ', 'an ', 'the ')):
+                tag = ' '.join(tag.split()[1:])
+            
+            formatted_tags.append(tag)
+        
+        formatted_caption = ', '.join(formatted_tags)
+        if special_params:
+            formatted_caption += ', ' + ', '.join(special_params)
+            
+        return formatted_caption
+
     def __init__(
         self,
         tag_classes: Optional[Dict[str, Set[str]]] = None,
@@ -343,57 +392,6 @@ class TagBasedLossWeighter:
                 tags.append(tag)
         
         return tags, special_tags
-
-    def format_caption(self, caption: str) -> str:
-        """
-        Format and standardize caption text.
-        
-        Args:
-            caption (str): Raw caption text
-            
-        Returns:
-            str: Formatted caption
-        """
-        # Remove extra whitespace and normalize separators
-        caption = re.sub(r'\s+', ' ', caption.strip())
-        caption = re.sub(r'\s*,\s*', ', ', caption)
-        
-        # Split into tags
-        tags = [t.strip().lower() for t in caption.split(',')]
-        
-        formatted_tags = []
-        special_params = []
-        
-        has_mj_tags = any('niji' in t.lower() or t.strip() in ['4', '5', '6'] for t in tags)
-        
-        for tag in tags:
-            if not tag:
-                continue
-                
-            if tag.startswith('--'):
-                special_params.append(tag)
-                continue
-                
-            if has_mj_tags and tag in ['4', '5', '6']:
-                if 'masterpiece' not in formatted_tags:
-                    formatted_tags.append('masterpiece')
-                continue
-                
-            if has_mj_tags and any(param in tag for param in ['stylize', 'chaos', 'quality', 'niji']):
-                special_params.append(tag)
-                continue
-                
-            tag = tag.strip()
-            if tag.startswith(('a ', 'an ', 'the ')):
-                tag = ' '.join(tag.split()[1:])
-            
-            formatted_tags.append(tag)
-        
-        formatted_caption = ', '.join(formatted_tags)
-        if special_params:
-            formatted_caption += ', ' + ', '.join(special_params)
-            
-        return formatted_caption
 
     def calculate_weights(self, tags: List[str], special_tags: Dict[str, any] = None) -> Dict[str, float]:
         """
