@@ -653,35 +653,26 @@ class CustomDataset(Dataset):
         return stats
 
     def _get_target_size(self, width, height):
-        """Calculate target size while preserving aspect ratio"""
-        aspect_ratio = width / height
-        
-        # Calculate target dimensions while preserving aspect ratio
-        if width >= height:
-            # Landscape or square
-            target_width = min(width, self.max_bucket_reso)
-            target_height = int(target_width / aspect_ratio)
-            # Ensure height doesn't exceed max
-            if target_height > self.max_bucket_reso:
-                target_height = self.max_bucket_reso
-                target_width = int(target_height * aspect_ratio)
-        else:
-            # Portrait
-            target_height = min(height, self.max_bucket_reso)
-            target_width = int(target_height * aspect_ratio)
-            # Ensure width doesn't exceed max
-            if target_width > self.max_bucket_reso:
-                target_width = self.max_bucket_reso
-                target_height = int(target_width / aspect_ratio)
-        
-        # Round to nearest bucket resolution step
-        target_width = round(target_width / self.bucket_reso_steps) * self.bucket_reso_steps
-        target_height = round(target_height / self.bucket_reso_steps) * self.bucket_reso_steps
-        
-        # Ensure minimum dimensions
-        target_width = max(target_width, self.min_bucket_reso)
-        target_height = max(target_height, self.min_bucket_reso)
-        
+        """Calculate target size preserving aspect ratio without upper limits"""
+        aspect_ratio = height / width
+
+        # For extreme aspect ratios, we'll preserve them while keeping reasonable dimensions
+        if aspect_ratio > 1:  # Portrait
+            # Start with target width and calculate height to maintain AR
+            target_width = 1024  # Base width for portrait
+            target_height = int(target_width * aspect_ratio)
+        else:  # Landscape
+            # Start with target height and calculate width to maintain AR
+            target_height = 1024  # Base height for landscape
+            target_width = int(target_height / aspect_ratio)
+
+        # Scale down if needed while preserving AR
+        max_dim = max(target_width, target_height)
+        if max_dim > 2048:  # Only scale down if absolutely necessary
+            scale = 2048 / max_dim
+            target_width = int(target_width * scale)
+            target_height = int(target_height * scale)
+
         return target_height, target_width
 
     def process_image_size(self, image, target_width, target_height):
@@ -802,11 +793,12 @@ class CustomDataset(Dataset):
             return image.resize((target_width, target_height), Image.LANCZOS)
 
     def _initialize_buckets(self):
-        """Initialize buckets dynamically based on dataset content"""
+        """Initialize buckets dynamically based on dataset content with unlimited AR support"""
         from concurrent.futures import ThreadPoolExecutor
         import math
         import logging
         from collections import defaultdict
+        import numpy as np
         
         logger = logging.getLogger(__name__)
         
@@ -839,13 +831,28 @@ class CustomDataset(Dataset):
                 except Exception as e:
                     logger.error(f"Error getting result: {str(e)}")
         
-        # Group similar sizes to create buckets
+        # Group similar sizes to create buckets, preserving extreme aspect ratios
         size_groups = defaultdict(list)
         
         for h, w in image_sizes:
-            # Round to nearest multiple of bucket_reso_steps
-            bucket_h = round(h / self.bucket_reso_steps) * self.bucket_reso_steps
-            bucket_w = round(w / self.bucket_reso_steps) * self.bucket_reso_steps
+            # Calculate aspect ratio for grouping
+            ar = h / w
+            
+            # Use different step sizes based on aspect ratio
+            if ar > 2 or ar < 0.5:  # Extreme aspect ratios
+                h_step = max(32, self.bucket_reso_steps)  # Larger steps for extreme ARs
+                w_step = max(32, self.bucket_reso_steps)
+            else:  # Normal aspect ratios
+                h_step = self.bucket_reso_steps
+                w_step = self.bucket_reso_steps
+            
+            # Round to nearest step while preserving aspect ratio
+            if h > w:  # Portrait
+                bucket_w = round(w / w_step) * w_step
+                bucket_h = round(h / h_step) * h_step
+            else:  # Landscape
+                bucket_h = round(h / h_step) * h_step
+                bucket_w = round(w / w_step) * w_step
             
             # Ensure minimum size
             bucket_h = max(self.min_bucket_reso, bucket_h)
@@ -859,44 +866,69 @@ class CustomDataset(Dataset):
         
         logger.info(f"Created {len(self.buckets)} dynamic buckets")
         
-        # Second pass: assign images to buckets
-        def assign_image(img_path):
-            try:
-                with Image.open(img_path) as img:
-                    width, height = img.size
-                    target_h, target_w = self._get_target_size(width, height)
-                    
-                    # Find best bucket based on aspect ratio and area
-                    target_ar = target_h / target_w
-                    target_area = target_h * target_w
-                    
-                    def bucket_score(bucket):
-                        bh, bw = bucket
-                        # Consider both aspect ratio difference and area difference
-                        ar_diff = abs((bh / bw) - target_ar)
-                        area_diff = abs((bh * bw) - target_area) / target_area
-                        return ar_diff + 0.5 * area_diff
-                    
-                    best_bucket = min(self.buckets, key=bucket_score)
-                    return img_path, best_bucket
-            except Exception as e:
-                logger.error(f"Error processing {img_path}: {str(e)}")
-                return None
+        # Log aspect ratio distribution
+        aspect_ratios = [h/w for h, w in self.buckets]
+        min_ar = min(aspect_ratios)
+        max_ar = max(aspect_ratios)
+        logger.info(f"Aspect ratio range: {min_ar:.2f} to {max_ar:.2f}")
         
-        # Assign images to buckets
-        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-            futures = [executor.submit(assign_image, img_path) for img_path in self.image_paths]
-            
-            for i, future in enumerate(futures):
-                if i % 1000 == 0:
-                    logger.info(f"Assigned {i}/{total_images} images to buckets")
+        # Prepare bucket lookup arrays for faster matching
+        bucket_arrays = np.array(self.buckets)
+        bucket_ars = bucket_arrays[:, 0] / bucket_arrays[:, 1]  # height/width ratios
+        bucket_areas = bucket_arrays[:, 0] * bucket_arrays[:, 1]
+        
+        def process_image_batch(img_paths):
+            results = []
+            for img_path in img_paths:
                 try:
-                    result = future.result()
-                    if result:
-                        img_path, bucket = result
-                        self.bucket_data[bucket].append(img_path)
+                    with Image.open(img_path) as img:
+                        width, height = img.size
+                        
+                        # Calculate target size first
+                        target_h, target_w = self._get_target_size(width, height)
+                        target_area = target_h * target_w
+                        
+                        # Find the best fitting bucket using area-based comparison
+                        best_bucket = None
+                        min_area_diff = float('inf')
+                        
+                        for bucket_h, bucket_w in self.buckets:
+                            # Skip if bucket is too small
+                            if bucket_h < target_h or bucket_w < target_w:
+                                continue
+                            
+                            # Calculate area difference
+                            area_diff = abs((bucket_h * bucket_w) - target_area)
+                            if area_diff < min_area_diff:
+                                min_area_diff = area_diff
+                                best_bucket = (bucket_h, bucket_w)
+                        
+                        results.append((img_path, best_bucket))
                 except Exception as e:
-                    logger.error(f"Error assigning image: {str(e)}")
+                    logger.error(f"Error processing {img_path}: {str(e)}")
+            return results
+        
+        # Split images into batches for parallel processing
+        batch_size = 100  # Process 100 images per batch
+        image_batches = [self.image_paths[i:i + batch_size] 
+                        for i in range(0, len(self.image_paths), batch_size)]
+        
+        # Process batches in parallel
+        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+            futures = [executor.submit(process_image_batch, batch) 
+                      for batch in image_batches]
+            
+            # Collect results and assign to buckets
+            for i, future in enumerate(futures):
+                try:
+                    batch_results = future.result()
+                    for img_path, bucket in batch_results:
+                        self.bucket_data[bucket].append(img_path)
+                    
+                    if i % 10 == 0:  # Log every 1000 images (10 batches * 100 images)
+                        logger.info(f"Assigned {i * batch_size}/{total_images} images to buckets")
+                except Exception as e:
+                    logger.error(f"Error processing batch: {str(e)}")
         
         # Remove empty buckets
         empty_buckets = [bucket for bucket, images in self.bucket_data.items() if not images]
