@@ -81,6 +81,8 @@ def parse_args():
                       help="Enable CFG rescaling")
     parser.add_argument("--rescale_multiplier", type=float, default=0.7,
                       help="Multiplier for CFG rescaling")
+    parser.add_argument("--resolution_scaling", action="store_true", default=True,
+                      help="Enable resolution-based scaling")
     parser.add_argument("--min_snr_gamma", type=float, default=5.0,
                       help="Minimum SNR value for loss weighting")
     parser.add_argument("--sigma_data", type=float, default=1.0,

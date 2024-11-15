@@ -66,7 +66,8 @@ def train_one_epoch(
     vae_finetuner: Optional[Any] = None,
     vae_train_freq: int = 10,
     ema_model: Optional[Any] = None,
-    verbose: bool = False
+    verbose: bool = False,
+    scaler: Optional[torch.cuda.amp.GradScaler] = None,  # Add scaler parameter
 ) -> Tuple[float, Dict[str, float]]:
     """Train the model for one epoch with improved v-prediction, ZTSNR, VAE finetuning and EMA support"""
     model.train()
@@ -77,8 +78,9 @@ def train_one_epoch(
     else:
         model.gradient_checkpointing_disable()
     
-    # Initialize scaler based on amp setting
-    scaler = GradScaler(enabled=use_amp and mixed_precision)
+    # Use passed scaler or create new one if none provided
+    if scaler is None and mixed_precision:
+        scaler = torch.amp.GradScaler('cuda')
     
     # Handle CPU offload if enabled
     if use_cpu_offload:
@@ -225,21 +227,14 @@ def train(args, models, train_components, device, dtype):
         ema_model = models.get("ema")
         if ema_model:
             ema_model.to(device=device, dtype=dtype)
+            ema_model.decay = args.ema_decay
+            ema_model.update_after_step = args.ema_update_after_step
+            ema_model.power = args.ema_power
+            ema_model.min_decay = args.ema_min_decay
+            ema_model.max_decay = args.ema_max_decay
+            ema_model.update_every = args.ema_update_every
+            ema_model.use_warmup = True
             logger.info("EMA model initialized and moved to device")
-            if args.ema_decay:
-                ema_model.decay = args.ema_decay
-            if args.ema_update_after_step:
-                ema_model.update_after_step = args.ema_update_after_step
-            if args.ema_power:
-                ema_model.power = args.ema_power
-            if args.ema_min_decay:
-                ema_model.min_decay = args.ema_min_decay
-            if args.ema_max_decay:
-                ema_model.max_decay = args.ema_max_decay
-            if args.ema_update_every:
-                ema_model.update_every = args.ema_update_every
-            if args.use_ema_warmup:
-                ema_model.use_warmup = True
     
     # Optimizer and components setup
     optimizer = train_components["optimizer"]
@@ -248,13 +243,7 @@ def train(args, models, train_components, device, dtype):
     tag_weighter = train_components["tag_weighter"]
     
     # Initialize training history
-    training_history = {
-        'loss_history': [],
-        'validation_scores': [],
-        'ema_validation_scores': [],
-        'best_score': float('inf'),
-        'best_ema_score': float('inf')
-    }
+    training_history = defaultdict(list)
     
     global_step = 0
     start_epoch = 0
@@ -262,7 +251,7 @@ def train(args, models, train_components, device, dtype):
     # Set up mixed precision training
     scaler = None
     if args.mixed_precision:
-        scaler = GradScaler()
+        scaler = torch.amp.GradScaler('cuda')
     
     # Enable gradient checkpointing if requested
     if args.gradient_checkpointing:
@@ -298,7 +287,6 @@ def train(args, models, train_components, device, dtype):
     # Training loop
     logger.info("\nStarting training loop...")
     for epoch in range(start_epoch, args.num_epochs):
-        # Log epoch start
         logger.info(f"\nStarting epoch {epoch+1}/{args.num_epochs}")
         if args.use_wandb:
             log_metrics_batch({"train/epoch": epoch}, step=global_step)
@@ -326,10 +314,24 @@ def train(args, models, train_components, device, dtype):
             vae_finetuner=train_components.get("vae_finetuner"),
             vae_train_freq=args.vae_train_freq,
             ema_model=ema_model,
-            verbose=args.verbose
+            verbose=args.verbose,
+            scaler=scaler
         )
         
-        # Run end-of-epoch validation
+        # Log and store training metrics
+        logger.info(f"Epoch {epoch+1} - Average Loss: {avg_loss:.4f}")
+        for metric_name, meter in metrics.items():
+            if meter is not None:  # Skip None metrics
+                value = meter.avg
+                logger.info(f"Epoch {epoch+1} - {metric_name}: {value:.4f}")
+                training_history[f"train/{metric_name}"].append(value)
+                if args.use_wandb:
+                    wandb.log({f"train/{metric_name}": value}, step=global_step)
+        
+        # Store average loss
+        training_history["train/loss"].append(avg_loss)
+        
+        # Run validation if needed
         if not args.skip_validation and (epoch + 1) % args.validation_frequency == 0:
             logger.info("\nRunning end-of-epoch validation...")
             
@@ -344,6 +346,13 @@ def train(args, models, train_components, device, dtype):
                 height=1024,
                 width=1024
             )
+            
+            # Log and store validation metrics
+            for metric_name, value in validation_metrics.items():
+                logger.info(f"Validation {metric_name}: {value:.4f}")
+                training_history[f"val/{metric_name}"].append(value)
+                if args.use_wandb:
+                    wandb.log({f"val/{metric_name}": value}, step=global_step)
             
             # EMA validation if enabled
             if args.use_ema and ema_model is not None:
@@ -363,10 +372,17 @@ def train(args, models, train_components, device, dtype):
                     prefix="ema_"
                 )
                 
+                # Log and store EMA validation metrics
+                for metric_name, value in ema_validation_metrics.items():
+                    logger.info(f"EMA Validation {metric_name}: {value:.4f}")
+                    training_history[f"ema_val/{metric_name}"].append(value)
+                    if args.use_wandb:
+                        wandb.log({f"ema_val/{metric_name}": value}, step=global_step)
+                
                 # Restore original UNet
                 train_components["validator"].pipeline.unet = original_unet
         
-        # Save checkpoint
+        # Save checkpoint with updated history
         if args.save_checkpoints and (epoch + 1) % args.save_epochs == 0:
             checkpoint_path = os.path.join(args.output_dir, f"checkpoint_epoch_{epoch+1}.pt")
             save_checkpoint(
@@ -378,6 +394,15 @@ def train(args, models, train_components, device, dtype):
                 global_step=global_step
             )
             logger.info(f"Saved checkpoint: {checkpoint_path}")
+        
+        # Update learning rate scheduler
+        lr_scheduler.step()
+        
+        # Log learning rate
+        if args.use_wandb:
+            wandb.log({
+                "train/learning_rate": lr_scheduler.get_last_lr()[0]
+            }, step=global_step)
         
         # Update global step
         global_step += len(train_dataloader)
@@ -399,6 +424,14 @@ def train(args, models, train_components, device, dtype):
                 commit_message=f"Epoch {epoch+1}",
                 private=args.hub_private
             )
+    
+    # Log final training summary
+    logger.info("\nTraining completed!")
+    logger.info(f"Final loss: {avg_loss:.4f}")
+    logger.info("Final metrics:")
+    for metric_name, values in training_history.items():
+        if values:  # Only log if we have values
+            logger.info(f"{metric_name}: {values[-1]:.4f}")
     
     return training_history
 
