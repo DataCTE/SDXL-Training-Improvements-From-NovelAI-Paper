@@ -28,7 +28,9 @@ def get_latents_from_seed(
     width,
     latent_channels=4,
     device="cuda",
-    dtype=torch.float16
+    dtype=torch.float16,
+    use_cache=True,
+    cache_size=1000
 ):
     """
     Generate reproducible latents from seed.
