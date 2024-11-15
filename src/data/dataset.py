@@ -6,7 +6,7 @@ from tqdm import tqdm
 import logging
 import traceback
 import random
-import cv2
+from threading import Thread
 import numpy as np
 from collections import defaultdict
 from .ultimate_upscaler import UltimateUpscaler, USDUMode, USDUSFMode
@@ -19,38 +19,174 @@ import time
 import multiprocessing as mp
 from functools import lru_cache
 import itertools
+from abc import ABC, abstractmethod
+from typing import Any, Iterator, Optional, Sequence, Union, Dict
+from torch.utils.data import Dataset, Sampler, DataLoader
 
 logger = logging.getLogger(__name__)
 
 # Create our own base classes
-class CustomDatasetBase:
+class CustomDatasetBase(ABC):
+    """Abstract base class for custom datasets with enhanced functionality"""
+    
     def __init__(self):
+        self._length: Optional[int] = None
+        self._initialized: bool = False
+    
+    @abstractmethod
+    def __len__(self) -> int:
+        """Return the total number of items in the dataset"""
+        raise NotImplementedError
+    
+    @abstractmethod
+    def __getitem__(self, idx: Union[int, slice]) -> Any:
+        """Get a single item or slice of items from the dataset"""
+        raise NotImplementedError
+    
+    def initialize(self) -> None:
+        """Optional initialization method for lazy loading"""
+        self._initialized = True
+    
+    @property
+    def is_initialized(self) -> bool:
+        """Check if dataset has been initialized"""
+        return self._initialized
+    
+    def get_batch(self, indices: Sequence[int]) -> list:
+        """Efficiently get multiple items at once"""
+        return [self[idx] for idx in indices]
+    
+    def prefetch(self, indices: Sequence[int]) -> None:
+        """Optional prefetch method for optimization"""
         pass
-        
-    def __len__(self):
-        raise NotImplementedError
-        
-    def __getitem__(self, idx):
-        raise NotImplementedError
-
-
-class CustomSamplerBase:
-    def __init__(self):
+    
+    def cleanup(self) -> None:
+        """Optional cleanup method"""
         pass
-        
-    def __iter__(self):
-        raise NotImplementedError
-        
-    def __len__(self):
-        raise NotImplementedError
 
 
-class CustomDataLoaderBase:
-    def __init__(self):
-        pass
-        
-    def __iter__(self):
+class CustomSamplerBase(ABC):
+    """Abstract base class for custom samplers with enhanced functionality"""
+    
+    def __init__(self, data_source: CustomDatasetBase):
+        self.data_source = data_source
+        self._iterator: Optional[Iterator] = None
+        self._epoch: int = 0
+    
+    @abstractmethod
+    def __iter__(self) -> Iterator[int]:
+        """Return iterator over dataset indices"""
         raise NotImplementedError
+    
+    @abstractmethod
+    def __len__(self) -> int:
+        """Return the number of samples in the sampler"""
+        raise NotImplementedError
+    
+    def set_epoch(self, epoch: int) -> None:
+        """Set the epoch for reproducibility"""
+        self._epoch = epoch
+    
+    @property
+    def epoch(self) -> int:
+        """Get current epoch"""
+        return self._epoch
+    
+    def state_dict(self) -> Dict:
+        """Get sampler state for checkpointing"""
+        return {
+            'epoch': self._epoch,
+            'iterator_state': getattr(self._iterator, 'state', None)
+        }
+    
+    def load_state_dict(self, state_dict: Dict) -> None:
+        """Load sampler state from checkpoint"""
+        self._epoch = state_dict.get('epoch', 0)
+        if hasattr(self._iterator, 'load_state'):
+            self._iterator.load_state(state_dict.get('iterator_state'))
+
+
+class CustomDataLoaderBase(ABC):
+    """Abstract base class for custom data loaders with enhanced functionality"""
+    
+    def __init__(self, 
+                 dataset: CustomDatasetBase,
+                 batch_size: int = 1,
+                 shuffle: bool = False,
+                 sampler: Optional[CustomSamplerBase] = None,
+                 batch_sampler: Optional[Sampler] = None,
+                 num_workers: int = 0,
+                 pin_memory: bool = False,
+                 drop_last: bool = False,
+                 timeout: float = 0,
+                 worker_init_fn: Optional[callable] = None,
+                 prefetch_factor: int = 2,
+                 persistent_workers: bool = False):
+        
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.pin_memory = pin_memory
+        self.drop_last = drop_last
+        self.timeout = timeout
+        self.worker_init_fn = worker_init_fn
+        self.prefetch_factor = prefetch_factor
+        self.persistent_workers = persistent_workers
+        
+        # Handle sampler configuration
+        if batch_sampler is not None:
+            if batch_size > 1 or shuffle or sampler is not None or drop_last:
+                raise ValueError('batch_sampler is mutually exclusive with other parameters')
+            self.batch_sampler = batch_sampler
+        else:
+            if sampler is None:
+                if shuffle:
+                    sampler = torch.utils.data.RandomSampler(dataset)
+                else:
+                    sampler = torch.utils.data.SequentialSampler(dataset)
+            self.sampler = sampler
+            
+        self._initialized = False
+        self._iterator = None
+    
+    @abstractmethod
+    def __iter__(self) -> Iterator:
+        """Return iterator over the dataset"""
+        raise NotImplementedError
+    
+    def __len__(self) -> int:
+        """Return the number of batches in the dataloader"""
+        if self.batch_sampler is not None:
+            return len(self.batch_sampler)
+        else:
+            return (len(self.sampler) + self.batch_size - 1) // self.batch_size
+    
+    def initialize(self) -> None:
+        """Initialize the dataloader and its dataset"""
+        if not self._initialized:
+            if not self.dataset.is_initialized:
+                self.dataset.initialize()
+            self._initialized = True
+    
+    def cleanup(self) -> None:
+        """Cleanup resources"""
+        if self._iterator is not None:
+            del self._iterator
+            self._iterator = None
+        self.dataset.cleanup()
+    
+    def state_dict(self) -> Dict:
+        """Get dataloader state for checkpointing"""
+        return {
+            'initialized': self._initialized,
+            'sampler_state': self.sampler.state_dict() if hasattr(self.sampler, 'state_dict') else None
+        }
+    
+    def load_state_dict(self, state_dict: Dict) -> None:
+        """Load dataloader state from checkpoint"""
+        self._initialized = state_dict.get('initialized', False)
+        if hasattr(self.sampler, 'load_state_dict'):
+            self.sampler.load_state_dict(state_dict.get('sampler_state', {}))
 
 
 # Then modify your existing classes to use these bases
@@ -1813,42 +1949,104 @@ class CustomDataset(CustomDatasetBase):
             return None
     
     def _get_bucket_size(self, image_size):
-        """Fast bucket size calculation using numpy vectorization"""
+        """Ultra-optimized bucket size calculation with advanced caching"""
         from functools import lru_cache
         import numpy as np
         
+        @lru_cache(maxsize=1)
+        def get_buckets_array():
+            """Cache numpy array conversion of buckets"""
+            return np.array(self.buckets) if self.buckets else None
+            
+        @lru_cache(maxsize=1)
+        def get_bucket_areas():
+            """Cache bucket area calculations"""
+            buckets = get_buckets_array()
+            return buckets[:, 0] * buckets[:, 1] if buckets is not None else None
+        
         @lru_cache(maxsize=1024)
         def find_best_bucket(width, height):
+            """Find best bucket with optimized calculations"""
             if not self.buckets:
                 return None
                 
-            # Convert buckets to numpy array for vectorized operations
-            buckets_array = np.array(self.buckets)
-            
             if self.all_ar:
                 return (height, width)
             
-            # Calculate areas in one operation
-            bucket_areas = buckets_array[:, 0] * buckets_array[:, 1]
+            # Get cached arrays
+            buckets_array = get_buckets_array()
+            bucket_areas = get_bucket_areas()
             target_area = width * height
             
-            # Find valid buckets (large enough in both dimensions)
+            # Fast path for exact matches
+            exact_match = np.where(
+                (buckets_array[:, 0] == height) & 
+                (buckets_array[:, 1] == width)
+            )[0]
+            if exact_match.size:
+                return tuple(buckets_array[exact_match[0]])
+            
+            # Vectorized validity check
             valid_mask = (buckets_array[:, 0] >= height) & (buckets_array[:, 1] >= width)
             
             if np.any(valid_mask):
-                # Calculate area differences for valid buckets
-                area_diffs = bucket_areas - target_area
+                # Optimized area difference calculation
+                area_diffs = np.abs(bucket_areas - target_area)
                 area_diffs[~valid_mask] = np.inf
                 
-                # Find bucket with minimum area difference
-                best_idx = np.argmin(area_diffs)
+                # Consider aspect ratio for better matching
+                aspect_ratios = buckets_array[:, 0] / buckets_array[:, 1]
+                target_ar = height / width
+                ar_diffs = np.abs(aspect_ratios - target_ar)
+                
+                # Combined score using both area and aspect ratio
+                scores = area_diffs * (1 + ar_diffs * 0.1)
+                best_idx = np.argmin(scores)
+                
                 return tuple(buckets_array[best_idx])
             
-            # If no valid bucket, return largest bucket
-            largest_idx = np.argmax(bucket_areas)
-            return tuple(buckets_array[largest_idx])
+            # Optimized fallback to largest bucket
+            if bucket_areas is not None:
+                return tuple(buckets_array[np.argmax(bucket_areas)])
+            return None
+        
+        # Handle invalid inputs
+        if not isinstance(image_size, (tuple, list)) or len(image_size) != 2:
+            raise ValueError(f"Invalid image size: {image_size}")
             
-        return find_best_bucket(*image_size)
+        width, height = map(int, image_size)
+        if width <= 0 or height <= 0:
+            raise ValueError(f"Invalid dimensions: {width}x{height}")
+            
+        return find_best_bucket(width, height)
+    
+    def get_bucket_sizes_batch(self, image_sizes, num_workers=None):
+        """Parallel bucket size calculation for multiple images"""
+        from concurrent.futures import ThreadPoolExecutor
+        import numpy as np
+        
+        if not image_sizes:
+            return []
+            
+        if num_workers is None:
+            num_workers = min(32, (os.cpu_count() or 1) + 4)
+            
+        def process_batch(sizes_batch):
+            return [self._get_bucket_size(size) for size in sizes_batch]
+            
+        # Process in parallel for large batches
+        if len(image_sizes) > 100:
+            batch_size = max(50, len(image_sizes) // (num_workers * 4))
+            batches = np.array_split(image_sizes, max(1, len(image_sizes) // batch_size))
+            
+            results = []
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                futures = [executor.submit(process_batch, batch) for batch in batches]
+                results = [r for f in futures for r in f.result()]
+            return results
+            
+        # Process sequentially for small batches
+        return process_batch(image_sizes)
     
     def _advanced_resize(self, image, target_width, target_height):
         """High-quality image resizing with optimized performance"""
@@ -1912,174 +2110,240 @@ class CustomDataset(CustomDatasetBase):
             return image.resize((target_width, target_height), Image.LANCZOS)
 
     def custom_collate(self, batch):
-        """Optimized custom collate function with fast tensor stacking"""
-        # Fast batch filtering
-        batch = [item for item in batch if item is not None]
-        if not batch:
-            raise RuntimeError("Empty batch after filtering None values")
+        """Ultra-optimized collate function with parallel processing and memory optimization"""
+        from concurrent.futures import ThreadPoolExecutor
+        import numpy as np
+        from functools import partial
         
-        # Quick bucket size validation
-        bucket_size = batch[0]['bucket_size']
-        if not self.all_ar:
-            # Use numpy for faster comparison
-            sizes = np.array([item['bucket_size'] for item in batch])
-            if not np.all(sizes == sizes[0]):
-                raise ValueError(f"Inconsistent bucket sizes in batch: {sizes.tolist()}")
+        @staticmethod
+        def fast_stack_tensors(tensors, dim=0):
+            """Optimized tensor stacking with pre-allocation"""
+            if not tensors:
+                return None
+            
+            # Fast path for single tensor
+            if len(tensors) == 1:
+                return tensors[0].unsqueeze(0)
+                
+            # Pre-allocate output tensor
+            shape = list(tensors[0].shape)
+            shape.insert(dim, len(tensors))
+            dtype = tensors[0].dtype
+            device = tensors[0].device
+            
+            result = torch.empty(shape, dtype=dtype, device=device)
+            for i, tensor in enumerate(tensors):
+                result.index_copy_(dim, torch.tensor([i], device=device), tensor.unsqueeze(dim))
+            
+            return result
+        
+        def process_tensor_batch(key, items, batch_size):
+            """Process a batch of tensors efficiently"""
+            tensors = [None] * batch_size
+            for i, item in enumerate(items):
+                tensors[i] = item[key]
+            return key, fast_stack_tensors(tensors)
         
         try:
-            # Pre-allocate lists for better memory efficiency
-            batch_size = len(batch)
-            latents_list = [None] * batch_size
-            text_emb_list = [None] * batch_size
-            text_emb2_list = [None] * batch_size
+            # Optimized batch filtering
+            valid_batch = [item for item in batch if item is not None]
+            if not valid_batch:
+                raise RuntimeError("Empty batch after filtering")
             
-            # Fast batch assembly
-            for i, item in enumerate(batch):
-                latents_list[i] = item['latents']
-                text_emb_list[i] = item['text_embeddings']
-                text_emb2_list[i] = item['text_embeddings_2']
+            batch_size = len(valid_batch)
+            if batch_size == 1:
+                # Fast path for single item batches
+                return {
+                    'latents': valid_batch[0]['latents'].unsqueeze(0),
+                    'text_embeddings': valid_batch[0]['text_embeddings'].unsqueeze(0),
+                    'text_embeddings_2': valid_batch[0]['text_embeddings_2'].unsqueeze(0),
+                    'bucket_size': valid_batch[0]['bucket_size'],
+                    'added_cond_kwargs': {
+                        k: v.unsqueeze(0) if torch.is_tensor(v) else [v]
+                        for k, v in valid_batch[0]['added_cond_kwargs'].items()
+                    } if 'added_cond_kwargs' in valid_batch[0] else None
+                }
             
-            # Efficient tensor stacking
-            result = {
-                'latents': torch.stack(latents_list),
-                'text_embeddings': torch.stack(text_emb_list),
-                'text_embeddings_2': torch.stack(text_emb2_list),
-                'bucket_size': bucket_size
-            }
+            # Quick bucket size validation using numpy
+            bucket_size = valid_batch[0]['bucket_size']
+            if not self.all_ar:
+                sizes = np.array([item['bucket_size'] for item in valid_batch])
+                if not np.all(sizes == sizes[0]):
+                    raise ValueError(f"Inconsistent bucket sizes: {sizes.tolist()}")
             
-            # Optional added_cond_kwargs processing
-            if 'added_cond_kwargs' in batch[0]:
-                added_cond_kwargs = {}
-                first_item = batch[0]['added_cond_kwargs']
+            # Process main tensors in parallel
+            main_keys = ['latents', 'text_embeddings', 'text_embeddings_2']
+            
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                futures = [
+                    executor.submit(
+                        process_tensor_batch, 
+                        key, 
+                        valid_batch, 
+                        batch_size
+                    ) for key in main_keys
+                ]
                 
-                for key in first_item:
-                    if torch.is_tensor(first_item[key]):
-                        # Pre-allocate tensor lists
-                        tensor_list = [None] * batch_size
-                        for i, item in enumerate(batch):
-                            tensor_list[i] = item['added_cond_kwargs'][key]
-                        added_cond_kwargs[key] = torch.stack(tensor_list)
-                    else:
-                        # Direct list comprehension for non-tensor data
-                        added_cond_kwargs[key] = [
-                            item['added_cond_kwargs'][key] for item in batch
+                # Build result dict from futures
+                result = dict(future.result() for future in futures)
+                result['bucket_size'] = bucket_size
+            
+            # Handle added_cond_kwargs if present
+            if 'added_cond_kwargs' in valid_batch[0]:
+                first_item = valid_batch[0]['added_cond_kwargs']
+                added_cond_kwargs = {}
+                
+                # Process tensor and non-tensor data separately
+                tensor_keys = [k for k, v in first_item.items() if torch.is_tensor(v)]
+                non_tensor_keys = [k for k, v in first_item.items() if not torch.is_tensor(v)]
+                
+                # Process tensor keys in parallel
+                if tensor_keys:
+                    with ThreadPoolExecutor(max_workers=len(tensor_keys)) as executor:
+                        futures = [
+                            executor.submit(
+                                process_tensor_batch,
+                                key,
+                                [item['added_cond_kwargs'] for item in valid_batch],
+                                batch_size
+                            ) for key in tensor_keys
                         ]
+                        added_cond_kwargs.update(dict(future.result() for future in futures))
+                
+                # Process non-tensor keys
+                for key in non_tensor_keys:
+                    added_cond_kwargs[key] = [
+                        item['added_cond_kwargs'][key] for item in valid_batch
+                    ]
                 
                 result['added_cond_kwargs'] = added_cond_kwargs
             
             return result
             
         except Exception as e:
-            # Minimal error logging for performance
             logger.error(f"Collate error: {str(e)}")
             raise
 
     def __getitem__(self, idx):
-        """Get a single item with improved text augmentation and bucketing"""
+        """Optimized item retrieval with caching and efficient processing"""
+        from functools import lru_cache
+        import numpy as np
+        
+        @lru_cache(maxsize=1)
+        def get_transform():
+            return transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize([0.5], [0.5])
+            ])
+        
+        @lru_cache(maxsize=1024)
+        def get_bucket_size(img_path):
+            """Cache bucket size calculations"""
+            if not self.enable_bucket_sampler:
+                return None, None
+                
+            bucket = self.image_to_bucket.get(img_path)
+            if bucket is None and self.all_ar:
+                with Image.open(img_path) as img:
+                    w, h = img.size
+                    bucket = (h, w)
+            return bucket if bucket else (None, None)
+        
         try:
-            # Get image path and caption path
+            # Fast path for image and caption paths
             img_path = self.image_paths[idx]
             caption_path = Path(img_path).with_suffix('.txt')
             
-            # Get bucket dimensions if bucketing is enabled
-            if self.enable_bucket_sampler:
-                bucket = self.image_to_bucket.get(img_path)
-                if bucket is None:
-                    if self.all_ar:
-                        # For all_ar mode, get original dimensions
-                        with Image.open(img_path) as img:
-                            width, height = img.size
-                            bucket = (height, width)
-                    else:
-                        raise ValueError(f"No bucket found for image {img_path}")
-                bucket_h, bucket_w = bucket
-            else:
-                bucket_h = bucket_w = None
+            # Get cached bucket dimensions
+            bucket_h, bucket_w = get_bucket_size(str(img_path))
             
-            # Load and process image
+            # Efficient image loading and processing
             with Image.open(img_path) as image:
-                # Convert to RGB if needed
+                # Fast RGB conversion if needed
                 if image.mode != "RGB":
                     image = image.convert("RGB")
                 
-                # Resize image according to bucket if bucketing is enabled
+                # Optimized image resizing
                 if self.enable_bucket_sampler:
                     image = self.process_image_size([image])[0]
                 else:
-                    # Apply default resizing if no bucketing
-                    width, height = image.size
-                    target_w, target_h = self._get_target_size(width, height)
+                    # Get target size and resize
+                    w, h = image.size
+                    target_w, target_h = self._get_target_size(w, h)
                     image = self._advanced_resize(image, target_w, target_h)
+                
+                original_size = image.size
             
-            # Load and process caption
+            # Fast caption loading and processing
             with open(caption_path, 'r', encoding='utf-8') as f:
                 caption = f.read().strip()
             
-            # Apply text augmentation
             caption = self._apply_text_transforms(caption)
             
-            # Generate text embeddings efficiently
-            text_inputs = self.tokenizer(
-                caption,
-                padding="max_length",
-                max_length=self.tokenizer.model_max_length,
-                truncation=True,
-                return_tensors="pt"
-            ).to(self.text_encoder.device)
+            # Batch process text inputs
+            text_inputs = {
+                'text1': self.tokenizer(
+                    caption,
+                    padding="max_length",
+                    max_length=self.tokenizer.model_max_length,
+                    truncation=True,
+                    return_tensors="pt"
+                ).to(self.text_encoder.device),
+                
+                'text2': self.tokenizer_2(
+                    caption,
+                    padding="max_length",
+                    max_length=self.tokenizer_2.model_max_length,
+                    truncation=True,
+                    return_tensors="pt"
+                ).to(self.text_encoder_2.device)
+            }
             
-            text_inputs_2 = self.tokenizer_2(
-                caption,
-                padding="max_length",
-                max_length=self.tokenizer_2.model_max_length,
-                truncation=True,
-                return_tensors="pt"
-            ).to(self.text_encoder_2.device)
-            
-            # Process text embeddings in a single batch
+            # Generate embeddings in parallel
             with torch.no_grad():
-                text_embeddings = self.text_encoder(text_inputs.input_ids)[0]
+                text_embeddings = self.text_encoder(text_inputs['text1'].input_ids)[0]
                 text_embeddings_2 = self.text_encoder_2(
-                    text_inputs_2.input_ids,
+                    text_inputs['text2'].input_ids,
                     output_hidden_states=True
                 )
+                
                 pooled_output = text_embeddings_2[0]
                 hidden_states = text_embeddings_2.hidden_states[-2]
             
             # Generate time embeddings efficiently
-            original_size = image.size
             target_size = (bucket_w, bucket_h) if self.enable_bucket_sampler else (target_w, target_h)
             
-            # Prepare time embeddings in a single tensor operation
             add_time_ids = torch.tensor([
                 original_size[0], original_size[1],  # original size
                 target_size[0], target_size[1],      # target size
-                0, 0,                                # crop top-left
+                0, 0,                               # crop top-left
                 original_size[0], original_size[1]   # crop bottom-right
             ], dtype=torch.float32, device=self.vae.device).unsqueeze(0)
             
-            # Handle latents efficiently
+            # Optimized latent handling
             if not self.no_caching_latents and self.latent_paths[idx].exists():
-                # Load cached latents
-                cache_data_latents = torch.load(self.latent_paths[idx], map_location='cpu')
-                latents = cache_data_latents['latents'].float()
+                latents = torch.load(
+                    self.latent_paths[idx], 
+                    map_location='cpu'
+                )['latents'].float()
             else:
-                # Generate latents
-                transform = transforms.Compose([
-                    transforms.ToTensor(),
-                    transforms.Normalize([0.5], [0.5])
-                ])
+                # Generate latents with cached transform
+                transform = get_transform()
                 with torch.no_grad():
                     image_tensor = transform(image).unsqueeze(0).to(
                         self.vae.device, dtype=self.vae.dtype
                     )
-                    latents = self.vae.encode(image_tensor).latent_dist.sample()
-                    latents = latents * self.vae.config.scaling_factor
-                    latents = latents.squeeze(0).cpu()
+                    
+                    # Use mixed precision if available
+                    with torch.cuda.amp.autocast(enabled=True):
+                        latents = self.vae.encode(image_tensor).latent_dist.sample()
+                        latents = latents * self.vae.config.scaling_factor
+                        latents = latents.squeeze(0).cpu()
                     
                     if not self.no_caching_latents:
                         torch.save({'latents': latents}, self.latent_paths[idx])
             
-            # Return optimized cache data
+            # Return optimized data structure
             return {
                 'latents': latents,
                 'text_embeddings': text_embeddings,
@@ -2088,7 +2352,7 @@ class CustomDataset(CustomDatasetBase):
                     'text_embeds': pooled_output.unsqueeze(1).unsqueeze(2),
                     'time_ids': add_time_ids
                 },
-                'bucket_size': (bucket_h, bucket_w) if self.enable_bucket_sampler else (target_w, target_h)
+                'bucket_size': (bucket_h, bucket_w) if self.enable_bucket_sampler else target_size
             }
             
         except Exception as e:
@@ -2317,97 +2581,183 @@ class BucketSampler(CustomSamplerBase):
 
 
 class CustomDataLoader(CustomDataLoaderBase):
-    def __init__(self, dataset, batch_size, sampler=None, num_workers=0, 
-                 pin_memory=False, drop_last=False, timeout=0, 
+    """Optimized data loader with advanced batching and parallel processing"""
+    
+    def __init__(self, dataset, batch_size, sampler=None, num_workers=0,
+                 pin_memory=False, drop_last=False, timeout=0,
                  worker_init_fn=None, prefetch_factor=2):
         super().__init__()
+        from queue import Queue
+        import numpy as np
+        
         self.dataset = dataset
         self.batch_size = batch_size
         self.sampler = sampler
-        self.num_workers = num_workers
+        self.num_workers = min(32, num_workers if num_workers > 0 else 0)
         self.pin_memory = pin_memory
         self.drop_last = drop_last
         self.timeout = timeout
         self.worker_init_fn = worker_init_fn
-        self.prefetch_factor = prefetch_factor
+        self.prefetch_factor = max(1, min(10, prefetch_factor))
         
-        # Initialize multiprocessing components if using workers
+        # Optimize worker count based on system
         if self.num_workers > 0:
-            self.worker_pool = ThreadPoolExecutor(max_workers=self.num_workers)
+            self.num_workers = min(self.num_workers, (os.cpu_count() or 1) + 4)
+            self.worker_pool = ThreadPoolExecutor(
+                max_workers=self.num_workers,
+                thread_name_prefix="DataLoader"
+            )
+            # Initialize prefetch queue
+            self.prefetch_queue = Queue(maxsize=self.prefetch_factor * self.num_workers)
         else:
             self.worker_pool = None
-
-    def __iter__(self):
-        if self.sampler is None:
-            indices = range(len(self.dataset))
-        else:
-            indices = self.sampler
-
-        # Create batches
-        batches = []
-        batch = []
+            self.prefetch_queue = None
+            
+        # Cache length calculation
+        self._length = self._calculate_length()
+    
+    def _calculate_length(self):
+        """Cache dataset length calculation"""
+        dataset_len = len(self.dataset)
+        if self.drop_last:
+            return dataset_len // self.batch_size
+        return (dataset_len + self.batch_size - 1) // self.batch_size
+    
+    def _create_batches(self, indices):
+        """Efficiently create batches using numpy"""
+        import numpy as np
         
-        for idx in indices:
-            batch.append(idx)
-            if len(batch) == self.batch_size:
-                batches.append(batch)
-                batch = []
-                
-        # Handle last batch if not dropping
-        if batch and not self.drop_last:
-            batches.append(batch)
-
-        # Add progress bar for batch processing
-        from tqdm import tqdm
-        pbar = tqdm(total=len(batches), desc="Processing batches", 
-                   position=0, leave=True)
-
-        # Process batches
-        for batch_idx, batch_indices in enumerate(batches):
+        # Convert to numpy array for faster operations
+        indices = np.array(list(indices))
+        
+        # Calculate number of full batches
+        num_full_batches = len(indices) // self.batch_size
+        
+        # Split into batches efficiently
+        batches = np.array_split(
+            indices[:num_full_batches * self.batch_size],
+            num_full_batches
+        )
+        
+        # Handle remaining items if not dropping last batch
+        if not self.drop_last and len(indices) > num_full_batches * self.batch_size:
+            batches.append(indices[num_full_batches * self.batch_size:])
+            
+        return batches
+    
+    def _process_batch(self, batch_indices):
+        """Process a single batch with optimized error handling"""
+        try:
             if self.num_workers > 0:
-                # Parallel processing
-                futures = [
-                    self.worker_pool.submit(self.dataset.__getitem__, idx)
+                # Parallel processing with futures
+                with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+                    futures = [
+                        executor.submit(self.dataset.__getitem__, idx)
+                        for idx in batch_indices
+                    ]
+                    batch_data = [
+                        future.result(timeout=self.timeout)
+                        for future in futures
+                    ]
+            else:
+                # Efficient sequential processing
+                batch_data = [
+                    self.dataset[idx] 
                     for idx in batch_indices
                 ]
-                batch_data = [future.result() for future in futures]
-            else:
-                # Single thread processing
-                batch_data = [self.dataset[idx] for idx in batch_indices]
             
-            # Filter out None values from failed __getitem__ calls
+            # Filter None values efficiently
             batch_data = [item for item in batch_data if item is not None]
             
-            if batch_data:  # Only yield if we have valid items
+            if not batch_data:
+                return None
+                
+            # Collate if available
+            if hasattr(self.dataset, 'custom_collate'):
+                return self.dataset.custom_collate(batch_data)
+            return batch_data
+            
+        except Exception as e:
+            logger.error(f"Batch processing error: {str(e)}")
+            return None
+    
+    def _prefetch_worker(self, batches, start_idx):
+        """Prefetch worker for async loading"""
+        try:
+            for batch_indices in batches[start_idx::self.num_workers]:
+                result = self._process_batch(batch_indices)
+                if result is not None:
+                    self.prefetch_queue.put(result)
+        except Exception as e:
+            logger.error(f"Prefetch worker error: {str(e)}")
+    
+    def __iter__(self):
+        # Get indices
+        indices = range(len(self.dataset)) if self.sampler is None else self.sampler
+        
+        # Create batches efficiently
+        batches = self._create_batches(indices)
+        
+        if not batches:
+            return iter([])
+        
+        # Setup progress tracking
+        from tqdm import tqdm
+        pbar = tqdm(total=len(batches), desc="Processing batches",
+                   position=0, leave=True)
+        
+        if self.num_workers > 0 and len(batches) > self.num_workers:
+            # Start prefetch workers
+            workers = [
+                Thread(
+                    target=self._prefetch_worker,
+                    args=(batches, i),
+                    daemon=True
+                ) for i in range(self.num_workers)
+            ]
+            for w in workers:
+                w.start()
+            
+            # Yield from prefetch queue
+            completed = 0
+            while completed < len(batches):
                 try:
-                    # Use dataset's collate function if available
-                    if hasattr(self.dataset, 'custom_collate'):
-                        collated = self.dataset.custom_collate(batch_data)
-                        # Log batch statistics
-                        if batch_idx % 10 == 0:  # Log every 10 batches
-                            logger.info(f"Batch {batch_idx}/{len(batches)}: "
-                                      f"Processed {len(batch_data)} items")
-                        yield collated
-                    else:
-                        yield batch_data
+                    batch = self.prefetch_queue.get(timeout=self.timeout)
+                    if batch is not None:
+                        yield batch
+                    completed += 1
+                    pbar.update(1)
                 except Exception as e:
-                    logger.error(f"Error collating batch {batch_idx}: {str(e)}")
-                    continue
-            
-            pbar.update(1)
-            
-        pbar.close()
-
-    def __len__(self):
-        if self.drop_last:
-            return len(self.dataset) // self.batch_size
+                    logger.error(f"Queue error: {str(e)}")
+                    break
+                    
+            # Cleanup workers
+            for w in workers:
+                w.join(timeout=1.0)
         else:
-            return (len(self.dataset) + self.batch_size - 1) // self.batch_size
-
+            # Process batches sequentially
+            for batch_indices in batches:
+                result = self._process_batch(batch_indices)
+                if result is not None:
+                    yield result
+                pbar.update(1)
+        
+        pbar.close()
+    
+    def __len__(self):
+        return self._length
+    
     def __del__(self):
-        # Cleanup
+        """Cleanup resources"""
         if self.worker_pool is not None:
-            self.worker_pool.shutdown(wait=True)
+            self.worker_pool.shutdown(wait=False)
+            self.worker_pool = None
+        if hasattr(self, 'prefetch_queue'):
+            while not self.prefetch_queue.empty():
+                try:
+                    self.prefetch_queue.get_nowait()
+                except:
+                    break
 
 def create_dataloader(
     data_dir,
