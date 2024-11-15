@@ -22,56 +22,20 @@ import gc
 logger = logging.getLogger(__name__)
 
 class CustomDataset(Dataset):
-    def __init__(
-        self,
-        data_dir,
-        vae=None,
-        tokenizer=None,
-        tokenizer_2=None,
-        text_encoder=None,
-        text_encoder_2=None,
-        cache_dir="latents_cache",
-        no_caching_latents=False,
-        all_ar=False, 
-        max_dimension=2048,
-        num_workers=None,
-        prefetch_factor=2, 
-        min_size=512,
-        max_size=2048,
-        resolution_type="square",
-        enable_bucket_sampler=True,
-        bucket_reso_steps=64,
-        min_bucket_reso=256,
-        max_bucket_reso=2048,
-        token_dropout_rate=0.1,
-        caption_dropout_rate=0.1,
-        **kwargs
-    ):
+    def __init__(self, data_dir, vae=None, tokenizer=None, tokenizer_2=None, text_encoder=None, text_encoder_2=None,
+                 cache_dir="latents_cache", no_caching_latents=False, all_ar=False, max_dimension=2048,
+                 num_workers=None, prefetch_factor=2, min_size=512, max_size=2048,
+                 resolution_type="square", enable_bucket_sampler=True,
+                 bucket_reso_steps=64, min_bucket_reso=256, max_bucket_reso=2048,
+                 token_dropout_rate=0.1, caption_dropout_rate=0.1,
+                 min_tag_weight=0.1, max_tag_weight=3.0, use_tag_weighting=True,
+                 finetune_vae=False, vae_learning_rate=1e-6, vae_train_freq=10,
+                 adaptive_loss_scale=False, kl_weight=0.0, perceptual_weight=0.0,
+                 **kwargs):
         """
-        Enhanced dataset initialization with NovelAI improvements
-        Args:
-            data_dir: Directory containing training images
-            vae: VAE model component
-            tokenizer: Primary tokenizer
-            tokenizer_2: Secondary tokenizer
-            text_encoder: Primary text encoder
-            text_encoder_2: Secondary text encoder
-            cache_dir: Directory to cache latents
-            no_caching_latents: If True, disable latent caching
-            all_ar: Accept all aspect ratios without resizing
-            max_dimension: Maximum dimension for any side
-            num_workers: Number of worker processes
-            prefetch_factor: Number of batches to prefetch
-            min_size: Minimum size for any side
-            max_size: Maximum size for any side
-            resolution_type: One of ["square", "portrait", "landscape"]
-            enable_bucket_sampler: Use bucketing for efficient batching
-            bucket_reso_steps: Resolution steps for bucketing
-            min_bucket_reso: Minimum resolution for buckets
-            max_bucket_reso: Maximum resolution for buckets
-            token_dropout_rate: Rate for random token dropout
-            caption_dropout_rate: Rate for entire caption dropout
+        Enhanced dataset initialization with NovelAI improvements and all command line parameters
         """
+        super().__init__()
         
         # Basic initialization
         self.data_dir = Path(data_dir)
@@ -88,6 +52,19 @@ class CustomDataset(Dataset):
         self.min_bucket_reso = min_bucket_reso
         self.max_bucket_reso = max_bucket_reso
         
+        # Tag weighting parameters
+        self.min_tag_weight = min_tag_weight
+        self.max_tag_weight = max_tag_weight
+        self.use_tag_weighting = use_tag_weighting
+        
+        # VAE parameters
+        self.finetune_vae = finetune_vae
+        self.vae_learning_rate = vae_learning_rate
+        self.vae_train_freq = vae_train_freq
+        self.adaptive_loss_scale = adaptive_loss_scale
+        self.kl_weight = kl_weight
+        self.perceptual_weight = perceptual_weight
+        
         # Text augmentation parameters
         self.token_dropout_rate = token_dropout_rate
         self.caption_dropout_rate = caption_dropout_rate
@@ -103,15 +80,15 @@ class CustomDataset(Dataset):
         if not all_ar:
             self.upscaler = UltimateUpscaler(
                 model_path="Lykon/DreamShaper",
-                device=self.vae.device,
-                dtype=self.vae.dtype
+                device=self.vae.device if self.vae else "cuda",
+                dtype=self.vae.dtype if self.vae else torch.float32
             )
         else:
             self.upscaler = None
             logger.info("Skipping upscaler initialization since all_ar is enabled")
         
         # Performance optimization
-        self.num_workers = num_workers if num_workers is not None else os.cpu_count()
+        self.num_workers = num_workers if num_workers is not None else min(8, os.cpu_count() or 1)
         self.prefetch_factor = prefetch_factor
         
         # Create cache directory
@@ -908,24 +885,18 @@ class CustomDataset(Dataset):
             for img_path in img_paths:
                 try:
                     with Image.open(img_path) as img:
-                        if img.mode not in ('RGB', 'RGBA'):
-                            img = img.convert('RGB')
                         width, height = img.size
-                        target_h, target_w = get_cached_target_size(width, height)
                         
-                        if not target_h or not target_w:
-                            continue
-                            
-                        # Vectorized bucket matching
-                        target_ar = target_h / target_w
+                        # Calculate target size first
+                        target_h, target_w = get_cached_target_size(width, height)
                         target_area = target_h * target_w
                         
-                        # Calculate scores using numpy operations
-                        ar_scores = np.abs(np.log(bucket_ars / target_ar))  # Log scale for better AR comparison
+                        # Vectorized bucket matching
+                        target_ar = target_h / target_w
                         area_scores = np.abs(bucket_areas - target_area) / target_area
                         
                         # Combined score with more weight on aspect ratio
-                        scores = ar_scores * 2 + area_scores
+                        scores = np.abs(np.log(bucket_ars / target_ar))  # Log scale for better AR comparison
                         
                         # Find best bucket that's large enough
                         valid_buckets = (bucket_arrays[:, 0] >= target_h) & (bucket_arrays[:, 1] >= target_w)
@@ -942,7 +913,9 @@ class CustomDataset(Dataset):
             return results
         
         # Process final assignment in batches
-        logger.info("Assigning images to buckets...")
+        logger.info(f"Assigning {total_images} images to buckets using {self.num_workers} workers...")
+        
+        # Process in parallel with specified number of workers
         with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
             futures = []
             for i in range(0, total_images, batch_size):
@@ -989,7 +962,6 @@ class CustomDataset(Dataset):
                 
                 # Calculate target size first
                 target_h, target_w = self._get_target_size(width, height)
-                target_area = target_h * target_w
                 
                 # Find the best fitting bucket using area-based comparison
                 best_bucket = None
@@ -1001,7 +973,7 @@ class CustomDataset(Dataset):
                         continue
                     
                     # Calculate area difference
-                    area_diff = abs((bucket_h * bucket_w) - target_area)
+                    area_diff = abs((bucket_h * bucket_w) - (target_h * target_w))
                     if area_diff < min_area_diff:
                         min_area_diff = area_diff
                         best_bucket = (bucket_h, bucket_w)
