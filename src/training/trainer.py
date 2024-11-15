@@ -210,14 +210,14 @@ def _get_ema_config(
         'min_value': min_value
     }
 
-def setup_ema(args, model):
+def setup_ema(args, model, device=None):
     """Setup EMA model with proper error handling"""
     try:
         # Get EMA config safely
         ema_config = _get_ema_config(
             decay=getattr(args, 'ema_decay', 0.9999),
             update_interval=getattr(args, 'ema_update_interval', 10),
-            device=getattr(args, 'ema_device', 'auto'),
+            device=getattr(args, 'ema_device', 'auto') if device is None else device,
             update_after_step=getattr(args, 'ema_update_after_step', 0),
             use_warmup=getattr(args, 'ema_use_warmup', True),
             warmup_steps=getattr(args, 'ema_warmup_steps', 2000),
@@ -434,7 +434,7 @@ def initialize_training_components(args, device, dtype, models):
         
         # Setup optional components with parallel initialization
         optional_components = {
-            "ema": (setup_ema, args.use_ema, (args, models, device)),
+            "ema": (setup_ema, args.use_ema, (args, models["unet"])),
             "tag_weighter": (setup_tag_weighter, args.use_tag_weighting, (args,)),
             "vae_finetuner": (setup_vae_finetuner, args.finetune_vae, (args, models))
         }
