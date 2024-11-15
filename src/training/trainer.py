@@ -444,6 +444,21 @@ def _log_ema_config(args):
 @lru_cache(maxsize=1)
 def _get_training_config(args) -> Dict[str, Any]:
     """Cache training configuration."""
+    # Convert Namespace to hashable tuple of (key, value) pairs
+    args_tuple = tuple(sorted(
+        (k, v) for k, v in vars(args).items()
+        if k in {
+            'training_mode',
+            'min_snr_gamma',
+            'sigma_data',
+            'sigma_min',
+            'sigma_max',
+            'scale_method',
+            'scale_factor'
+        }
+    ))
+    
+    # Return the actual config dictionary
     return {
         "mode": args.training_mode,
         "min_snr_gamma": args.min_snr_gamma,
