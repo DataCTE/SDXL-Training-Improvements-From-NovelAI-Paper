@@ -19,9 +19,8 @@ Most SDXL implementations use a maximum noise deviation (σ_max) of 14.6 [meanin
 - [x] Automatic mixed precision (AMP)
 
 - [x] 10k dataset proof of concept (completed) [link](https://huggingface.co/dataautogpt3/ProteusSigma)
-- [x] 200k+ dataset finetune (completed)
-- [ ] 12M dataset finetune (in progress)
-- [ ] Multi-aspect ratio support (planned)
+- [ ] 200k+ dataset finetune (in progress)
+- [ ] 12M dataset finetune (planned)
 - [ ] LoRA support (planned)
 
 ## Technical Implementation
