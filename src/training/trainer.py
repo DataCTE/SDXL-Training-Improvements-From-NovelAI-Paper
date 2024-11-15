@@ -486,14 +486,16 @@ def initialize_training_components(args, device, dtype, models):
         if not all(k in models for k in required_models):
             raise ValueError(f"Missing required models: {[k for k in required_models if k not in models]}")
             
-        # Create a clean copy of models for the dataloader
-        dataloader_models = {
-            "vae": models["vae"],
-            "tokenizer": models["tokenizer"],
-            "tokenizer_2": models["tokenizer_2"],
-            "text_encoder": models["text_encoder"],
-            "text_encoder_2": models["text_encoder_2"]
-        }
+        # Create process-safe copies of models for the dataloader
+        dataloader_models = {}
+        for key in required_models:
+            if hasattr(models[key], 'state_dict'):
+                # For torch models, create a new instance
+                dataloader_models[key] = type(models[key])(**models[key].config)
+                dataloader_models[key].load_state_dict(models[key].state_dict())
+            else:
+                # For tokenizers and other objects that don't need special handling
+                dataloader_models[key] = models[key]
             
         components["train_dataloader"] = create_dataloader(
             data_dir=args.data_dir,
@@ -502,8 +504,11 @@ def initialize_training_components(args, device, dtype, models):
             no_caching_latents=args.no_caching,
             all_ar=args.all_ar,
             cache_dir=args.cache_dir,
-            **dataloader_models  # Pass models as separate arguments
+            **dataloader_models
         )
+        
+        # Setup metrics manager
+        components["metrics_manager"] = MetricsManager()
         
         # Setup learning rate scheduler
         num_training_steps = args.num_epochs * len(components["train_dataloader"])
@@ -620,11 +625,8 @@ class MetricsManager:
         return {name: meter.avg for name, meter in dict(self._metrics).items()}
 
 def train(args, models, components, device, dtype) -> Dict[str, float]:
-    """Execute training steps with proper error handling and logging."""
-    metrics_manager = components.get('metrics_manager')
-    if metrics_manager is None:
-        metrics_manager = MetricsManager()
-        components['metrics_manager'] = metrics_manager
+    """Execute training steps with proper error handling."""
+    metrics_manager = components["metrics_manager"]
     
     # Set model to training mode
     models["unet"].train()
@@ -660,25 +662,6 @@ def train(args, models, components, device, dtype) -> Dict[str, float]:
                 # Update metrics
                 for k, v in batch_metrics.items():
                     metrics_manager.update_metric(k, v)
-                
-                # Update VAE if enabled
-                if components.get("vae_finetuner") is not None:
-                    vae_metrics = components["vae_finetuner"].train_step(batch)
-                    for k, v in vae_metrics.items():
-                        metrics_manager.update_metric(f"vae_{k}", v)
-                
-                # Update EMA if enabled
-                if (components.get("ema") is not None and 
-                    (batch_idx + 1) % args.gradient_accumulation_steps == 0):
-                    components["ema"].step(models["unet"])
-                    metrics_manager.update_metric("ema_decay", components["ema"].cur_decay_value)
-                
-                # Log learning rate
-                if components.get("lr_scheduler") is not None:
-                    metrics_manager.update_metric(
-                        "lr", 
-                        components["optimizer"].param_groups[0]["lr"]
-                    )
                 
                 # Update progress bar
                 progress_bar.set_postfix(
