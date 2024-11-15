@@ -2260,11 +2260,21 @@ class CustomDataset(CustomDatasetBase):
             if not self.enable_bucket_sampler:
                 return None, None
                 
+            # Initialize image_to_bucket if it doesn't exist
+            if not hasattr(self, 'image_to_bucket'):
+                self.image_to_bucket = {}
+                logger.warning("image_to_bucket not initialized, creating empty dict")
+                
             bucket = self.image_to_bucket.get(img_path)
             if bucket is None and self.all_ar:
-                with Image.open(img_path) as img:
-                    w, h = img.size
-                    bucket = (h, w)
+                try:
+                    with Image.open(img_path) as img:
+                        w, h = img.size
+                        bucket = (h, w)
+                        self.image_to_bucket[img_path] = bucket  # Cache the result
+                except Exception as e:
+                    logger.error(f"Error calculating bucket size for {img_path}: {str(e)}")
+                    return None, None
             return bucket if bucket else (None, None)
         
         try:
@@ -2272,107 +2282,137 @@ class CustomDataset(CustomDatasetBase):
             img_path = self.image_paths[idx]
             caption_path = Path(img_path).with_suffix('.txt')
             
-            # Get cached bucket dimensions
+            # Get cached bucket dimensions with error handling
             bucket_h, bucket_w = get_bucket_size(str(img_path))
+            if bucket_h is None and self.enable_bucket_sampler:
+                logger.warning(f"Failed to get bucket size for {img_path}, using fallback")
+                bucket_h, bucket_w = 1024, 1024  # Fallback size
             
             # Efficient image loading and processing
-            with Image.open(img_path) as image:
-                # Fast RGB conversion if needed
-                if image.mode != "RGB":
-                    image = image.convert("RGB")
+            try:
+                with Image.open(img_path) as image:
+                    # Fast RGB conversion if needed
+                    if image.mode != "RGB":
+                        image = image.convert("RGB")
+                    
+                    # Optimized image resizing
+                    if self.enable_bucket_sampler:
+                        image = self.process_image_size([image])[0]
+                    else:
+                        # Get target size and resize
+                        w, h = image.size
+                        target_w, target_h = self._get_target_size(w, h)
+                        image = self._advanced_resize(image, target_w, target_h)
+                    
+                    original_size = image.size
+            except Exception as e:
+                logger.error(f"Error processing image {img_path}: {str(e)}")
+                return None
+            
+            # Fast caption loading and processing with error handling
+            try:
+                with open(caption_path, 'r', encoding='utf-8') as f:
+                    caption = f.read().strip()
                 
-                # Optimized image resizing
-                if self.enable_bucket_sampler:
-                    image = self.process_image_size([image])[0]
-                else:
-                    # Get target size and resize
-                    w, h = image.size
-                    target_w, target_h = self._get_target_size(w, h)
-                    image = self._advanced_resize(image, target_w, target_h)
+                caption = self._apply_text_transforms(caption)
+            except Exception as e:
+                logger.error(f"Error loading caption {caption_path}: {str(e)}")
+                return None
+            
+            try:
+                # Batch process text inputs
+                text_inputs = {
+                    'text1': self.tokenizer(
+                        caption,
+                        padding="max_length",
+                        max_length=self.tokenizer.model_max_length,
+                        truncation=True,
+                        return_tensors="pt"
+                    ).to(self.text_encoder.device),
+                    
+                    'text2': self.tokenizer_2(
+                        caption,
+                        padding="max_length",
+                        max_length=self.tokenizer_2.model_max_length,
+                        truncation=True,
+                        return_tensors="pt"
+                    ).to(self.text_encoder_2.device)
+                }
                 
-                original_size = image.size
-            
-            # Fast caption loading and processing
-            with open(caption_path, 'r', encoding='utf-8') as f:
-                caption = f.read().strip()
-            
-            caption = self._apply_text_transforms(caption)
-            
-            # Batch process text inputs
-            text_inputs = {
-                'text1': self.tokenizer(
-                    caption,
-                    padding="max_length",
-                    max_length=self.tokenizer.model_max_length,
-                    truncation=True,
-                    return_tensors="pt"
-                ).to(self.text_encoder.device),
-                
-                'text2': self.tokenizer_2(
-                    caption,
-                    padding="max_length",
-                    max_length=self.tokenizer_2.model_max_length,
-                    truncation=True,
-                    return_tensors="pt"
-                ).to(self.text_encoder_2.device)
-            }
-            
-            # Generate embeddings in parallel
-            with torch.no_grad():
-                text_embeddings = self.text_encoder(text_inputs['text1'].input_ids)[0]
-                text_embeddings_2 = self.text_encoder_2(
-                    text_inputs['text2'].input_ids,
-                    output_hidden_states=True
-                )
-                
-                pooled_output = text_embeddings_2[0]
-                hidden_states = text_embeddings_2.hidden_states[-2]
-            
-            # Generate time embeddings efficiently
-            target_size = (bucket_w, bucket_h) if self.enable_bucket_sampler else (target_w, target_h)
-            
-            add_time_ids = torch.tensor([
-                original_size[0], original_size[1],  # original size
-                target_size[0], target_size[1],      # target size
-                0, 0,                               # crop top-left
-                original_size[0], original_size[1]   # crop bottom-right
-            ], dtype=torch.float32, device=self.vae.device).unsqueeze(0)
-            
-            # Optimized latent handling
-            if not self.no_caching_latents and self.latent_paths[idx].exists():
-                latents = torch.load(
-                    self.latent_paths[idx], 
-                    map_location='cpu'
-                )['latents'].float()
-            else:
-                # Generate latents with cached transform
-                transform = get_transform()
+                # Generate embeddings in parallel
                 with torch.no_grad():
-                    image_tensor = transform(image).unsqueeze(0).to(
-                        self.vae.device, dtype=self.vae.dtype
+                    text_embeddings = self.text_encoder(text_inputs['text1'].input_ids)[0]
+                    text_embeddings_2 = self.text_encoder_2(
+                        text_inputs['text2'].input_ids,
+                        output_hidden_states=True
                     )
                     
-                    # Use mixed precision if available
-                    with torch.cuda.amp.autocast(enabled=True):
-                        latents = self.vae.encode(image_tensor).latent_dist.sample()
-                        latents = latents * self.vae.config.scaling_factor
-                        latents = latents.squeeze(0).cpu()
+                    pooled_output = text_embeddings_2[0]
+                    hidden_states = text_embeddings_2.hidden_states[-2]
+            except Exception as e:
+                logger.error(f"Error generating text embeddings for {img_path}: {str(e)}")
+                return None
+            
+            try:
+                # Generate time embeddings efficiently
+                target_size = (bucket_w, bucket_h) if self.enable_bucket_sampler else (target_w, target_h)
+                
+                add_time_ids = torch.tensor([
+                    original_size[0], original_size[1],  # original size
+                    target_size[0], target_size[1],      # target size
+                    0, 0,                               # crop top-left
+                    original_size[0], original_size[1]   # crop bottom-right
+                ], dtype=torch.float32, device=self.vae.device).unsqueeze(0)
+                
+                # Optimized latent handling
+                if not self.no_caching_latents and self.latent_paths[idx].exists():
+                    try:
+                        latents = torch.load(
+                            self.latent_paths[idx], 
+                            map_location='cpu'
+                        )['latents'].float()
+                    except Exception as e:
+                        logger.warning(f"Failed to load cached latents for {img_path}, regenerating")
+                        latents = None
+                else:
+                    latents = None
                     
-                    if not self.no_caching_latents:
-                        torch.save({'latents': latents}, self.latent_paths[idx])
-            
-            # Return optimized data structure
-            return {
-                'latents': latents,
-                'text_embeddings': text_embeddings,
-                'text_embeddings_2': hidden_states,
-                'added_cond_kwargs': {
-                    'text_embeds': pooled_output.unsqueeze(1).unsqueeze(2),
-                    'time_ids': add_time_ids
-                },
-                'bucket_size': (bucket_h, bucket_w) if self.enable_bucket_sampler else target_size
-            }
-            
+                if latents is None:
+                    # Generate latents with cached transform
+                    transform = get_transform()
+                    with torch.no_grad():
+                        image_tensor = transform(image).unsqueeze(0).to(
+                            self.vae.device, dtype=self.vae.dtype
+                        )
+                        
+                        # Use mixed precision if available
+                        with torch.cuda.amp.autocast(enabled=True):
+                            latents = self.vae.encode(image_tensor).latent_dist.sample()
+                            latents = latents * self.vae.config.scaling_factor
+                            latents = latents.squeeze(0).cpu()
+                        
+                        if not self.no_caching_latents:
+                            try:
+                                torch.save({'latents': latents}, self.latent_paths[idx])
+                            except Exception as e:
+                                logger.warning(f"Failed to cache latents for {img_path}: {str(e)}")
+                
+                # Return optimized data structure
+                return {
+                    'latents': latents,
+                    'text_embeddings': text_embeddings,
+                    'text_embeddings_2': hidden_states,
+                    'added_cond_kwargs': {
+                        'text_embeds': pooled_output.unsqueeze(1).unsqueeze(2),
+                        'time_ids': add_time_ids
+                    },
+                    'bucket_size': (bucket_h, bucket_w) if self.enable_bucket_sampler else target_size
+                }
+                
+            except Exception as e:
+                logger.error(f"Error processing latents for {img_path}: {str(e)}")
+                return None
+                
         except Exception as e:
             logger.error(f"Error getting item {idx}: {str(e)}")
             return None
