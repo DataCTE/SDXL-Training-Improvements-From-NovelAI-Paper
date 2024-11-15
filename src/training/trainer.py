@@ -189,7 +189,7 @@ def setup_vae_finetuner(args, models) -> Optional[VAEFineTuner]:
 def _get_ema_config(
     decay: float = 0.9999,
     update_every: int = 10,
-    device: str = 'auto',
+    device: Union[str, torch.device] = None,
     model_path: str = None
 ) -> Dict[str, Any]:
     """Get basic EMA configuration."""
@@ -203,11 +203,9 @@ def _get_ema_config(
 def setup_ema(args, model, device=None):
     """Setup EMA model with proper error handling"""
     try:
-        # Validate device
+        # Use provided device or default to CUDA/CPU
         if device is None:
-            device = getattr(args, 'ema_device', 'auto')
-        if isinstance(device, str) and device != 'auto':
-            device = torch.device(device)
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             
         decay = getattr(args, 'ema_decay', 0.9999)
         

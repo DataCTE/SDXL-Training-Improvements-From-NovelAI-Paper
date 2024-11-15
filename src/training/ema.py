@@ -1,6 +1,6 @@
 import torch
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Union
 from diffusers import StableDiffusionXLPipeline
 from functools import lru_cache
 
@@ -16,7 +16,7 @@ class EMAModel:
         model_path: str,
         decay: float = 0.9999,
         update_after_step: int = 100,
-        device: Optional[torch.device] = None,
+        device: Optional[Union[str, torch.device]] = None,
         update_every: int = 1,
         use_ema_warmup: bool = True,
         power: float = 2/3,
@@ -34,7 +34,13 @@ class EMAModel:
         self.power = power
         self.min_decay = min_decay
         self.max_decay = max_decay
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # Handle device initialization
+        if device is None or (isinstance(device, str) and device.lower() == 'auto'):
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = device if isinstance(device, torch.device) else torch.device(device)
+            
         self.mixed_precision = mixed_precision
         
         # Load and optimize EMA model
