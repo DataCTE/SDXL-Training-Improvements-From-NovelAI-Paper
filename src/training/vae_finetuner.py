@@ -71,6 +71,9 @@ class VAEFineTuner:
             self.use_channel_scaling = use_channel_scaling
             self.max_grad_norm = max_grad_norm
             self.scale_factor = scale_factor
+            self.use_cache = use_cache
+            self.cache = deque(maxlen=cache_size) if use_cache else None
+            self.use_amp = use_amp
             
             # Initialize optimizer with configurable parameters
             optim_cls = AdamW8bit if use_8bit_adam else torch.optim.AdamW
@@ -90,10 +93,10 @@ class VAEFineTuner:
             )
             
             # Initialize mixed precision training
-            self.scaler = GradScaler() if mixed_precision == "fp16" else None
+            self.scaler = GradScaler() if use_amp else None
             
-            # Convert model precision
-            if mixed_precision == "fp16":
+            # Convert model precision based on both mixed_precision and use_amp settings
+            if use_amp and mixed_precision == "fp16":
                 self.vae = self.vae.to(dtype=torch.float16)
             elif mixed_precision == "bf16":
                 self.vae = self.vae.to(dtype=torch.bfloat16)
@@ -263,10 +266,16 @@ class VAEFineTuner:
             if original_images is not None:
                 original_images = original_images.to(self.device, non_blocking=True)
 
+            # Cache handling
+            if self.use_cache:
+                cache_key = self._get_cache_key(latents)
+                if cache_key in self.cache:
+                    return self.cache[cache_key]
+
             # Use a separate stream for VAE computation
             with torch.cuda.stream(torch.cuda.current_stream()):
                 # Enable mixed precision if configured
-                with autocast(enabled=self.mixed_precision != "no"):
+                with autocast(enabled=self.use_amp):
                     # Normalize latents using pre-computed statistics
                     if self.use_channel_scaling:
                         latents = self.normalize_latents(latents)
@@ -324,6 +333,10 @@ class VAEFineTuner:
                 # Update loss history
                 self.loss_history.append(loss.item())
                 
+                # Cache the result if enabled
+                if self.use_cache:
+                    self.cache[cache_key] = loss.item()
+
                 return loss
 
         except Exception as e:
@@ -355,3 +368,8 @@ class VAEFineTuner:
             self.optimizer.load_state_dict(state['optimizer'])
             self.scale_factor = state['scale_factor']
             self.loss_history = deque(state['loss_history'], maxlen=self.loss_history.maxlen)
+
+    def _get_cache_key(self, latents: torch.Tensor) -> str:
+        """Generate a cache key for the input latents"""
+        # Using a hash of the tensor data as the cache key
+        return str(hash(latents.cpu().numpy().tobytes()))
