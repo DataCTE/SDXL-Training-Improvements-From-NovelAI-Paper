@@ -107,7 +107,10 @@ python src/main.py \
   --gradient_checkpointing \
   --use_8bit_adam \
   --enable_xformers \
-  --max_grad_norm 1.0
+  --max_grad_norm 1.0 \
+  --adaptive_loss_scale \
+  --kl_weight 0.1 \
+  --perceptual_weight 0.1
 ```
 
 ## Tag-Based CLIP Weighting
@@ -162,6 +165,53 @@ Example: `1girl, anime style, outdoor, high quality`
 ## Project Structure
 See [Project Structure Documentation](src/filestruc.md) for detailed component descriptions.
 
+
+## ComfyUI Integration
+
+This repository includes custom ComfyUI nodes that implement the ZTSNR and NovelAI V3 improvements. The nodes can be found in `src/inference/Comfyui-zsnrnode/`.
+
+### Available Nodes
+
+1. **ZSNR V-Prediction Node**
+   - Implements Zero Terminal SNR and V-prediction
+   - Configurable σ_min and σ_data parameters
+   - Resolution-aware scaling
+   - Dynamic SNR gamma adjustment
+   - Category: "conditioning"
+
+2. **CFG Rescale Node**
+   - Advanced CFG rescaling methods
+   - Multiple scaling algorithms
+   - Configurable rescale multiplier
+   - Category: "sampling"
+
+3. **Laplace Scheduler Node**
+   - Laplace distribution-based noise scheduling
+   - Configurable μ and β parameters
+   - Optimized for SDXL's scale
+   - Category: "sampling"
+
+### Installation
+
+1. Copy the `src/inference/Comfyui-zsnrnode` directory to your ComfyUI custom nodes folder:
+```bash
+cp -r src/inference/Comfyui-zsnrnode /path/to/ComfyUI/custom_nodes/
+```
+
+2. Restart ComfyUI to load the new nodes
+
+### Usage
+
+The nodes will appear in the ComfyUI node browser under their respective categories:
+- ZSNR V-prediction under "conditioning"
+- CFG Rescale and Laplace Scheduler under "sampling"
+
+Recommended workflow:
+1. Add ZSNR V-prediction node before your main sampling node
+2. Configure CFG rescaling if using high CFG values
+3. Optionally use the Laplace scheduler for improved noise distribution
+
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit issues or pull requests for improvements.
@@ -177,3 +227,5 @@ Apache 2.0
   journal={arXiv preprint arXiv:2409.15997v2},
   year={2024}
 }
+
+```
