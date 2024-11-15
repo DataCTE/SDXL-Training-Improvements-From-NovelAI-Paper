@@ -17,6 +17,7 @@ import time
 from tqdm import tqdm
 from data.dataset import create_dataloader
 import os
+from ema import EMAModel
 
 logger = logging.getLogger(__name__)
 
@@ -30,12 +31,26 @@ def _get_optimizer_config(
     adam_epsilon: float
 ) -> Dict[str, Any]:
     """Cache optimizer configurations."""
-    return {
+    base_config = {
         "lr": learning_rate,
         "weight_decay": weight_decay,
-        "betas": (adam_beta1, adam_beta2),
-        "eps": adam_epsilon
     }
+    
+    if optimizer_type.lower() == "adamw":
+        return {
+            **base_config,
+            "betas": (adam_beta1, adam_beta2),
+            "eps": adam_epsilon
+        }
+    elif optimizer_type.lower() == "adafactor":
+        return {
+            **base_config,
+            "scale_parameter": True,
+            "relative_step": False,
+            "warmup_init": False
+        }
+    else:
+        raise ValueError(f"Unsupported optimizer type: {optimizer_type}")
 
 def setup_optimizer(args, models) -> torch.optim.Optimizer:
     """Set up optimizer with proper configuration and memory optimizations."""
@@ -170,44 +185,49 @@ def setup_vae_finetuner(args, models) -> Optional[VAEFineTuner]:
         logger.error(traceback.format_exc())
         raise
 
-@lru_cache(maxsize=32)
-def _get_ema_config(args) -> Dict[str, Any]:
-    """Cache EMA configuration."""
+@lru_cache(maxsize=1)
+def _get_ema_config(args):
+    """Get EMA configuration with proper handling of Namespace objects"""
+    # Convert Namespace to dict if needed
+    if hasattr(args, '__dict__'):
+        args = vars(args)
+    
+    # Create a hashable key for caching
+    config_key = tuple(sorted((k, v) for k, v in args.items() 
+                     if k.startswith('ema_')))
+    
     return {
-        'decay': args.ema_decay,
-        'update_after_step': args.ema_update_after_step,
-        'update_every': args.ema_update_every,
-        'power': args.ema_power,
-        'min_decay': args.ema_min_decay,
-        'max_decay': args.ema_max_decay,
-        'mixed_precision': args.mixed_precision,
-        'jit_compile': args.enable_compile,
-        'gradient_checkpointing': args.gradient_checkpointing
+        'decay': args.get('ema_decay', 0.9999),
+        'update_interval': args.get('ema_update_interval', 10),
+        'device': args.get('ema_device', 'auto'),
+        'update_after_step': args.get('ema_update_after_step', 0),
+        'use_ema_warmup': args.get('ema_use_warmup', True),
+        'warmup_steps': args.get('ema_warmup_steps', 2000),
+        'inv_gamma': args.get('ema_inv_gamma', 1.0),
+        'power': args.get('ema_power', 3/4),
+        'min_value': args.get('ema_min_value', 0.0)
     }
 
-def setup_ema(args, models, device) -> Optional[Any]:
-    """Initialize EMA model with proper configuration."""
+def setup_ema(args, model):
+    """Setup EMA model with proper error handling"""
     try:
-        if not args.use_ema:
-            return None
-            
-        logger.info("Initializing EMA model")
-        from .ema import EMAModel
-        
+        # Get EMA config safely
         ema_config = _get_ema_config(args)
-        ema = EMAModel(
-            model=models["unet"],
-            model_path=args.model_path,
-            device=device,
-            **ema_config
-        )
         
-        _log_ema_config(args)
-        return ema
+        # Create EMA model
+        if args.use_ema:
+            logger.info("Creating EMA model...")
+            ema = EMAModel(
+                model,
+                **ema_config
+            )
+            logger.info("EMA model created successfully")
+            return ema
+        return None
         
     except Exception as e:
         logger.error(f"Failed to setup EMA: {str(e)}")
-        logger.error(traceback.format_exc())
+        logger.error(f"Traceback: {traceback.format_exc()}")
         raise
 
 def setup_validator(args, models, device, dtype) -> Optional[Any]:
