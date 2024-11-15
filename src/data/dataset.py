@@ -499,91 +499,92 @@ class CustomDataset(CustomDatasetBase):
         return valid_paths
 
     def _validate_image_chunk(self, img_paths):
-        """Validate a chunk of images with multi-threading support"""
+        """Validate a chunk of images with ultra-fast parallel processing"""
         from concurrent.futures import ThreadPoolExecutor
-        from functools import partial
+        import numpy as np
+        from functools import lru_cache
         
         valid_paths = []
         bucket_data = defaultdict(list) if self.all_ar else None
-        
-        def validate_single_image(img_path):
-            """Process a single image with all validation checks"""
-            try:
-                # Check caption file
-                caption_path = img_path.with_suffix('.txt')
-                if not caption_path.exists():
-                    logger.warning(f"Skipping {img_path}: No caption file")
-                    return None
-                    
-                # Validate image
-                with Image.open(img_path) as img:
-                    if img.mode not in ['RGB', 'RGBA']:
-                        img = img.convert('RGB')
-                    
-                    # Get dimensions
-                    width, height = img.size
-                    
-                    # If all_ar is True, store in bucket and accept all sizes
-                    if self.all_ar:
-                        return (img_path, (height, width))
-                    
-                    # Basic validation
-                    if width < self.min_size or height < self.min_size:
-                        # Instead of skipping, try to upscale
-                        target_width = max(width, self.min_size)
-                        target_height = max(height, self.min_size)
-                        img = self.process_image_size([img])[0]
+
+        # Cache common operations
+        @lru_cache(maxsize=1024)
+        def check_aspect_ratio(width, height, resolution_type):
+            ratio = width / height
+            if resolution_type == "square":
+                return 0.95 <= ratio <= 1.05
+            elif resolution_type == "portrait":
+                return ratio < 1
+            elif resolution_type == "landscape":
+                return ratio > 1
+            return True
+
+        def process_batch(paths_batch):
+            results = []
+            for path in paths_batch:
+                try:
+                    # Quick caption check
+                    if not path.with_suffix('.txt').exists():
+                        continue
+
+                    # Fast image validation
+                    with Image.open(path) as img:
+                        # Quick mode check and conversion
+                        if img.mode not in ['RGB', 'RGBA']:
+                            img = img.convert('RGB')
+                        
                         width, height = img.size
                         
-                    # Aspect ratio validation for non-all_ar mode
-                    aspect_ratio = width / height
-                    if self.resolution_type == "square" and not 0.95 <= aspect_ratio <= 1.05:
-                        logger.warning(f"Skipping {img_path}: Not square ({aspect_ratio:.2f})")
-                        return None
-                    elif self.resolution_type == "portrait" and aspect_ratio >= 1:
-                        logger.warning(f"Skipping {img_path}: Not portrait ({aspect_ratio:.2f})")
-                        return None
-                    elif self.resolution_type == "landscape" and aspect_ratio <= 1:
-                        logger.warning(f"Skipping {img_path}: Not landscape ({aspect_ratio:.2f})")
-                        return None
+                        if self.all_ar:
+                            results.append((path, (height, width)))
+                            continue
+
+                        # Size validation
+                        if width < self.min_size or height < self.min_size:
+                            img = self.process_image_size([img])[0]
+                            width, height = img.size
+
+                        # Quick AR check
+                        if not check_aspect_ratio(width, height, self.resolution_type):
+                            continue
+
+                        # Handle latent caching efficiently
+                        if not self.no_caching_latents:
+                            cache_path = Path(str(path).replace(str(self.data_dir), str(self.cache_dir)))
+                            cache_path = cache_path.with_suffix('.pt')
+                            if not cache_path.exists() and hasattr(self, 'vae'):
+                                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                                try:
+                                    self._precompute_latents(path, cache_path, img)
+                                except Exception:
+                                    continue
+
+                        results.append(path)
+
+                except Exception:
+                    continue
                     
-                    # Handle latent caching
-                    if not self.no_caching_latents:
-                        cache_path = Path(str(img_path).replace(str(self.data_dir), str(self.cache_dir)))
-                        cache_path = cache_path.with_suffix('.pt')
-                        cache_path.parent.mkdir(parents=True, exist_ok=True)
-                        
-                        if not cache_path.exists() and hasattr(self, 'vae'):
-                            try:
-                                self._precompute_latents(img_path, cache_path, img)
-                            except Exception as e:
-                                logger.warning(f"Failed to precompute latents for {img_path}: {str(e)}")
-                    
-                    return img_path
-                    
-            except Exception as e:
-                logger.warning(f"Skipping {img_path}: {str(e)}")
-                return None
+            return results
+
+        # Optimize batch size and parallel processing
+        optimal_batch_size = 1000
+        batches = np.array_split(img_paths, 
+                               max(1, len(img_paths) // optimal_batch_size))
         
-        # Calculate optimal chunk size and number of workers
-        chunk_size = max(1, len(img_paths) // (self.num_workers * 4))
-        num_workers = min(self.num_workers, len(img_paths))
-        
-        # Process images in parallel
-        with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            # Process all images
-            results = list(executor.map(validate_single_image, img_paths, chunksize=chunk_size))
+        # Process batches in parallel
+        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+            futures = [executor.submit(process_batch, batch) for batch in batches]
             
-            # Filter out None results and organize data
-            for result in results:
-                if result is not None:
-                    if self.all_ar:
-                        path, bucket = result
+            # Collect results efficiently
+            for future in futures:
+                batch_results = future.result()
+                if self.all_ar:
+                    for path, bucket in batch_results:
                         valid_paths.append(path)
                         bucket_data[bucket].append(path)
-                    else:
-                        valid_paths.append(result)
-        
+                else:
+                    valid_paths.extend(batch_results)
+
         if self.all_ar:
             return valid_paths, bucket_data
         return valid_paths
