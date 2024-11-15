@@ -188,7 +188,7 @@ def setup_vae_finetuner(args, models) -> Optional[VAEFineTuner]:
 @lru_cache(maxsize=1)
 def _get_ema_config(
     decay: float = 0.9999,
-    update_interval: int = 10,
+    update_every: int = 10,
     device: str = 'auto',
     update_after_step: int = 0,
     use_warmup: bool = True,
@@ -200,7 +200,7 @@ def _get_ema_config(
     """Get EMA configuration with proper parameter handling"""
     return {
         'decay': decay,
-        'update_interval': update_interval,
+        'update_every': update_every,
         'device': device,
         'update_after_step': update_after_step,
         'use_ema_warmup': use_warmup,
@@ -216,7 +216,7 @@ def setup_ema(args, model, device=None):
         # Get EMA config safely
         ema_config = _get_ema_config(
             decay=getattr(args, 'ema_decay', 0.9999),
-            update_interval=getattr(args, 'ema_update_interval', 10),
+            update_every=getattr(args, 'ema_update_every', 10),
             device=getattr(args, 'ema_device', 'auto') if device is None else device,
             update_after_step=getattr(args, 'ema_update_after_step', 0),
             use_warmup=getattr(args, 'ema_use_warmup', True),
