@@ -596,7 +596,12 @@ class MetricsManager:
 def train(args, models, components, device, dtype) -> Dict[str, float]:
     """Execute training steps with proper error handling and logging."""
     metrics_manager = MetricsManager()
+    
+    # Set model to training mode
     models["unet"].train()
+    if getattr(args, 'train_text_encoder', False):
+        models["text_encoder"].train()
+        models["text_encoder_2"].train()
     
     start_time = time.time()
     data_time = AverageMeter("data_time")
@@ -629,13 +634,36 @@ def train(args, models, components, device, dtype) -> Dict[str, float]:
                 for k, v in batch_metrics.items():
                     metrics_manager.update_metric(k, v)
                 
-                # Update progress bar
+                # Update VAE if enabled
+                if components.get("vae_finetuner") is not None:
+                    vae_metrics = components["vae_finetuner"].train_step(batch)
+                    for k, v in vae_metrics.items():
+                        metrics_manager.update_metric(f"vae_{k}", v)
+                
+                # Update EMA if enabled
+                if (components.get("ema") is not None and 
+                    (batch_idx + 1) % args.gradient_accumulation_steps == 0):
+                    components["ema"].step(models["unet"])
+                    metrics_manager.update_metric("ema_decay", components["ema"].cur_decay_value)
+                
+                # Log learning rate
+                if components.get("lr_scheduler") is not None:
+                    metrics_manager.update_metric(
+                        "lr", 
+                        components["optimizer"].param_groups[0]["lr"]
+                    )
+                
+                # Update progress bar with current metrics
                 progress_bar.set_postfix(
-                    {k: f"{v.avg:.4f}" for k, v in metrics_manager.get_all_metrics().items()}
+                    {k: f"{v:.4f}" for k, v in metrics_manager.get_all_metrics().items()}
                 )
                 
                 batch_time.update(time.time() - start_time)
                 start_time = time.time()
+                
+                # Optional memory stats logging
+                if args.log_memory_stats and batch_idx % args.memory_stats_freq == 0:
+                    log_memory_stats(batch_idx)
                 
             except Exception as e:
                 logger.error(f"Error in training batch {batch_idx}: {str(e)}")
@@ -646,7 +674,13 @@ def train(args, models, components, device, dtype) -> Dict[str, float]:
         
     finally:
         progress_bar.close()
-
+        
+        # Set models back to eval mode if needed
+        models["unet"].eval()
+        if getattr(args, 'train_text_encoder', False):
+            models["text_encoder"].eval()
+            models["text_encoder_2"].eval()
+            
 def log_epoch_metrics(wandb_run, metrics: Dict[str, float], epoch: int, global_step: int) -> None:
     """Log epoch metrics to W&B with proper error handling."""
     try:
