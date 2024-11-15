@@ -1145,63 +1145,62 @@ class CustomDataset(CustomDatasetBase):
             logger.info(f"  Area range: {areas.min():.0f} to {areas.max():.0f}")
 
     def _assign_to_bucket(self, img_path):
-        """Assign an image to the appropriate bucket based on mode"""
+        """Fast bucket assignment with caching and optimized calculations"""
+        from functools import lru_cache
+        import numpy as np
+        
+        # Cache bucket calculations
+        @lru_cache(maxsize=1024)
+        def find_best_bucket(target_h, target_w, aspect_ratio):
+            if not self.buckets:
+                return None
+                
+            buckets_array = np.array(self.buckets)
+            areas = buckets_array[:, 0] * buckets_array[:, 1]
+            target_area = target_h * target_w
+            
+            # Calculate area differences for all buckets at once
+            area_diffs = areas - target_area
+            valid_buckets = area_diffs >= 0
+            
+            if np.any(valid_buckets):
+                # Find bucket with minimum area difference
+                best_idx = np.argmin(area_diffs * valid_buckets)
+                return tuple(buckets_array[best_idx])
+            
+            # If no valid bucket, try aspect ratio matching
+            bucket_ars = buckets_array[:, 0] / buckets_array[:, 1]
+            ar_diffs = np.abs(bucket_ars - aspect_ratio)
+            ar_valid = ar_diffs < 0.1
+            
+            if np.any(ar_valid):
+                best_idx = np.argmin(np.abs(areas - target_area) * ar_valid)
+                return tuple(buckets_array[best_idx])
+            
+            # Return largest bucket as fallback
+            return tuple(buckets_array[np.argmax(areas)])
+
         try:
             with Image.open(img_path) as img:
                 width, height = img.size
                 
                 if self.all_ar:
-                    # In all_ar mode, use exact dimensions as bucket
+                    # Fast all_ar handling
                     bucket = (height, width)
                     if bucket not in self.buckets:
                         self.buckets.append(bucket)
                         self.bucket_data[bucket] = []
                     return img_path, bucket
-                else:
-                    # Original bucket assignment logic for non-all_ar mode
-                    # Calculate target dimensions
-                    target_h, target_w = self._get_target_size(width, height)
-                    
-                    # Find best fitting bucket
-                    best_bucket = None
-                    min_area_diff = float('inf')
-                    
-                    for bucket_h, bucket_w in self.buckets:
-                        # Skip if bucket is too small
-                        if bucket_h < target_h or bucket_w < target_w:
-                            continue
-                        
-                        # Calculate area difference
-                        area_diff = (bucket_h * bucket_w) - (target_h * target_w)
-                        
-                        # Update best bucket if this one is better
-                        if area_diff < min_area_diff:
-                            min_area_diff = area_diff
-                            best_bucket = (bucket_h, bucket_w)
-                    
-                    # If no suitable bucket found, use largest bucket that maintains aspect ratio
-                    if best_bucket is None:
-                        aspect_ratio = height / width
-                        best_area_diff = float('inf')
-                        
-                        for bucket_h, bucket_w in self.buckets:
-                            bucket_ar = bucket_h / bucket_w
-                            if abs(bucket_ar - aspect_ratio) < 0.1:  # Allow some AR tolerance
-                                area_diff = abs((bucket_h * bucket_w) - (target_h * target_w))
-                                if area_diff < best_area_diff:
-                                    best_area_diff = area_diff
-                                    best_bucket = (bucket_h, bucket_w)
-                    
-                    # If still no bucket found, use the largest available bucket
-                    if best_bucket is None:
-                        best_bucket = max(self.buckets, key=lambda x: x[0] * x[1])
-                        logger.warning(f"Using largest bucket {best_bucket} for image {img_path} "
-                                     f"with dimensions {width}x{height}")
-                    
-                    return img_path, best_bucket
                 
-        except Exception as e:
-            logger.error(f"Error assigning {img_path} to bucket: {str(e)}")
+                # Get target dimensions
+                target_h, target_w = self._get_target_size(width, height)
+                aspect_ratio = height / width
+                
+                # Find best bucket using cached function
+                best_bucket = find_best_bucket(target_h, target_w, aspect_ratio)
+                return img_path, best_bucket
+                
+        except Exception:
             return img_path, None
 
     def _apply_text_transforms(self, caption):
@@ -1324,31 +1323,42 @@ class CustomDataset(CustomDatasetBase):
             return cache_data
     
     def _get_bucket_size(self, image_size):
-        """Get the most appropriate bucket size for an image"""
-        width, height = image_size
+        """Fast bucket size calculation using numpy vectorization"""
+        from functools import lru_cache
+        import numpy as np
         
-        if self.all_ar:
-            # In all_ar mode, return exact dimensions
-            return (height, width)
-        
-        # Find best fitting bucket
-        best_bucket = None
-        min_area_diff = float('inf')
-        
-        for bucket_h, bucket_w in self.buckets:
-            if bucket_h < height or bucket_w < width:
-                continue
+        @lru_cache(maxsize=1024)
+        def find_best_bucket(width, height):
+            if not self.buckets:
+                return None
+                
+            # Convert buckets to numpy array for vectorized operations
+            buckets_array = np.array(self.buckets)
             
-            area_diff = (bucket_h * bucket_w) - (height * width)
-            if area_diff < min_area_diff:
-                min_area_diff = area_diff
-                best_bucket = (bucket_h, bucket_w)
-        
-        if best_bucket is None:
-            # If no bucket fits, use the largest bucket
-            best_bucket = max(self.buckets, key=lambda x: x[0] * x[1])
-        
-        return best_bucket
+            if self.all_ar:
+                return (height, width)
+            
+            # Calculate areas in one operation
+            bucket_areas = buckets_array[:, 0] * buckets_array[:, 1]
+            target_area = width * height
+            
+            # Find valid buckets (large enough in both dimensions)
+            valid_mask = (buckets_array[:, 0] >= height) & (buckets_array[:, 1] >= width)
+            
+            if np.any(valid_mask):
+                # Calculate area differences for valid buckets
+                area_diffs = bucket_areas - target_area
+                area_diffs[~valid_mask] = np.inf
+                
+                # Find bucket with minimum area difference
+                best_idx = np.argmin(area_diffs)
+                return tuple(buckets_array[best_idx])
+            
+            # If no valid bucket, return largest bucket
+            largest_idx = np.argmax(bucket_areas)
+            return tuple(buckets_array[largest_idx])
+            
+        return find_best_bucket(*image_size)
     
     def _advanced_resize(self, image, target_width, target_height):
         """Advanced image resizing with aspect ratio preservation"""
