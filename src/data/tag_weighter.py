@@ -21,50 +21,119 @@ class TagBasedLossWeighter:
     max_weight = 3.0
     
     @staticmethod
-    def format_caption(caption: str) -> str:
-        """Static method for caption formatting to support multiprocessing"""
-        if not caption:
-            return ""
+    def parse_tags(caption: str) -> Tuple[List[str], Dict[str, any]]:
+        """
+        Static method to parse caption into tags and special tags with improved Midjourney compatibility.
+        
+        Args:
+            caption (str): Raw caption text
             
-        # Remove extra whitespace and normalize separators
-        caption = re.sub(r'\s+', ' ', caption.strip())
-        caption = re.sub(r'\s*,\s*', ', ', caption)
+        Returns:
+            Tuple[List[str], Dict]: Regular tags and special tag parameters
+        """
+        if not caption:
+            return [], {}
+            
+        tags = []
+        special_tags = {}
         
-        # Split into tags
-        tags = [t.strip().lower() for t in caption.split(',')]
-        formatted_tags = []
-        special_params = []
+        # Split and process tags
+        raw_tags = [t.strip() for t in caption.split(',')]
         
-        has_mj_tags = any('niji' in t.lower() or t.strip() in ['4', '5', '6'] for t in tags)
+        # Check for MJ-specific tags
+        has_mj_tags = any('niji' in t.lower() or t.strip() in ['4', '5', '6'] for t in raw_tags)
         
-        for tag in tags:
+        if has_mj_tags:
+            # Handle anime style/niji at start
+            if raw_tags and ('anime style' in raw_tags[0].lower() or 'niji' in raw_tags[0].lower()):
+                special_tags['niji'] = True
+                raw_tags = raw_tags[1:]
+                
+            # Handle version number
+            if raw_tags and raw_tags[-1].strip() in ['4', '5', '6']:
+                raw_tags = raw_tags[:-1]
+                tags.append('masterpiece')
+        
+        for tag in raw_tags:
+            tag = tag.lower().strip()
+            
             if not tag:
                 continue
-                
-            if tag.startswith('--'):
-                special_params.append(tag)
-                continue
-                
-            if has_mj_tags and tag in ['4', '5', '6']:
-                if 'masterpiece' not in formatted_tags:
-                    formatted_tags.append('masterpiece')
-                continue
-                
-            if has_mj_tags and any(param in tag for param in ['stylize', 'chaos', 'quality', 'niji']):
-                special_params.append(tag)
-                continue
-                
-            tag = tag.strip()
+            
+            # Handle compound tags with weights
+            if '::' in tag:
+                parts = tag.split('::')
+                tag = parts[0].strip()
+                try:
+                    weight = float(parts[1])
+                    special_tags[f'{tag}_weight'] = weight
+                except:
+                    pass
+
+            # Handle style references
+            if 'sref' in tag:
+                refs = re.findall(r'[a-f0-9]{8}|https?://[^\s>]+', tag)
+                if refs:
+                    special_tags['sref'] = refs
+                    continue
+
+            # Handle MJ style parameters
+            if has_mj_tags:
+                is_param = False
+                for param in ['stylize', 'chaos', 'sw', 'sv']:
+                    if param in tag:
+                        try:
+                            value = float(re.search(r'[\d.]+', tag).group())
+                            special_tags[param] = value
+                            is_param = True
+                        except:
+                            continue
+                if is_param:
+                    continue
+
+            # Clean up tag
             if tag.startswith(('a ', 'an ', 'the ')):
                 tag = ' '.join(tag.split()[1:])
             
-            formatted_tags.append(tag)
+            if tag:
+                tags.append(tag)
         
-        formatted_caption = ', '.join(formatted_tags)
-        if special_params:
-            formatted_caption += ', ' + ', '.join(special_params)
+        return tags, special_tags
+
+    @staticmethod
+    def calculate_static_weights(tags: List[str], special_tags: Dict[str, any] = None) -> float:
+        """
+        Static method to calculate basic weights without instance-specific data.
+        
+        Args:
+            tags (List[str]): List of tags
+            special_tags (Dict): Special tag parameters
             
-        return formatted_caption
+        Returns:
+            float: Basic weight value
+        """
+        if special_tags is None:
+            special_tags = {}
+            
+        base_weight = 1.0
+        
+        # Apply basic modifiers
+        if 'masterpiece' in tags:
+            base_weight *= 1.3
+        if special_tags.get('niji', False):
+            base_weight *= 1.2
+        if 'stylize' in special_tags:
+            stylize_value = special_tags['stylize']
+            stylize_weight = 1.0 + (math.log10(stylize_value) / 3.0)
+            base_weight *= stylize_weight
+        if 'chaos' in special_tags:
+            chaos_value = special_tags['chaos']
+            chaos_factor = 1.0 + (chaos_value / 200.0)
+            base_weight *= chaos_factor
+            
+        # Clamp between min and max
+        return max(TagBasedLossWeighter.min_weight, 
+                  min(TagBasedLossWeighter.max_weight, base_weight))
 
     def __init__(
         self,
@@ -316,82 +385,6 @@ class TagBasedLossWeighter:
             return [future.result() for future in futures]
         else:
             return [self._calculate_tag_weights(tuple(tags)) for tags in batch_tags]
-
-    def parse_tags(self, caption: str) -> Tuple[List[str], Dict[str, any]]:
-        """
-        Parse caption into tags and special tags with improved Midjourney compatibility.
-        
-        Args:
-            caption (str): Raw caption text
-            
-        Returns:
-            Tuple[List[str], Dict]: Regular tags and special tag parameters
-        """
-        tags = []
-        special_tags = {}
-        
-        # Split and process tags
-        raw_tags = [t.strip() for t in caption.split(',')]
-        
-        # Check for MJ-specific tags
-        has_mj_tags = any('niji' in t.lower() or t.strip() in ['4', '5', '6'] for t in raw_tags)
-        
-        if has_mj_tags:
-            # Handle anime style/niji at start
-            if raw_tags and ('anime style' in raw_tags[0].lower() or 'niji' in raw_tags[0].lower()):
-                special_tags['niji'] = True
-                raw_tags = raw_tags[1:]
-                
-            # Handle version number
-            if raw_tags and raw_tags[-1].strip() in ['4', '5', '6']:
-                raw_tags = raw_tags[:-1]
-                tags.append('masterpiece')
-        
-        for tag in raw_tags:
-            tag = tag.lower().strip()
-            
-            if not tag:
-                continue
-            
-            # Handle compound tags with weights
-            if '::' in tag:
-                parts = tag.split('::')
-                tag = parts[0].strip()
-                try:
-                    weight = float(parts[1])
-                    special_tags[f'{tag}_weight'] = weight
-                except:
-                    pass
-
-            # Handle style references
-            if 'sref' in tag:
-                refs = re.findall(r'[a-f0-9]{8}|https?://[^\s>]+', tag)
-                if refs:
-                    special_tags['sref'] = refs
-                    continue
-
-            # Handle MJ style parameters
-            if has_mj_tags:
-                is_param = False
-                for param in ['stylize', 'chaos', 'sw', 'sv']:
-                    if param in tag:
-                        try:
-                            value = float(re.search(r'[\d.]+', tag).group())
-                            special_tags[param] = value
-                            is_param = True
-                        except:
-                            continue
-                if is_param:
-                    continue
-
-            # Clean up tag
-            if tag.startswith(('a ', 'an ', 'the ')):
-                tag = ' '.join(tag.split()[1:])
-            
-            if tag:
-                tags.append(tag)
-        
-        return tags, special_tags
 
     def calculate_weights(self, tags: List[str], special_tags: Dict[str, any] = None) -> Dict[str, float]:
         """

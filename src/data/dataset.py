@@ -131,6 +131,10 @@ class CustomDataset(Dataset):
     def _parse_tags(self, caption):
         """Parse tags using tag weighter class method"""
         if self.tag_weighter:
+            if self.no_caching_latents:
+                # Use static method when no caching
+                return TagBasedLossWeighter.parse_tags(caption)
+            # Use instance method when caching
             return self.tag_weighter.parse_tags(caption)
         return [], {}
 
@@ -151,9 +155,13 @@ class CustomDataset(Dataset):
         return caption
 
     def _calculate_tag_weights(self, tags, special_tags):
-        """Calculate tag weights using tag weighter class method"""
+        """Calculate tag weights using appropriate tag weighter method"""
         if self.tag_weighter:
-            return self.tag_weighter.calculate_weights(tags, special_tags)
+            if self.no_caching_latents:
+                # Use static method when no caching
+                return TagBasedLossWeighter.calculate_static_weights(tags, special_tags)
+            # Use instance method when caching
+            return self.tag_weighter.calculate_weights(tags)
         return 1.0
 
     def _initialize_workers(self):
