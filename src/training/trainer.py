@@ -557,7 +557,7 @@ def _cleanup_failed_initialization(components: Dict[str, Any]) -> None:
         logger.error(f"Error during cleanup: {str(e)}")
 
 @torch.no_grad()
-def train_epoch(epoch: int, args, models, components, device, dtype, wandb_run, global_step: int):
+def train_epoch(epoch: int, args, models, components, device, dtype, wandb_run, global_step: int) -> Dict[str, float]:
     """Execute single training epoch with proper logging and memory management."""
     try:
         logger.info(f"Starting epoch {epoch + 1}/{args.num_epochs}")

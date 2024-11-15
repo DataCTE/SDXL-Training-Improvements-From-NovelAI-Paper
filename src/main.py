@@ -329,8 +329,6 @@ def main(args):
                     components=components,
                     device=device,
                     dtype=dtype,
-                    metrics=metrics,
-                    scaler=scaler,
                     wandb_run=wandb_run,
                     global_step=global_step
                 )
