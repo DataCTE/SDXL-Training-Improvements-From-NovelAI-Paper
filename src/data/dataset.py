@@ -95,7 +95,7 @@ class CustomDataset(Dataset):
         # Performance optimization
         self.prefetch_factor = prefetch_factor
         
-        # Create cache directory
+        # Create cache directory if caching is enabled
         if not no_caching_latents:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
         
@@ -106,9 +106,12 @@ class CustomDataset(Dataset):
         if self.enable_bucket_sampler:
             self._initialize_buckets()
             
-        # Process latents and build tag statistics
+        # Process latents if caching is enabled
         if not no_caching_latents:
             self._batch_process_latents_efficient()
+        else:
+            logger.info("Latent caching disabled - will process images on-the-fly")
+            
         self.tag_stats = self._build_tag_statistics()
         
         # Set collate function
@@ -1294,11 +1297,26 @@ class CustomDataset(Dataset):
                 'bucket_size': (bucket_h, bucket_w) if self.enable_bucket_sampler else (target_w, target_h)
             }
             
-            # Load cached latents if available
+            # Handle latents based on caching mode
             if not self.no_caching_latents and self.latent_paths[idx].exists():
-                cache_data_latents = torch.load(self.latent_paths[idx], map_location='cpu')  # Load to CPU first
-                # Ensure tensors are on CPU and in float32
+                # Load cached latents
+                cache_data_latents = torch.load(self.latent_paths[idx], map_location='cpu')
                 cache_data['latents'] = cache_data_latents['latents'].float().cpu()
+            else:
+                # Generate latents on-the-fly if caching is disabled
+                with torch.no_grad():
+                    # Convert image to tensor
+                    transform = transforms.Compose([
+                        transforms.ToTensor(),
+                        transforms.Normalize([0.5], [0.5])
+                    ])
+                    image_tensor = transform(image).unsqueeze(0)
+                    image_tensor = image_tensor.to(self.vae.device, dtype=self.vae.dtype)
+                    
+                    # Generate latents
+                    latents = self.vae.encode(image_tensor).latent_dist.sample()
+                    latents = latents * self.vae.config.scaling_factor
+                    cache_data['latents'] = latents.squeeze(0).cpu()
             
             return cache_data
         

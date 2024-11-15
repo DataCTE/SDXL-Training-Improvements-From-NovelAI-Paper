@@ -102,6 +102,8 @@ def parse_args():
     # Data arguments
     parser.add_argument("--data_dir", type=str, required=True)
     parser.add_argument("--cache_dir", type=str, default="latents_cache")
+    parser.add_argument("--no-caching", action="store_true",
+                       help="Disable latent caching for lower memory usage")
     parser.add_argument("--num_inference_steps", type=int, default=28,
                        help="Number of inference steps (default: 28 as per paper)")
     
@@ -230,7 +232,8 @@ def main(args):
             tokenizer=models["tokenizer"],
             tokenizer_2=models["tokenizer_2"],
             text_encoder=models["text_encoder"],
-            text_encoder_2=models["text_encoder_2"]
+            text_encoder_2=models["text_encoder_2"],
+            no_caching_latents=args.no_caching
         )
         
         # Setup optimizer
