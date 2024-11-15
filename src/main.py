@@ -219,15 +219,17 @@ def main(args):
         # Load model and initialize components
         models, optimizer_state, training_history = load_checkpoint(args)
         
-        # Move models to device
+        # Move models to device and setup gradient checkpointing
         for model_name, model in models.items():
             if isinstance(model, torch.nn.Module):
                 model.to(device=device, dtype=dtype)
                 if args.gradient_checkpointing:
                     if hasattr(model, 'enable_gradient_checkpointing'):
                         model.enable_gradient_checkpointing()
-                    elif hasattr(model, 'gradient_checkpointing_enable'):
-                        model.gradient_checkpointing_enable()
+                    else:
+                        # For newer diffusers versions
+                        model.enable_gradient_checkpointing()
+                        model.set_gradient_checkpointing(value=True)
         
         # Setup data loader first since we need it for lr_scheduler
         train_dataloader = create_dataloader(
