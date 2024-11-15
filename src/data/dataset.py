@@ -222,6 +222,7 @@ class CustomDataset(CustomDatasetBase):
         super().__init__()
         
         # Initialize flags first before any processing
+        self.collate_fn = self.custom_collate 
         self.all_ar = all_ar
         self.no_caching_latents = no_caching_latents
         self.enable_bucket_sampler = enable_bucket_sampler
@@ -1755,6 +1756,14 @@ class CustomDataset(CustomDatasetBase):
             logger.info(f"  Images in buckets: {total_bucketed_images}/{total_images} ({coverage:.1f}%)")
             logger.info(f"  Aspect ratio range: {aspect_ratios.min():.2f} to {aspect_ratios.max():.2f}")
             logger.info(f"  Area range: {areas.min():.0f} to {areas.max():.0f}")
+
+        # Create image to bucket mapping
+        self.image_to_bucket = {}
+        for bucket, paths in self.bucket_data.items():
+            for path in paths:
+                self.image_to_bucket[path] = bucket
+                
+        logger.info(f"Created bucket mappings for {len(self.image_to_bucket)} images")
 
     def _assign_to_bucket(self, img_path):
         """Fast bucket assignment with caching and optimized calculations"""
