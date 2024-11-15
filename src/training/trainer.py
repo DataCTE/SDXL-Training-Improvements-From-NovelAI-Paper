@@ -25,8 +25,35 @@ logger = logging.getLogger(__name__)
 def setup_optimizer(args, models) -> torch.optim.Optimizer:
     """Set up optimizer with proper configuration and memory optimizations."""
     try:
-        params_to_optimize = models["unet"].parameters()
+        # For SDXL, we need to get trainable parameters
+        if not hasattr(models["unet"], "parameters"):
+            raise ValueError("UNet model is not properly initialized")
+            
+        # Get parameters that require gradients
+        params_to_optimize = [
+            p for p in models["unet"].parameters() 
+            if p.requires_grad
+        ]
         
+        # Additional text encoder parameters if training text encoder
+        if getattr(args, 'train_text_encoder', False):
+            if "text_encoder" in models and "text_encoder_2" in models:
+                text_encoder_params = [
+                    p for p in models["text_encoder"].parameters() if p.requires_grad
+                ]
+                text_encoder_2_params = [
+                    p for p in models["text_encoder_2"].parameters() if p.requires_grad
+                ]
+                params_to_optimize.extend(text_encoder_params)
+                params_to_optimize.extend(text_encoder_2_params)
+        
+        # Validate parameters
+        if not params_to_optimize:
+            raise ValueError("No trainable parameters found")
+            
+        logger.info(f"Setting up optimizer for {sum(p.numel() for p in params_to_optimize):,} parameters")
+        
+        # Set up optimizer based on configuration
         if args.use_8bit_adam:
             try:
                 import bitsandbytes as bnb
@@ -41,8 +68,14 @@ def setup_optimizer(args, models) -> torch.optim.Optimizer:
             except ImportError:
                 logger.warning("bitsandbytes not found, falling back to regular AdamW")
                 args.use_8bit_adam = False
-        
-        if args.use_adafactor:
+                optimizer = torch.optim.AdamW(
+                    params_to_optimize,
+                    lr=args.learning_rate,
+                    betas=(args.adam_beta1, args.adam_beta2),
+                    eps=args.adam_epsilon,
+                    weight_decay=args.weight_decay
+                )
+        elif args.use_adafactor:
             optimizer = Adafactor(
                 params_to_optimize,
                 lr=args.learning_rate,
@@ -67,6 +100,14 @@ def setup_optimizer(args, models) -> torch.optim.Optimizer:
         
     except Exception as e:
         logger.error(f"Failed to setup optimizer: {str(e)}")
+        logger.error(f"Models keys available: {list(models.keys())}")
+        if "unet" in models:
+            logger.error(f"UNet model type: {type(models['unet'])}")
+            try:
+                logger.error(f"UNet parameters count: {sum(1 for _ in models['unet'].parameters())}")
+                logger.error(f"UNet trainable parameters: {sum(1 for p in models['unet'].parameters() if p.requires_grad)}")
+            except:
+                logger.error("Could not count UNet parameters")
         logger.error(traceback.format_exc())
         raise
 
