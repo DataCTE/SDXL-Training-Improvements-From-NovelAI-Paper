@@ -510,19 +510,25 @@ def initialize_training_components(args, device, dtype, models):
         dataloader_models = {}
         for key in required_models:
             model = models[key]
-            if hasattr(model, 'state_dict'):
+            if key == "vae":
+                # Special handling for VAE
+                from diffusers import AutoencoderKL
+                dataloader_models[key] = AutoencoderKL.from_config(model.config)
+                dataloader_models[key].load_state_dict(model.state_dict())
+            elif hasattr(model, 'state_dict'):
                 if hasattr(model, 'config'):
-                    # Handle transformers models (like CLIPTextModel)
+                    # Handle transformers models
                     if 'CLIPTextModel' in model.__class__.__name__:
                         dataloader_models[key] = type(model)(config=model.config)
-                    # Handle VAE and other custom models
+                        dataloader_models[key].load_state_dict(model.state_dict())
                     else:
-                        dataloader_models[key] = type(model)(model.config)
+                        # Handle other models with configs
+                        dataloader_models[key] = type(model)(**model.config)
+                        dataloader_models[key].load_state_dict(model.state_dict())
                 else:
                     # Handle models without config
                     dataloader_models[key] = type(model)()
-                # Load state dict for all model types
-                dataloader_models[key].load_state_dict(model.state_dict())
+                    dataloader_models[key].load_state_dict(model.state_dict())
             else:
                 # For tokenizers and other objects that don't need special handling
                 dataloader_models[key] = model
