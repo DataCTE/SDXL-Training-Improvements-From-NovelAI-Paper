@@ -10,7 +10,7 @@ from pathlib import Path
 
 from training.trainer import train
 from utils.checkpoint import load_checkpoint, save_checkpoint, save_final_outputs
-from utils.model_card import create_model_card, save_model_card, push_to_hub
+from utils.hub import create_model_card, save_model_card, push_to_hub
 from utils.logging import (
     setup_logging,
     log_system_info,
