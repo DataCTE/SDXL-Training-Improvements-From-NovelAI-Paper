@@ -2461,8 +2461,10 @@ class BucketSampler(CustomSamplerBase):
             self.drop_last = drop_last
             self.shuffle = shuffle
             self.seed = seed
-            self.epoch = 0
             self.resolution_binning = resolution_binning
+            
+            # Initialize epoch counter properly
+            self._epoch = 0
             
             # Initialize buckets efficiently
             self._initialize_buckets()
@@ -2475,6 +2477,18 @@ class BucketSampler(CustomSamplerBase):
         except Exception as e:
             logger.error(f"Failed to initialize BucketSampler: {str(e)}")
             raise
+
+    @property
+    def epoch(self) -> int:
+        """Get current epoch number"""
+        return self._epoch
+
+    @epoch.setter
+    def epoch(self, value: int) -> None:
+        """Set epoch number and clear caches"""
+        self._epoch = value
+        # Clear cached weights when epoch changes
+        self._calculate_bucket_weights.cache_clear()
 
     @torch.no_grad()
     def _initialize_buckets(self):
@@ -2533,7 +2547,7 @@ class BucketSampler(CustomSamplerBase):
             # Use generator for memory efficiency
             generator = torch.Generator()
             if self.seed is not None:
-                generator.manual_seed(self.seed + self.epoch)
+                generator.manual_seed(self.seed + self._epoch)
             
             # Pre-allocate indices array
             indices = np.zeros(self.total_samples, dtype=np.int32)
@@ -2568,13 +2582,7 @@ class BucketSampler(CustomSamplerBase):
         if self.drop_last:
             return self.total_samples // self.batch_size
         return (self.total_samples + self.batch_size - 1) // self.batch_size
-
-    def set_epoch(self, epoch: int) -> None:
-        """Update epoch for reproducibility"""
-        self.epoch = epoch
-        # Clear cached weights
-        self._calculate_bucket_weights.cache_clear()
-
+    
 class CustomDataLoader(CustomDataLoaderBase):
     """Optimized data loader with advanced batching and parallel processing"""
     
