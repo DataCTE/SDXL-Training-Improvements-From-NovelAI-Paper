@@ -727,6 +727,40 @@ class CustomDataset(CustomDatasetBase):
         
         logger.info(f"Successfully initialized dataset with {len(self.image_paths)} valid images")
 
+        # Initialize size cache for faster bucket sampling
+        if self.enable_bucket_sampler:
+            self._size_cache = {}
+            
+            def cache_image_sizes(paths_batch):
+                """Process a batch of images to cache their sizes"""
+                batch_sizes = {}
+                for path in paths_batch:
+                    try:
+                        with Image.open(path) as img:
+                            batch_sizes[path] = img.size[::-1]  # (h,w)
+                    except Exception as e:
+                        logger.warning(f"Failed to cache size for {path}: {str(e)}")
+                return batch_sizes
+            
+            # Process in batches
+            batch_size = 1000
+            with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+                futures = []
+                for i in range(0, len(self.image_paths), batch_size):
+                    batch = self.image_paths[i:i + batch_size]
+                    futures.append(executor.submit(cache_image_sizes, batch))
+                
+                # Collect results
+                for future in futures:
+                    try:
+                        self._size_cache.update(future.result())
+                    except Exception as e:
+                        logger.error(f"Failed to process size cache batch: {str(e)}")
+            
+            logger.info(f"Cached sizes for {len(self._size_cache)} images")
+        
+        # ... rest of initialization code ...
+
     def _validate_and_process_chunk(self, image_paths, process_ar=False, cache_latents=True):
         """Ultra-fast image validation using batched processing and caching"""
         from concurrent.futures import ThreadPoolExecutor
@@ -854,7 +888,7 @@ class CustomDataset(CustomDatasetBase):
                     
                     # Only process if resize is needed
                     if width != target_width or height != target_height:
-                        processed = self.process_image_size(image, target_width, target_height)
+                        processed = self.process_image_size([image])[0]
                         output_path = img_path.with_suffix('.png')
                         processed.save(output_path, format='PNG', quality=95)
                         
@@ -2438,6 +2472,31 @@ class CustomDataset(CustomDatasetBase):
                     pbar.update(1)
         
         logger.info(f"Formatted {len(formatted_paths)} captions")
+
+    def get_image_size(self, idx):
+        """Efficiently get image dimensions without loading full image"""
+        try:
+            img_path = self.image_paths[idx]
+            
+            # Try to get cached size first
+            if hasattr(self, '_size_cache'):
+                cached_size = self._size_cache.get(img_path)
+                if cached_size is not None:
+                    return cached_size
+            
+            # Use PIL's fast size reading
+            with Image.open(img_path) as img:
+                size = img.size[::-1]  # Convert (w,h) to (h,w)
+                
+                # Cache the result if cache exists
+                if hasattr(self, '_size_cache'):
+                    self._size_cache[img_path] = size
+                    
+                return size
+                
+        except Exception as e:
+            logger.warning(f"Failed to get size for image {idx}: {str(e)}")
+            return None
 
 
 class BucketSampler(CustomSamplerBase):
