@@ -1464,6 +1464,8 @@ class BucketSampler(CustomSamplerBase):
     """
     def __init__(self, dataset, batch_size, drop_last=True):
         super().__init__()
+        logger.info("Initializing bucket sampler...")
+        
         if not hasattr(dataset, 'bucket_data'):
             raise ValueError("Dataset must have 'bucket_data' attribute for BucketSampler")
         
@@ -1475,15 +1477,23 @@ class BucketSampler(CustomSamplerBase):
         self.samples = []
         
         if self.all_ar:
-            # In all_ar mode, each image is its own bucket
-            for bucket, img_paths in dataset.bucket_data.items():
+            logger.info("Processing all_ar mode buckets...")
+            from tqdm import tqdm
+            # Add progress bar for bucket processing
+            for bucket, img_paths in tqdm(dataset.bucket_data.items(), 
+                                        desc="Processing buckets",
+                                        total=len(dataset.bucket_data)):
                 for img_path in img_paths:
                     idx = dataset.image_paths.index(img_path)
                     self.samples.append((bucket, idx))
+            logger.info(f"Processed {len(self.samples)} samples for all_ar mode")
         else:
-            # Original bucket validation logic for non-all_ar mode
-            # Validate buckets and create sample list
-            for bucket, img_paths in dataset.bucket_data.items():
+            # Original bucket validation logic with progress bar
+            logger.info("Processing standard buckets...")
+            from tqdm import tqdm
+            for bucket, img_paths in tqdm(dataset.bucket_data.items(),
+                                        desc="Processing buckets",
+                                        total=len(dataset.bucket_data)):
                 bucket_h, bucket_w = bucket
                 
                 # Skip invalid buckets
@@ -1508,6 +1518,8 @@ class BucketSampler(CustomSamplerBase):
                 if len(img_paths) > 0:
                     logger.debug(f"Bucket {bucket}: {len(img_paths)} images")
             
+            logger.info(f"Processed {len(self.samples)} samples across {len(dataset.bucket_data)} buckets")
+            
             # Verify we have valid samples
             if not self.samples:
                 raise ValueError("No valid samples found after bucket validation")
@@ -1515,8 +1527,7 @@ class BucketSampler(CustomSamplerBase):
             # Sort samples by bucket size for potentially better memory usage
             self.samples.sort(key=lambda x: x[0][0] * x[0][1])
             
-            logger.info(f"BucketSampler initialized with {len(self.samples)} valid samples "
-                       f"across {len(dataset.bucket_data)} buckets")
+        logger.info(f"BucketSampler initialized with {len(self.samples)} samples")
     
     def __iter__(self):
         if not self.samples:
@@ -1702,7 +1713,7 @@ def create_dataloader(
     if no_caching_latents:
         logger.info("Latent caching disabled - processing will be done on-the-fly")
 
-    # Initialize dataset
+    # Initialize dataset with progress reporting
     dataset = CustomDataset(
         data_dir=data_dir,
         tokenizer=tokenizer,
@@ -1717,19 +1728,21 @@ def create_dataloader(
         use_tag_weighting=use_tag_weighting,
         **kwargs
     )
-
-    # Create sampler if bucket sampling is enabled
+    
+    logger.info("Setting up bucket sampler...")
     if enable_bucket_sampler:
         sampler = BucketSampler(
             dataset=dataset,
             batch_size=batch_size,
             drop_last=True
         )
+        logger.info(f"Bucket sampler initialized with {len(sampler)} samples")
     else:
         sampler = None
+        logger.info("No bucket sampler used")
 
-    # Create and return dataloader
-    return CustomDataLoader(
+    logger.info("Initializing dataloader...")
+    dataloader = CustomDataLoader(
         dataset=dataset,
         batch_size=batch_size,
         sampler=sampler,
@@ -1739,3 +1752,6 @@ def create_dataloader(
         timeout=0,
         prefetch_factor=2
     )
+    logger.info(f"Dataloader initialized with {len(dataloader)} batches")
+    
+    return dataloader
