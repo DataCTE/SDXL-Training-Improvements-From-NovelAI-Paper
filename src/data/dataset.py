@@ -2,9 +2,6 @@ from pathlib import Path
 from PIL import Image
 import torch
 import torchvision.transforms as transforms
-from torch.utils.data import Dataset, DataLoader, Sampler
-from torch.utils.data.sampler import SubsetRandomSampler
-import math
 from tqdm import tqdm
 import logging
 import traceback
@@ -14,21 +11,50 @@ import cv2
 import numpy as np
 from collections import defaultdict
 from .ultimate_upscaler import UltimateUpscaler, USDUMode, USDUSFMode
-from utils.validation import validate_image_dimensions
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed, ProcessPoolExecutor
 import gc
 from .tag_weighter import TagBasedLossWeighter
-from multiprocessing import Process, Queue
 import threading
-import psutil
 import time
 import multiprocessing as mp
 from functools import lru_cache
 
 logger = logging.getLogger(__name__)
 
-class CustomDataset(Dataset):
+# Create our own base classes
+class CustomDatasetBase:
+    def __init__(self):
+        pass
+        
+    def __len__(self):
+        raise NotImplementedError
+        
+    def __getitem__(self, idx):
+        raise NotImplementedError
+
+
+class CustomSamplerBase:
+    def __init__(self):
+        pass
+        
+    def __iter__(self):
+        raise NotImplementedError
+        
+    def __len__(self):
+        raise NotImplementedError
+
+
+class CustomDataLoaderBase:
+    def __init__(self):
+        pass
+        
+    def __iter__(self):
+        raise NotImplementedError
+
+
+# Then modify your existing classes to use these bases
+class CustomDataset(CustomDatasetBase):
     def __init__(self, data_dir, vae=None, tokenizer=None, tokenizer_2=None, text_encoder=None, text_encoder_2=None,
                  cache_dir="latents_cache", no_caching_latents=False, all_ar=False,
                  num_workers=None, prefetch_factor=2,
@@ -1405,12 +1431,12 @@ class CustomDataset(Dataset):
             return latents
 
 
-class BucketSampler(Sampler):
+class BucketSampler(CustomSamplerBase):
     """
     Sampler that creates batches of samples from the same bucket to ensure consistent tensor sizes.
     """
     def __init__(self, dataset, batch_size, drop_last=True):
-        super().__init__(dataset)
+        super().__init__()
         if not hasattr(dataset, 'bucket_data'):
             raise ValueError("Dataset must have 'bucket_data' attribute for BucketSampler")
         
@@ -1522,49 +1548,81 @@ class BucketSampler(Sampler):
         return len(self.samples)
 
 
-def create_dataloader(
-    data_dir,
-    batch_size,
-    num_workers=None,
-    tokenizer=None,
-    text_encoder=None,
-    tokenizer_2=None,
-    text_encoder_2=None,
-    vae=None,
-    enable_bucket_sampler=True,
-    no_caching_latents=False,
-    **kwargs
-):
-    """Create a DataLoader with bucketing support"""
-    # Initialize dataset
-    dataset = CustomDataset(
-        data_dir=data_dir,
-        tokenizer=tokenizer,
-        text_encoder=text_encoder,
-        tokenizer_2=tokenizer_2,
-        text_encoder_2=text_encoder_2,
-        vae=vae,
-        num_workers=num_workers,  # Pass through num_workers
-        enable_bucket_sampler=enable_bucket_sampler,
-        no_caching_latents=no_caching_latents,
-        **kwargs
-    )
+class CustomDataLoader(CustomDataLoaderBase):
+    def __init__(self, dataset, batch_size, sampler=None, num_workers=0, 
+                 pin_memory=False, drop_last=False, timeout=0, 
+                 worker_init_fn=None, prefetch_factor=2):
+        super().__init__()
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.sampler = sampler
+        self.num_workers = num_workers
+        self.pin_memory = pin_memory
+        self.drop_last = drop_last
+        self.timeout = timeout
+        self.worker_init_fn = worker_init_fn
+        self.prefetch_factor = prefetch_factor
+        
+        # Initialize multiprocessing components if using workers
+        if self.num_workers > 0:
+            self.worker_pool = ThreadPoolExecutor(max_workers=self.num_workers)
+        else:
+            self.worker_pool = None
 
-    if enable_bucket_sampler and hasattr(dataset, 'bucket_data'):
-        sampler = BucketSampler(dataset, batch_size)
-        shuffle = False  # Bucket sampler handles shuffling
-    else:
-        sampler = None
-        shuffle = True
+    def __iter__(self):
+        if self.sampler is None:
+            indices = range(len(self.dataset))
+        else:
+            indices = self.sampler
 
-    # Create DataLoader with the same num_workers as dataset
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=dataset.num_workers,  # Use dataset's num_workers for consistency
-        sampler=sampler,
-        collate_fn=dataset.collate_fn,
-        pin_memory=True,
-        drop_last=True
-    )
+        # Create batches
+        batches = []
+        batch = []
+        
+        for idx in indices:
+            batch.append(idx)
+            if len(batch) == self.batch_size:
+                batches.append(batch)
+                batch = []
+                
+        # Handle last batch if not dropping
+        if batch and not self.drop_last:
+            batches.append(batch)
+
+        # Process batches
+        for batch_indices in batches:
+            if self.num_workers > 0:
+                # Parallel processing
+                futures = [
+                    self.worker_pool.submit(self.dataset.__getitem__, idx)
+                    for idx in batch_indices
+                ]
+                batch_data = [future.result() for future in futures]
+            else:
+                # Single thread processing
+                batch_data = [self.dataset[idx] for idx in batch_indices]
+            
+            # Filter out None values from failed __getitem__ calls
+            batch_data = [item for item in batch_data if item is not None]
+            
+            if batch_data:  # Only yield if we have valid items
+                try:
+                    # Use dataset's collate function if available
+                    if hasattr(self.dataset, 'custom_collate'):
+                        yield self.dataset.custom_collate(batch_data)
+                    else:
+                        yield batch_data
+                except Exception as e:
+                    logger.error(f"Error collating batch: {str(e)}")
+                    continue
+
+    def __len__(self):
+        if self.drop_last:
+            return len(self.dataset) // self.batch_size
+        else:
+            return (len(self.dataset) + self.batch_size - 1) // self.batch_size
+
+    def __del__(self):
+        # Cleanup
+        if self.worker_pool is not None:
+            self.worker_pool.shutdown(wait=True)
