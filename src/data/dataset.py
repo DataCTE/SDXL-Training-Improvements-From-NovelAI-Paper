@@ -18,7 +18,7 @@ from utils.validation import validate_image_dimensions
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import gc
-from .tag_based_loss_weighter import TagBasedLossWeighter
+from tag_weighter import TagBasedLossWeighter
 
 logger = logging.getLogger(__name__)
 
@@ -305,7 +305,7 @@ class CustomDataset(Dataset):
             caption_path = Path(img_path).with_suffix('.txt')
             with open(caption_path, 'r', encoding='utf-8') as f:
                 current_caption = f.read().strip()
-                
+            
             # Tokenize current caption
             current_tokens = self.tokenizer(
                 current_caption,
