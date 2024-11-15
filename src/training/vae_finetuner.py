@@ -68,8 +68,7 @@ class VAEFineTuner:
             self._init_model(vae)
             self._init_optimizer(kwargs)
             self._init_tracking()
-            
-            # Pre-compile critical ops
+            self.register_vae_statistics()
             self._init_compiled_ops()
             
             # Pre-allocate buffers
@@ -139,11 +138,17 @@ class VAEFineTuner:
         self.latent_means = None
         self.latent_m2 = None
 
+    def register_vae_statistics(self) -> None:
+        """Register VAE latent space statistics for normalization."""
+        if not hasattr(self.vae, 'latent_means') or not hasattr(self.vae, 'latent_stds'):
+            # Initialize default statistics if not present
+            latent_size = self.vae.config.latent_channels
+            self.vae.register_buffer('latent_means', torch.zeros(latent_size, device=self.device))
+            self.vae.register_buffer('latent_stds', torch.ones(latent_size, device=self.device))
+            logger.info("Initialized default VAE latent statistics")
+
     def _init_compiled_ops(self):
         """Initialize compiled operations"""
-        # Register VAE statistics once
-        self.register_vae_statistics()
-        
         # Pre-compile VGG features extraction
         if self.perceptual_weight > 0:
             self._init_perceptual_model()

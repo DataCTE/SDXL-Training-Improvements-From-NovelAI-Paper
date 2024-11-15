@@ -21,6 +21,7 @@ from .ema import EMAModel
 
 logger = logging.getLogger(__name__)
 
+
 @lru_cache(maxsize=128)
 def _get_optimizer_config(
     optimizer_type: str,
