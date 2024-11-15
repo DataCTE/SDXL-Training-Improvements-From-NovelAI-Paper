@@ -184,8 +184,7 @@ def parse_args():
     # Add to argument parser
     parser.add_argument('--all_ar', action='store_true',
                        help='Accept all aspect ratios without resizing')
-    parser.add_argument('--no_caching', action='store_true', help='Disable latent caching')
-
+    
     
     # Add num_workers argument
     parser.add_argument(
