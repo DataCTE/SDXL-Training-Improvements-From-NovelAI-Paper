@@ -142,36 +142,72 @@ def setup_optimizer(args, models) -> torch.optim.Optimizer:
         raise
 
 @lru_cache(maxsize=32)
-def _get_vae_config(args) -> Dict[str, Any]:
+def _get_vae_config(
+    device: str,
+    mixed_precision: str,
+    use_amp: bool,
+    learning_rate: float,
+    adam_beta1: float,
+    adam_beta2: float,
+    adam_epsilon: float,
+    weight_decay: float,
+    max_grad_norm: float,
+    gradient_checkpointing: bool,
+    use_8bit_adam: bool,
+    use_channel_scaling: bool = False,
+    adaptive_loss_scale: bool = False,
+    kl_weight: float = 0.0,
+    perceptual_weight: float = 0.0,
+    min_snr_gamma: float = 5.0,
+    initial_scale_factor: float = 1.0
+) -> Dict[str, Any]:
     """Cache VAE configuration."""
     return {
-        'device': args.device,
-        'mixed_precision': args.mixed_precision,
-        'use_amp': args.use_amp,
-        'learning_rate': args.vae_learning_rate,
-        'adam_beta1': args.adam_beta1,
-        'adam_beta2': args.adam_beta2,
-        'adam_epsilon': args.adam_epsilon,
-        'weight_decay': args.weight_decay,
-        'max_grad_norm': args.max_grad_norm,
-        'gradient_checkpointing': args.gradient_checkpointing,
-        'use_8bit_adam': args.use_8bit_adam,
-        'use_channel_scaling': args.vae_use_channel_scaling,
-        'adaptive_loss_scale': args.vae_adaptive_loss_scale,
-        'kl_weight': args.vae_kl_weight,
-        'perceptual_weight': args.vae_perceptual_weight,
-        'min_snr_gamma': args.min_snr_gamma,
-        'initial_scale_factor': args.vae_initial_scale_factor
+        'device': device,
+        'mixed_precision': mixed_precision,
+        'use_amp': use_amp,
+        'learning_rate': learning_rate,
+        'adam_beta1': adam_beta1,
+        'adam_beta2': adam_beta2,
+        'adam_epsilon': adam_epsilon,
+        'weight_decay': weight_decay,
+        'max_grad_norm': max_grad_norm,
+        'gradient_checkpointing': gradient_checkpointing,
+        'use_8bit_adam': use_8bit_adam,
+        'use_channel_scaling': use_channel_scaling,
+        'adaptive_loss_scale': adaptive_loss_scale,
+        'kl_weight': kl_weight,
+        'perceptual_weight': perceptual_weight,
+        'min_snr_gamma': min_snr_gamma,
+        'initial_scale_factor': initial_scale_factor
     }
 
 def setup_vae_finetuner(args, models) -> Optional[VAEFineTuner]:
     """Initialize VAE finetuner with proper configuration."""
     try:
-        if not args.finetune_vae:
+        if not getattr(args, 'finetune_vae', False):
             return None
             
         logger.info("Initializing VAE finetuner")
-        vae_config = _get_vae_config(args)
+        vae_config = _get_vae_config(
+            device=getattr(args, 'device', 'cuda'),
+            mixed_precision=getattr(args, 'mixed_precision', 'no'),
+            use_amp=getattr(args, 'use_amp', False),
+            learning_rate=getattr(args, 'vae_learning_rate', 1e-6),
+            adam_beta1=getattr(args, 'adam_beta1', 0.9),
+            adam_beta2=getattr(args, 'adam_beta2', 0.999),
+            adam_epsilon=getattr(args, 'adam_epsilon', 1e-8),
+            weight_decay=getattr(args, 'weight_decay', 1e-2),
+            max_grad_norm=getattr(args, 'max_grad_norm', 1.0),
+            gradient_checkpointing=getattr(args, 'gradient_checkpointing', False),
+            use_8bit_adam=getattr(args, 'use_8bit_adam', False),
+            use_channel_scaling=getattr(args, 'vae_use_channel_scaling', False),
+            adaptive_loss_scale=getattr(args, 'vae_adaptive_loss_scale', False),
+            kl_weight=getattr(args, 'vae_kl_weight', 0.0),
+            perceptual_weight=getattr(args, 'vae_perceptual_weight', 0.0),
+            min_snr_gamma=getattr(args, 'min_snr_gamma', 5.0),
+            initial_scale_factor=getattr(args, 'vae_initial_scale_factor', 1.0)
+        )
         vae_finetuner = VAEFineTuner(
             vae=models["vae"],
             **vae_config
