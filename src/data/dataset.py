@@ -1626,3 +1626,57 @@ class CustomDataLoader(CustomDataLoaderBase):
         # Cleanup
         if self.worker_pool is not None:
             self.worker_pool.shutdown(wait=True)
+
+def create_dataloader(
+    data_dir,
+    batch_size,
+    num_workers=None,
+    tokenizer=None,
+    text_encoder=None,
+    tokenizer_2=None,
+    text_encoder_2=None,
+    vae=None,
+    enable_bucket_sampler=True,
+    no_caching_latents=False,
+    all_ar=False,
+    **kwargs
+):
+    """
+    Create a dataloader with the specified parameters
+    """
+    # Initialize dataset
+    dataset = CustomDataset(
+        data_dir=data_dir,
+        tokenizer=tokenizer,
+        text_encoder=text_encoder,
+        tokenizer_2=tokenizer_2,
+        text_encoder_2=text_encoder_2,
+        vae=vae,
+        num_workers=num_workers,
+        enable_bucket_sampler=enable_bucket_sampler,
+        no_caching_latents=no_caching_latents,
+        all_ar=all_ar,
+        **kwargs
+    )
+
+    # Create sampler if bucket sampling is enabled
+    if enable_bucket_sampler:
+        sampler = BucketSampler(
+            dataset=dataset,
+            batch_size=batch_size,
+            drop_last=True
+        )
+    else:
+        sampler = None
+
+    # Create and return dataloader
+    return CustomDataLoader(
+        dataset=dataset,
+        batch_size=batch_size,
+        sampler=sampler,
+        num_workers=num_workers if num_workers is not None else 0,
+        pin_memory=True,
+        drop_last=True,
+        timeout=0,
+        prefetch_factor=2
+    )
