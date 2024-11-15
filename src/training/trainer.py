@@ -553,6 +553,10 @@ def train_epoch(epoch: int, args, models, components, device, dtype, wandb_run, 
     try:
         logger.info(f"Starting epoch {epoch + 1}/{args.num_epochs}")
         
+        # Create metrics manager here in the main process
+        metrics_manager = MetricsManager()
+        components['metrics_manager'] = metrics_manager
+        
         # Train for one epoch
         epoch_metrics = train(args, models, components, device, dtype)
         
@@ -574,28 +578,24 @@ def train_epoch(epoch: int, args, models, components, device, dtype, wandb_run, 
             torch.cuda.empty_cache()
 
 class MetricsManager:
-    """Thread-safe metrics manager."""
+    """Process-safe metrics manager."""
     def __init__(self):
         self._metrics = {}
-        self._lock = Lock()
     
     def get_metric(self, name: str) -> AverageMeter:
-        with self._lock:
-            if name not in self._metrics:
-                self._metrics[name] = AverageMeter(name=name)
-            return self._metrics[name]
+        if name not in self._metrics:
+            self._metrics[name] = AverageMeter(name=name)
+        return self._metrics[name]
     
     def update_metric(self, name: str, value: float, n: int = 1) -> None:
-        with self._lock:
-            self.get_metric(name).update(value, n)
+        self.get_metric(name).update(value, n)
     
     def get_all_metrics(self) -> Dict[str, float]:
-        with self._lock:
-            return {name: meter.avg for name, meter in self._metrics.items()}
+        return {name: meter.avg for name, meter in self._metrics.items()}
 
 def train(args, models, components, device, dtype) -> Dict[str, float]:
     """Execute training steps with proper error handling and logging."""
-    metrics_manager = MetricsManager()
+    metrics_manager = components['metrics_manager']
     
     # Set model to training mode
     models["unet"].train()
@@ -604,8 +604,6 @@ def train(args, models, components, device, dtype) -> Dict[str, float]:
         models["text_encoder_2"].train()
     
     start_time = time.time()
-    data_time = AverageMeter("data_time")
-    batch_time = AverageMeter("batch_time")
     
     progress_bar = tqdm(
         components["train_dataloader"],
@@ -617,7 +615,7 @@ def train(args, models, components, device, dtype) -> Dict[str, float]:
     try:
         for batch_idx, batch in enumerate(progress_bar):
             try:
-                data_time.update(time.time() - start_time)
+                metrics_manager.update_metric('data_time', time.time() - start_time)
                 
                 # Execute training step
                 batch_metrics = train_step(
@@ -630,7 +628,7 @@ def train(args, models, components, device, dtype) -> Dict[str, float]:
                     dtype=dtype
                 )
                 
-                # Update metrics using manager
+                # Update metrics
                 for k, v in batch_metrics.items():
                     metrics_manager.update_metric(k, v)
                 
@@ -653,12 +651,12 @@ def train(args, models, components, device, dtype) -> Dict[str, float]:
                         components["optimizer"].param_groups[0]["lr"]
                     )
                 
-                # Update progress bar with current metrics
+                # Update progress bar
                 progress_bar.set_postfix(
                     {k: f"{v:.4f}" for k, v in metrics_manager.get_all_metrics().items()}
                 )
                 
-                batch_time.update(time.time() - start_time)
+                metrics_manager.update_metric('batch_time', time.time() - start_time)
                 start_time = time.time()
                 
                 # Optional memory stats logging
