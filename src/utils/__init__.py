@@ -1,6 +1,6 @@
 from .checkpoint import save_checkpoint, load_checkpoint, save_final_outputs
 from .device import cleanup, get_device, to_device
-from .hub import push_to_hub
+from .hub import push_to_hub, create_model_card, save_model_card
 from .logging import (
     setup_logging,
     log_system_info,
@@ -9,7 +9,6 @@ from .logging import (
     setup_wandb,
     cleanup_wandb
 )
-from .model_card import create_model_card, save_model_card
 from .validation import validate_dataset
 
 __all__ = [

@@ -11,7 +11,7 @@ import wandb
 import numpy as np
 from tqdm import tqdm
 from torch.cuda.amp import autocast, GradScaler
-
+from utils.hub import save_model_card, push_to_hub
 from training import get_sigmas, training_loss_v_prediction
 from utils import save_checkpoint, load_checkpoint
 from utils.logging import log_metrics_batch
