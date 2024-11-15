@@ -111,7 +111,7 @@ class CustomDataset(Dataset):
             logger.info("Skipping upscaler initialization since all_ar is enabled")
         
         # Performance optimization
-        self.num_workers = num_workers or min(os.cpu_count(), 32)
+        self.num_workers = num_workers if num_workers is not None else os.cpu_count()
         self.prefetch_factor = prefetch_factor
         
         # Create cache directory
@@ -799,6 +799,7 @@ class CustomDataset(Dataset):
         import logging
         from collections import defaultdict
         import numpy as np
+        from functools import lru_cache
         
         logger = logging.getLogger(__name__)
         
@@ -807,74 +808,99 @@ class CustomDataset(Dataset):
         total_images = len(self.image_paths)
         logger.info(f"Analyzing {total_images} images using {self.num_workers} workers")
         
-        def analyze_image(img_path):
-            try:
-                with Image.open(img_path) as img:
-                    width, height = img.size
-                    target_h, target_w = self._get_target_size(width, height)
-                    return target_h, target_w
-            except Exception as e:
-                logger.error(f"Error analyzing {img_path}: {str(e)}")
-                return None
+        # Cache target size calculations
+        @lru_cache(maxsize=1024)
+        def get_cached_target_size(width, height):
+            return self._get_target_size(width, height)
         
-        # First pass: collect all target sizes
-        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-            futures = [executor.submit(analyze_image, img_path) for img_path in self.image_paths]
-            
-            for i, future in enumerate(futures):
-                if i % 1000 == 0:
-                    logger.info(f"Analyzed {i}/{total_images} images")
+        # Process images in batches for better memory efficiency
+        batch_size = 1000
+        
+        def analyze_image_batch(img_paths):
+            results = []
+            for img_path in img_paths:
                 try:
-                    result = future.result()
-                    if result:
-                        image_sizes.append(result)
+                    with Image.open(img_path) as img:
+                        if img.mode not in ('RGB', 'RGBA'):
+                            img = img.convert('RGB')
+                        width, height = img.size
+                        target_h, target_w = get_cached_target_size(width, height)
+                        if target_h and target_w:  # Ensure valid dimensions
+                            results.append((target_h, target_w))
                 except Exception as e:
-                    logger.error(f"Error getting result: {str(e)}")
+                    logger.error(f"Error analyzing {img_path}: {str(e)}")
+            return results
         
-        # Group similar sizes to create buckets, preserving extreme aspect ratios
+        # Process images in batches
+        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+            futures = []
+            for i in range(0, total_images, batch_size):
+                batch = self.image_paths[i:i + batch_size]
+                futures.append(executor.submit(analyze_image_batch, batch))
+            
+            # Collect results
+            for i, future in enumerate(futures):
+                try:
+                    batch_results = future.result()
+                    image_sizes.extend(batch_results)
+                    processed = min((i + 1) * batch_size, total_images)
+                    if processed % 1000 == 0:
+                        logger.info(f"Analyzed {processed}/{total_images} images")
+                except Exception as e:
+                    logger.error(f"Error in batch {i}: {str(e)}")
+        
+        if not image_sizes:
+            raise RuntimeError("No valid images found in dataset")
+        
+        # Use numpy for faster calculations
+        sizes_array = np.array(image_sizes)
+        aspect_ratios = sizes_array[:, 0] / sizes_array[:, 1]  # height/width ratios
+        
+        # Determine AR ranges for adaptive step sizes
+        ar_percentiles = np.percentile(aspect_ratios, [5, 95])
+        
+        # Group similar sizes to create buckets, using numpy for efficiency
         size_groups = defaultdict(list)
         
-        for h, w in image_sizes:
-            # Calculate aspect ratio for grouping
+        # Vectorized operations for bucket assignment
+        for h, w in sizes_array:
             ar = h / w
             
-            # Use different step sizes based on aspect ratio
-            if ar > 2 or ar < 0.5:  # Extreme aspect ratios
-                h_step = max(32, self.bucket_reso_steps)  # Larger steps for extreme ARs
-                w_step = max(32, self.bucket_reso_steps)
-            else:  # Normal aspect ratios
+            # Adaptive step sizes based on aspect ratio distribution
+            if ar < ar_percentiles[0] or ar > ar_percentiles[1]:
+                # Extreme aspect ratios get larger steps
+                h_step = max(64, self.bucket_reso_steps * 2)
+                w_step = max(64, self.bucket_reso_steps * 2)
+            else:
+                # Normal aspect ratios use standard steps
                 h_step = self.bucket_reso_steps
                 w_step = self.bucket_reso_steps
             
             # Round to nearest step while preserving aspect ratio
-            if h > w:  # Portrait
-                bucket_w = round(w / w_step) * w_step
-                bucket_h = round(h / h_step) * h_step
-            else:  # Landscape
-                bucket_h = round(h / h_step) * h_step
-                bucket_w = round(w / w_step) * w_step
-            
-            # Ensure minimum size
-            bucket_h = max(self.min_bucket_reso, bucket_h)
-            bucket_w = max(self.min_bucket_reso, bucket_w)
+            if h > w:
+                bucket_w = max(self.min_bucket_reso, round(w / w_step) * w_step)
+                bucket_h = max(self.min_bucket_reso, round(h / h_step) * h_step)
+            else:
+                bucket_h = max(self.min_bucket_reso, round(h / h_step) * h_step)
+                bucket_w = max(self.min_bucket_reso, round(w / w_step) * w_step)
             
             size_groups[(bucket_h, bucket_w)].append((h, w))
+        
+        # Filter out buckets with too few images to avoid memory fragmentation
+        min_images_per_bucket = max(5, total_images // 1000)  # Adaptive threshold
+        size_groups = {k: v for k, v in size_groups.items() if len(v) >= min_images_per_bucket}
         
         # Create buckets from groups
         self.buckets = sorted(size_groups.keys(), key=lambda x: x[0] * x[1])
         self.bucket_data = {bucket: [] for bucket in self.buckets}
         
+        # Log bucket statistics
         logger.info(f"Created {len(self.buckets)} dynamic buckets")
+        logger.info(f"Aspect ratio range: {ar_percentiles[0]:.2f} to {ar_percentiles[1]:.2f}")
         
-        # Log aspect ratio distribution
-        aspect_ratios = [h/w for h, w in self.buckets]
-        min_ar = min(aspect_ratios)
-        max_ar = max(aspect_ratios)
-        logger.info(f"Aspect ratio range: {min_ar:.2f} to {max_ar:.2f}")
-        
-        # Prepare bucket lookup arrays for faster matching
+        # Prepare lookup arrays for faster matching
         bucket_arrays = np.array(self.buckets)
-        bucket_ars = bucket_arrays[:, 0] / bucket_arrays[:, 1]  # height/width ratios
+        bucket_ars = bucket_arrays[:, 0] / bucket_arrays[:, 1]
         bucket_areas = bucket_arrays[:, 0] * bucket_arrays[:, 1]
         
         def process_image_batch(img_paths):
@@ -882,66 +908,72 @@ class CustomDataset(Dataset):
             for img_path in img_paths:
                 try:
                     with Image.open(img_path) as img:
+                        if img.mode not in ('RGB', 'RGBA'):
+                            img = img.convert('RGB')
                         width, height = img.size
+                        target_h, target_w = get_cached_target_size(width, height)
                         
-                        # Calculate target size first
-                        target_h, target_w = self._get_target_size(width, height)
+                        if not target_h or not target_w:
+                            continue
+                            
+                        # Vectorized bucket matching
+                        target_ar = target_h / target_w
                         target_area = target_h * target_w
                         
-                        # Find the best fitting bucket using area-based comparison
-                        best_bucket = None
-                        min_area_diff = float('inf')
+                        # Calculate scores using numpy operations
+                        ar_scores = np.abs(np.log(bucket_ars / target_ar))  # Log scale for better AR comparison
+                        area_scores = np.abs(bucket_areas - target_area) / target_area
                         
-                        for bucket_h, bucket_w in self.buckets:
-                            # Skip if bucket is too small
-                            if bucket_h < target_h or bucket_w < target_w:
-                                continue
+                        # Combined score with more weight on aspect ratio
+                        scores = ar_scores * 2 + area_scores
+                        
+                        # Find best bucket that's large enough
+                        valid_buckets = (bucket_arrays[:, 0] >= target_h) & (bucket_arrays[:, 1] >= target_w)
+                        if not np.any(valid_buckets):
+                            continue
                             
-                            # Calculate area difference
-                            area_diff = abs((bucket_h * bucket_w) - target_area)
-                            if area_diff < min_area_diff:
-                                min_area_diff = area_diff
-                                best_bucket = (bucket_h, bucket_w)
+                        scores[~valid_buckets] = np.inf
+                        best_idx = np.argmin(scores)
+                        best_bucket = self.buckets[best_idx]
                         
                         results.append((img_path, best_bucket))
                 except Exception as e:
                     logger.error(f"Error processing {img_path}: {str(e)}")
             return results
         
-        # Split images into batches for parallel processing
-        batch_size = 100  # Process 100 images per batch
-        image_batches = [self.image_paths[i:i + batch_size] 
-                        for i in range(0, len(self.image_paths), batch_size)]
-        
-        # Process batches in parallel
+        # Process final assignment in batches
+        logger.info("Assigning images to buckets...")
         with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-            futures = [executor.submit(process_image_batch, batch) 
-                      for batch in image_batches]
+            futures = []
+            for i in range(0, total_images, batch_size):
+                batch = self.image_paths[i:i + batch_size]
+                futures.append(executor.submit(process_image_batch, batch))
             
-            # Collect results and assign to buckets
+            # Process results as they come in
             for i, future in enumerate(futures):
                 try:
                     batch_results = future.result()
                     for img_path, bucket in batch_results:
                         self.bucket_data[bucket].append(img_path)
                     
-                    if i % 10 == 0:  # Log every 1000 images (10 batches * 100 images)
-                        logger.info(f"Assigned {i * batch_size}/{total_images} images to buckets")
+                    processed = min((i + 1) * batch_size, total_images)
+                    if processed % 5000 == 0:
+                        logger.info(f"Assigned {processed}/{total_images} images to buckets")
                 except Exception as e:
-                    logger.error(f"Error processing batch: {str(e)}")
+                    logger.error(f"Error in batch {i}: {str(e)}")
         
-        # Remove empty buckets
+        # Clean up empty buckets
         empty_buckets = [bucket for bucket, images in self.bucket_data.items() if not images]
         for bucket in empty_buckets:
             del self.bucket_data[bucket]
             self.buckets.remove(bucket)
         
-        # Log statistics
+        # Final statistics
         num_buckets = len(self.bucket_data)
         total_assigned = sum(len(imgs) for imgs in self.bucket_data.values())
         logger.info(f"Final bucket count: {num_buckets} with {total_assigned}/{total_images} images assigned")
         
-        # Log bucket distribution
+        # Log distribution
         bucket_sizes = {bucket: len(imgs) for bucket, imgs in self.bucket_data.items()}
         top_buckets = sorted(bucket_sizes.items(), key=lambda x: x[1], reverse=True)[:10]
         logger.info("Top 10 bucket sizes:")
