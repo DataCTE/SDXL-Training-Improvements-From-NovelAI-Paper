@@ -210,18 +210,30 @@ class CustomDataLoaderBase(ABC):
 
 # Then modify your existing classes to use these bases
 class CustomDataset(CustomDatasetBase):
-    def __init__(self, data_dir, vae=None, tokenizer=None, tokenizer_2=None, text_encoder=None, text_encoder_2=None,
-                 cache_dir="latents_cache", no_caching_latents=False, all_ar=False,
-                 num_workers=None, prefetch_factor=2,
+    def __init__(self, data_dir, vae=None, tokenizer=None, tokenizer_2=None, 
+                 text_encoder=None, text_encoder_2=None,
+                 cache_dir="latents_cache", no_caching_latents=False, 
+                 all_ar=False, num_workers=None, prefetch_factor=2,
                  resolution_type="square", enable_bucket_sampler=True,
-                 min_size=512, max_size=2048,
-                 bucket_reso_steps=64,
+                 min_size=512, max_size=2048, bucket_reso_steps=64,
                  token_dropout_rate=0.1, caption_dropout_rate=0.1,
-                 min_tag_weight=0.1, max_tag_weight=3.0, use_tag_weighting=True,
-                 finetune_vae=False, vae_learning_rate=1e-6, vae_train_freq=10,
-                 adaptive_loss_scale=False, kl_weight=0.0, perceptual_weight=0.0,
-                 **kwargs):
+                 min_tag_weight=0.1, max_tag_weight=3.0, 
+                 use_tag_weighting=True, **kwargs):
         super().__init__()
+        
+        # Initialize flags first before any processing
+        self.all_ar = all_ar
+        self.no_caching_latents = no_caching_latents
+        self.enable_bucket_sampler = enable_bucket_sampler
+        self.resolution_type = resolution_type
+        self.min_size = min_size
+        self.max_size = max_size
+        self.bucket_reso_steps = bucket_reso_steps
+        self.use_tag_weighting = use_tag_weighting
+        
+        # Set up workers
+        self.num_workers = num_workers or min(8, os.cpu_count() or 1)
+        self.prefetch_factor = prefetch_factor
         
         # Store initialization parameters for workers
         self.init_params = {
@@ -233,7 +245,7 @@ class CustomDataset(CustomDatasetBase):
             'cache_dir': cache_dir,
             'no_caching_latents': no_caching_latents,
             'all_ar': all_ar,
-            'num_workers': num_workers or min(8, os.cpu_count() or 1),
+            'num_workers': self.num_workers,
             'prefetch_factor': prefetch_factor,
             'resolution_type': resolution_type,
             'enable_bucket_sampler': enable_bucket_sampler,
@@ -244,13 +256,7 @@ class CustomDataset(CustomDatasetBase):
             'caption_dropout_rate': caption_dropout_rate,
             'min_tag_weight': min_tag_weight,
             'max_tag_weight': max_tag_weight,
-            'use_tag_weighting': use_tag_weighting,
-            'finetune_vae': finetune_vae,
-            'vae_learning_rate': vae_learning_rate,
-            'vae_train_freq': vae_train_freq,
-            'adaptive_loss_scale': adaptive_loss_scale,
-            'kl_weight': kl_weight,
-            'perceptual_weight': perceptual_weight
+            'use_tag_weighting': use_tag_weighting
         }
         
         # Basic initialization
