@@ -813,7 +813,6 @@ class CustomDataset(Dataset):
         import logging
         from collections import defaultdict
         import numpy as np
-        from functools import lru_cache
         
         logger = logging.getLogger(__name__)
         
@@ -860,16 +859,16 @@ class CustomDataset(Dataset):
             logger.info(f"Created {len(self.buckets)} unique size buckets for all_ar mode")
             
         else:
-            # Original bucket initialization code for non-all_ar mode
             # Initialize temporary storage for image sizes
             image_sizes = []
             total_images = len(self.image_paths)
             logger.info(f"Analyzing {total_images} images using {self.num_workers} workers")
 
-            # Cache target size calculations
-            @lru_cache(maxsize=1024)
-            def get_cached_target_size(width, height):
-                return self._get_target_size(width, height)
+            # Only use cache if not in no_caching mode
+            if not self.no_caching_latents:
+                get_target_size = lru_cache(maxsize=1024)(self._get_target_size)
+            else:
+                get_target_size = self._get_target_size
 
             # Process images in batches for better memory efficiency
             batch_size = 1000
@@ -881,7 +880,7 @@ class CustomDataset(Dataset):
                             if img.mode not in ('RGB', 'RGBA'):
                                 img = img.convert('RGB')
                             width, height = img.size
-                            target_h, target_w = get_cached_target_size(width, height)
+                            target_h, target_w = get_target_size(width, height)
                             if target_h and target_w:  # Ensure valid dimensions
                                 results.append((target_h, target_w))
                     except Exception as e:
