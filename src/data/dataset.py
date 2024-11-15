@@ -12,6 +12,7 @@ import random
 import re
 import cv2
 import numpy as np
+from collections import defaultdict
 from .ultimate_upscaler import UltimateUpscaler, USDUMode, USDUSFMode
 from utils.validation import validate_image_dimensions
 import os
