@@ -189,23 +189,14 @@ def setup_vae_finetuner(args, models) -> Optional[VAEFineTuner]:
 def _get_ema_config(
     decay: float = 0.9999,
     update_every: int = 10,
-    device: str = 'auto',
-    min_value: float = 0.0
+    device: str = 'auto'
 ) -> Dict[str, Any]:
     """Get basic EMA configuration."""
     return {
         'decay': decay,
         'update_every': update_every,
-        'device': device,
-        'min_value': min_value
+        'device': device
     }
-
-def _validate_ema_params(decay: float, min_value: float) -> None:
-    """Validate EMA parameters."""
-    if not 0.0 <= decay <= 1.0:
-        raise ValueError(f"EMA decay must be between 0 and 1, got {decay}")
-    if not 0.0 <= min_value <= 1.0:
-        raise ValueError(f"EMA min_value must be between 0 and 1, got {min_value}")
 
 def setup_ema(args, model, device=None):
     """Setup EMA model with proper error handling"""
@@ -217,16 +208,15 @@ def setup_ema(args, model, device=None):
             device = torch.device(device)
             
         decay = getattr(args, 'ema_decay', 0.9999)
-        min_value = getattr(args, 'ema_min_value', 0.0)
         
-        # Validate parameters
-        _validate_ema_params(decay, min_value)
+        # Basic validation
+        if not 0.0 <= decay <= 1.0:
+            raise ValueError(f"EMA decay must be between 0 and 1, got {decay}")
         
         ema_config = _get_ema_config(
             decay=decay,
             update_every=getattr(args, 'ema_update_every', 10),
-            device=device,
-            min_value=min_value
+            device=device
         )
         
         if args.use_ema:
@@ -237,13 +227,6 @@ def setup_ema(args, model, device=None):
                 model,
                 **ema_config
             )
-            
-            # Configure warmup after creation if supported
-            if hasattr(ema, 'set_warmup') and getattr(args, 'ema_use_warmup', False):
-                ema.set_warmup(
-                    warmup_steps=getattr(args, 'ema_warmup_steps', 2000),
-                    update_after_step=getattr(args, 'ema_update_after_step', 0)
-                )
             
             logger.info("EMA model created successfully")
             return ema
