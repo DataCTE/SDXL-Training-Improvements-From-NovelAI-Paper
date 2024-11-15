@@ -318,13 +318,14 @@ def train(args, models, train_components, device, dtype):
         
         # Log and store training metrics
         logger.info(f"Epoch {epoch+1} - Average Loss: {avg_loss:.4f}")
-        for metric_name, meter in metrics.items():
-            if meter is not None:  # Skip None metrics
-                value = meter.avg
-                logger.info(f"Epoch {epoch+1} - {metric_name}: {value:.4f}")
-                training_history[f"train/{metric_name}"].append(value)
+        for metric_name, value in metrics.items():
+            if value is not None:  # Skip None metrics
+                # Check if value is already a float/number or an AverageMeter
+                metric_value = value.avg if hasattr(value, 'avg') else value
+                logger.info(f"Epoch {epoch+1} - {metric_name}: {metric_value:.4f}")
+                training_history[f"train/{metric_name}"].append(metric_value)
                 if args.use_wandb:
-                    wandb.log({f"train/{metric_name}": value}, step=global_step)
+                    wandb.log({f"train/{metric_name}": metric_value}, step=global_step)
         
         # Store average loss
         training_history["train/loss"].append(avg_loss)
