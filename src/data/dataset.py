@@ -809,22 +809,52 @@ class CustomDataset(Dataset):
         
         logger = logging.getLogger(__name__)
         
-        # Initialize bucket data structure
-        self.bucket_data = defaultdict(list)
+        # Initialize buckets with predefined sizes
+        buckets = []
+        
+        # Add landscape buckets with more granular steps
+        width = self.max_bucket_reso
+        while width >= self.min_bucket_reso:
+            height = self.min_bucket_reso
+            while height * width <= 1024 * 1024 and height <= self.max_bucket_reso:
+                buckets.append((height, width))
+                height += self.bucket_reso_steps
+            width -= self.bucket_reso_steps
+        
+        # Add portrait buckets
+        height = self.max_bucket_reso
+        while height >= self.min_bucket_reso:
+            width = self.min_bucket_reso
+            while height * width <= 1024 * 1024 and width <= self.max_bucket_reso:
+                if (height, width) not in buckets:
+                    buckets.append((height, width))
+                width += self.bucket_reso_steps
+            height -= self.bucket_reso_steps
+        
+        # Add square buckets at different resolutions
+        for size in range(self.min_bucket_reso, self.max_bucket_reso + 1, self.bucket_reso_steps):
+            bucket = (size, size)
+            if bucket not in buckets:
+                buckets.append(bucket)
+        
+        # Store bucket info
+        self.buckets = sorted(buckets, key=lambda x: x[0] * x[1])  # Sort by area for efficiency
+        self.bucket_data = {bucket: [] for bucket in buckets}
         
         # Calculate total number of images
         total_images = len(self.image_paths)
-        logger.info(f"Initializing buckets for {total_images} images using {self.num_workers} workers")
+        logger.info(f"Initializing {len(buckets)} buckets for {total_images} images using {self.num_workers} workers")
         
         def process_image(img_path):
             try:
-                # Get image size
                 with Image.open(img_path) as img:
                     width, height = img.size
-                
-                # Calculate bucket size
-                bucket_size = self._get_bucket_size((width, height))
-                return img_path, bucket_size
+                    target_h, target_w = self._get_target_size(width, height)
+                    
+                    # Find the best matching bucket
+                    best_bucket = min(self.buckets, 
+                                    key=lambda b: abs(b[0] - target_h) + abs(b[1] - target_w))
+                    return img_path, best_bucket
             except Exception as e:
                 logger.error(f"Error processing {img_path}: {str(e)}")
                 return None
@@ -841,11 +871,16 @@ class CustomDataset(Dataset):
                 try:
                     result = future.result()
                     if result:
-                        img_path, (bucket_w, bucket_h) = result
-                        bucket = (bucket_w, bucket_h)
+                        img_path, bucket = result
                         self.bucket_data[bucket].append(img_path)
                 except Exception as e:
                     logger.error(f"Error getting result: {str(e)}")
+        
+        # Remove empty buckets
+        empty_buckets = [bucket for bucket, images in self.bucket_data.items() if not images]
+        for bucket in empty_buckets:
+            del self.bucket_data[bucket]
+            self.buckets.remove(bucket)
         
         # Log bucket statistics
         num_buckets = len(self.bucket_data)
