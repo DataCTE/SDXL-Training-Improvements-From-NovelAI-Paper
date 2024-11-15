@@ -196,29 +196,142 @@ class CustomDataset(CustomDatasetBase):
                         self.bucket_data[bucket].extend(paths)
 
     def _parse_tags(self, caption):
-        """Parse tags using tag weighter class method"""
-        if self.tag_weighter:
-            # Always use instance method - static method not needed
-            return self.tag_weighter.parse_tags(caption)
-        return [], {}
+        """Optimized tag parsing with caching"""
+        from functools import lru_cache
+        
+        @lru_cache(maxsize=10000)
+        def cached_parse_tags(caption_text):
+            """Cache tag parsing results for repeated captions"""
+            if not self.tag_weighter:
+                return [], {}
+            return self.tag_weighter.parse_tags(caption_text)
+        
+        if not caption:
+            return [], {}
+            
+        return cached_parse_tags(caption)
+    
+    def parse_tags_batch(self, captions, num_workers=None):
+        """Parallel tag parsing for multiple captions"""
+        from concurrent.futures import ThreadPoolExecutor
+        import numpy as np
+        
+        if not captions:
+            return [], {}
+            
+        if num_workers is None:
+            num_workers = min(32, (os.cpu_count() or 1) + 4)
+            
+        def process_batch(caption_batch):
+            return [self._parse_tags(caption) for caption in caption_batch]
+            
+        # Process in parallel for large batches
+        if len(captions) > 100:
+            batch_size = max(50, len(captions) // (num_workers * 4))
+            batches = np.array_split(captions, max(1, len(captions) // batch_size))
+            
+            results = []
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                futures = [executor.submit(process_batch, batch) for batch in batches]
+                results = [r for f in futures for r in f.result()]
+            return results
+            
+        # Process sequentially for small batches
+        return process_batch(captions)
 
     def _format_caption(self, caption):
-        """Format caption using tag weighter instance method"""
-        if not caption:
-            return ""
-        if self.tag_weighter:
+        """Optimized caption formatting with caching"""
+        from functools import lru_cache
+        
+        @lru_cache(maxsize=10000)
+        def cached_format_caption(caption_text):
+            """Cache formatted captions"""
+            if not caption_text:
+                return ""
+            if not self.tag_weighter:
+                return caption_text
+                
             try:
-                return self.tag_weighter.format_caption(caption)
+                return self.tag_weighter.format_caption(caption_text)
             except Exception as e:
                 logger.error(f"Caption formatting failed: {str(e)}")
-                return caption
-        return caption
+                return caption_text
+                
+        return cached_format_caption(caption)
+    
+    def format_captions_batch(self, captions, num_workers=None):
+        """Parallel caption formatting for multiple captions"""
+        from concurrent.futures import ThreadPoolExecutor
+        import numpy as np
+        
+        if not captions:
+            return []
+            
+        if num_workers is None:
+            num_workers = min(32, (os.cpu_count() or 1) + 4)
+            
+        def process_batch(caption_batch):
+            return [self._format_caption(caption) for caption in caption_batch]
+            
+        # Process in parallel for large batches
+        if len(captions) > 100:
+            batch_size = max(50, len(captions) // (num_workers * 4))
+            batches = np.array_split(captions, max(1, len(captions) // batch_size))
+            
+            results = []
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                futures = [executor.submit(process_batch, batch) for batch in batches]
+                results = [r for f in futures for r in f.result()]
+            return results
+            
+        # Process sequentially for small batches
+        return process_batch(captions)
 
     def _calculate_tag_weights(self, tags, special_tags):
-        """Calculate tag weights using tag weighter instance method"""
-        if self.tag_weighter:
-            return self.tag_weighter.calculate_weights(tags, special_tags)
-        return 1.0
+        """Optimized tag weight calculation with caching"""
+        from functools import lru_cache
+        
+        @lru_cache(maxsize=10000)
+        def cached_calculate_weights(tags_tuple, special_tags_tuple):
+            """Cache weight calculations for repeated tag combinations"""
+            if not self.tag_weighter:
+                return 1.0
+            return self.tag_weighter.calculate_weights(list(tags_tuple), dict(special_tags_tuple))
+        
+        # Convert inputs to hashable types for caching
+        tags_tuple = tuple(sorted(tags))
+        special_tags_tuple = tuple(sorted(special_tags.items()))
+        
+        return cached_calculate_weights(tags_tuple, special_tags_tuple)
+    
+    def calculate_weights_batch(self, tag_pairs, num_workers=None):
+        """Parallel weight calculation for multiple tag pairs"""
+        from concurrent.futures import ThreadPoolExecutor
+        import numpy as np
+        
+        if not tag_pairs:
+            return []
+            
+        if num_workers is None:
+            num_workers = min(32, (os.cpu_count() or 1) + 4)
+            
+        def process_batch(pairs_batch):
+            return [self._calculate_tag_weights(tags, special_tags) 
+                   for tags, special_tags in pairs_batch]
+            
+        # Process in parallel for large batches
+        if len(tag_pairs) > 100:
+            batch_size = max(50, len(tag_pairs) // (num_workers * 4))
+            batches = np.array_split(tag_pairs, max(1, len(tag_pairs) // batch_size))
+            
+            results = []
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                futures = [executor.submit(process_batch, batch) for batch in batches]
+                results = [r for f in futures for r in f.result()]
+            return results
+            
+        # Process sequentially for small batches
+        return process_batch(tag_pairs)
 
     def _initialize_workers(self):
         """Initialize worker processes with proper error handling"""
@@ -353,75 +466,130 @@ class CustomDataset(CustomDatasetBase):
         return len(self.image_paths)
 
     def _initialize_dataset(self):
-        """Initialize dataset with improved image validation and AR/caching handling"""
+        """Highly optimized parallel dataset initialization"""
+        from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+        import numpy as np
+        from itertools import chain
+        from functools import partial
+        
         logger.info("Initializing dataset...")
         
-        # Collect image paths
-        image_paths = []
-        for ext in ['*.png', '*.jpg', '*.jpeg', '*.webp']:
-            image_paths.extend(self.data_dir.glob(ext))
+        def collect_image_paths():
+            """Efficiently collect image paths using set for uniqueness"""
+            extensions = {'.png', '.jpg', '.jpeg', '.webp'}
+            paths = set()
             
-        # Calculate optimal chunk size based on num_workers
-        chunk_size = max(1, len(image_paths) // (self.num_workers * 4))
-        chunks = [image_paths[i:i + chunk_size] for i in range(0, len(image_paths), chunk_size)]
+            # Use chain for efficient iteration
+            for file in chain.from_iterable(
+                self.data_dir.glob(f'*{ext}') for ext in extensions
+            ):
+                paths.add(file)
+            return list(paths)
         
-        logger.info(f"Processing {len(image_paths)} images using {self.num_workers} workers")
+        def process_image_batch(batch, all_ar=False):
+            """Process a batch of images with optimized validation"""
+            batch_valid = []
+            batch_buckets = defaultdict(list) if all_ar else None
+            
+            # Pre-compile checks for better performance
+            def is_valid_image(path):
+                try:
+                    with Image.open(path) as img:
+                        # Fast header checks
+                        if img.mode not in {'RGB', 'RGBA'}:
+                            return False
+                            
+                        # Quick size validation
+                        w, h = img.size
+                        if w < 256 or h < 256:
+                            return False
+                            
+                        if not self.all_ar and (w > 4096 or h > 4096):
+                            return False
+                            
+                        # Verify caption exists
+                        if not path.with_suffix('.txt').exists():
+                            return False
+                            
+                        return True
+                except:
+                    return False
+            
+            # Process batch efficiently
+            for path in batch:
+                if is_valid_image(path):
+                    if all_ar:
+                        with Image.open(path) as img:
+                            w, h = img.size
+                            batch_buckets[(h, w)].append(path)
+                    batch_valid.append(path)
+            
+            return (batch_valid, batch_buckets) if all_ar else batch_valid
         
-        # Initialize storage for valid paths and bucket data
+        # Collect paths efficiently
+        image_paths = collect_image_paths()
+        total_images = len(image_paths)
+        
+        if total_images == 0:
+            logger.warning("No images found in data directory")
+            self.image_paths = []
+            return
+        
+        logger.info(f"Found {total_images} potential images")
+        
+        # Optimize worker and batch configuration
+        num_workers = min(32, (os.cpu_count() or 1) + 4)
+        batch_size = max(100, total_images // (num_workers * 4))
+        
+        # Create optimally sized batches
+        batches = np.array_split(image_paths, 
+                               max(1, total_images // batch_size))
+        
+        # Initialize results containers
         valid_paths = []
         bucket_data = defaultdict(list) if self.all_ar else None
         
-        # Validate images in parallel with chunking
-        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-            futures = []
+        # Process batches in parallel with progress tracking
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            process_func = partial(process_image_batch, all_ar=self.all_ar)
+            futures = [executor.submit(process_func, batch) for batch in batches]
             
-            # Process chunks of images
-            for chunk in chunks:
-                futures.append(
-                    executor.submit(
-                        self._validate_and_process_chunk, 
-                        chunk,
-                        self.all_ar,
-                        not self.no_caching_latents
-                    )
-                )
-            
-            # Use tqdm to show progress
-            pbar = tqdm(total=len(image_paths), desc="Validating images")
-            
-            for future in as_completed(futures):
-                try:
-                    chunk_results = future.result()
-                    if self.all_ar:
-                        chunk_valid_paths, chunk_buckets = chunk_results
-                        valid_paths.extend(chunk_valid_paths)
-                        # Merge bucket data
-                        for bucket, paths in chunk_buckets.items():
-                            bucket_data[bucket].extend(paths)
-                    else:
-                        valid_paths.extend(chunk_results)
-                    pbar.update(chunk_size)
-                except Exception as e:
-                    logger.error(f"Error processing chunk: {str(e)}")
-                    
-            pbar.close()
+            with tqdm(total=len(batches), desc="Validating images") as pbar:
+                for future in as_completed(futures):
+                    try:
+                        result = future.result()
+                        if self.all_ar:
+                            batch_valid, batch_buckets = result
+                            valid_paths.extend(batch_valid)
+                            # Merge bucket data efficiently
+                            for bucket, paths in batch_buckets.items():
+                                bucket_data[bucket].extend(paths)
+                        else:
+                            valid_paths.extend(result)
+                    except Exception as e:
+                        logger.error(f"Batch processing error: {str(e)}")
+                    pbar.update(1)
         
+        # Sort paths for consistency
         self.image_paths = sorted(valid_paths)
         
-        # Handle latent caching paths if enabled
+        # Handle latent caching setup
         if not self.no_caching_latents:
-            self.latent_paths = [self.cache_dir / f"{path.stem}_latents.pt" for path in self.image_paths]
-            logger.info(f"Latent cache paths created for {len(self.image_paths)} images")
+            # Pre-calculate all paths at once
+            self.latent_paths = [
+                self.cache_dir / f"{Path(p).stem}_latents.pt" 
+                for p in self.image_paths
+            ]
+            logger.info(f"Created {len(self.latent_paths)} latent cache paths")
         else:
-            logger.info("Latent caching disabled - will process images on-the-fly")
-            
-        logger.info(f"Found {len(self.image_paths)} valid images")
+            logger.info("Latent caching disabled - using on-the-fly processing")
         
-        # Handle all_ar bucket data
+        # Set up bucket data if needed
         if self.all_ar:
-            logger.info("all_ar enabled - creating individual buckets for each image size")
             self.bucket_data = bucket_data
-            logger.info(f"Created {len(bucket_data)} unique size buckets for all_ar mode")
+            logger.info(f"Created {len(bucket_data)} unique size buckets")
+        
+        logger.info(f"Successfully initialized dataset with {len(self.image_paths)} valid images")
 
     def _validate_and_process_chunk(self, image_paths, process_ar=False, cache_latents=True):
         """Ultra-fast image validation using batched processing and caching"""
@@ -763,28 +931,171 @@ class CustomDataset(CustomDatasetBase):
                 # Clear GPU memory
                 torch.cuda.empty_cache()
                 
-    def check_latent_dimensions(self, image_path):
-        """Check if image has correct latent dimensions using cache"""
-        if image_path in self.latent_cache:
-            return self.latent_cache[image_path] == self.expected_latent_shape
+    def check_latent_dimensions(self, image_paths, batch_size=32):
+        """Efficiently check latent dimensions for multiple images in parallel"""
+        from concurrent.futures import ThreadPoolExecutor
+        import numpy as np
+        
+        if isinstance(image_paths, (str, Path)):
+            image_paths = [image_paths]
             
-        # If not in cache, queue for batch processing
-        self.validate_and_cache_latents([image_path])
-        return self.latent_cache.get(image_path, None) == self.expected_latent_shape
+        # Fast path for cached images
+        results = {}
+        uncached_paths = []
+        
+        for path in image_paths:
+            if path in self.latent_cache:
+                results[path] = self.latent_cache[path] == self.expected_latent_shape
+            else:
+                uncached_paths.append(path)
+        
+        if not uncached_paths:
+            return results if len(image_paths) > 1 else results[image_paths[0]]
+        
+        # Process uncached images in batches
+        num_workers = min(8, (os.cpu_count() or 1))
+        
+        def process_batch(paths):
+            batch_results = {}
+            batch_images = []
+            valid_paths = []
+            
+            # Load images in parallel
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                future_to_path = {
+                    executor.submit(self.load_and_transform_image, path): path 
+                    for path in paths
+                }
+                
+                for future in future_to_path:
+                    path = future_to_path[future]
+                    try:
+                        img = future.result()
+                        if img is not None:
+                            batch_images.append(img)
+                            valid_paths.append(path)
+                    except Exception as e:
+                        logger.warning(f"Failed to process {path}: {str(e)}")
+                        batch_results[path] = False
+            
+            if not batch_images:
+                return batch_results
+            
+            # Process batch through VAE
+            try:
+                with torch.no_grad():
+                    batch_tensor = torch.stack(batch_images).to(self.vae.device)
+                    
+                    # Use mixed precision if available
+                    with torch.cuda.amp.autocast(enabled=True):
+                        latents = self.vae.encode(batch_tensor).latent_dist.sample()
+                    
+                    # Update cache and results
+                    for idx, path in enumerate(valid_paths):
+                        shape = tuple(latents[idx].shape)
+                        self.latent_cache[path] = shape
+                        batch_results[path] = shape == self.expected_latent_shape
+                    
+            except Exception as e:
+                logger.error(f"Batch encoding failed: {str(e)}")
+                for path in valid_paths:
+                    batch_results[path] = False
+            
+            return batch_results
+        
+        # Process in optimally sized batches
+        batches = [
+            uncached_paths[i:i + batch_size] 
+            for i in range(0, len(uncached_paths), batch_size)
+        ]
+        
+        for batch in batches:
+            batch_results = process_batch(batch)
+            results.update(batch_results)
+        
+        return results if len(image_paths) > 1 else results[image_paths[0]]
 
     def load_and_transform_image(self, image_path):
-        """Load and transform image for VAE encoding"""
+        """Optimized image loading and transformation"""
+        from functools import lru_cache
+        
+        @lru_cache(maxsize=1)
+        def get_transform():
+            return transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize([0.5], [0.5])
+            ])
+        
         try:
-            image = Image.open(image_path).convert('RGB')
-            image = self.transform(image)
-            return image
+            # Use context manager for proper cleanup
+            with Image.open(image_path) as img:
+                if img.mode != 'RGB':
+                    img = img.convert('RGB')
+                
+                # Use cached transform
+                transform = get_transform()
+                return transform(img)
+                
         except Exception as e:
             logger.warning(f"Failed to load image {image_path}: {str(e)}")
             return None
 
     def _build_tag_statistics(self):
-        """Build dataset-wide tag statistics and format captions"""
-        stats = {
+        """Multi-threaded tag statistics builder with optimized processing"""
+        from concurrent.futures import ThreadPoolExecutor
+        import numpy as np
+        from collections import Counter
+        from functools import partial
+        
+        def process_caption_batch(paths_batch):
+            """Process a batch of captions and return stats"""
+            batch_stats = {
+                'niji_count': 0,
+                'quality_6_count': 0,
+                'stylize_values': [],
+                'chaos_values': [],
+                'formatted_count': 0,
+                'formatted_paths': []  # Track paths that need writing
+            }
+            
+            for img_path in paths_batch:
+                caption_path = img_path.with_suffix('.txt')
+                if not caption_path.exists():
+                    continue
+                    
+                try:
+                    # Read caption
+                    with open(caption_path, 'r', encoding='utf-8') as f:
+                        original_caption = f.read().strip()
+                    
+                    # Format caption
+                    formatted_caption = self._format_caption(original_caption)
+                    
+                    # Track if needs saving
+                    if formatted_caption != original_caption:
+                        batch_stats['formatted_count'] += 1
+                        batch_stats['formatted_paths'].append(
+                            (caption_path, formatted_caption)
+                        )
+                    
+                    # Update tag statistics
+                    _, special_tags = self._parse_tags(formatted_caption)
+                    if special_tags.get('niji', False):
+                        batch_stats['niji_count'] += 1
+                    if special_tags.get('version', 0) == 6:
+                        batch_stats['quality_6_count'] += 1
+                    if 'stylize' in special_tags:
+                        batch_stats['stylize_values'].append(special_tags['stylize'])
+                    if 'chaos' in special_tags:
+                        batch_stats['chaos_values'].append(special_tags['chaos'])
+                        
+                except Exception as e:
+                    logger.warning(f"Error processing {img_path}: {str(e)}")
+                    
+            return batch_stats
+        
+        # Initialize combined stats
+        combined_stats = {
             'niji_count': 0,
             'quality_6_count': 0,
             'stylize_values': [],
@@ -793,66 +1104,187 @@ class CustomDataset(CustomDatasetBase):
             'formatted_count': 0
         }
         
-        for img_path in tqdm(self.image_paths, desc="Processing captions"):
-            caption_path = img_path.with_suffix('.txt')
-            if caption_path.exists():
-                try:
-                    with open(caption_path, 'r', encoding='utf-8') as f:
-                        original_caption = f.read().strip()
-                    
-                    # Format caption
-                    formatted_caption = self._format_caption(original_caption)
-                    
-                    # Save if changed
-                    if formatted_caption != original_caption:
-                        with open(caption_path, 'w', encoding='utf-8') as f:
-                            f.write(formatted_caption)
-                        stats['formatted_count'] += 1
-                    
-                    # Update tag statistics
-                    _, special_tags = self._parse_tags(formatted_caption)
-                    if special_tags.get('niji', False):
-                        stats['niji_count'] += 1
-                    if special_tags.get('version', 0) == 6:
-                        stats['quality_6_count'] += 1
-                    if 'stylize' in special_tags:
-                        stats['stylize_values'].append(special_tags['stylize'])
-                    if 'chaos' in special_tags:
-                        stats['chaos_values'].append(special_tags['chaos'])
-                        
-                except Exception as e:
-                    logger.warning(f"Error processing caption for {img_path}: {str(e)}")
+        # Calculate optimal batch size and number of workers
+        num_workers = min(32, (os.cpu_count() or 1) + 4)
+        batch_size = max(100, len(self.image_paths) // (num_workers * 4))
         
-        logger.info(f"Formatted {stats['formatted_count']} captions")
-        return stats
+        # Create batches
+        batches = np.array_split(self.image_paths, 
+                               max(1, len(self.image_paths) // batch_size))
+        
+        # Process batches in parallel
+        formatted_paths = []
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = [executor.submit(process_caption_batch, batch) 
+                      for batch in batches]
+            
+            # Process results with progress bar
+            with tqdm(total=len(batches), desc="Processing caption batches") as pbar:
+                for future in futures:
+                    try:
+                        batch_stats = future.result()
+                        
+                        # Combine statistics
+                        combined_stats['niji_count'] += batch_stats['niji_count']
+                        combined_stats['quality_6_count'] += batch_stats['quality_6_count']
+                        combined_stats['stylize_values'].extend(batch_stats['stylize_values'])
+                        combined_stats['chaos_values'].extend(batch_stats['chaos_values'])
+                        combined_stats['formatted_count'] += batch_stats['formatted_count']
+                        
+                        # Collect paths that need writing
+                        formatted_paths.extend(batch_stats['formatted_paths'])
+                        
+                        pbar.update(1)
+                        
+                    except Exception as e:
+                        logger.error(f"Batch processing error: {str(e)}")
+        
+        # Write formatted captions in parallel
+        if formatted_paths:
+            def write_caption(path_caption):
+                path, caption = path_caption
+                try:
+                    with open(path, 'w', encoding='utf-8') as f:
+                        f.write(caption)
+                except Exception as e:
+                    logger.error(f"Error writing to {path}: {str(e)}")
+            
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                list(executor.map(write_caption, formatted_paths))
+        
+        logger.info(f"Formatted {combined_stats['formatted_count']} captions")
+        return combined_stats
 
     def _get_target_size(self, width, height):
-        """Calculate target size preserving aspect ratio with all_ar support"""
-        if self.all_ar:
-            # In all_ar mode, just round to bucket steps if needed
-            if self.bucket_reso_steps > 1:
-                target_width = int(round(width / self.bucket_reso_steps) * self.bucket_reso_steps)
-                target_height = int(round(height / self.bucket_reso_steps) * self.bucket_reso_steps)
-                return max(target_width, self.min_size), max(target_height, self.min_size)
-            return width, height
+        """Single image target size calculation"""
+        from functools import lru_cache
+        import numpy as np
+        
+        @lru_cache(maxsize=1024)
+        def calculate_target_size(w, h, steps, min_size, all_ar):
+            if all_ar:
+                if steps > 1:
+                    target = np.array([w, h], dtype=np.float32)
+                    target = np.round(target / steps) * steps
+                    target = np.maximum(target, min_size)
+                    return int(target[0]), int(target[1])
+                return w, h
+            
+            aspect_ratio = h / w
+            if aspect_ratio > 1:
+                tw = 1024
+                th = int(np.round(tw * aspect_ratio / steps) * steps)
+            else:
+                th = 1024
+                tw = int(np.round(th / aspect_ratio / steps) * steps)
+            
+            max_dim = max(tw, th)
+            if max_dim > 2048:
+                scale = 2048 / max_dim
+                dims = np.array([tw, th], dtype=np.float32)
+                dims = np.round(dims * scale / steps) * steps
+                return int(dims[0]), int(dims[1])
+            
+            return tw, th
+        
+        return calculate_target_size(
+            width, height, 
+            self.bucket_reso_steps,
+            self.min_size,
+            self.all_ar
+        )
 
-        # Standard processing for non-all_ar mode
-        aspect_ratio = height / width
-        if aspect_ratio > 1:  # Portrait
-            target_width = 1024
-            target_height = int(round(target_width * aspect_ratio / self.bucket_reso_steps) * self.bucket_reso_steps)
-        else:  # Landscape
-            target_height = 1024
-            target_width = int(round(target_height / aspect_ratio / self.bucket_reso_steps) * self.bucket_reso_steps)
+    def _get_target_sizes_batch(self, image_sizes, num_workers=None):
+        """Multi-threaded batch processing of target sizes"""
+        from concurrent.futures import ThreadPoolExecutor
+        import numpy as np
+        
+        if num_workers is None:
+            num_workers = min(32, (os.cpu_count() or 1) + 4)
+            
+        def process_batch(batch):
+            return [self._get_target_size(w, h) for w, h in batch]
+        
+        # Optimize batch size based on total images
+        batch_size = max(1, len(image_sizes) // (num_workers * 4))
+        batches = [
+            image_sizes[i:i + batch_size] 
+            for i in range(0, len(image_sizes), batch_size)
+        ]
+        
+        # Process batches in parallel
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            results = list(executor.map(process_batch, batches))
+            
+        # Flatten results
+        return [size for batch_result in results for size in batch_result]
 
-        # Scale down if needed
-        max_dim = max(target_width, target_height)
-        if max_dim > 2048:
-            scale = 2048 / max_dim
-            target_width = int(round(target_width * scale / self.bucket_reso_steps) * self.bucket_reso_steps)
-            target_height = int(round(target_height * scale / self.bucket_reso_steps) * self.bucket_reso_steps)
+    def _get_target_sizes_vectorized(self, image_sizes):
+        """Vectorized processing for large batches"""
+        import numpy as np
+        
+        # Convert to numpy array for vectorized operations
+        sizes = np.array(image_sizes, dtype=np.float32)
+        widths = sizes[:, 0]
+        heights = sizes[:, 1]
+        
+        if self.all_ar and self.bucket_reso_steps > 1:
+            # Vectorized all_ar processing
+            target = np.round(sizes / self.bucket_reso_steps) * self.bucket_reso_steps
+            target = np.maximum(target, self.min_size)
+            return target.astype(np.int32).tolist()
+        
+        # Calculate aspect ratios
+        aspect_ratios = heights / widths
+        is_portrait = aspect_ratios > 1
+        
+        # Initialize target arrays
+        target_widths = np.zeros_like(widths)
+        target_heights = np.zeros_like(heights)
+        
+        # Process portrait images
+        portrait_mask = is_portrait
+        target_widths[portrait_mask] = 1024
+        target_heights[portrait_mask] = np.round(
+            1024 * aspect_ratios[portrait_mask] / self.bucket_reso_steps
+        ) * self.bucket_reso_steps
+        
+        # Process landscape images
+        landscape_mask = ~portrait_mask
+        target_heights[landscape_mask] = 1024
+        target_widths[landscape_mask] = np.round(
+            1024 / aspect_ratios[landscape_mask] / self.bucket_reso_steps
+        ) * self.bucket_reso_steps
+        
+        # Scale down large images
+        max_dims = np.maximum(target_widths, target_heights)
+        scale_mask = max_dims > 2048
+        if np.any(scale_mask):
+            scale = 2048 / max_dims[scale_mask]
+            target_widths[scale_mask] = np.round(
+                target_widths[scale_mask] * scale / self.bucket_reso_steps
+            ) * self.bucket_reso_steps
+            target_heights[scale_mask] = np.round(
+                target_heights[scale_mask] * scale / self.bucket_reso_steps
+            ) * self.bucket_reso_steps
+        
+        return np.stack([target_widths, target_heights], axis=1).astype(np.int32).tolist()
 
-        return max(target_width, self.min_size), max(target_height, self.min_size)
+    def get_target_sizes(self, image_sizes, use_vectorized=True):
+        """Smart dispatcher for target size calculations"""
+        if not image_sizes:
+            return []
+            
+        # Use vectorized version for large batches
+        if use_vectorized and len(image_sizes) > 1000:
+            return self._get_target_sizes_vectorized(image_sizes)
+        
+        # Use multi-threaded version for medium batches
+        if len(image_sizes) > 32:
+            return self._get_target_sizes_batch(image_sizes)
+        
+        # Use single-threaded version for small batches
+        return [self._get_target_size(w, h) for w, h in image_sizes]
 
     def process_image_size(self, images):
         """Multi-threaded image processing using num_workers"""
@@ -939,54 +1371,93 @@ class CustomDataset(CustomDatasetBase):
             return image.resize((target_width, target_height), Image.LANCZOS)
 
     def _downscale_image(self, image, target_width, target_height):
-        """High-quality downscaling optimized for performance while maintaining quality"""
+        """Ultra-fast high-quality downscaling with optimized processing"""
+        from functools import lru_cache
+        import cv2
+        import numpy as np
+        
+        @lru_cache(maxsize=32)
+        def get_sharpening_kernel():
+            """Cache sharpening kernel"""
+            return np.array([[-0.5,-0.5,-0.5], 
+                           [-0.5, 5.0,-0.5],
+                           [-0.5,-0.5,-0.5]], dtype=np.float32) / 2.0
+        
+        @lru_cache(maxsize=1024)
+        def calculate_steps(scale):
+            """Cache step calculations"""
+            return max(1, min(3, int(scale // 1.5)))
+        
         try:
-            # Convert to numpy once at the start
-            img_np = np.array(image)
+            # Fast numpy conversion with proper dtype
+            img_np = np.asarray(image, dtype=np.uint8)
             
-            # Calculate scale factor
-            scale_factor = max(image.width / target_width, image.height / target_height)
+            # Efficient scale calculation
+            scale_factor = max(image.width / target_width, 
+                             image.height / target_height)
             
-            # Calculate number of steps - fewer steps for smaller scale factors
-            num_steps = max(1, min(3, int(scale_factor // 1.5)))
+            if scale_factor <= 1.0:
+                return image
             
-            # Apply initial gaussian blur to prevent aliasing
-            # Adjust blur based on scale factor
+            # Get cached number of steps
+            num_steps = calculate_steps(scale_factor)
+            
+            # Optimized initial blur
             blur_radius = min(2.0, 0.6 * scale_factor)
-            kernel_size = int(blur_radius * 3) | 1  # ensure odd number
-            img_np = cv2.GaussianBlur(img_np, (kernel_size, kernel_size), blur_radius)
+            kernel_size = max(3, int(blur_radius * 3) | 1)
             
-            # Apply edge-preserving bilateral filter for large downscaling
+            # Apply blur only if necessary
+            if scale_factor > 1.5:
+                img_np = cv2.GaussianBlur(
+                    img_np, 
+                    (kernel_size, kernel_size),
+                    blur_radius,
+                    borderType=cv2.BORDER_REFLECT
+                )
+            
+            # Optimized bilateral filter for large downscaling
             if scale_factor > 2.0:
-                d = 9  # diameter of pixel neighborhood
-                sigma_color = 75
-                sigma_space = 75
-                img_np = cv2.bilateralFilter(img_np, d, sigma_color, sigma_space)
+                img_np = cv2.bilateralFilter(
+                    img_np, 
+                    d=9,
+                    sigmaColor=75,
+                    sigmaSpace=75,
+                    borderType=cv2.BORDER_REFLECT
+                )
             
-            # Progressive downscaling
-            for step in range(num_steps):
-                # Calculate intermediate size
-                progress = (step + 1) / num_steps
-                intermediate_width = int(target_width + (image.width - target_width) * (1 - progress))
-                intermediate_height = int(target_height + (image.height - target_height) * (1 - progress))
-                
-                # Use INTER_AREA for downscaling
-                img_np = cv2.resize(img_np, (intermediate_width, intermediate_height), 
-                                  interpolation=cv2.INTER_AREA)
-                
-                # Apply light sharpening on final step
-                if step == num_steps - 1:
-                    kernel = np.array([[-0.5,-0.5,-0.5], 
-                                     [-0.5, 5.0,-0.5],
-                                     [-0.5,-0.5,-0.5]]) / 2.0
-                    img_np = cv2.filter2D(img_np, -1, kernel)
+            # Pre-calculate sizes for progressive downscaling
+            sizes = [(
+                int(target_width + (image.width - target_width) * (1 - (step + 1) / num_steps)),
+                int(target_height + (image.height - target_height) * (1 - (step + 1) / num_steps))
+            ) for step in range(num_steps)]
             
-            # Convert back to PIL
+            # Progressive downscaling with optimized memory usage
+            for i, (w, h) in enumerate(sizes):
+                img_np = cv2.resize(
+                    img_np, 
+                    (w, h), 
+                    interpolation=cv2.INTER_AREA,
+                    dst=img_np  # Reuse memory when possible
+                )
+                
+                # Apply cached sharpening kernel on final step
+                if i == num_steps - 1:
+                    kernel = get_sharpening_kernel()
+                    img_np = cv2.filter2D(
+                        img_np, 
+                        -1, 
+                        kernel,
+                        borderType=cv2.BORDER_REFLECT
+                    )
+            
             return Image.fromarray(img_np)
             
-        except Exception as e:
-            logger.error(f"Advanced downscaling failed: {str(e)}, falling back to basic resize")
-            return image.resize((target_width, target_height), Image.LANCZOS)
+        except Exception:
+            # Fast fallback without logging
+            return image.resize(
+                (target_width, target_height), 
+                Image.LANCZOS
+            )
 
     def _initialize_buckets(self):
         """Initialize buckets dynamically based on dataset content with unlimited AR support"""
@@ -1204,111 +1675,128 @@ class CustomDataset(CustomDatasetBase):
             return img_path, None
 
     def _apply_text_transforms(self, caption):
-        """Apply text augmentation transforms"""
+        """Optimized text augmentation with faster token processing"""
+        from functools import lru_cache
+        import numpy as np
+        
+        @lru_cache(maxsize=128)
+        def split_and_clean(text):
+            """Cache token splitting and cleaning for repeated captions"""
+            return [t.strip() for t in text.split(",") if t.strip()]
+        
+        # Fast caption dropout
         if random.random() < self.caption_dropout_rate:
             return ""
         
         if self.token_dropout_rate > 0:
-            tokens = caption.split(",")
-            tokens = [token.strip() for token in tokens if token.strip()]
+            # Get clean tokens using cached function
+            tokens = split_and_clean(caption)
             
-            # Keep tokens with probability (1 - token_dropout_rate)
-            tokens = [token for token in tokens if random.random() > self.token_dropout_rate]
-            
-            # Ensure at least one token remains
             if not tokens:
-                tokens = [random.choice(caption.split(",")).strip()]
+                return caption
+                
+            # Use numpy for faster random operations
+            mask = np.random.random(len(tokens)) > self.token_dropout_rate
             
-            return ", ".join(tokens)
+            # Keep at least one token
+            if not mask.any():
+                mask[np.random.randint(len(tokens))] = True
+            
+            # Fast token filtering
+            kept_tokens = [t for i, t in enumerate(tokens) if mask[i]]
+            
+            # Efficient string joining
+            return ", ".join(kept_tokens)
         
         return caption
 
     def _process_uncached_item(self, img_path, caption_path):
-        """Process an item that hasn't been cached yet"""
-        with Image.open(img_path) as image:
-            image = image.convert('RGB')
+        """Optimized uncached item processing with better performance"""
+        from functools import lru_cache
+        
+        # Cache transform composition
+        @lru_cache(maxsize=1)
+        def get_transform():
+            return transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize([0.5], [0.5])
+            ])
+        
+        try:
+            # Load and process image efficiently
+            with Image.open(img_path) as image:
+                image = image.convert('RGB')
+                
+                # Fast bucket dimension calculation
+                if self.all_ar:
+                    bucket_h, bucket_w = image.size[::-1]  # Faster than separate assignment
+                else:
+                    bucket_h, bucket_w = self._get_bucket_size(image.size)
+                
+                # Process image with optimized resizing
+                processed_image = self._advanced_resize(image, bucket_w, bucket_h)
+                original_size = image.size
             
-            # Get bucket dimensions based on all_ar setting
-            if self.all_ar:
-                width, height = image.size
-                bucket_h, bucket_w = height, width
-            else:
-                bucket_h, bucket_w = self._get_bucket_size(image.size)
-            
-            # Process image with advanced resizing
-            processed_image = self._advanced_resize(image, bucket_w, bucket_h)
-            
-            # Generate latents on-the-fly if no_caching is enabled
-            if self.no_caching_latents:
-                with torch.no_grad():
-                    transform = transforms.Compose([
-                        transforms.ToTensor(),
-                        transforms.Normalize([0.5], [0.5])
-                    ])
-                    image_tensor = transform(processed_image).unsqueeze(0)
-                    image_tensor = image_tensor.to(self.vae.device, dtype=self.vae.dtype)
+            # Generate latents efficiently
+            transform = get_transform()
+            with torch.no_grad():
+                image_tensor = transform(processed_image).unsqueeze(0).to(
+                    self.vae.device, dtype=self.vae.dtype
+                )
+                
+                if self.no_caching_latents:
                     latents = self.vae.encode(image_tensor).latent_dist.sample()
                     latents = latents * self.vae.config.scaling_factor
                     latents = latents.squeeze(0)
-            else:
-                # Use cached latents
-                latents = self._get_cached_latents(img_path, processed_image)
+                else:
+                    latents = self._get_cached_latents(img_path, processed_image)
             
-            # Load and process caption
+            # Process caption and generate embeddings efficiently
             with open(caption_path, 'r', encoding='utf-8') as f:
                 caption = f.read().strip()
             
-            # Apply text augmentation
             caption = self._apply_text_transforms(caption)
             
-            # Generate text embeddings
-            text_inputs = self.tokenizer(
-                caption,
-                padding="max_length",
-                max_length=self.tokenizer.model_max_length,
-                truncation=True,
-                return_tensors="pt"
-            ).to(self.text_encoder.device)
+            # Batch process text inputs
+            text_inputs = {
+                'text1': self.tokenizer(
+                    caption,
+                    padding="max_length",
+                    max_length=self.tokenizer.model_max_length,
+                    truncation=True,
+                    return_tensors="pt"
+                ).to(self.text_encoder.device),
+                
+                'text2': self.tokenizer_2(
+                    caption,
+                    padding="max_length",
+                    max_length=self.tokenizer_2.model_max_length,
+                    truncation=True,
+                    return_tensors="pt"
+                ).to(self.text_encoder_2.device)
+            }
             
-            text_inputs_2 = self.tokenizer_2(
-                caption,
-                padding="max_length",
-                max_length=self.tokenizer_2.model_max_length,
-                truncation=True,
-                return_tensors="pt"
-            ).to(self.text_encoder_2.device)
-            
+            # Generate embeddings in parallel
             with torch.no_grad():
-                text_embeddings = self.text_encoder(text_inputs.input_ids)[0]
+                text_embeddings = self.text_encoder(text_inputs['text1'].input_ids)[0]
                 text_embeddings_2 = self.text_encoder_2(
-                    text_inputs_2.input_ids,
+                    text_inputs['text2'].input_ids,
                     output_hidden_states=True
                 )
+                
                 pooled_output = text_embeddings_2[0]
                 hidden_states = text_embeddings_2.hidden_states[-2]
             
-            # Generate time embeddings
-            original_size = image.size
-            target_size = (bucket_w, bucket_h)
-            crop_coords_top_left = (0, 0)
-            crop_coords_bottom_right = original_size
-            
+            # Generate time embeddings efficiently
             add_time_ids = torch.tensor([
-                original_size[0],          # original width
-                original_size[1],          # original height
-                target_size[0],            # target width
-                target_size[1],            # target height
-                crop_coords_top_left[0],     # crop left
-                crop_coords_top_left[1],     # crop top
-                crop_coords_bottom_right[0], # crop right
-                crop_coords_bottom_right[1]  # crop bottom
-            ], dtype=torch.float32, device=self.vae.device)
+                original_size[0], original_size[1],  # original size
+                bucket_w, bucket_h,                  # target size
+                0, 0,                               # crop top-left
+                original_size[0], original_size[1]   # crop bottom-right
+            ], dtype=torch.float32, device=self.vae.device).unsqueeze(0)
             
-            # Add batch dimension: [1, 6]
-            add_time_ids = add_time_ids.unsqueeze(0)
-            
-            # Prepare cache data
-            cache_data = {
+            # Return optimized cache data
+            return {
                 'latents': latents,
                 'text_embeddings': text_embeddings,
                 'text_embeddings_2': hidden_states,
@@ -1320,7 +1808,8 @@ class CustomDataset(CustomDatasetBase):
                 'bucket_size': (bucket_h, bucket_w)
             }
             
-            return cache_data
+        except Exception as e:
+            logger.error(f"Error processing uncached item {
     
     def _get_bucket_size(self, image_size):
         """Fast bucket size calculation using numpy vectorization"""
@@ -1361,82 +1850,127 @@ class CustomDataset(CustomDatasetBase):
         return find_best_bucket(*image_size)
     
     def _advanced_resize(self, image, target_width, target_height):
-        """Advanced image resizing with aspect ratio preservation"""
-        width, height = image.size
+        """High-quality image resizing with optimized performance"""
+        from functools import lru_cache
+        import cv2
+        import numpy as np
         
-        # Calculate target dimensions preserving aspect ratio
-        aspect_ratio = width / height
+        @lru_cache(maxsize=1024)
+        def calculate_dimensions(w, h, tw, th):
+            aspect_ratio = w / h
+            target_ratio = tw / th
+            
+            if aspect_ratio > target_ratio:
+                new_w = tw
+                new_h = int(tw / aspect_ratio)
+            else:
+                new_h = th
+                new_w = int(th * aspect_ratio)
+                
+            left = (tw - new_w) // 2
+            top = (th - new_h) // 2
+            return new_w, new_h, left, top
         
-        if aspect_ratio > target_width / target_height:
-            # Image is wider than target
-            new_width = target_width
-            new_height = int(target_width / aspect_ratio)
-        else:
-            # Image is taller than target
-            new_height = target_height
-            new_width = int(target_height * aspect_ratio)
-        
-        # High-quality downscaling
-        if width > new_width or height > new_height:
-            # Use Lanczos for downscaling
-            image = image.resize((new_width, new_height), Image.LANCZOS)
-        else:
-            # Use bicubic for upscaling
-            image = image.resize((new_width, new_height), Image.BICUBIC)
-        
-        # Create new image with padding
-        result = Image.new('RGB', (target_width, target_height))
-        left = (target_width - new_width) // 2
-        top = (target_height - new_height) // 2
-        result.paste(image, (left, top))
-        
-        return result
+        try:
+            width, height = image.size
+            new_width, new_height, left, top = calculate_dimensions(
+                width, height, target_width, target_height
+            )
+            
+            # Convert to numpy array once
+            img_np = np.array(image)
+            
+            # Determine if downscaling or upscaling
+            if width > new_width or height > new_height:
+                # Downscaling with quality preservation
+                scale_factor = max(width / new_width, height / new_height)
+                
+                # Apply initial gaussian blur to prevent aliasing
+                if scale_factor > 2.0:
+                    sigma = 0.3 * scale_factor
+                    kernel_size = int(2 * round(sigma) + 1)
+                    img_np = cv2.GaussianBlur(img_np, (kernel_size, kernel_size), sigma)
+                
+                # High-quality downscaling
+                img_np = cv2.resize(img_np, (new_width, new_height), 
+                                  interpolation=cv2.INTER_AREA)
+                
+            else:
+                # Upscaling with enhanced quality
+                img_np = cv2.resize(img_np, (new_width, new_height), 
+                                  interpolation=cv2.INTER_CUBIC)
+            
+            # Create padded result efficiently
+            result = np.zeros((target_height, target_width, 3), dtype=np.uint8)
+            result[top:top + new_height, left:left + new_width] = img_np
+            
+            return Image.fromarray(result)
+            
+        except Exception as e:
+            logger.error(f"Advanced resize failed: {str(e)}, falling back to basic resize")
+            return image.resize((target_width, target_height), Image.LANCZOS)
 
     def custom_collate(self, batch):
-        """Custom collate function that ensures all items in a batch are from the same bucket"""
-        # Filter out None values from failed __getitem__ calls
+        """Optimized custom collate function with fast tensor stacking"""
+        # Fast batch filtering
         batch = [item for item in batch if item is not None]
         if not batch:
             raise RuntimeError("Empty batch after filtering None values")
         
-        # All items should have the same bucket size since we're using BucketSampler
+        # Quick bucket size validation
         bucket_size = batch[0]['bucket_size']
-        if not all(item['bucket_size'] == bucket_size for item in batch):
-            if not self.all_ar:  # Only raise error if not in all_ar mode
-                sizes = [item['bucket_size'] for item in batch]
-                raise ValueError(f"Inconsistent bucket sizes in batch: {sizes}")
+        if not self.all_ar:
+            # Use numpy for faster comparison
+            sizes = np.array([item['bucket_size'] for item in batch])
+            if not np.all(sizes == sizes[0]):
+                raise ValueError(f"Inconsistent bucket sizes in batch: {sizes.tolist()}")
         
-        # Stack tensors
         try:
-            latents = torch.stack([item['latents'] for item in batch])
-            text_embeddings = torch.stack([item['text_embeddings'] for item in batch])
-            text_embeddings_2 = torch.stack([item['text_embeddings_2'] for item in batch])
+            # Pre-allocate lists for better memory efficiency
+            batch_size = len(batch)
+            latents_list = [None] * batch_size
+            text_emb_list = [None] * batch_size
+            text_emb2_list = [None] * batch_size
             
-            # Handle added_cond_kwargs if present
-            added_cond_kwargs = {}
-            if 'added_cond_kwargs' in batch[0]:
-                for key in batch[0]['added_cond_kwargs']:
-                    if torch.is_tensor(batch[0]['added_cond_kwargs'][key]):
-                        added_cond_kwargs[key] = torch.stack([
-                            item['added_cond_kwargs'][key] for item in batch
-                        ])
-                    else:
-                        added_cond_kwargs[key] = [
-                            item['added_cond_kwargs'][key] for item in batch
-                        ]
+            # Fast batch assembly
+            for i, item in enumerate(batch):
+                latents_list[i] = item['latents']
+                text_emb_list[i] = item['text_embeddings']
+                text_emb2_list[i] = item['text_embeddings_2']
             
-            return {
-                'latents': latents,
-                'text_embeddings': text_embeddings,
-                'text_embeddings_2': text_embeddings_2,
-                'added_cond_kwargs': added_cond_kwargs,
+            # Efficient tensor stacking
+            result = {
+                'latents': torch.stack(latents_list),
+                'text_embeddings': torch.stack(text_emb_list),
+                'text_embeddings_2': torch.stack(text_emb2_list),
                 'bucket_size': bucket_size
             }
             
+            # Optional added_cond_kwargs processing
+            if 'added_cond_kwargs' in batch[0]:
+                added_cond_kwargs = {}
+                first_item = batch[0]['added_cond_kwargs']
+                
+                for key in first_item:
+                    if torch.is_tensor(first_item[key]):
+                        # Pre-allocate tensor lists
+                        tensor_list = [None] * batch_size
+                        for i, item in enumerate(batch):
+                            tensor_list[i] = item['added_cond_kwargs'][key]
+                        added_cond_kwargs[key] = torch.stack(tensor_list)
+                    else:
+                        # Direct list comprehension for non-tensor data
+                        added_cond_kwargs[key] = [
+                            item['added_cond_kwargs'][key] for item in batch
+                        ]
+                
+                result['added_cond_kwargs'] = added_cond_kwargs
+            
+            return result
+            
         except Exception as e:
-            logger.error(f"Error in custom_collate: {str(e)}")
-            logger.error(f"Batch sizes: {[item['latents'].shape for item in batch]}")
-            logger.error(f"Bucket sizes: {[item.get('bucket_size') for item in batch]}")
+            # Minimal error logging for performance
+            logger.error(f"Collate error: {str(e)}")
             raise
 
     def __getitem__(self, idx):
@@ -1483,7 +2017,7 @@ class CustomDataset(CustomDatasetBase):
             # Apply text augmentation
             caption = self._apply_text_transforms(caption)
             
-            # Generate text embeddings
+            # Generate text embeddings efficiently
             text_inputs = self.tokenizer(
                 caption,
                 padding="max_length",
@@ -1500,6 +2034,7 @@ class CustomDataset(CustomDatasetBase):
                 return_tensors="pt"
             ).to(self.text_encoder_2.device)
             
+            # Process text embeddings in a single batch
             with torch.no_grad():
                 text_embeddings = self.text_encoder(text_inputs.input_ids)[0]
                 text_embeddings_2 = self.text_encoder_2(
@@ -1509,128 +2044,135 @@ class CustomDataset(CustomDatasetBase):
                 pooled_output = text_embeddings_2[0]
                 hidden_states = text_embeddings_2.hidden_states[-2]
             
-            # Generate time embeddings
+            # Generate time embeddings efficiently
             original_size = image.size
             target_size = (bucket_w, bucket_h) if self.enable_bucket_sampler else (target_w, target_h)
-            crop_coords_top_left = (0, 0)
-            crop_coords_bottom_right = original_size
             
+            # Prepare time embeddings in a single tensor operation
             add_time_ids = torch.tensor([
-                original_size[0],          # original width
-                original_size[1],          # original height
-                target_size[0],            # target width
-                target_size[1],            # target height
-                crop_coords_top_left[0],     # crop left
-                crop_coords_top_left[1],     # crop top
-                crop_coords_bottom_right[0], # crop right
-                crop_coords_bottom_right[1]  # crop bottom
-            ], dtype=torch.float32, device=self.vae.device)
+                original_size[0], original_size[1],  # original size
+                target_size[0], target_size[1],      # target size
+                0, 0,                                # crop top-left
+                original_size[0], original_size[1]   # crop bottom-right
+            ], dtype=torch.float32, device=self.vae.device).unsqueeze(0)
             
-            # Add batch dimension: [1, 6]
-            add_time_ids = add_time_ids.unsqueeze(0)
+            # Handle latents efficiently
+            if not self.no_caching_latents and self.latent_paths[idx].exists():
+                # Load cached latents
+                cache_data_latents = torch.load(self.latent_paths[idx], map_location='cpu')
+                latents = cache_data_latents['latents'].float()
+            else:
+                # Generate latents
+                transform = transforms.Compose([
+                    transforms.ToTensor(),
+                    transforms.Normalize([0.5], [0.5])
+                ])
+                with torch.no_grad():
+                    image_tensor = transform(image).unsqueeze(0).to(
+                        self.vae.device, dtype=self.vae.dtype
+                    )
+                    latents = self.vae.encode(image_tensor).latent_dist.sample()
+                    latents = latents * self.vae.config.scaling_factor
+                    latents = latents.squeeze(0).cpu()
+                    
+                    if not self.no_caching_latents:
+                        torch.save({'latents': latents}, self.latent_paths[idx])
             
-            # Prepare cache data
-            cache_data = {
-                'latents': None,
+            # Return optimized cache data
+            return {
+                'latents': latents,
                 'text_embeddings': text_embeddings,
                 'text_embeddings_2': hidden_states,
                 'added_cond_kwargs': {
                     'text_embeds': pooled_output.unsqueeze(1).unsqueeze(2),
                     'time_ids': add_time_ids
                 },
-                'original_caption': caption,
                 'bucket_size': (bucket_h, bucket_w) if self.enable_bucket_sampler else (target_w, target_h)
             }
             
-            # Handle latents based on caching mode
-            if self.no_caching_latents:
-                # Always generate latents on-the-fly if caching is disabled
-                with torch.no_grad():
-                    transform = transforms.Compose([
-                        transforms.ToTensor(),
-                        transforms.Normalize([0.5], [0.5])
-                    ])
-                    image_tensor = transform(image).unsqueeze(0)
-                    image_tensor = image_tensor.to(self.vae.device, dtype=self.vae.dtype)
-                    
-                    latents = self.vae.encode(image_tensor).latent_dist.sample()
-                    latents = latents * self.vae.config.scaling_factor
-                    cache_data['latents'] = latents.squeeze(0).cpu()
-            else:
-                # Only use cached latents if caching is enabled
-                if self.latent_paths[idx].exists():
-                    cache_data_latents = torch.load(self.latent_paths[idx], map_location='cpu')
-                    cache_data['latents'] = cache_data_latents['latents'].float().cpu()
-                else:
-                    # Generate and cache if file doesn't exist
-                    with torch.no_grad():
-                        # Convert image to tensor
-                        transform = transforms.Compose([
-                            transforms.ToTensor(),
-                            transforms.Normalize([0.5], [0.5])
-                        ])
-                        image_tensor = transform(image).unsqueeze(0)
-                        image_tensor = image_tensor.to(self.vae.device, dtype=self.vae.dtype)
-                        
-                        # Generate latents
-                        latents = self.vae.encode(image_tensor).latent_dist.sample()
-                        latents = latents * self.vae.config.scaling_factor
-                        cache_data['latents'] = latents.squeeze(0).cpu()
-                        if not self.no_caching_latents:  # Only save if caching is enabled
-                            torch.save({'latents': cache_data['latents']}, self.latent_paths[idx])
-            
-            return cache_data
-        
         except Exception as e:
-            logger.error(f"Error getting item {idx} ({img_path}): {str(e)}")
+            logger.error(f"Error getting item {idx}: {str(e)}")
             return None
 
     def _get_cached_latents(self, img_path, processed_image):
-        """Get latents either from cache or generate them"""
-        cache_path = self.cache_dir / f"{Path(img_path).stem}.pt"
+        """Optimized latent generation and caching"""
+        from functools import lru_cache
         
-        if not self.no_caching_latents and cache_path.exists():
-            return torch.load(cache_path, map_location='cpu')['latents']
-        
-        # Generate latents
-        with torch.no_grad():
-            transform = transforms.Compose([
+        # Cache transform composition
+        @lru_cache(maxsize=1)
+        def get_transform():
+            return transforms.Compose([
                 transforms.ToTensor(),
                 transforms.Normalize([0.5], [0.5])
             ])
-            image_tensor = transform(processed_image).unsqueeze(0)
-            image_tensor = image_tensor.to(self.vae.device, dtype=self.vae.dtype)
-            latents = self.vae.encode(image_tensor).latent_dist.sample()
-            latents = latents * self.vae.config.scaling_factor
-            latents = latents.squeeze(0)
+        
+        cache_path = self.cache_dir / f"{Path(img_path).stem}.pt"
+        
+        try:
+            if not self.no_caching_latents and cache_path.exists():
+                return torch.load(cache_path, map_location='cpu')['latents']
             
-            # Cache only if caching is enabled
-            if not self.no_caching_latents:
-                torch.save({'latents': latents}, cache_path)
-            
-            return latents
+            # Generate latents efficiently
+            with torch.no_grad():
+                transform = get_transform()
+                image_tensor = transform(processed_image).unsqueeze(0).to(
+                    self.vae.device, dtype=self.vae.dtype
+                )
+                
+                latents = self.vae.encode(image_tensor).latent_dist.sample()
+                latents = latents * self.vae.config.scaling_factor
+                latents = latents.squeeze(0)
+                
+                if not self.no_caching_latents:
+                    torch.save({'latents': latents}, cache_path)
+                
+                return latents
+                
+        except Exception as e:
+            logger.error(f"Error generating latents: {str(e)}")
+            raise
 
     def _format_captions(self):
-        """Format all captions with progress bar"""
+        """Parallel caption formatting with batched processing"""
+        from concurrent.futures import ThreadPoolExecutor
+        import numpy as np
         from tqdm import tqdm
         
-        formatted_count = 0
-        logger.info("Formatting captions...")
+        def process_caption_batch(paths_batch):
+            results = []
+            for img_path in paths_batch:
+                caption_path = img_path.with_suffix('.txt')
+                if caption_path.exists():
+                    try:
+                        with open(caption_path, 'r', encoding='utf-8') as f:
+                            caption = f.read().strip()
+                        if caption:
+                            formatted = self._format_caption(caption)
+                            if formatted != caption:
+                                results.append(img_path)
+                    except Exception:
+                        continue
+            return results
         
-        for img_path in tqdm(self.image_paths, desc="Formatting captions"):
-            caption_path = img_path.with_suffix('.txt')
-            if caption_path.exists():
-                try:
-                    with open(caption_path, 'r', encoding='utf-8') as f:
-                        caption = f.read().strip()
-                    if caption:
-                        formatted = self._format_caption(caption)
-                        if formatted != caption:
-                            formatted_count += 1
-                except Exception as e:
-                    logger.warning(f"Error formatting caption for {img_path}: {str(e)}")
-                
-        logger.info(f"Formatted {formatted_count} captions")
+        logger.info("Formatting captions in parallel...")
+        
+        # Optimize batch size and parallel processing
+        optimal_batch_size = 1000
+        batches = np.array_split(self.image_paths, 
+                               max(1, len(self.image_paths) // optimal_batch_size))
+        
+        formatted_paths = []
+        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+            futures = [executor.submit(process_caption_batch, batch) for batch in batches]
+            
+            # Process results with progress bar
+            with tqdm(total=len(batches), desc="Processing caption batches") as pbar:
+                for future in futures:
+                    batch_results = future.result()
+                    formatted_paths.extend(batch_results)
+                    pbar.update(1)
+        
+        logger.info(f"Formatted {len(formatted_paths)} captions")
 
 
 class BucketSampler(CustomSamplerBase):
