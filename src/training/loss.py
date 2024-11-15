@@ -425,18 +425,19 @@ def compute_loss_weights(
     scale_method: str,
     rescale_multiplier: float,
     rescale_cfg: bool
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute SNR weights and CFG scaling"""
     # MinSNR weighting
     snr_weight = (snr / min_snr_gamma).clamp(max=1.0)
     
     # CFG rescaling
-    cfg_scale = None
     if rescale_cfg:
         if scale_method == "karras":
             cfg_scale = rescale_multiplier * torch.sqrt(1 + snr)
         else:  # simple
             cfg_scale = rescale_multiplier * (1 + snr)
+    else:
+        cfg_scale = torch.ones_like(snr)  # Default to 1.0 when rescaling is disabled
     
     return snr_weight, cfg_scale
 
