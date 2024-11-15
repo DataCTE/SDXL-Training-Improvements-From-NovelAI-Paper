@@ -8,125 +8,110 @@ from torch.cuda.amp import autocast, GradScaler
 from collections import deque
 import numpy as np
 from transformers import get_cosine_schedule_with_warmup
+from dataclasses import dataclass, field
+from threading import Lock
+from typing import Optional, Dict, Any
 
 logger = logging.getLogger(__name__)
 
+@dataclass
+class VAELossMeter:
+    """Thread-safe loss meter for VAE training."""
+    window_size: int = 100
+    _losses: list = field(default_factory=list)
+    _lock: Lock = field(default_factory=Lock)
+    
+    def update(self, loss: float) -> None:
+        with self._lock:
+            self._losses.append(loss)
+            if len(self._losses) > self.window_size:
+                self._losses.pop(0)
+    
+    @property
+    def mean(self) -> float:
+        with self._lock:
+            return np.mean(self._losses) if self._losses else 0.0
+    
+    @property
+    def std(self) -> float:
+        with self._lock:
+            return np.std(self._losses) if len(self._losses) > 1 else 0.0
+
 class VAEFineTuner:
-    def __init__(
-        self,
-        vae,
-        learning_rate=1e-6,
-        min_snr_gamma=5.0,
-        use_cache=True,
-        cache_size=1000,
-        use_amp=True,
-        use_gradient_checkpointing=True,
-        adaptive_loss_scale=True,
-        kl_weight=0.0,
-        perceptual_weight=0.0,
-        use_8bit_adam=True,
-        gradient_checkpointing=True,
-        mixed_precision="bf16",
-        use_channel_scaling=True,  # Enable per-channel scale-and-shift
-        adam_beta1=0.9,
-        adam_beta2=0.999,
-        adam_weight_decay=0.01,
-        adam_epsilon=1e-8,
-        max_grad_norm=1.0,
-        warmup_steps=1000,
-        scale_factor=1.0,
-        device=None
-    ):
-        """
-        Initialize VAE finetuner with NovelAI improvements.
-        
-        Args:
-            vae: VAE model to finetune
-            learning_rate: Base learning rate
-            min_snr_gamma: Minimum SNR gamma for loss weighting
-            adaptive_loss_scale: Whether to use adaptive loss scaling
-            kl_weight: Weight for KL divergence loss
-            perceptual_weight: Weight for perceptual loss
-            use_8bit_adam: Whether to use 8-bit Adam
-            gradient_checkpointing: Whether to use gradient checkpointing
-            mixed_precision: Mixed precision type ("no", "fp16", "bf16")
-            use_channel_scaling: Whether to use per-channel scale-and-shift normalization
-            adam_beta1: Beta1 parameter for Adam optimizer
-            adam_beta2: Beta2 parameter for Adam optimizer
-            adam_weight_decay: Weight decay for Adam optimizer
-            adam_epsilon: Epsilon parameter for Adam optimizer
-            max_grad_norm: Maximum gradient norm for clipping
-            warmup_steps: Number of warmup steps for learning rate
-            scale_factor: Initial scale factor for loss scaling
-            device: Device to place model on
-        """
+    def __init__(self, vae, **kwargs):
+        """Initialize VAE finetuner with improved configuration."""
         try:
-            self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            self.vae = vae.to(self.device)
-            self.min_snr_gamma = min_snr_gamma
-            self.adaptive_loss_scale = adaptive_loss_scale
-            self.kl_weight = kl_weight
-            self.perceptual_weight = perceptual_weight
-            self.mixed_precision = mixed_precision
-            self.use_channel_scaling = use_channel_scaling
-            self.max_grad_norm = max_grad_norm
-            self.scale_factor = scale_factor
-            self.use_cache = use_cache
-            self.cache = deque(maxlen=cache_size) if use_cache else None
-            self.use_amp = use_amp
-            
-            # Initialize optimizer with configurable parameters
-            optim_cls = AdamW8bit if use_8bit_adam else torch.optim.AdamW
-            self.optimizer = optim_cls(
-                vae.parameters(),
-                lr=learning_rate,
-                betas=(adam_beta1, adam_beta2),
-                weight_decay=adam_weight_decay,
-                eps=adam_epsilon
-            )
-            
-            # Initialize learning rate scheduler
-            self.lr_scheduler = get_cosine_schedule_with_warmup(
-                self.optimizer,
-                num_warmup_steps=warmup_steps,
-                num_training_steps=10000  # Approximate, will be adjusted during training
-            )
-            
-            # Initialize mixed precision training
-            self.scaler = GradScaler() if use_amp else None
-            
-            # Convert model precision based on both mixed_precision and use_amp settings
-            if use_amp and mixed_precision == "fp16":
-                self.vae = self.vae.to(dtype=torch.float16)
-            elif mixed_precision == "bf16":
-                self.vae = self.vae.to(dtype=torch.bfloat16)
-            
-            # Move channel statistics to device and dtype
-            self.register_vae_statistics()
-            
-            # Enable memory optimizations
-            if hasattr(self.vae, 'enable_xformers_memory_efficient_attention'):
-                self.vae.enable_xformers_memory_efficient_attention()
-            if gradient_checkpointing and hasattr(self.vae, 'enable_gradient_checkpointing'):
-                self.vae.enable_gradient_checkpointing()
-            
-            # Initialize statistics tracking
-            self.latent_count = 0
-            self.latent_means = None
-            self.latent_m2 = None
-            self.loss_history = deque(maxlen=100)
-            
-            # Initialize perceptual loss if needed
-            if self.perceptual_weight > 0:
-                self._initialize_perceptual_loss()
+            # Move core initialization to separate methods
+            self._init_base_config(kwargs)
+            self._init_model(vae)
+            self._init_optimizer(kwargs)
+            self._init_tracking()
+            self._init_additional_components(kwargs)
             
             logger.info("VAEFineTuner initialized successfully")
             self._log_config()
             
         except Exception as e:
             logger.error(f"VAEFineTuner initialization failed: {str(e)}")
-            logger.error(f"Initialization traceback: {traceback.format_exc()}")
+            logger.error(traceback.format_exc())
             raise
+
+    def _init_base_config(self, config: Dict[str, Any]) -> None:
+        """Initialize base configuration parameters."""
+        self.device = config.get('device') or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.min_snr_gamma = config.get('min_snr_gamma', 5.0)
+        self.adaptive_loss_scale = config.get('adaptive_loss_scale', True)
+        self.use_channel_scaling = config.get('use_channel_scaling', True)
+        self.mixed_precision = config.get('mixed_precision', 'bf16')
+        self.use_amp = config.get('use_amp', True)
+        self.max_grad_norm = config.get('max_grad_norm', 1.0)
+        
+        # Initialize loss weights
+        self.kl_weight = config.get('kl_weight', 0.0)
+        self.perceptual_weight = config.get('perceptual_weight', 0.0)
+        self.scale_factor = config.get('scale_factor', 1.0)
+
+    def _init_model(self, vae: torch.nn.Module) -> None:
+        """Initialize and configure VAE model."""
+        self.vae = vae.to(self.device)
+        
+        # Configure model precision
+        if self.use_amp and self.mixed_precision == "fp16":
+            self.vae = self.vae.to(dtype=torch.float16)
+        elif self.mixed_precision == "bf16":
+            self.vae = self.vae.to(dtype=torch.bfloat16)
+            
+        # Enable optimizations
+        if hasattr(self.vae, 'enable_xformers_memory_efficient_attention'):
+            self.vae.enable_xformers_memory_efficient_attention()
+        if config.get('gradient_checkpointing') and hasattr(self.vae, 'enable_gradient_checkpointing'):
+            self.vae.enable_gradient_checkpointing()
+
+    def _init_optimizer(self, config: Dict[str, Any]) -> None:
+        """Initialize optimizer and related components."""
+        optim_cls = AdamW8bit if config.get('use_8bit_adam', True) else torch.optim.AdamW
+        self.optimizer = optim_cls(
+            self.vae.parameters(),
+            lr=config.get('learning_rate', 1e-6),
+            betas=(config.get('adam_beta1', 0.9), config.get('adam_beta2', 0.999)),
+            weight_decay=config.get('adam_weight_decay', 0.01),
+            eps=config.get('adam_epsilon', 1e-8)
+        )
+        
+        self.lr_scheduler = get_cosine_schedule_with_warmup(
+            self.optimizer,
+            num_warmup_steps=config.get('warmup_steps', 1000),
+            num_training_steps=10000
+        )
+        
+        self.scaler = GradScaler() if self.use_amp else None
+
+    def _init_tracking(self) -> None:
+        """Initialize tracking metrics."""
+        self.loss_meter = VAELossMeter(window_size=100)
+        self.latent_count = 0
+        self.latent_means = None
+        self.latent_m2 = None
 
     def _log_config(self):
         """Log the current configuration"""
@@ -239,12 +224,12 @@ class VAEFineTuner:
         if not self.adaptive_loss_scale:
             return
         try:
-            self.loss_history.append(loss.item())
-            if len(self.loss_history) < 50:
+            self.loss_meter.update(loss.item())
+            if len(self.loss_meter._losses) < 50:
                 return
                 
-            loss_std = np.std(self.loss_history)
-            loss_mean = np.mean(self.loss_history)
+            loss_std = self.loss_meter.std
+            loss_mean = self.loss_meter.mean
             
             # Update scale factor based on loss statistics
             target_loss = 1.0
@@ -331,7 +316,7 @@ class VAEFineTuner:
                 self.lr_scheduler.step()
                 
                 # Update loss history
-                self.loss_history.append(loss.item())
+                self.loss_meter.update(loss.item())
                 
                 # Cache the result if enabled
                 if self.use_cache:
@@ -353,7 +338,7 @@ class VAEFineTuner:
         state = {
             'optimizer': self.optimizer.state_dict(),
             'scale_factor': self.scale_factor,
-            'loss_history': list(self.loss_history)
+            'loss_history': list(self.loss_meter._losses)
         }
         torch.save(state, os.path.join(save_dir, 'finetuning_state.pt'))
     
@@ -367,7 +352,7 @@ class VAEFineTuner:
             state = torch.load(state_path)
             self.optimizer.load_state_dict(state['optimizer'])
             self.scale_factor = state['scale_factor']
-            self.loss_history = deque(state['loss_history'], maxlen=self.loss_history.maxlen)
+            self.loss_meter._losses = deque(state['loss_history'], maxlen=self.loss_meter.window_size)
 
     def _get_cache_key(self, latents: torch.Tensor) -> str:
         """Generate a cache key for the input latents"""

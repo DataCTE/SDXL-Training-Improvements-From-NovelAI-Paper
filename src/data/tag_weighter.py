@@ -1,104 +1,229 @@
 import torch
 import logging
 import traceback
-from typing import Dict, Set, Optional, List, Tuple
+from typing import Dict, Set, Optional, List, Tuple, Any, FrozenSet
+from dataclasses import dataclass, field
 from functools import lru_cache
 from collections import defaultdict
-import numpy as np
-import re
 import math
 from concurrent.futures import ThreadPoolExecutor
 import os
+from threading import Lock
 
 logger = logging.getLogger(__name__)
 
-def _default_zero():
-    """Default function to return 0 for defaultdict"""
-    return 0
+@dataclass
+class TagStats:
+    """Thread-safe container for tag statistics."""
+    frequencies: Dict[str, Dict[str, int]] = field(default_factory=lambda: defaultdict(lambda: defaultdict(int)))
+    class_counts: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    cooccurrence: Dict[str, Dict[str, int]] = field(default_factory=lambda: defaultdict(lambda: defaultdict(int)))
+    _lock: Lock = field(default_factory=Lock)
+
+    def update(self, class_name: str, tag: str) -> None:
+        """Thread-safe update of tag frequencies."""
+        with self._lock:
+            self.frequencies[class_name][tag] += 1
+            self.class_counts[class_name] += 1
+
+    def update_cooccurrence(self, tag1: str, tag2: str) -> None:
+        """Thread-safe update of tag co-occurrence."""
+        with self._lock:
+            self.cooccurrence[tag1][tag2] += 1
+            self.cooccurrence[tag2][tag1] += 1
+
+@dataclass
+class TagCache:
+    """Cache container for tag computations."""
+    rarity_scores: Dict[str, float] = field(default_factory=dict)
+    importance_scores: Dict[str, float] = field(default_factory=dict)
+    _lock: Lock = field(default_factory=Lock)
+
+    def update_rarity(self, tag: str, score: float) -> None:
+        with self._lock:
+            self.rarity_scores[tag] = score
+
+    def get_rarity(self, tag: str, default: float = 1.0) -> float:
+        with self._lock:
+            return self.rarity_scores.get(tag, default)
 
 class TagBasedLossWeighter:
-    min_weight = 0.1
-    max_weight = 3.0
+    """Improved tag-based loss weighting system with thread safety and optimized performance."""
     
-    @staticmethod
-    def parse_tags(caption: str) -> Tuple[List[str], Dict[str, any]]:
+    def __init__(
+        self,
+        tag_classes: Optional[Dict[str, Set[str]]] = None,
+        config: Optional[Dict[str, Any]] = None
+    ):
         """
-        Static method to parse caption into tags and special tags with improved Midjourney compatibility.
+        Initialize the tag-based loss weighting system with improved configuration.
         
         Args:
-            caption (str): Raw caption text
-            
-        Returns:
-            Tuple[List[str], Dict]: Regular tags and special tag parameters
+            tag_classes: Dictionary mapping tag class names to sets of tags
+            config: Configuration dictionary for weighter parameters
         """
-        if not caption:
-            return [], {}
+        try:
+            self._init_config(config or {})
+            self._init_tag_classes(tag_classes)
+            self._init_statistics()
+            self._init_executor()
             
-        tags = []
-        special_tags = {}
+            logger.info("TagBasedLossWeighter initialized successfully")
+            self._log_config()
+            
+        except Exception as e:
+            logger.error(f"TagBasedLossWeighter initialization failed: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
+
+    def _init_config(self, config: Dict[str, Any]) -> None:
+        """Initialize configuration parameters."""
+        self.min_weight = config.get('min_weight', 0.1)
+        self.max_weight = config.get('max_weight', 3.0)
+        self.emphasis_factor = config.get('emphasis_factor', 1.1)
+        self.rarity_factor = config.get('rarity_factor', 0.9)
+        self.quality_bonus = config.get('quality_bonus', 0.2)
+        self.character_emphasis = config.get('character_emphasis', 1.2)
+        self.cache_size = config.get('cache_size', 1024)
+        self.no_cache = config.get('no_cache', False)
+
+    def _init_tag_classes(self, tag_classes: Optional[Dict[str, Set[str]]]) -> None:
+        """Initialize tag classification system."""
+        self.tag_classes = tag_classes or {
+            'character': set(),
+            'style': set(),
+            'setting': set(),
+            'action': set(),
+            'object': set(),
+            'quality': set(),
+            'emphasis': set(),
+            'meta': set()
+        }
         
-        # Split and process tags
-        raw_tags = [t.strip() for t in caption.split(',')]
+        # Initialize class weights
+        self.class_base_weights = {
+            'character': 1.2,
+            'style': 1.1,
+            'setting': 0.9,
+            'action': 1.0,
+            'object': 0.8,
+            'quality': 1.3,
+            'emphasis': 1.4,
+            'meta': 0.7
+        }
         
-        # Check for MJ-specific tags
-        has_mj_tags = any('niji' in t.lower() or t.strip() in ['4', '5', '6'] for t in raw_tags)
+        # Create tag to class mapping
+        self.tag_to_class = {
+            tag: class_name 
+            for class_name, tags in self.tag_classes.items() 
+            for tag in tags
+        }
+
+    def _init_statistics(self) -> None:
+        """Initialize statistical tracking components."""
+        self.stats = TagStats()
+        self.cache = TagCache()
         
-        if has_mj_tags:
-            # Handle anime style/niji at start
-            if raw_tags and ('anime style' in raw_tags[0].lower() or 'niji' in raw_tags[0].lower()):
-                special_tags['niji'] = True
-                raw_tags = raw_tags[1:]
+        # Configure caching behavior
+        if not self.no_cache:
+            self.calculate_tag_weights = lru_cache(maxsize=self.cache_size)(self._calculate_tag_weights)
+        else:
+            self.calculate_tag_weights = self._calculate_tag_weights
+
+    def _init_executor(self) -> None:
+        """Initialize thread pool executor."""
+        self.num_workers = min(8, os.cpu_count() or 1)
+        self.executor = ThreadPoolExecutor(max_workers=self.num_workers)
+
+    def _log_config(self) -> None:
+        """Log configuration settings."""
+        logger.info("TagBasedLossWeighter configuration:")
+        logger.info(f"- Min weight: {self.min_weight}")
+        logger.info(f"- Max weight: {self.max_weight}")
+        logger.info(f"- Emphasis factor: {self.emphasis_factor}")
+        logger.info(f"- Rarity factor: {self.rarity_factor}")
+        logger.info(f"- Cache size: {self.cache_size}")
+        logger.info(f"- Workers: {self.num_workers}")
+
+    @staticmethod
+    def parse_tags(caption: str) -> Tuple[List[str], Dict[str, Any]]:
+        """
+        Parse caption into tags and special tags with improved error handling.
+        """
+        try:
+            if not caption:
+                return [], {}
+
+            tags = []
+            special_tags = {}
+            
+            # Process tags in a single pass
+            raw_tags = [t.strip().lower() for t in caption.split(',')]
+            
+            # Early processing for MJ tags
+            has_mj_tags = any('niji' in t or t in ['4', '5', '6'] for t in raw_tags)
+            
+            for i, tag in enumerate(raw_tags):
+                # Skip empty tags
+                if not tag:
+                    continue
+                    
+                # Process special tag formats
+                if '::' in tag:
+                    tag, weight = TagBasedLossWeighter._process_weighted_tag(tag)
+                    if weight is not None:
+                        special_tags[f'{tag}_weight'] = weight
                 
-            # Handle version number
-            if raw_tags and raw_tags[-1].strip() in ['4', '5', '6']:
-                raw_tags = raw_tags[:-1]
-                tags.append('masterpiece')
-        
-        for tag in raw_tags:
-            tag = tag.lower().strip()
+                elif has_mj_tags:
+                    tag = TagBasedLossWeighter._process_mj_tag(tag, i, len(raw_tags), special_tags)
+                
+                # Clean and add tag
+                if tag := TagBasedLossWeighter._clean_tag(tag):
+                    tags.append(tag)
             
-            if not tag:
-                continue
+            return tags, special_tags
             
-            # Handle compound tags with weights
-            if '::' in tag:
-                parts = tag.split('::')
-                tag = parts[0].strip()
+        except Exception as e:
+            logger.error(f"Tag parsing failed: {str(e)}")
+            return [], {}
+
+    @staticmethod
+    def _process_weighted_tag(tag: str) -> Tuple[str, Optional[float]]:
+        """Process a weighted tag format (tag::weight)."""
+        parts = tag.split('::')
+        try:
+            return parts[0].strip(), float(parts[1])
+        except (IndexError, ValueError):
+            return parts[0].strip(), None
+
+    @staticmethod
+    def _process_mj_tag(tag: str, index: int, total_tags: int, special_tags: Dict[str, Any]) -> Optional[str]:
+        """Process Midjourney-specific tags."""
+        # Handle style/version tags
+        if index == 0 and ('anime style' in tag or 'niji' in tag):
+            special_tags['niji'] = True
+            return None
+        if index == total_tags - 1 and tag in ['4', '5', '6']:
+            return 'masterpiece'
+            
+        # Handle parameters
+        for param in ['stylize', 'chaos', 'sw', 'sv']:
+            if param in tag:
                 try:
-                    weight = float(parts[1])
-                    special_tags[f'{tag}_weight'] = weight
+                    value = float(re.search(r'[\d.]+', tag).group())
+                    special_tags[param] = value
+                    return None
                 except:
                     pass
-
-            # Handle style references
-            if 'sref' in tag:
-                refs = re.findall(r'[a-f0-9]{8}|https?://[^\s>]+', tag)
-                if refs:
-                    special_tags['sref'] = refs
-                    continue
-
-            # Handle MJ style parameters
-            if has_mj_tags:
-                is_param = False
-                for param in ['stylize', 'chaos', 'sw', 'sv']:
-                    if param in tag:
-                        try:
-                            value = float(re.search(r'[\d.]+', tag).group())
-                            special_tags[param] = value
-                            is_param = True
-                        except:
-                            continue
-                if is_param:
-                    continue
-
-            # Clean up tag
-            if tag.startswith(('a ', 'an ', 'the ')):
-                tag = ' '.join(tag.split()[1:])
-            
-            if tag:
-                tags.append(tag)
         
-        return tags, special_tags
+        return tag
+
+    @staticmethod
+    def _clean_tag(tag: str) -> Optional[str]:
+        """Clean and normalize a tag."""
+        if tag.startswith(('a ', 'an ', 'the ')):
+            tag = ' '.join(tag.split()[1:])
+        return tag.strip() if tag.strip() else None
 
     @staticmethod
     def calculate_static_weights(tags: List[str], special_tags: Dict[str, any] = None) -> float:
@@ -189,182 +314,6 @@ class TagBasedLossWeighter:
             logger.error(f"Caption formatting error: {str(e)}")
             return caption  # Return original if formatting fails
 
-    def __init__(
-        self,
-        tag_classes: Optional[Dict[str, Set[str]]] = None,
-        min_weight: float = 0.1,
-        max_weight: float = 3.0,
-        cache_size: int = 1024,
-        no_cache: bool = False,
-        emphasis_factor: float = 1.1,
-        rarity_factor: float = 0.9,
-        quality_bonus: float = 0.2,
-        character_emphasis: float = 1.2,
-        num_workers: Optional[int] = None
-    ):
-        """
-        Initialize the tag-based loss weighting system with NovelAI improvements.
-        
-        Args:
-            tag_classes (dict): Dictionary mapping tag class names to lists of tags
-            min_weight (float): Minimum weight multiplier for any image
-            max_weight (float): Maximum weight multiplier for any image
-            cache_size (int): Size of LRU cache for tag classification and weight calculation
-            no_cache (bool): Flag to disable caching
-            emphasis_factor (float): Multiplier for emphasized tags
-            rarity_factor (float): Multiplier for rare tags
-            quality_bonus (float): Additional weight for high-quality images
-            character_emphasis (float): Special multiplier for character tags
-            num_workers (int, optional): Number of worker threads for parallel processing
-        """
-        self.tag_classes = tag_classes or {
-            'character': set(),  # Character-specific tags
-            'style': set(),     # Artistic style tags
-            'setting': set(),   # Background and environment tags
-            'action': set(),    # Pose and action tags
-            'object': set(),    # Props and objects
-            'quality': set(),   # Image quality indicators
-            'emphasis': set(),  # Tags that should receive extra weight
-            'meta': set()       # Meta tags for special handling
-        }
-        
-        # Advanced weighting parameters
-        self.emphasis_factor = emphasis_factor
-        self.rarity_factor = rarity_factor
-        self.quality_bonus = quality_bonus
-        self.character_emphasis = character_emphasis
-        
-        # Initialize frequency tracking with defaultdict
-        self.tag_frequencies = defaultdict(lambda: defaultdict(_default_zero))
-        self.class_total_counts = defaultdict(_default_zero)
-        self.tag_cooccurrence = defaultdict(lambda: defaultdict(_default_zero))
-        
-        # Precompute mappings
-        self._initialize_mappings()
-        
-        # Caching parameters
-        self.min_weight = min_weight
-        self.max_weight = max_weight
-        self.cache_size = cache_size
-        
-        # Modify caching behavior based on no_cache flag
-        self.no_cache = no_cache
-        if no_cache:
-            # Don't use caching when no_cache is True
-            self.calculate_tag_weights = self._calculate_tag_weights
-        else:
-            # Use LRU cache when caching is enabled
-            self.calculate_tag_weights = lru_cache(maxsize=cache_size)(self._calculate_tag_weights)
-        
-        # Initialize caches
-        self._tag_rarity_scores = {}
-        self._tag_importance_scores = {}
-        
-        # Initialize worker pool
-        self.num_workers = num_workers if num_workers is not None else min(8, os.cpu_count() or 1)
-        self.executor = ThreadPoolExecutor(max_workers=self.num_workers)
-    
-    def _initialize_mappings(self):
-        """Initialize tag mappings and importance scores"""
-        self.tag_to_class = {
-            tag: class_name 
-            for class_name, tags in self.tag_classes.items() 
-            for tag in tags
-        }
-        
-        # Initialize importance scores based on tag classes
-        self.class_base_weights = {
-            'character': 1.2,    # Character tags get higher base weight
-            'style': 1.1,       # Style tags are important for consistency
-            'setting': 0.9,     # Background elements get slightly lower weight
-            'action': 1.0,      # Action tags get normal weight
-            'object': 0.8,      # Object tags get lower weight
-            'quality': 1.3,     # Quality tags get higher weight
-            'emphasis': 1.4,    # Emphasized tags get highest weight
-            'meta': 0.7         # Meta tags get lowest weight
-        }
-    
-    def update_tag_statistics(self, batch_tags: List[List[str]]):
-        """
-        Update tag statistics with a batch of tags, including co-occurrence.
-        Uses parallel processing for large batches.
-        
-        Args:
-            batch_tags (List[List[str]]): List of tag lists from a batch of images
-        """
-        def process_tag_list(tags):
-            result = {
-                'frequencies': defaultdict(lambda: defaultdict(_default_zero)),
-                'class_counts': defaultdict(_default_zero),
-                'cooccurrence': defaultdict(lambda: defaultdict(_default_zero))
-            }
-            
-            # Update individual tag frequencies
-            for tag in tags:
-                class_name = self._classify_tag(tag)
-                if class_name:
-                    result['frequencies'][class_name][tag] += 1
-                    result['class_counts'][class_name] += 1
-            
-            # Update co-occurrence matrix
-            for i, tag1 in enumerate(tags):
-                for tag2 in tags[i+1:]:
-                    result['cooccurrence'][tag1][tag2] += 1
-                    result['cooccurrence'][tag2][tag1] += 1
-                    
-            return result
-
-        # Process tags in parallel for large batches
-        if len(batch_tags) > 100:  # Only parallelize for large batches
-            futures = []
-            chunk_size = max(1, len(batch_tags) // self.num_workers)
-            
-            for i in range(0, len(batch_tags), chunk_size):
-                chunk = batch_tags[i:i + chunk_size]
-                futures.extend([self.executor.submit(process_tag_list, tags) for tags in chunk])
-            
-            # Combine results
-            for future in futures:
-                result = future.result()
-                for class_name, tags in result['frequencies'].items():
-                    for tag, count in tags.items():
-                        self.tag_frequencies[class_name][tag] += count
-                for class_name, count in result['class_counts'].items():
-                    self.class_total_counts[class_name] += count
-                for tag1, coocs in result['cooccurrence'].items():
-                    for tag2, count in coocs.items():
-                        self.tag_cooccurrence[tag1][tag2] += count
-        else:
-            # Process sequentially for small batches
-            for tags in batch_tags:
-                result = process_tag_list(tags)
-                for class_name, tags in result['frequencies'].items():
-                    for tag, count in tags.items():
-                        self.tag_frequencies[class_name][tag] += count
-                for class_name, count in result['class_counts'].items():
-                    self.class_total_counts[class_name] += count
-                for tag1, coocs in result['cooccurrence'].items():
-                    for tag2, count in coocs.items():
-                        self.tag_cooccurrence[tag1][tag2] += count
-        
-        # Recalculate rarity scores
-        self._update_rarity_scores()
-
-    def _update_rarity_scores(self):
-        """Update tag rarity scores based on frequency distribution"""
-        total_images = max(sum(self.class_total_counts.values()), 1)
-        
-        for class_name, tags in self.tag_frequencies.items():
-            for tag, freq in tags.items():
-                # Calculate normalized frequency
-                norm_freq = freq / total_images
-                
-                # Calculate rarity score with smoothing
-                rarity = 1.0 - np.sqrt(norm_freq)
-                rarity = np.clip(rarity * self.rarity_factor, 0.5, 2.0)
-                
-                self._tag_rarity_scores[tag] = rarity
-    
     def _calculate_tag_importance(self, tag: str, tags: List[str]) -> float:
         """
         Calculate importance score for a tag based on context.
@@ -392,7 +341,7 @@ class TagBasedLossWeighter:
             importance *= self.emphasis_factor
         
         # Apply rarity bonus
-        rarity_score = self._tag_rarity_scores.get(tag, 1.0)
+        rarity_score = self.cache.get_rarity(tag, 1.0)
         importance *= rarity_score
         
         # Apply quality bonus for high-quality images
@@ -491,7 +440,7 @@ class TagBasedLossWeighter:
             position_weight = 1.0 - (i * 0.05)
             
             # Apply rarity bonus
-            rarity_score = self._tag_rarity_scores.get(tag, 1.0)
+            rarity_score = self.cache.get_rarity(tag, 1.0)
             
             # Combine all factors
             final_weight = base_weight * class_weight * position_weight * rarity_score
@@ -550,11 +499,11 @@ class TagBasedLossWeighter:
     
     def reset_statistics(self):
         """Reset all statistical tracking"""
-        self.tag_frequencies.clear()
-        self.class_total_counts.clear()
-        self.tag_cooccurrence.clear()
-        self._tag_rarity_scores.clear()
-        self._tag_importance_scores.clear()
+        self.stats.frequencies.clear()
+        self.stats.class_counts.clear()
+        self.stats.cooccurrence.clear()
+        self.cache.rarity_scores.clear()
+        self.cache.importance_scores.clear()
         
         # Clear caches
         self.calculate_tag_weights.cache_clear()

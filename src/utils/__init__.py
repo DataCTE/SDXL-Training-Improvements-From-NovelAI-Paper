@@ -9,7 +9,6 @@ from .logging import (
     setup_wandb,
     cleanup_wandb
 )
-from .validation import validate_dataset
 
 __all__ = [
     'save_checkpoint',
@@ -27,5 +26,4 @@ __all__ = [
     'cleanup_wandb',
     'create_model_card',
     'save_model_card',
-    'validate_dataset'
 ]

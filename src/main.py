@@ -6,9 +6,32 @@ import wandb
 import torch
 import traceback
 from pathlib import Path
+from training.trainer import (
+    setup_optimizer,
+    setup_vae_finetuner,
+    setup_ema,
+    setup_validator,
+    setup_tag_weighter,
+    AverageMeter
+)
 
+# Optional: If you need the logging utility functions
+from training.trainer import (
+    _log_optimizer_config,
+    _log_vae_config,
+    _log_ema_config
+)
 
-from training.trainer import train
+import time
+from collections import defaultdict
+from tqdm import tqdm
+import torch.cuda
+import math
+import re
+from typing import Dict
+# Required imports for the components
+from torch.cuda.amp import autocast, GradScaler
+from transformers import Adafactor
 from utils.checkpoint import load_checkpoint, save_checkpoint, save_final_outputs
 from utils.hub import create_model_card, save_model_card, push_to_hub
 from utils.logging import (
@@ -18,7 +41,8 @@ from utils.logging import (
     setup_wandb,
     cleanup_wandb,
     log_memory_stats,
-    log_model_gradients
+    log_model_gradients,
+
 )
 from training.trainer import get_cosine_schedule_with_warmup
 from data.dataset import create_dataloader
@@ -201,34 +225,16 @@ def parse_args():
                        help='Enable mixed precision training')
     return parser.parse_args()
 
-def main(args):
-    """Main training pipeline"""
-    wandb_run = None
+def initialize_training_components(args, device, dtype, models):
+    """Initialize all training components with proper error handling"""
+    components = {}
+    
     try:
-        # Set up logging
-        setup_logging(os.path.join("logs", args.wandb_run_name) if args.wandb_run_name else "logs")
-        log_system_info()
+        # Setup optimizer
+        components["optimizer"] = setup_optimizer(args, models)
         
-        # Set up Weights & Biases
-        wandb_run = setup_wandb(args)
-        
-        # Set device and dtype
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        dtype = torch.float16 if args.mixed_precision else torch.float32
-        
-        # Load model and initialize components
-        models, optimizer_state, training_history = load_checkpoint(args)
-        
-        # Move models to device and setup gradient checkpointing
-        for model_name, model in models.items():
-            if isinstance(model, torch.nn.Module):
-                model.to(device=device, dtype=dtype)
-                # Only enable gradient checkpointing for UNet
-                if args.gradient_checkpointing and model_name == "unet":
-                    model.enable_gradient_checkpointing()
-        
-        # Setup data loader first since we need it for lr_scheduler
-        train_dataloader = create_dataloader(
+        # Setup data loader
+        components["train_dataloader"] = create_dataloader(
             data_dir=args.data_dir,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
@@ -242,177 +248,443 @@ def main(args):
             text_encoder_2=models["text_encoder_2"]
         )
         
-        # Setup optimizer
-        if args.use_adafactor:
-            from transformers import Adafactor
-            optimizer = Adafactor(
-                models["unet"].parameters(),
-                lr=args.learning_rate,
-                weight_decay=args.weight_decay,
-                scale_parameter=True,
-                relative_step=False
-            )
-        else:
-            optimizer = torch.optim.AdamW(
-                models["unet"].parameters(),
-                lr=args.learning_rate,
-                betas=(args.adam_beta1, args.adam_beta2),
-                eps=args.adam_epsilon,
-                weight_decay=args.weight_decay
-            )
-        
-        if optimizer_state:
-            optimizer.load_state_dict(optimizer_state)
-        
         # Setup learning rate scheduler
-        lr_scheduler = get_cosine_schedule_with_warmup(
-            optimizer=optimizer,
+        components["lr_scheduler"] = get_cosine_schedule_with_warmup(
+            optimizer=components["optimizer"],
             num_warmup_steps=args.warmup_steps,
-            num_training_steps=args.num_epochs * len(train_dataloader)
+            num_training_steps=args.num_epochs * len(components["train_dataloader"])
         )
         
-        # Setup EMA
-        if args.use_ema:
-            from training.ema import EMAModel
-            ema = EMAModel(
-            model=models["unet"],  
-            model_path=args.model_path,
-            device=device,
-            update_after_step=args.ema_update_after_step,
-            update_every=args.ema_update_every,
-            decay=args.ema_decay,
-            power=args.ema_power,
-            min_decay=args.ema_min_decay,
-            max_decay=args.ema_max_decay,
-            use_ema_warmup=args.use_ema_warmup
-            )
-            
-            models["ema"] = ema
-        else:
-            ema = None
-            
-        # Setup tag weighter if enabled
-        if args.use_tag_weighting:
-            from data.tag_weighter import TagBasedLossWeighter
-            tag_weighter = TagBasedLossWeighter(
-                min_weight=args.min_tag_weight,
-                max_weight=args.max_tag_weight
-            )
-        else:
-            tag_weighter = None
+        # Optional components
+        components.update({
+            "ema": setup_ema(args, models, device) if args.use_ema else None,
+            "tag_weighter": setup_tag_weighter(args) if args.use_tag_weighting else None,
+            "vae_finetuner": setup_vae_finetuner(args, models) if args.finetune_vae else None
+        })
         
-        # Setup VAE finetuner if enabled
-        if args.finetune_vae:
-            from training.vae_finetuner import VAEFineTuner
-            vae_finetuner = VAEFineTuner(
-                models["vae"],
-                learning_rate=args.vae_learning_rate,
-                min_snr_gamma=args.min_snr_gamma,
-                adaptive_loss_scale=args.adaptive_loss_scale,
-                kl_weight=args.kl_weight,
-                perceptual_weight=args.perceptual_weight,
-                use_8bit_adam=args.use_8bit_adam,
-                gradient_checkpointing=args.gradient_checkpointing,
-                mixed_precision="fp16" if args.mixed_precision else "no"
-            )
-        else:
-            vae_finetuner = None
-        
-        # Create components dictionary with training configuration
-        train_components = {
-            "optimizer": optimizer,
-            "lr_scheduler": lr_scheduler,
-            "train_dataloader": train_dataloader,
-            "tag_weighter": tag_weighter,
-            "vae_finetuner": vae_finetuner,
-            "ema": ema if args.use_ema else None,
-            "training_config": {
-                "mode": args.training_mode,
-                "min_snr_gamma": args.min_snr_gamma,
-                "sigma_data": args.sigma_data,
-                "sigma_min": args.sigma_min,
-                "sigma_max": args.sigma_max,
-                "scale_method": args.scale_method,
-                "scale_factor": args.scale_factor
-            }
+        # Training configuration
+        components["training_config"] = {
+            "mode": args.training_mode,
+            "min_snr_gamma": args.min_snr_gamma,
+            "sigma_data": args.sigma_data,
+            "sigma_min": args.sigma_min,
+            "sigma_max": args.sigma_max,
+            "scale_method": args.scale_method,
+            "scale_factor": args.scale_factor
         }
         
-        # Log training setup and initial system state
-        log_training_setup(args, models, train_components)
+        return components
         
+    except Exception as e:
+        logger.error(f"Failed to initialize training components: {str(e)}")
+        raise
+
+def train(args, models, components, device, dtype) -> Dict[str, float]:
+    """Execute training steps with proper error handling and logging."""
+    metrics = defaultdict(lambda: AverageMeter(name="default"))
+    models["unet"].train()
+    
+    start_time = time.time()
+    data_time = AverageMeter("data_time")
+    batch_time = AverageMeter("batch_time")
+    
+    progress_bar = tqdm(
+        components["train_dataloader"],
+        desc=f"Training",
+        dynamic_ncols=True
+    )
+    
+    for batch_idx, batch in enumerate(progress_bar):
+        try:
+            data_time.update(time.time() - start_time)
+            batch_metrics = train_step(
+                args=args,
+                models=models,
+                components=components,
+                batch=batch,
+                batch_idx=batch_idx,  # Added batch_idx here
+                device=device,
+                dtype=dtype
+            )
+            
+            # Update metrics
+            for k, v in batch_metrics.items():
+                metrics[k].update(v)
+            
+            # Update progress bar
+            progress_bar.set_postfix({
+                k: f"{v.avg:.4f}" for k, v in metrics.items()
+            })
+            
+            batch_time.update(time.time() - start_time)
+            start_time = time.time()
+            
+        except Exception as e:
+            logger.error(f"Error in training batch {batch_idx}: {str(e)}")
+            logger.error(traceback.format_exc())
+            continue
+    
+    return {k: v.avg for k, v in metrics.items()}
+
+def train_step(args, models, components, batch, batch_idx, device, dtype) -> Dict[str, float]:
+    """Execute single training step with proper error handling."""
+    try:
+        # Move batch to device
+        batch = {k: v.to(device=device, dtype=dtype) if isinstance(v, torch.Tensor) else v 
+                for k, v in batch.items()}
+        
+        # Forward pass
+        with autocast(enabled=args.mixed_precision):
+            loss = models["unet"](batch)
+            
+            if args.gradient_accumulation_steps > 1:
+                loss = loss / args.gradient_accumulation_steps
+        
+        # Backward pass
+        if args.mixed_precision:
+            components["scaler"].scale(loss).backward()
+            if (batch_idx + 1) % args.gradient_accumulation_steps == 0:
+                components["scaler"].unscale_(components["optimizer"])
+                torch.nn.utils.clip_grad_norm_(models["unet"].parameters(), args.max_grad_norm)
+                components["scaler"].step(components["optimizer"])
+                components["scaler"].update()
+                components["optimizer"].zero_grad()
+        else:
+            loss.backward()
+            if (batch_idx + 1) % args.gradient_accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(models["unet"].parameters(), args.max_grad_norm)
+                components["optimizer"].step()
+                components["optimizer"].zero_grad()
+        
+        # Update EMA if enabled
+        if components.get("ema"):
+            components["ema"].step(models["unet"])
+        
+        # Update learning rate
+        if components.get("lr_scheduler"):
+            components["lr_scheduler"].step()
+        
+        # Calculate metrics
+        metrics = {
+            "loss": loss.item(),
+            "lr": components["optimizer"].param_groups[0]["lr"],
+            "grad_norm": get_grad_norm(models["unet"])
+        }
+        
+        return metrics
+        
+    except Exception as e:
+        logger.error(f"Error in training step: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise
+
+def log_epoch_metrics(wandb_run, metrics: Dict[str, float], epoch: int, global_step: int) -> None:
+    """Log epoch metrics to W&B with proper error handling."""
+    try:
+        # Prepare metrics for logging
+        log_dict = {
+            f"train/{k}": v for k, v in metrics.items()
+        }
+        
+        # Add epoch info
+        log_dict.update({
+            "train/epoch": epoch,
+            "train/global_step": global_step
+        })
+        
+        # Log to W&B
+        wandb_run.log(log_dict, step=global_step)
+        
+        # Log to console
+        logger.info(
+            f"Epoch {epoch} metrics: " + 
+            ", ".join(f"{k}: {v:.4f}" for k, v in metrics.items())
+        )
+        
+    except Exception as e:
+        logger.error(f"Failed to log epoch metrics: {str(e)}")
+        logger.error(traceback.format_exc())
+
+def get_grad_norm(model: torch.nn.Module) -> float:
+    """Calculate gradient norm with proper error handling."""
+    try:
+        total_norm = 0.0
+        for p in model.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.detach().data.norm(2)
+                total_norm += param_norm.item() ** 2
+        return math.sqrt(total_norm)
+    except Exception as e:
+        logger.error(f"Failed to calculate gradient norm: {str(e)}")
+        return 0.0
+    
+def train_epoch(epoch, args, models, components, device, dtype, wandb_run, global_step):
+    """Execute single training epoch with proper logging"""
+    logger.info(f"Starting epoch {epoch + 1}/{args.num_epochs}")
+    
+    # Train for one epoch
+    epoch_metrics = train(args, models, components, device, dtype)
+    
+    if wandb_run:
+        log_epoch_metrics(wandb_run, epoch_metrics, epoch, global_step)
+        log_model_gradients(models["unet"], step=global_step)
+        log_memory_stats(step=global_step)
+    
+    return epoch_metrics
+
+def run_validation(args, models, components, device, dtype, global_step) -> Dict[str, float]:
+    """Run validation with proper error handling and metrics tracking."""
+    try:
+        logger.info(f"Running validation at step {global_step}")
+        
+        # Get validator from components
+        validator = components.get("validator")
+        if validator is None:
+            logger.warning("No validator found in components, skipping validation")
+            return {}
+
+        # Set models to eval mode
+        for model in models.values():
+            if isinstance(model, torch.nn.Module):
+                model.eval()
+
+        with torch.no_grad():
+            # Run validation using configured prompts
+            validation_metrics = validator.run_validation(
+                prompts=args.validation_prompts,
+                output_dir=os.path.join(args.output_dir, f"validation_{global_step}"),
+                log_to_wandb=args.use_wandb,
+                guidance_scale=args.validation_guidance_scale,
+                num_inference_steps=args.validation_num_steps,
+                height=args.validation_height,
+                width=args.validation_width,
+                num_images_per_prompt=args.validation_images_per_prompt,
+                seed=args.validation_seed
+            )
+
+            # Add additional metrics if needed
+            if components.get("ema"):
+                validation_metrics["validation/ema_decay"] = components["ema"].cur_decay_value
+
+            # Log validation results
+            logger.info(
+                "Validation Results: " +
+                ", ".join(f"{k}: {v:.4f}" for k, v in validation_metrics.items())
+            )
+
+            return validation_metrics
+
+    except Exception as e:
+        logger.error(f"Validation failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        return {}
+
+    finally:
+        # Set models back to train mode
+        for model in models.values():
+            if isinstance(model, torch.nn.Module):
+                model.train()
+        
+        # Clear CUDA cache
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+def main(args):
+    """Main training function with improved organization and error handling."""
+    wandb_run = None
+    try:
+        # Initial setup and logging
+        setup_logging(
+            log_dir=os.path.join("logs", args.wandb_run_name) if args.wandb_run_name else "logs",
+            log_level=logging.DEBUG if args.verbose else logging.INFO
+        )
+        log_system_info()
+        
+        # Initialize W&B if enabled
+        if args.use_wandb:
+            wandb_run = setup_wandb(args)
+            logger.info("Weights & Biases initialized successfully")
+
+        # Device and precision setup
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        dtype = torch.float16 if args.mixed_precision else torch.float32
+        logger.info(f"Using device: {device}, precision: {dtype}")
+
+        # Model initialization and loading
+        try:
+            models, optimizer_state, training_history = load_checkpoint(args)
+            logger.info("Models loaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to load models: {str(e)}")
+            raise
+
+        # Move models to device and configure
+        for model_name, model in models.items():
+            if isinstance(model, torch.nn.Module):
+                model.to(device=device, dtype=dtype)
+                if args.gradient_checkpointing and hasattr(model, 'enable_gradient_checkpointing'):
+                    model.enable_gradient_checkpointing()
+                if hasattr(model, 'enable_xformers_memory_efficient_attention'):
+                    model.enable_xformers_memory_efficient_attention()
+
+        # Initialize training components
+        components = initialize_training_components(args, device, dtype, models)
+        
+        # Load optimizer state if resuming
+        if optimizer_state and components.get("optimizer"):
+            components["optimizer"].load_state_dict(optimizer_state)
+            logger.info("Optimizer state loaded successfully")
+
+        # Setup W&B monitoring
         if wandb_run and args.wandb_watch:
-            wandb_run.watch(models["unet"], log="all", log_freq=args.wandb_log_freq)
-        
-        if wandb_run:
+            wandb_run.watch(
+                models["unet"],
+                log="all",
+                log_freq=args.wandb_log_freq,
+                log_graph=True
+            )
             log_memory_stats(step=0)
+
+        # Initialize metrics tracking
+        metrics = {
+            "loss": AverageMeter("loss"),
+            "grad_norm": AverageMeter("grad_norm"),
+            "lr": AverageMeter("learning_rate"),
+            "vae_loss": AverageMeter("vae_loss") if args.finetune_vae else None,
+            "batch_time": AverageMeter("batch_time"),
+            "data_time": AverageMeter("data_time")
+        }
+
+        # Training loop
+        global_step = training_history.get("global_step", 0)
+        best_loss = float('inf')
+        scaler = GradScaler() if args.mixed_precision else None
         
-        # Train model
-        global_step = 0
+        logger.info("Starting training loop")
         for epoch in range(args.num_epochs):
-            logger.info(f"Starting epoch {epoch + 1}/{args.num_epochs}")
-            
-            # Train for one epoch
-            epoch_metrics = train(args, models, train_components, device, dtype)
-            
-            if wandb_run:
-                # Log epoch metrics
-                wandb.log({
-                    "epoch": epoch + 1,
-                    "epoch/loss": epoch_metrics["loss"],
-                    "epoch/learning_rate": epoch_metrics["learning_rate"],
-                    **{f"epoch/{k}": v for k, v in epoch_metrics.items() 
-                       if k not in ["loss", "learning_rate"]}
-                }, step=global_step)
+            try:
+                # Training epoch
+                epoch_metrics = train_epoch(
+                    epoch=epoch,
+                    args=args,
+                    models=models,
+                    components=components,
+                    device=device,
+                    dtype=dtype,
+                    metrics=metrics,
+                    scaler=scaler,
+                    wandb_run=wandb_run,
+                    global_step=global_step
+                )
                 
-                # Log model gradients
-                log_model_gradients(models["unet"], step=global_step)
+                global_step += len(components["train_dataloader"])
                 
-                # Log memory stats
-                log_memory_stats(step=global_step)
-            
-            global_step += len(train_components["train_dataloader"])
+                # Update best loss
+                if epoch_metrics["loss"] < best_loss:
+                    best_loss = epoch_metrics["loss"]
+                    if args.save_checkpoints:
+                        save_checkpoint(
+                            args=args,
+                            models=models,
+                            optimizer=components["optimizer"],
+                            epoch=epoch,
+                            metrics=epoch_metrics,
+                            is_best=True
+                        )
+
+                # Regular checkpoint saving
+                if args.save_checkpoints and (epoch + 1) % args.save_epochs == 0:
+                    save_checkpoint(
+                        args=args,
+                        models=models,
+                        optimizer=components["optimizer"],
+                        epoch=epoch,
+                        metrics=epoch_metrics
+                    )
+
+                # Validation
+                if not args.skip_validation and (epoch + 1) % args.validation_frequency == 0:
+                    validation_metrics = run_validation(
+                        args=args,
+                        models=models,
+                        components=components,
+                        device=device,
+                        dtype=dtype,
+                        global_step=global_step
+                    )
+                    
+                    if wandb_run:
+                        wandb.log(
+                            {f"validation/{k}": v for k, v in validation_metrics.items()},
+                            step=global_step
+                        )
+
+            except Exception as e:
+                logger.error(f"Error during epoch {epoch}: {str(e)}")
+                logger.error(traceback.format_exc())
+                if wandb_run:
+                    wandb.alert(
+                        title=f"Training Error - Epoch {epoch}",
+                        text=str(e)
+                    )
+                continue
 
         # Save final outputs
-        save_final_outputs(args, models, training_history, train_components)
+        try:
+            save_final_outputs(
+                args=args,
+                models=models,
+                training_history={
+                    "global_step": global_step,
+                    "best_loss": best_loss,
+                    "final_metrics": epoch_metrics
+                },
+                components=components
+            )
+            
+            if args.push_to_hub:
+                push_to_hub(args, models)
+                
+            save_model_card(args, models)
+            logger.info("Training completed successfully")
+            
+            return True
 
-        # Push to HuggingFace Hub
-        if args.push_to_hub:
-            push_to_hub(args, models)
+        except Exception as e:
+            logger.error(f"Error during final save: {str(e)}")
+            logger.error(traceback.format_exc())
+            return False
 
-        # Save model card
-        save_model_card(args, models)
-        
-        # Log final metrics if using W&B
-        if wandb_run:
-            wandb.log({
-                "training/completed": True,
-                "training/total_steps": global_step,
-                "training/final_loss": epoch_metrics["loss"],
-                "training/final_lr": epoch_metrics["learning_rate"]
-            })
-        
-        return True
-        
     except Exception as e:
         logger.error(f"Training failed with error: {str(e)}")
         logger.error(traceback.format_exc())
         if wandb_run:
-            wandb.log({"training/failed": True, "training/error": str(e)})
+            wandb.alert(
+                title="Training Failed",
+                text=str(e)
+            )
         return False
-        
+
     finally:
+        # Cleanup
         if wandb_run:
             cleanup_wandb(wandb_run)
+        
+        # Release memory
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
+        logger.info("Cleanup completed")
 
 if __name__ == "__main__":
     try:
-        # Try to set the start method only if it hasn't been set yet
+        # Set multiprocessing start method
         if not torch.multiprocessing.get_start_method(allow_none=True):
             torch.multiprocessing.set_start_method('spawn')
-    except RuntimeError as e:
-        # If already set, just log and continue
-        logger.info("Multiprocessing start method already set")
+    except RuntimeError:
+        logger.warning("Multiprocessing start method already set")
 
+    # Parse arguments and run
     args = parse_args()
     success = main(args)
     sys.exit(0 if success else 1)
