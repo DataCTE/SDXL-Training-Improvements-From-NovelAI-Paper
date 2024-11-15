@@ -1030,29 +1030,34 @@ class CustomDataset(Dataset):
 
     def _process_uncached_item(self, img_path, caption_path):
         """Process an item that hasn't been cached yet"""
-        # Load and process image
         with Image.open(img_path) as image:
             image = image.convert('RGB')
             
-            # Get bucket dimensions
-            bucket_h, bucket_w = self._get_bucket_size(image.size)
+            # Get bucket dimensions based on all_ar setting
+            if self.all_ar:
+                width, height = image.size
+                bucket_h, bucket_w = height, width
+            else:
+                bucket_h, bucket_w = self._get_bucket_size(image.size)
             
             # Process image with advanced resizing
             processed_image = self._advanced_resize(image, bucket_w, bucket_h)
             
-            # Convert to tensor and normalize
-            transform = transforms.Compose([
-                transforms.ToTensor(),
-                transforms.Normalize([0.5], [0.5])
-            ])
-            image_tensor = transform(processed_image).unsqueeze(0)
-            
-            # Generate VAE latents
-            with torch.no_grad():
-                image_tensor = image_tensor.to(self.vae.device, dtype=self.vae.dtype)
-                latents = self.vae.encode(image_tensor).latent_dist.sample()
-                latents = latents * self.vae.config.scaling_factor
-                latents = latents.squeeze(0)
+            # Generate latents on-the-fly if no_caching is enabled
+            if self.no_caching_latents:
+                with torch.no_grad():
+                    transform = transforms.Compose([
+                        transforms.ToTensor(),
+                        transforms.Normalize([0.5], [0.5])
+                    ])
+                    image_tensor = transform(processed_image).unsqueeze(0)
+                    image_tensor = image_tensor.to(self.vae.device, dtype=self.vae.dtype)
+                    latents = self.vae.encode(image_tensor).latent_dist.sample()
+                    latents = latents * self.vae.config.scaling_factor
+                    latents = latents.squeeze(0)
+            else:
+                # Use cached latents
+                latents = self._get_cached_latents(img_path, processed_image)
             
             # Load and process caption
             with open(caption_path, 'r', encoding='utf-8') as f:
@@ -1373,6 +1378,31 @@ class CustomDataset(Dataset):
         except Exception as e:
             logger.error(f"Error getting item {idx}: {str(e)}")
             return None
+
+    def _get_cached_latents(self, img_path, processed_image):
+        """Get latents either from cache or generate them"""
+        cache_path = self.cache_dir / f"{Path(img_path).stem}.pt"
+        
+        if not self.no_caching_latents and cache_path.exists():
+            return torch.load(cache_path, map_location='cpu')['latents']
+        
+        # Generate latents
+        with torch.no_grad():
+            transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize([0.5], [0.5])
+            ])
+            image_tensor = transform(processed_image).unsqueeze(0)
+            image_tensor = image_tensor.to(self.vae.device, dtype=self.vae.dtype)
+            latents = self.vae.encode(image_tensor).latent_dist.sample()
+            latents = latents * self.vae.config.scaling_factor
+            latents = latents.squeeze(0)
+            
+            # Cache only if caching is enabled
+            if not self.no_caching_latents:
+                torch.save({'latents': latents}, cache_path)
+            
+            return latents
 
 
 class BucketSampler(Sampler):
