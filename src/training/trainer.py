@@ -441,6 +441,20 @@ def _log_ema_config(args):
     logger.info(f"- Power: {args.ema_power}")
     logger.info(f"- Min/Max decay: {args.ema_min_decay}/{args.ema_max_decay}")
 
+def _get_training_config_impl(args_tuple: tuple) -> Dict[str, Any]:
+    """Implementation of training config that takes a hashable tuple."""
+    # Convert tuple back to dict for easy access
+    args_dict = dict(args_tuple)
+    return {
+        "mode": args_dict['training_mode'],
+        "min_snr_gamma": args_dict['min_snr_gamma'],
+        "sigma_data": args_dict['sigma_data'],
+        "sigma_min": args_dict['sigma_min'],
+        "sigma_max": args_dict['sigma_max'],
+        "scale_method": args_dict['scale_method'],
+        "scale_factor": args_dict['scale_factor']
+    }
+
 @lru_cache(maxsize=1)
 def _get_training_config(args) -> Dict[str, Any]:
     """Cache training configuration."""
@@ -457,17 +471,7 @@ def _get_training_config(args) -> Dict[str, Any]:
             'scale_factor'
         }
     ))
-    
-    # Return the actual config dictionary
-    return {
-        "mode": args.training_mode,
-        "min_snr_gamma": args.min_snr_gamma,
-        "sigma_data": args.sigma_data,
-        "sigma_min": args.sigma_min,
-        "sigma_max": args.sigma_max,
-        "scale_method": args.scale_method,
-        "scale_factor": args.scale_factor
-    }
+    return _get_training_config_impl(args_tuple)
 
 def initialize_training_components(args, device, dtype, models):
     """Initialize all training components with proper error handling"""
