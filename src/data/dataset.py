@@ -222,56 +222,50 @@ class CustomDataset(CustomDatasetBase):
                  adaptive_loss_scale=False, kl_weight=0.0, perceptual_weight=0.0,
                  **kwargs):
         super().__init__()
-         # Log initialization parameters
-        logger.info(f"Initializing dataset with:")
-        logger.info(f"  no_caching_latents: {no_caching_latents}")
-        logger.info(f"  all_ar: {all_ar}")
-        logger.info(f"  num_workers: {num_workers}")
-        logger.info(f"  use_tag_weighting: {use_tag_weighting}")
         
-        # Data directory and paths
+        # Store initialization parameters for workers
+        self.init_params = {
+            'vae': vae,
+            'tokenizer': tokenizer,
+            'tokenizer_2': tokenizer_2,
+            'text_encoder': text_encoder,
+            'text_encoder_2': text_encoder_2,
+            'cache_dir': cache_dir,
+            'no_caching_latents': no_caching_latents,
+            'all_ar': all_ar,
+            'num_workers': num_workers or min(8, os.cpu_count() or 1),
+            'prefetch_factor': prefetch_factor,
+            'resolution_type': resolution_type,
+            'enable_bucket_sampler': enable_bucket_sampler,
+            'min_size': min_size,
+            'max_size': max_size,
+            'bucket_reso_steps': bucket_reso_steps,
+            'token_dropout_rate': token_dropout_rate,
+            'caption_dropout_rate': caption_dropout_rate,
+            'min_tag_weight': min_tag_weight,
+            'max_tag_weight': max_tag_weight,
+            'use_tag_weighting': use_tag_weighting,
+            'finetune_vae': finetune_vae,
+            'vae_learning_rate': vae_learning_rate,
+            'vae_train_freq': vae_train_freq,
+            'adaptive_loss_scale': adaptive_loss_scale,
+            'kl_weight': kl_weight,
+            'perceptual_weight': perceptual_weight
+        }
+        
+        # Basic initialization
         self.data_dir = Path(data_dir)
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(exist_ok=True)
         
-        # Models and tokenizers
-        self.vae = vae
-        self.tokenizer = tokenizer
-        self.tokenizer_2 = tokenizer_2
-        self.text_encoder = text_encoder
-        self.text_encoder_2 = text_encoder_2
-        
-        # Processing settings
-        self.no_caching_latents = no_caching_latents
-        self.all_ar = all_ar
-        self.num_workers = num_workers or min(8, os.cpu_count() or 1)
-        self.prefetch_factor = prefetch_factor
-        
-        # Resolution and bucketing settings
-        self.resolution_type = resolution_type
-        self.enable_bucket_sampler = enable_bucket_sampler
-        self.min_size = min_size
-        self.max_size = max_size
-        self.bucket_reso_steps = bucket_reso_steps
-        
-        # Text augmentation settings
-        self.token_dropout_rate = token_dropout_rate
-        self.caption_dropout_rate = caption_dropout_rate
-        
-        # Tag weighting settings
-        self.use_tag_weighting = use_tag_weighting
-        self.min_tag_weight = min_tag_weight
-        self.max_tag_weight = max_tag_weight
-        
-        # VAE finetuning settings
-        self.finetune_vae = finetune_vae
-        self.vae_learning_rate = vae_learning_rate
-        self.vae_train_freq = vae_train_freq
-        self.adaptive_loss_scale = adaptive_loss_scale
-        self.kl_weight = kl_weight
-        self.perceptual_weight = perceptual_weight
-        
-        # Initialize tag weighter with proper no_cache handling
+        # Initialize multiprocessing components
+        if not no_caching_latents:
+            self.process_pool = None
+            self.task_queue = mp.Queue()
+            self.result_queue = mp.Queue()
+            self.workers = []
+            
+        # Initialize tag weighter if needed
         if use_tag_weighting:
             self.tag_weighter = TagBasedLossWeighter(
                 min_weight=min_tag_weight,
@@ -281,74 +275,113 @@ class CustomDataset(CustomDatasetBase):
         else:
             self.tag_weighter = None
             
-        # Initialize multiprocessing components only if caching is enabled
-        if not no_caching_latents:
-            self.process_pool = None
-            self.task_queue = None
-            self.result_queue = None
-            self.workers = []
-            self.cache_lock = threading.Lock()
-            self.latent_cache = {}
-            
-            # Initialize workers and process latents
-            if self.num_workers > 0:
-                self._initialize_workers()
-                self._batch_process_latents_efficient()
-        else:
-            logger.info("Latent caching disabled - will process images on-the-fly")
-            self.latent_cache = {}
-            self.cache_lock = threading.Lock()
+        # Convert image paths to strings once
+        self.image_paths = [str(p) for p in Path(data_dir).glob("*.png")]
         
         # Initialize dataset structure
         self._initialize_dataset()
         
-        # Initialize bucketing if enabled
-        if self.enable_bucket_sampler:
-            self._initialize_buckets()
-            
-        # Build tag statistics
-        self.tag_stats = self._build_tag_statistics()
-        
-        # Set collate function
-        self.collate_fn = self.custom_collate
-
-        # Convert image paths to strings once
-        self.image_paths = [str(p) for p in Path(data_dir).glob("*.png")]
-        
-        # Pre-compute bucket data efficiently
-        
-        if self.all_ar:
-            logger.info("Pre-computing bucket data...")
-            from concurrent.futures import ThreadPoolExecutor
-            from tqdm import tqdm
-            
-            def process_image_batch(paths):
-                results = {}
-                for path in paths:
-                    try:
-                        with Image.open(path) as img:
-                            width, height = img.size
-                            bucket = (height, width)
-                            if bucket not in results:
-                                results[bucket] = []
-                            results[bucket].append(path)
-                    except Exception as e:
-                        logger.error(f"Error processing {path}: {str(e)}")
-                return results
-            
-            # Process in parallel
-            chunk_size = max(1, len(self.image_paths) // (self.num_workers * 4))
-            with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-                futures = []
-                for i in range(0, len(self.image_paths), chunk_size):
-                    chunk = self.image_paths[i:i + chunk_size]
-                    futures.append(executor.submit(process_image_batch, chunk))
+    def _initialize_dataset(self):
+        """Initialize dataset structure with proper error handling"""
+        try:
+            # Pre-compute bucket data efficiently using ThreadPoolExecutor
+            if self.init_params['all_ar']:
+                logger.info("Pre-computing bucket data...")
+                self._precompute_bucket_data()
                 
-                # Combine results with progress bar
-                self.bucket_data = defaultdict(list)
-                for future in tqdm(futures, desc="Processing image buckets"):
-                    for bucket, paths in future.result().items():
-                        self.bucket_data[bucket].extend(paths)
+            # Initialize workers if needed
+            if not self.init_params['no_caching_latents']:
+                self._initialize_workers()
+                self._batch_process_latents_efficient()
+                
+        except Exception as e:
+            logger.error(f"Dataset initialization failed: {str(e)}")
+            logger.error(traceback.format_exc())
+            self.cleanup()
+            raise
+
+    def _precompute_bucket_data(self):
+        """Pre-compute bucket data using thread pool"""
+        def process_image_batch(paths):
+            results = defaultdict(list)
+            for path in paths:
+                try:
+                    with Image.open(path) as img:
+                        width, height = img.size
+                        bucket = (height, width)
+                        results[bucket].append(path)
+                except Exception as e:
+                    logger.error(f"Error processing {path}: {str(e)}")
+            return results
+            
+        # Process in parallel using ThreadPoolExecutor
+        chunk_size = max(1, len(self.image_paths) // (self.init_params['num_workers'] * 4))
+        self.bucket_data = defaultdict(list)
+        
+        with ThreadPoolExecutor(max_workers=self.init_params['num_workers']) as executor:
+            futures = []
+            for i in range(0, len(self.image_paths), chunk_size):
+                chunk = self.image_paths[i:i + chunk_size]
+                futures.append(executor.submit(process_image_batch, chunk))
+                
+            # Combine results
+            for future in tqdm(futures, desc="Processing image buckets"):
+                for bucket, paths in future.result().items():
+                    self.bucket_data[bucket].extend(paths)
+
+    def write_captions(self, formatted_paths):
+        """Write formatted captions using thread pool"""
+        def write_caption(path_caption):
+            path, caption = path_caption
+            try:
+                with open(path, 'w', encoding='utf-8') as f:
+                    f.write(caption)
+            except Exception as e:
+                logger.error(f"Error writing to {path}: {str(e)}")
+                
+        with ThreadPoolExecutor(max_workers=self.init_params['num_workers']) as executor:
+            list(executor.map(write_caption, formatted_paths))
+
+    def _initialize_worker(self):
+        """Initialize worker process state"""
+        if torch.cuda.is_available():
+            device = f'cuda:{torch.cuda.current_device()}'
+        else:
+            device = 'cpu'
+            
+        # Initialize models in worker process
+        self.worker_models = {
+            'vae': self.init_params['vae'].to(device),
+            'text_encoder': self.init_params['text_encoder'].to(device),
+            'text_encoder_2': self.init_params['text_encoder_2'].to(device),
+            'tokenizer': self.init_params['tokenizer'],
+            'tokenizer_2': self.init_params['tokenizer_2']
+        }
+
+    def _worker_process(self, task_queue, result_queue):
+        """Worker process function"""
+        try:
+            self._initialize_worker()
+            
+            while True:
+                task = task_queue.get()
+                if task is None:  # Poison pill
+                    break
+                    
+                try:
+                    result = self._process_task(task)
+                    result_queue.put(result)
+                except Exception as e:
+                    logger.error(f"Error processing task: {str(e)}")
+                    result_queue.put(None)
+                    
+        except Exception as e:
+            logger.error(f"Worker process error: {str(e)}")
+            logger.error(traceback.format_exc())
+        finally:
+            # Cleanup worker resources
+            if hasattr(self, 'worker_models'):
+                del self.worker_models
 
     def _parse_tags(self, caption):
         """Optimized tag parsing with caching"""
@@ -488,98 +521,8 @@ class CustomDataset(CustomDatasetBase):
         # Process sequentially for small batches
         return process_batch(tag_pairs)
 
-    def _initialize_workers(self):
-        """Initialize worker processes with proper error handling"""
-        if self.no_caching_latents:
-            logger.info("Skipping worker initialization - caching disabled")
-            return
-            
-        try:
-            self.task_queue = mp.Queue()
-            self.result_queue = mp.Queue()
-            
-            logger.info(f"Initializing {self.num_workers} worker processes for latent validation")
-            
-            # Create a copy of necessary attributes for workers
-            worker_args = (
-                self.task_queue,
-                self.result_queue,
-                self.vae,
-                self.cache_dir
-            )
-            
-            for _ in range(self.num_workers):
-                p = mp.Process(
-                    target=self._worker_process,
-                    args=worker_args
-                )
-                p.daemon = True  # Ensure process cleanup
-                p.start()
-                self.workers.append(p)
-                
-        except Exception as e:
-            logger.error(f"Failed to initialize workers: {str(e)}")
-            self.cleanup_workers()
-            raise
+  
 
-    def _worker_process(self, task_queue, result_queue):
-        """Worker process function for parallel processing"""
-        try:
-            # Initialize worker's VAE copy
-            if torch.cuda.is_available():
-                device = f'cuda:{torch.cuda.current_device()}'
-            else:
-                device = 'cpu'
-                
-            while True:
-                try:
-                    # Get batch of images to process
-                    batch_paths = task_queue.get()
-                    if batch_paths is None:  # Poison pill
-                        break
-                        
-                    batch_results = {}
-                    batch_images = []
-                    
-                    # Load images
-                    for path in batch_paths:
-                        try:
-                            image = self.load_and_transform_image(path)
-                            if image is not None:
-                                batch_images.append((path, image))
-                        except Exception as e:
-                            logger.warning(f"Worker failed to load {path}: {str(e)}")
-                    
-                    if not batch_images:
-                        continue
-                    
-                    # Process batch through VAE
-                    try:
-                        with torch.no_grad():
-                            batch_tensor = torch.stack([img for _, img in batch_images])
-                            batch_tensor = batch_tensor.to(device)
-                            
-                            with torch.cuda.amp.autocast(enabled=True):
-                                latents = self.vae.encode(batch_tensor).latent_dist.sample()
-                            
-                            # Store results
-                            for idx, (path, _) in enumerate(batch_images):
-                                if idx < len(latents):
-                                    batch_results[path] = latents[idx].shape
-                                    
-                    except Exception as e:
-                        logger.warning(f"Worker batch processing failed: {str(e)}")
-                        
-                    # Send results back
-                    result_queue.put(batch_results)
-                    
-                except Exception as e:
-                    logger.error(f"Worker process error: {str(e)}")
-                    continue
-                    
-        except Exception as e:
-            logger.error(f"Fatal worker error: {str(e)}")
-            logger.error(traceback.format_exc())
 
     def validate_and_cache_latents(self, image_paths):
         """Validate latent dimensions for a batch of images using multiple workers"""

@@ -18,6 +18,7 @@ from tqdm import tqdm
 from data.dataset import create_dataloader
 import os
 from .ema import EMAModel
+from multiprocessing import Manager
 
 logger = logging.getLogger(__name__)
 
@@ -345,7 +346,7 @@ def setup_tag_weighter(args) -> Optional[Any]:
 
 @dataclass
 class AverageMeter:
-    """Process-safe average meter."""
+    """Fully pickleable average meter."""
     name: str
     fmt: str = ':f'
     window_size: Optional[int] = None
@@ -356,6 +357,23 @@ class AverageMeter:
         self._count: int = 0
         self._avg: float = 0
         self._history: List[float] = []
+    
+    def __getstate__(self):
+        """Get state for pickling."""
+        return {
+            'name': self.name,
+            'fmt': self.fmt,
+            'window_size': self.window_size,
+            '_val': self._val,
+            '_sum': self._sum,
+            '_count': self._count,
+            '_avg': self._avg,
+            '_history': self._history
+        }
+    
+    def __setstate__(self, state):
+        """Set state for unpickling."""
+        self.__dict__.update(state)
     
     def reset(self) -> None:
         """Reset all metrics."""
@@ -468,6 +486,15 @@ def initialize_training_components(args, device, dtype, models):
         if not all(k in models for k in required_models):
             raise ValueError(f"Missing required models: {[k for k in required_models if k not in models]}")
             
+        # Create a clean copy of models for the dataloader
+        dataloader_models = {
+            "vae": models["vae"],
+            "tokenizer": models["tokenizer"],
+            "tokenizer_2": models["tokenizer_2"],
+            "text_encoder": models["text_encoder"],
+            "text_encoder_2": models["text_encoder_2"]
+        }
+            
         components["train_dataloader"] = create_dataloader(
             data_dir=args.data_dir,
             batch_size=args.batch_size,
@@ -475,11 +502,7 @@ def initialize_training_components(args, device, dtype, models):
             no_caching_latents=args.no_caching,
             all_ar=args.all_ar,
             cache_dir=args.cache_dir,
-            vae=models["vae"],
-            tokenizer=models["tokenizer"],
-            tokenizer_2=models["tokenizer_2"],
-            text_encoder=models["text_encoder"],
-            text_encoder_2=models["text_encoder_2"]
+            **dataloader_models  # Pass models as separate arguments
         )
         
         # Setup learning rate scheduler
@@ -578,9 +601,10 @@ def train_epoch(epoch: int, args, models, components, device, dtype, wandb_run, 
             torch.cuda.empty_cache()
 
 class MetricsManager:
-    """Process-safe metrics manager."""
+    """Fully process-safe metrics manager."""
     def __init__(self):
-        self._metrics = {}
+        self._manager = Manager()
+        self._metrics = self._manager.dict()
     
     def get_metric(self, name: str) -> AverageMeter:
         if name not in self._metrics:
@@ -588,14 +612,19 @@ class MetricsManager:
         return self._metrics[name]
     
     def update_metric(self, name: str, value: float, n: int = 1) -> None:
-        self.get_metric(name).update(value, n)
+        metric = self.get_metric(name)
+        metric.update(value, n)
+        self._metrics[name] = metric  # Update in shared dict
     
     def get_all_metrics(self) -> Dict[str, float]:
-        return {name: meter.avg for name, meter in self._metrics.items()}
+        return {name: meter.avg for name, meter in dict(self._metrics).items()}
 
 def train(args, models, components, device, dtype) -> Dict[str, float]:
     """Execute training steps with proper error handling and logging."""
-    metrics_manager = components['metrics_manager']
+    metrics_manager = components.get('metrics_manager')
+    if metrics_manager is None:
+        metrics_manager = MetricsManager()
+        components['metrics_manager'] = metrics_manager
     
     # Set model to training mode
     models["unet"].train()
@@ -974,3 +1003,4 @@ def run_validation(
         # Clear CUDA cache
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
