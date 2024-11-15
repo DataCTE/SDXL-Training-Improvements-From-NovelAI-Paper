@@ -345,87 +345,57 @@ def setup_tag_weighter(args) -> Optional[Any]:
 
 @dataclass
 class AverageMeter:
-    """Thread-safe average meter with enhanced functionality."""
+    """Process-safe average meter."""
     name: str
     fmt: str = ':f'
     window_size: Optional[int] = None
     
     def __post_init__(self):
-        """Initialize non-pickleable objects after instance creation."""
         self._val: float = 0
         self._sum: float = 0
         self._count: int = 0
         self._avg: float = 0
         self._history: List[float] = []
-        # Create lock only when needed, not as a class attribute
-        self._lock = None
-    
-    def _get_lock(self):
-        """Lazy initialization of lock object."""
-        if self._lock is None:
-            self._lock = Lock()
-        return self._lock
     
     def reset(self) -> None:
         """Reset all metrics."""
-        with self._get_lock():
-            self._val = 0
-            self._sum = 0
-            self._count = 0
-            self._avg = 0
-            self._history.clear()
+        self._val = 0
+        self._sum = 0
+        self._count = 0
+        self._avg = 0
+        self._history.clear()
     
     def update(self, val: Union[float, np.ndarray, torch.Tensor], n: int = 1) -> None:
-        """Thread-safe update with support for tensors and arrays."""
+        """Update with support for tensors and arrays."""
         if isinstance(val, (torch.Tensor, np.ndarray)):
             val = float(val.detach().cpu().item() if torch.is_tensor(val) else val.item())
             
-        with self._get_lock():
-            self._val = val
-            self._sum += val * n
-            self._count += n
-            self._avg = self._sum / self._count
-            
-            if self.window_size:
-                self._history.append(val)
-                if len(self._history) > self.window_size:
-                    self._history.pop(0)
-                self._avg = np.mean(self._history)
+        self._val = val
+        self._sum += val * n
+        self._count += n
+        self._avg = self._sum / self._count
+        
+        if self.window_size:
+            self._history.append(val)
+            if len(self._history) > self.window_size:
+                self._history.pop(0)
+            self._avg = np.mean(self._history)
     
     @property
     def val(self) -> float:
-        """Current value."""
-        with self._get_lock():
-            return self._val
+        return self._val
     
     @property
     def avg(self) -> float:
-        """Running average."""
-        with self._get_lock():
-            return self._avg
+        return self._avg
     
     @property
     def sum(self) -> float:
-        """Total sum."""
-        with self._get_lock():
-            return self._sum
+        return self._sum
     
     @property
     def count(self) -> int:
-        """Number of updates."""
-        with self._get_lock():
-            return self._count
-            
-    def __getstate__(self):
-        """Custom state getter for pickling."""
-        state = self.__dict__.copy()
-        # Don't pickle the lock
-        state['_lock'] = None
-        return state
-    
-    def __setstate__(self, state):
-        """Custom state setter for unpickling."""
-        self.__dict__.update(state)
+        return self._count
         # Lock will be recreated when needed via _get_lock()
 
 def _log_optimizer_config(args):
@@ -603,10 +573,29 @@ def train_epoch(epoch: int, args, models, components, device, dtype, wandb_run, 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+class MetricsManager:
+    """Thread-safe metrics manager."""
+    def __init__(self):
+        self._metrics = {}
+        self._lock = Lock()
+    
+    def get_metric(self, name: str) -> AverageMeter:
+        with self._lock:
+            if name not in self._metrics:
+                self._metrics[name] = AverageMeter(name=name)
+            return self._metrics[name]
+    
+    def update_metric(self, name: str, value: float, n: int = 1) -> None:
+        with self._lock:
+            self.get_metric(name).update(value, n)
+    
+    def get_all_metrics(self) -> Dict[str, float]:
+        with self._lock:
+            return {name: meter.avg for name, meter in self._metrics.items()}
+
 def train(args, models, components, device, dtype) -> Dict[str, float]:
     """Execute training steps with proper error handling and logging."""
-    # Create new metrics for each training run
-    metrics = defaultdict(lambda: AverageMeter(name="default"))
+    metrics_manager = MetricsManager()
     models["unet"].train()
     
     start_time = time.time()
@@ -623,7 +612,6 @@ def train(args, models, components, device, dtype) -> Dict[str, float]:
     try:
         for batch_idx, batch in enumerate(progress_bar):
             try:
-                # Update timing
                 data_time.update(time.time() - start_time)
                 
                 # Execute training step
@@ -637,16 +625,15 @@ def train(args, models, components, device, dtype) -> Dict[str, float]:
                     dtype=dtype
                 )
                 
-                # Update metrics
+                # Update metrics using manager
                 for k, v in batch_metrics.items():
-                    metrics[k].update(v)
+                    metrics_manager.update_metric(k, v)
                 
                 # Update progress bar
-                progress_bar.set_postfix({
-                    k: f"{v.avg:.4f}" for k, v in metrics.items()
-                })
+                progress_bar.set_postfix(
+                    {k: f"{v.avg:.4f}" for k, v in metrics_manager.get_all_metrics().items()}
+                )
                 
-                # Update timing
                 batch_time.update(time.time() - start_time)
                 start_time = time.time()
                 
@@ -655,7 +642,7 @@ def train(args, models, components, device, dtype) -> Dict[str, float]:
                 logger.error(traceback.format_exc())
                 continue
                 
-        return {k: v.avg for k, v in metrics.items()}
+        return metrics_manager.get_all_metrics()
         
     finally:
         progress_bar.close()
