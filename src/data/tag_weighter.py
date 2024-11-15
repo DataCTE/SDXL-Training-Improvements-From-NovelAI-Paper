@@ -9,6 +9,7 @@ import math
 from concurrent.futures import ThreadPoolExecutor
 import os
 from threading import Lock
+import re
 
 logger = logging.getLogger(__name__)
 

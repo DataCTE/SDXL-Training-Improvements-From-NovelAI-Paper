@@ -65,6 +65,7 @@ class VAEFineTuner:
         self.mixed_precision = config.get('mixed_precision', 'bf16')
         self.use_amp = config.get('use_amp', True)
         self.max_grad_norm = config.get('max_grad_norm', 1.0)
+        self.gradient_checkpointing = config.get('gradient_checkpointing', False)
         
         # Initialize loss weights
         self.kl_weight = config.get('kl_weight', 0.0)
@@ -84,7 +85,7 @@ class VAEFineTuner:
         # Enable optimizations
         if hasattr(self.vae, 'enable_xformers_memory_efficient_attention'):
             self.vae.enable_xformers_memory_efficient_attention()
-        if config.get('gradient_checkpointing') and hasattr(self.vae, 'enable_gradient_checkpointing'):
+        if self.gradient_checkpointing and hasattr(self.vae, 'enable_gradient_checkpointing'):
             self.vae.enable_gradient_checkpointing()
 
     def _init_optimizer(self, config: Dict[str, Any]) -> None:
