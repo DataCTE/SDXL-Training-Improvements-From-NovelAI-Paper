@@ -6,7 +6,6 @@ from tqdm import tqdm
 import logging
 import traceback
 import random
-import re
 import cv2
 import numpy as np
 from collections import defaultdict
@@ -1408,7 +1407,7 @@ class CustomDataset(CustomDatasetBase):
             return cache_data
         
         except Exception as e:
-            logger.error(f"Error getting item {idx}: {str(e)}")
+            logger.error(f"Error getting item {idx} ({img_path}): {str(e)}")
             return None
 
     def _get_cached_latents(self, img_path, processed_image):
@@ -1435,6 +1434,28 @@ class CustomDataset(CustomDatasetBase):
                 torch.save({'latents': latents}, cache_path)
             
             return latents
+
+    def _format_captions(self):
+        """Format all captions with progress bar"""
+        from tqdm import tqdm
+        
+        formatted_count = 0
+        logger.info("Formatting captions...")
+        
+        for img_path in tqdm(self.image_paths, desc="Formatting captions"):
+            caption_path = img_path.with_suffix('.txt')
+            if caption_path.exists():
+                try:
+                    with open(caption_path, 'r', encoding='utf-8') as f:
+                        caption = f.read().strip()
+                    if caption:
+                        formatted = self._format_caption(caption)
+                        if formatted != caption:
+                            formatted_count += 1
+                except Exception as e:
+                    logger.warning(f"Error formatting caption for {img_path}: {str(e)}")
+                
+        logger.info(f"Formatted {formatted_count} captions")
 
 
 class BucketSampler(CustomSamplerBase):
@@ -1595,8 +1616,13 @@ class CustomDataLoader(CustomDataLoaderBase):
         if batch and not self.drop_last:
             batches.append(batch)
 
+        # Add progress bar for batch processing
+        from tqdm import tqdm
+        pbar = tqdm(total=len(batches), desc="Processing batches", 
+                   position=0, leave=True)
+
         # Process batches
-        for batch_indices in batches:
+        for batch_idx, batch_indices in enumerate(batches):
             if self.num_workers > 0:
                 # Parallel processing
                 futures = [
@@ -1615,12 +1641,21 @@ class CustomDataLoader(CustomDataLoaderBase):
                 try:
                     # Use dataset's collate function if available
                     if hasattr(self.dataset, 'custom_collate'):
-                        yield self.dataset.custom_collate(batch_data)
+                        collated = self.dataset.custom_collate(batch_data)
+                        # Log batch statistics
+                        if batch_idx % 10 == 0:  # Log every 10 batches
+                            logger.info(f"Batch {batch_idx}/{len(batches)}: "
+                                      f"Processed {len(batch_data)} items")
+                        yield collated
                     else:
                         yield batch_data
                 except Exception as e:
-                    logger.error(f"Error collating batch: {str(e)}")
+                    logger.error(f"Error collating batch {batch_idx}: {str(e)}")
                     continue
+            
+            pbar.update(1)
+            
+        pbar.close()
 
     def __len__(self):
         if self.drop_last:
