@@ -24,6 +24,7 @@ import threading
 import psutil
 import time
 import multiprocessing as mp
+from functools import lru_cache
 
 logger = logging.getLogger(__name__)
 
@@ -816,202 +817,208 @@ class CustomDataset(Dataset):
         
         logger = logging.getLogger(__name__)
         
-        # Initialize temporary storage for image sizes
-        image_sizes = []
-        total_images = len(self.image_paths)
-        logger.info(f"Analyzing {total_images} images using {self.num_workers} workers")
-        
-        # Cache target size calculations
-        @lru_cache(maxsize=1024)
-        def get_cached_target_size(width, height):
-            return self._get_target_size(width, height)
-        
-        # Process images in batches for better memory efficiency
-        batch_size = 1000
-        
-        def analyze_image_batch(img_paths):
-            results = []
-            for img_path in img_paths:
-                try:
-                    with Image.open(img_path) as img:
-                        if img.mode not in ('RGB', 'RGBA'):
-                            img = img.convert('RGB')
-                        width, height = img.size
-                        target_h, target_w = get_cached_target_size(width, height)
-                        if target_h and target_w:  # Ensure valid dimensions
-                            results.append((target_h, target_w))
-                except Exception as e:
-                    logger.error(f"Error analyzing {img_path}: {str(e)}")
-            return results
-        
-        # Process images in batches
-        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-            # Submit all tasks
-            future_to_path = {executor.submit(analyze_image_batch, self.image_paths[i:i + batch_size]): i for i in range(0, total_images, batch_size)}
+        # If all_ar is True, create individual buckets for each unique size
+        if self.all_ar:
+            logger.info("all_ar enabled - creating individual buckets for each image size")
             
-            # Collect results
-            for i, future in enumerate(future_to_path):
-                try:
-                    batch_results = future.result()
-                    image_sizes.extend(batch_results)
-                    processed = min((i + 1) * batch_size, total_images)
-                    if processed % 1000 == 0:
-                        logger.info(f"Analyzed {processed}/{total_images} images")
-                except Exception as e:
-                    logger.error(f"Error in batch {i}: {str(e)}")
-        
-        if not image_sizes:
-            raise RuntimeError("No valid images found in dataset")
-        
-        # Use numpy for faster calculations
-        sizes_array = np.array(image_sizes)
-        aspect_ratios = sizes_array[:, 0] / sizes_array[:, 1]  # height/width ratios
-        
-        # Determine AR ranges for adaptive step sizes
-        ar_percentiles = np.percentile(aspect_ratios, [5, 95])
-        
-        # Group similar sizes to create buckets, using numpy for efficiency
-        size_groups = defaultdict(list)
-        
-        # Vectorized operations for bucket assignment
-        for h, w in sizes_array:
-            ar = h / w
+            # Initialize temporary storage for image sizes
+            size_groups = defaultdict(list)
             
-            # Adaptive step sizes based on aspect ratio distribution
-            if ar < ar_percentiles[0] or ar > ar_percentiles[1]:
-                # Extreme aspect ratios get larger steps
-                h_step = max(64, self.bucket_reso_steps * 2)
-                w_step = max(64, self.bucket_reso_steps * 2)
-            else:
-                # Normal aspect ratios use standard steps
-                h_step = self.bucket_reso_steps
-                w_step = self.bucket_reso_steps
+            def analyze_image_batch(img_paths):
+                results = []
+                for img_path in img_paths:
+                    try:
+                        with Image.open(img_path) as img:
+                            if img.mode not in ('RGB', 'RGBA'):
+                                img = img.convert('RGB')
+                            width, height = img.size
+                            # Store exact dimensions for all_ar mode
+                            results.append((img_path, (height, width)))
+                    except Exception as e:
+                        logger.error(f"Error analyzing {img_path}: {str(e)}")
+                return results
+
+            # Process images in batches
+            batch_size = 1000
+            total_images = len(self.image_paths)
             
-            # Round to nearest step while preserving aspect ratio
-            if h > w:
-                bucket_w = max(self.min_size, round(w / w_step) * w_step)
-                bucket_h = max(self.min_size, round(h / h_step) * h_step)
-            else:
-                bucket_h = max(self.min_size, round(h / h_step) * h_step)
-                bucket_w = max(self.min_size, round(w / w_step) * w_step)
+            with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+                futures = []
+                for i in range(0, total_images, batch_size):
+                    batch = self.image_paths[i:i + batch_size]
+                    futures.append(executor.submit(analyze_image_batch, batch))
+                
+                # Collect results and group by size
+                for future in as_completed(futures):
+                    for img_path, size in future.result():
+                        size_groups[size].append(img_path)
+
+            # Create buckets for each unique size
+            self.buckets = list(size_groups.keys())
+            self.bucket_data = size_groups
             
-            size_groups[(bucket_h, bucket_w)].append((h, w))
-        
-        # Filter out buckets with too few images to avoid memory fragmentation
-        min_images_per_bucket = max(5, total_images // 1000)  # Adaptive threshold
-        size_groups = {k: v for k, v in size_groups.items() if len(v) >= min_images_per_bucket}
-        
-        # Create buckets from groups
-        self.buckets = sorted(size_groups.keys(), key=lambda x: x[0] * x[1])
-        self.bucket_data = {bucket: [] for bucket in self.buckets}
-        
-        # Log bucket statistics
-        logger.info(f"Created {len(self.buckets)} dynamic buckets")
-        logger.info(f"Aspect ratio range: {ar_percentiles[0]:.2f} to {ar_percentiles[1]:.2f}")
-        
-        # Prepare lookup arrays for faster matching
-        bucket_arrays = np.array(self.buckets)
-        bucket_ars = bucket_arrays[:, 0] / bucket_arrays[:, 1]
-        bucket_areas = bucket_arrays[:, 0] * bucket_arrays[:, 1]
-        
-        def process_image_batch(img_paths):
-            results = []
-            for img_path in img_paths:
-                try:
-                    with Image.open(img_path) as img:
-                        width, height = img.size
-                        
-                        # Calculate target size first
-                        target_h, target_w = get_cached_target_size(width, height)
-                        
-                        # Find the best fitting bucket using area-based comparison
-                        best_bucket = None
-                        min_area_diff = float('inf')
-                        
-                        for bucket_h, bucket_w in self.buckets:
-                            # Skip if bucket is too small
-                            if bucket_h < target_h or bucket_w < target_w:
-                                continue
-                            
-                            # Calculate area difference
-                            area_diff = abs((bucket_h * bucket_w) - (target_h * target_w))
-                            if area_diff < min_area_diff:
-                                min_area_diff = area_diff
-                                best_bucket = (bucket_h, bucket_w)
-                    
-                        results.append((img_path, best_bucket))
-                except Exception as e:
-                    logger.error(f"Error processing {img_path}: {str(e)}")
-            return results
-        
-        # Process final assignment in batches
-        logger.info(f"Assigning {total_images} images to buckets using {self.num_workers} workers...")
-        
-        # Process in parallel with specified number of workers
-        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-            futures = []
-            for i in range(0, total_images, batch_size):
-                batch = self.image_paths[i:i + batch_size]
-                futures.append(executor.submit(process_image_batch, batch))
+            logger.info(f"Created {len(self.buckets)} unique size buckets for all_ar mode")
             
-            # Process results as they come in
-            for i, future in enumerate(futures):
-                try:
-                    batch_results = future.result()
-                    for img_path, bucket in batch_results:
-                        self.bucket_data[bucket].append(img_path)
-                    
-                    processed = min((i + 1) * batch_size, total_images)
-                    if processed % 5000 == 0:
-                        logger.info(f"Assigned {processed}/{total_images} images to buckets")
-                except Exception as e:
-                    logger.error(f"Error in batch {i}: {str(e)}")
-        
-        # Clean up empty buckets
-        empty_buckets = [bucket for bucket, images in self.bucket_data.items() if not images]
-        for bucket in empty_buckets:
-            del self.bucket_data[bucket]
-            self.buckets.remove(bucket)
-        
-        # Final statistics
-        num_buckets = len(self.bucket_data)
-        total_assigned = sum(len(imgs) for imgs in self.bucket_data.values())
-        logger.info(f"Final bucket count: {num_buckets} with {total_assigned}/{total_images} images assigned")
-        
-        # Log distribution
-        bucket_sizes = {bucket: len(imgs) for bucket, imgs in self.bucket_data.items()}
-        top_buckets = sorted(bucket_sizes.items(), key=lambda x: x[1], reverse=True)[:10]
-        logger.info("Top 10 bucket sizes:")
-        for (h, w), count in top_buckets:
-            aspect_ratio = f"{w/math.gcd(w,h)}:{h/math.gcd(w,h)}"
-            logger.info(f"  {w}x{h} ({aspect_ratio}): {count} images")
+        else:
+            # Original bucket initialization code for non-all_ar mode
+            # Initialize temporary storage for image sizes
+            image_sizes = []
+            total_images = len(self.image_paths)
+            logger.info(f"Analyzing {total_images} images using {self.num_workers} workers")
+
+            # Cache target size calculations
+            @lru_cache(maxsize=1024)
+            def get_cached_target_size(width, height):
+                return self._get_target_size(width, height)
+
+            # Process images in batches for better memory efficiency
+            batch_size = 1000
+            def analyze_image_batch(img_paths):
+                results = []
+                for img_path in img_paths:
+                    try:
+                        with Image.open(img_path) as img:
+                            if img.mode not in ('RGB', 'RGBA'):
+                                img = img.convert('RGB')
+                            width, height = img.size
+                            target_h, target_w = get_cached_target_size(width, height)
+                            if target_h and target_w:  # Ensure valid dimensions
+                                results.append((target_h, target_w))
+                    except Exception as e:
+                        logger.error(f"Error analyzing {img_path}: {str(e)}")
+                return results
+
+            # Process images in batches
+            with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+                # Submit all tasks
+                future_to_path = {
+                    executor.submit(analyze_image_batch, self.image_paths[i:i + batch_size]): i 
+                    for i in range(0, total_images, batch_size)
+                }
+                
+                # Collect results
+                for i, future in enumerate(future_to_path):
+                    try:
+                        batch_results = future.result()
+                        image_sizes.extend(batch_results)
+                        processed = min((i + 1) * batch_size, total_images)
+                        if processed % 1000 == 0:
+                            logger.info(f"Analyzed {processed}/{total_images} images")
+                    except Exception as e:
+                        logger.error(f"Error in batch {i}: {str(e)}")
+
+            if not image_sizes:
+                raise RuntimeError("No valid images found in dataset")
+
+            # Convert to numpy array for efficient operations
+            sizes_array = np.array(image_sizes)
+            
+            # Calculate aspect ratios and areas
+            aspect_ratios = sizes_array[:, 0] / sizes_array[:, 1]  # height/width ratios
+            areas = sizes_array[:, 0] * sizes_array[:, 1]
+
+            # Create bucket steps based on distribution
+            size_groups = defaultdict(list)
+            
+            # Process each image size to create appropriate buckets
+            for h, w in sizes_array:
+                # Round dimensions to nearest step
+                bucket_h = max(self.min_size, round(h / self.bucket_reso_steps) * self.bucket_reso_steps)
+                bucket_w = max(self.min_size, round(w / self.bucket_reso_steps) * self.bucket_reso_steps)
+                
+                # Ensure dimensions don't exceed max_size
+                if self.max_size:
+                    scale = min(1.0, self.max_size / max(bucket_h, bucket_w))
+                    if scale < 1.0:
+                        bucket_h = round(bucket_h * scale / self.bucket_reso_steps) * self.bucket_reso_steps
+                        bucket_w = round(bucket_w * scale / self.bucket_reso_steps) * self.bucket_reso_steps
+                
+                size_groups[(bucket_h, bucket_w)].append((h, w))
+
+            # Filter buckets to remove those with too few images
+            min_images = max(2, total_images // 1000)  # Adjust threshold based on dataset size
+            self.buckets = [k for k, v in size_groups.items() if len(v) >= min_images]
+            
+            # Sort buckets by area for efficient batching
+            self.buckets.sort(key=lambda x: x[0] * x[1])
+
+            # Create bucket data structure
+            self.bucket_data = {bucket: [] for bucket in self.buckets}
+
+            # Log bucket information
+            logger.info(f"Created {len(self.buckets)} buckets:")
+            for bucket in self.buckets:
+                bucket_h, bucket_w = bucket
+                count = len(size_groups[bucket])
+                logger.info(f"  {bucket_h}x{bucket_w}: {count} images")
+            
+            # Calculate and log statistics
+            total_buckets = len(self.buckets)
+            total_bucketed_images = sum(len(size_groups[b]) for b in self.buckets)
+            coverage = total_bucketed_images / total_images * 100
+            
+            logger.info(f"Bucket statistics:")
+            logger.info(f"  Total buckets: {total_buckets}")
+            logger.info(f"  Images in buckets: {total_bucketed_images}/{total_images} ({coverage:.1f}%)")
+            logger.info(f"  Aspect ratio range: {aspect_ratios.min():.2f} to {aspect_ratios.max():.2f}")
+            logger.info(f"  Area range: {areas.min():.0f} to {areas.max():.0f}")
 
     def _assign_to_bucket(self, img_path):
-        """Assign an image to the most appropriate bucket with optimized comparison"""
+        """Assign an image to the appropriate bucket based on mode"""
         try:
             with Image.open(img_path) as img:
                 width, height = img.size
                 
-                # Calculate target size first
-                target_h, target_w = self._get_target_size(width, height)
-                
-                # Find the best fitting bucket using area-based comparison
-                best_bucket = None
-                min_area_diff = float('inf')
-                
-                for bucket_h, bucket_w in self.buckets:
-                    # Skip if bucket is too small
-                    if bucket_h < target_h or bucket_w < target_w:
-                        continue
+                if self.all_ar:
+                    # In all_ar mode, use exact dimensions as bucket
+                    bucket = (height, width)
+                    if bucket not in self.buckets:
+                        self.buckets.append(bucket)
+                        self.bucket_data[bucket] = []
+                    return img_path, bucket
+                else:
+                    # Original bucket assignment logic for non-all_ar mode
+                    # Calculate target dimensions
+                    target_h, target_w = self._get_target_size(width, height)
                     
-                    # Calculate area difference
-                    area_diff = abs((bucket_h * bucket_w) - (target_h * target_w))
-                    if area_diff < min_area_diff:
-                        min_area_diff = area_diff
-                        best_bucket = (bucket_h, bucket_w)
-            
-                return img_path, best_bucket
-            
+                    # Find best fitting bucket
+                    best_bucket = None
+                    min_area_diff = float('inf')
+                    
+                    for bucket_h, bucket_w in self.buckets:
+                        # Skip if bucket is too small
+                        if bucket_h < target_h or bucket_w < target_w:
+                            continue
+                        
+                        # Calculate area difference
+                        area_diff = (bucket_h * bucket_w) - (target_h * target_w)
+                        
+                        # Update best bucket if this one is better
+                        if area_diff < min_area_diff:
+                            min_area_diff = area_diff
+                            best_bucket = (bucket_h, bucket_w)
+                    
+                    # If no suitable bucket found, use largest bucket that maintains aspect ratio
+                    if best_bucket is None:
+                        aspect_ratio = height / width
+                        best_area_diff = float('inf')
+                        
+                        for bucket_h, bucket_w in self.buckets:
+                            bucket_ar = bucket_h / bucket_w
+                            if abs(bucket_ar - aspect_ratio) < 0.1:  # Allow some AR tolerance
+                                area_diff = abs((bucket_h * bucket_w) - (target_h * target_w))
+                                if area_diff < best_area_diff:
+                                    best_area_diff = area_diff
+                                    best_bucket = (bucket_h, bucket_w)
+                    
+                    # If still no bucket found, use the largest available bucket
+                    if best_bucket is None:
+                        best_bucket = max(self.buckets, key=lambda x: x[0] * x[1])
+                        logger.warning(f"Using largest bucket {best_bucket} for image {img_path} "
+                                     f"with dimensions {width}x{height}")
+                    
+                    return img_path, best_bucket
+                
         except Exception as e:
             logger.error(f"Error assigning {img_path} to bucket: {str(e)}")
             return img_path, None
@@ -1134,6 +1141,10 @@ class CustomDataset(Dataset):
         """Get the most appropriate bucket size for an image"""
         width, height = image_size
         
+        if self.all_ar:
+            # In all_ar mode, return exact dimensions
+            return (height, width)
+        
         # Find best fitting bucket
         best_bucket = None
         min_area_diff = float('inf')
@@ -1195,8 +1206,9 @@ class CustomDataset(Dataset):
         # All items should have the same bucket size since we're using BucketSampler
         bucket_size = batch[0]['bucket_size']
         if not all(item['bucket_size'] == bucket_size for item in batch):
-            sizes = [item['bucket_size'] for item in batch]
-            raise ValueError(f"Inconsistent bucket sizes in batch: {sizes}")
+            if not self.all_ar:  # Only raise error if not in all_ar mode
+                sizes = [item['bucket_size'] for item in batch]
+                raise ValueError(f"Inconsistent bucket sizes in batch: {sizes}")
         
         # Stack tensors
         try:
@@ -1242,7 +1254,13 @@ class CustomDataset(Dataset):
             if self.enable_bucket_sampler:
                 bucket = self.image_to_bucket.get(img_path)
                 if bucket is None:
-                    raise ValueError(f"No bucket found for image {img_path}")
+                    if self.all_ar:
+                        # For all_ar mode, get original dimensions
+                        with Image.open(img_path) as img:
+                            width, height = img.size
+                            bucket = (height, width)
+                    else:
+                        raise ValueError(f"No bucket found for image {img_path}")
                 bucket_h, bucket_w = bucket
             else:
                 bucket_h = bucket_w = None
@@ -1367,92 +1385,105 @@ class BucketSampler(Sampler):
         
         self.batch_size = batch_size
         self.drop_last = drop_last
+        self.all_ar = dataset.all_ar
         
         # Store (bucket, index) pairs for all valid samples
         self.samples = []
-        for bucket, img_paths in dataset.bucket_data.items():
-            # Validate that all images in this bucket have the exact same dimensions
-            if len(img_paths) > 0:
-                first_img = Image.open(img_paths[0])
-                bucket_width, bucket_height = first_img.size
-                first_img.close()
-                
-                valid_paths = []
+        
+        if self.all_ar:
+            # In all_ar mode, each image is its own bucket
+            for bucket, img_paths in dataset.bucket_data.items():
                 for img_path in img_paths:
-                    with Image.open(img_path) as img:
-                        width, height = img.size
-                        if width == bucket_width and height == bucket_height:
-                            valid_paths.append(img_path)
-                        else:
-                            logger.warning(f"Image {img_path} dimensions ({width}x{height}) don't match bucket dimensions ({bucket_width}x{bucket_height})")
-                
-                # Only use images with matching dimensions
-                for img_path in valid_paths:
                     idx = dataset.image_paths.index(img_path)
                     self.samples.append((bucket, idx))
+        else:
+            # Original bucket validation logic for non-all_ar mode
+            # Validate buckets and create sample list
+            for bucket, img_paths in dataset.bucket_data.items():
+                bucket_h, bucket_w = bucket
+                
+                # Skip invalid buckets
+                if bucket_h < dataset.min_size or bucket_w < dataset.min_size:
+                    logger.warning(f"Skipping bucket {bucket} - dimensions too small")
+                    continue
+                    
+                if dataset.max_size and (bucket_h > dataset.max_size or bucket_w > dataset.max_size):
+                    logger.warning(f"Skipping bucket {bucket} - dimensions exceed max_size")
+                    continue
+                
+                # Get indices for images in this bucket
+                for img_path in img_paths:
+                    try:
+                        idx = dataset.image_paths.index(img_path)
+                        self.samples.append((bucket, idx))
+                    except ValueError:
+                        logger.warning(f"Image {img_path} not found in dataset paths")
+                        continue
+                
+                # Log bucket statistics
+                if len(img_paths) > 0:
+                    logger.debug(f"Bucket {bucket}: {len(img_paths)} images")
             
-        if not self.samples:
-            raise ValueError("No valid samples found in dataset buckets")
-    
-    def _validate_buckets(self, dataset):
-        """Validate bucket configurations to prevent runtime errors"""
-        bucket_sizes = {}
-        for bucket, img_paths in dataset.bucket_data.items():
-            if not img_paths:  # Skip empty buckets
-                continue
-            # Sample an image from each bucket to verify size
-            sample_path = img_paths[0]
-            try:
-                idx = dataset.image_paths.index(sample_path)
-                sample = dataset[idx]
-                if sample is None:
-                    raise ValueError(f"Invalid sample at index {idx} in bucket {bucket}")
-                bucket_sizes[bucket] = sample['bucket_size']
-            except Exception as e:
-                raise ValueError(f"Error validating bucket {bucket}: {str(e)}")
+            # Verify we have valid samples
+            if not self.samples:
+                raise ValueError("No valid samples found after bucket validation")
+                
+            # Sort samples by bucket size for potentially better memory usage
+            self.samples.sort(key=lambda x: x[0][0] * x[0][1])
+            
+            logger.info(f"BucketSampler initialized with {len(self.samples)} valid samples "
+                       f"across {len(dataset.bucket_data)} buckets")
     
     def __iter__(self):
-        """Return batches of indices, where each batch contains images from the same bucket"""
         if not self.samples:
             raise RuntimeError("No samples available for iteration")
             
-        # Group samples by bucket
-        bucket_samples = defaultdict(list)
-        for bucket, idx in self.samples:
-            bucket_samples[bucket].append(idx)
-        
-        # Create complete batches from each bucket
-        batches = []
-        for bucket, indices in bucket_samples.items():
-            # Shuffle indices within the bucket
-            indices = indices.copy()  # Create a copy to prevent modifying original
+        if self.all_ar:
+            # In all_ar mode, we can shuffle all samples
+            indices = [idx for _, idx in self.samples]
             random.shuffle(indices)
             
-            # Create full batches
-            complete_batches = len(indices) // self.batch_size
-            for i in range(complete_batches):
-                start_idx = i * self.batch_size
-                batch = indices[start_idx:start_idx + self.batch_size]
-                batches.append(batch)
+            # Create batches (they may have different sizes)
+            batches = []
+            for i in range(0, len(indices), self.batch_size):
+                batch = indices[i:i + self.batch_size]
+                if len(batch) == self.batch_size or not self.drop_last:
+                    batches.append(batch)
             
-            # Handle remaining samples if not dropping last
-            if not self.drop_last and len(indices) % self.batch_size > 0:
-                last_batch = indices[complete_batches * self.batch_size:]
-                if len(last_batch) >= self.batch_size // 2:  # Only keep if reasonable size
-                    batches.append(last_batch)
-        
-        if not batches:
-            raise RuntimeError("No valid batches could be created")
+            # Shuffle batches
+            random.shuffle(batches)
             
-        # Shuffle the batches themselves
-        random.shuffle(batches)
-        
-        # Flatten batches into single list of indices
-        indices = []
-        for batch in batches:
-            indices.extend(batch)
+            # Flatten batches
+            return iter([idx for batch in batches for idx in batch])
+        else:
+            # Original iteration logic for non-all_ar mode
+            # Group samples by bucket
+            bucket_groups = defaultdict(list)
+            for bucket, idx in self.samples:
+                bucket_groups[bucket].append(idx)
             
-        return iter(indices)
+            # Create batches for each bucket
+            batches = []
+            for bucket, indices in bucket_groups.items():
+                # Shuffle indices within each bucket
+                indices = indices.copy()
+                random.shuffle(indices)
+                
+                # Create batches of the specified size
+                for i in range(0, len(indices), self.batch_size):
+                    batch = indices[i:i + self.batch_size]
+                    if len(batch) == self.batch_size or not self.drop_last:
+                        batches.append(batch)
+            
+            # Shuffle the batches themselves
+            random.shuffle(batches)
+            
+            # Flatten batches into a single list of indices
+            indices = []
+            for batch in batches:
+                indices.extend(batch)
+            
+            return iter(indices)
     
     def __len__(self):
         if self.drop_last:
