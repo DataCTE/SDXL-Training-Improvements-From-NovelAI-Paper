@@ -39,7 +39,7 @@ class CustomDataset(Dataset):
         super().__init__()
         
         # Basic initialization
-        self.data_dir = data_dir
+        self.data_dir = Path(data_dir)
         self.vae = vae
         self.cache_dir = Path(cache_dir)
         self.no_caching_latents = no_caching_latents
