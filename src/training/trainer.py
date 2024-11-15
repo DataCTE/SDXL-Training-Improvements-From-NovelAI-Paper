@@ -1,68 +1,87 @@
-import os
 import math
-import time
 import logging
 import traceback
-from collections import defaultdict
-from typing import Union, Optional, Any, Tuple, Dict
+from typing import Union, Optional, Any, Dict, List
 from dataclasses import dataclass, field
 from threading import Lock
-
-import torch
 import wandb
+import torch
 import numpy as np
-from tqdm import tqdm
-from torch.cuda.amp import autocast, GradScaler
 from transformers import Adafactor
-from torch.optim.lr_scheduler import LambdaLR
-
+from functools import lru_cache
 from .vae_finetuner import VAEFineTuner
-from .ema import EMAModel
 from data.tag_weighter import TagBasedLossWeighter
+from .loss import get_cosine_schedule_with_warmup
+from collections import defaultdict
+import time
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
+
+@lru_cache(maxsize=128)
+def _get_optimizer_config(
+    optimizer_type: str,
+    learning_rate: float,
+    weight_decay: float,
+    adam_beta1: float,
+    adam_beta2: float,
+    adam_epsilon: float
+) -> Dict[str, Any]:
+    """Cache optimizer configurations."""
+    return {
+        "lr": learning_rate,
+        "weight_decay": weight_decay,
+        "betas": (adam_beta1, adam_beta2),
+        "eps": adam_epsilon
+    }
 
 def setup_optimizer(args, models) -> torch.optim.Optimizer:
     """Set up optimizer with proper configuration and memory optimizations."""
     try:
-        # For SDXL, we need to get trainable parameters
+        # Validate UNet model
         if not hasattr(models["unet"], "parameters"):
             raise ValueError("UNet model is not properly initialized")
             
-        # Get parameters that require gradients
+        # Get trainable parameters with optimized list comprehension
         params_to_optimize = [
             p for p in models["unet"].parameters() 
             if p.requires_grad
         ]
         
-        # Additional text encoder parameters if training text encoder
+        # Add text encoder parameters if needed
         if getattr(args, 'train_text_encoder', False):
-            if "text_encoder" in models and "text_encoder_2" in models:
-                text_encoder_params = [
-                    p for p in models["text_encoder"].parameters() if p.requires_grad
+            if all(k in models for k in ["text_encoder", "text_encoder_2"]):
+                text_params = [
+                    p for model_key in ["text_encoder", "text_encoder_2"]
+                    for p in models[model_key].parameters()
+                    if p.requires_grad
                 ]
-                text_encoder_2_params = [
-                    p for p in models["text_encoder_2"].parameters() if p.requires_grad
-                ]
-                params_to_optimize.extend(text_encoder_params)
-                params_to_optimize.extend(text_encoder_2_params)
+                params_to_optimize.extend(text_params)
         
         # Validate parameters
         if not params_to_optimize:
             raise ValueError("No trainable parameters found")
             
-        logger.info(f"Setting up optimizer for {sum(p.numel() for p in params_to_optimize):,} parameters")
+        num_params = sum(p.numel() for p in params_to_optimize)
+        logger.info(f"Setting up optimizer for {num_params:,} parameters")
         
-        # Set up optimizer based on configuration
+        # Get cached optimizer config
+        opt_config = _get_optimizer_config(
+            getattr(args, 'optimizer_type', 'adamw'),
+            args.learning_rate,
+            args.weight_decay,
+            args.adam_beta1,
+            args.adam_beta2,
+            args.adam_epsilon
+        )
+        
+        # Initialize optimizer based on type
         if args.use_8bit_adam:
             try:
                 import bitsandbytes as bnb
                 optimizer = bnb.optim.AdamW8bit(
                     params_to_optimize,
-                    lr=args.learning_rate,
-                    betas=(args.adam_beta1, args.adam_beta2),
-                    eps=args.adam_epsilon,
-                    weight_decay=args.weight_decay
+                    **opt_config
                 )
                 logger.info("Using 8-bit Adam optimizer")
             except ImportError:
@@ -70,16 +89,13 @@ def setup_optimizer(args, models) -> torch.optim.Optimizer:
                 args.use_8bit_adam = False
                 optimizer = torch.optim.AdamW(
                     params_to_optimize,
-                    lr=args.learning_rate,
-                    betas=(args.adam_beta1, args.adam_beta2),
-                    eps=args.adam_epsilon,
-                    weight_decay=args.weight_decay
+                    **opt_config
                 )
         elif args.use_adafactor:
             optimizer = Adafactor(
                 params_to_optimize,
-                lr=args.learning_rate,
-                weight_decay=args.weight_decay,
+                lr=opt_config["lr"],
+                weight_decay=opt_config["weight_decay"],
                 scale_parameter=True,
                 relative_step=False,
                 warmup_init=False
@@ -88,10 +104,7 @@ def setup_optimizer(args, models) -> torch.optim.Optimizer:
         else:
             optimizer = torch.optim.AdamW(
                 params_to_optimize,
-                lr=args.learning_rate,
-                betas=(args.adam_beta1, args.adam_beta2),
-                eps=args.adam_epsilon,
-                weight_decay=args.weight_decay
+                **opt_config
             )
             logger.info("Using AdamW optimizer")
         
@@ -111,6 +124,29 @@ def setup_optimizer(args, models) -> torch.optim.Optimizer:
         logger.error(traceback.format_exc())
         raise
 
+@lru_cache(maxsize=32)
+def _get_vae_config(args) -> Dict[str, Any]:
+    """Cache VAE configuration."""
+    return {
+        'device': args.device,
+        'mixed_precision': args.mixed_precision,
+        'use_amp': args.use_amp,
+        'learning_rate': args.vae_learning_rate,
+        'adam_beta1': args.adam_beta1,
+        'adam_beta2': args.adam_beta2,
+        'adam_epsilon': args.adam_epsilon,
+        'weight_decay': args.weight_decay,
+        'max_grad_norm': args.max_grad_norm,
+        'gradient_checkpointing': args.gradient_checkpointing,
+        'use_8bit_adam': args.use_8bit_adam,
+        'use_channel_scaling': args.vae_use_channel_scaling,
+        'adaptive_loss_scale': args.vae_adaptive_loss_scale,
+        'kl_weight': args.vae_kl_weight,
+        'perceptual_weight': args.vae_perceptual_weight,
+        'min_snr_gamma': args.min_snr_gamma,
+        'initial_scale_factor': args.vae_initial_scale_factor
+    }
+
 def setup_vae_finetuner(args, models) -> Optional[VAEFineTuner]:
     """Initialize VAE finetuner with proper configuration."""
     try:
@@ -118,25 +154,10 @@ def setup_vae_finetuner(args, models) -> Optional[VAEFineTuner]:
             return None
             
         logger.info("Initializing VAE finetuner")
+        vae_config = _get_vae_config(args)
         vae_finetuner = VAEFineTuner(
             vae=models["vae"],
-            device=args.device,
-            mixed_precision=args.mixed_precision,
-            use_amp=args.use_amp,
-            learning_rate=args.vae_learning_rate,
-            adam_beta1=args.adam_beta1,
-            adam_beta2=args.adam_beta2,
-            adam_epsilon=args.adam_epsilon,
-            weight_decay=args.weight_decay,
-            max_grad_norm=args.max_grad_norm,
-            gradient_checkpointing=args.gradient_checkpointing,
-            use_8bit_adam=args.use_8bit_adam,
-            use_channel_scaling=args.vae_use_channel_scaling,
-            adaptive_loss_scale=args.vae_adaptive_loss_scale,
-            kl_weight=args.vae_kl_weight,
-            perceptual_weight=args.vae_perceptual_weight,
-            min_snr_gamma=args.min_snr_gamma,
-            initial_scale_factor=args.vae_initial_scale_factor
+            **vae_config
         )
         
         _log_vae_config(args)
@@ -147,6 +168,21 @@ def setup_vae_finetuner(args, models) -> Optional[VAEFineTuner]:
         logger.error(traceback.format_exc())
         raise
 
+@lru_cache(maxsize=32)
+def _get_ema_config(args) -> Dict[str, Any]:
+    """Cache EMA configuration."""
+    return {
+        'decay': args.ema_decay,
+        'update_after_step': args.ema_update_after_step,
+        'update_every': args.ema_update_every,
+        'power': args.ema_power,
+        'min_decay': args.ema_min_decay,
+        'max_decay': args.ema_max_decay,
+        'mixed_precision': args.mixed_precision,
+        'jit_compile': args.enable_compile,
+        'gradient_checkpointing': args.gradient_checkpointing
+    }
+
 def setup_ema(args, models, device) -> Optional[Any]:
     """Initialize EMA model with proper configuration."""
     try:
@@ -156,19 +192,12 @@ def setup_ema(args, models, device) -> Optional[Any]:
         logger.info("Initializing EMA model")
         from .ema import EMAModel
         
+        ema_config = _get_ema_config(args)
         ema = EMAModel(
             model=models["unet"],
             model_path=args.model_path,
             device=device,
-            decay=args.ema_decay,
-            update_after_step=args.ema_update_after_step,
-            update_every=args.ema_update_every,
-            power=args.ema_power,
-            min_decay=args.ema_min_decay,
-            max_decay=args.ema_max_decay,
-            mixed_precision=args.mixed_precision,
-            jit_compile=args.enable_compile,
-            gradient_checkpointing=args.gradient_checkpointing
+            **ema_config
         )
         
         _log_ema_config(args)
@@ -198,6 +227,17 @@ def setup_validator(args, models, device, dtype) -> Optional[Any]:
         logger.error(traceback.format_exc())
         raise
 
+@lru_cache(maxsize=32)
+def _get_tag_weighter_config(args) -> Dict[str, Any]:
+    """Cache tag weighter configuration."""
+    return {
+        'base_weight': args.tag_base_weight,
+        'min_weight': args.tag_min_weight,
+        'max_weight': args.tag_max_weight,
+        'window_size': args.tag_window_size,
+        'no_cache': getattr(args, 'no_caching', False)
+    }
+
 def setup_tag_weighter(args) -> Optional[Any]:
     """Initialize tag weighting system."""
     try:
@@ -205,16 +245,8 @@ def setup_tag_weighter(args) -> Optional[Any]:
             return None
             
         logger.info("Initializing tag weighter")
-        
-        weighter = TagBasedLossWeighter(
-            config={
-                'base_weight': args.tag_base_weight,
-                'min_weight': args.tag_min_weight,
-                'max_weight': args.tag_max_weight,
-                'window_size': args.tag_window_size,
-                'no_cache': getattr(args, 'no_caching', False)
-            }
-        )
+        weighter_config = _get_tag_weighter_config(args)
+        weighter = TagBasedLossWeighter(config=weighter_config)
         
         return weighter
         
@@ -222,66 +254,6 @@ def setup_tag_weighter(args) -> Optional[Any]:
         logger.error(f"Failed to setup tag weighter: {str(e)}")
         logger.error(traceback.format_exc())
         raise
-
-def _log_optimizer_config(args):
-    """Log optimizer configuration details."""
-    logger.info(f"Optimizer settings:")
-    logger.info(f"- Learning rate: {args.learning_rate}")
-    logger.info(f"- Weight decay: {args.weight_decay}")
-    if not args.use_adafactor:
-        logger.info(f"- Beta1: {args.adam_beta1}")
-        logger.info(f"- Beta2: {args.adam_beta2}")
-        logger.info(f"- Epsilon: {args.adam_epsilon}")
-
-def _log_vae_config(args):
-    """Log VAE configuration details."""
-    logger.info(f"VAE Finetuner settings:")
-    logger.info(f"- Learning rate: {args.vae_learning_rate}")
-    logger.info(f"- Channel scaling: {args.vae_use_channel_scaling}")
-    logger.info(f"- Adaptive loss scale: {args.vae_adaptive_loss_scale}")
-    logger.info(f"- KL weight: {args.vae_kl_weight}")
-    logger.info(f"- Perceptual weight: {args.vae_perceptual_weight}")
-    logger.info(f"- Initial scale factor: {args.vae_initial_scale_factor}")
-
-def _log_ema_config(args):
-    """Log EMA configuration details."""
-    logger.info(f"EMA settings:")
-    logger.info(f"- Decay: {args.ema_decay}")
-    logger.info(f"- Update after step: {args.ema_update_after_step}")
-    logger.info(f"- Update every: {args.ema_update_every}")
-    logger.info(f"- Power: {args.ema_power}")
-    logger.info(f"- Min/Max decay: {args.ema_min_decay}/{args.ema_max_decay}")
-
-def get_cosine_schedule_with_warmup(
-    optimizer: torch.optim.Optimizer,
-    num_warmup_steps: int,
-    num_training_steps: int,
-    num_cycles: float = 0.5,
-    last_epoch: int = -1
-) -> LambdaLR:
-    """
-    Create a schedule with a learning rate that decreases following the values of the cosine function between the
-    initial lr set in the optimizer to 0, after a warmup period during which it increases linearly between 0 and the
-    initial lr set in the optimizer.
-
-    Args:
-        optimizer: The optimizer for which to schedule the learning rate
-        num_warmup_steps: The number of steps for the warmup phase
-        num_training_steps: The total number of training steps
-        num_cycles: The number of cosine cycles (default: 0.5)
-        last_epoch: The index of the last epoch when resuming training
-
-    Returns:
-        `torch.optim.lr_scheduler.LambdaLR` with the appropriate schedule
-    """
-
-    def lr_lambda(current_step: int):
-        if current_step < num_warmup_steps:
-            return float(current_step) / float(max(1, num_warmup_steps))
-        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
-        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)))
-
-    return LambdaLR(optimizer, lr_lambda, last_epoch)
 
 @dataclass
 class AverageMeter:
@@ -294,7 +266,7 @@ class AverageMeter:
     _sum: float = field(default=0, init=False)
     _count: int = field(default=0, init=False)
     _avg: float = field(default=0, init=False)
-    _history: list = field(default_factory=list, init=False)
+    _history: List[float] = field(default_factory=list, init=False)
     _lock: Lock = field(default_factory=Lock, init=False)
     
     def reset(self) -> None:
@@ -347,3 +319,406 @@ class AverageMeter:
         with self._lock:
             return self._count
 
+def _log_optimizer_config(args):
+    """Log optimizer configuration details."""
+    logger.info(f"Optimizer settings:")
+    logger.info(f"- Learning rate: {args.learning_rate}")
+    logger.info(f"- Weight decay: {args.weight_decay}")
+    if not args.use_adafactor:
+        logger.info(f"- Beta1: {args.adam_beta1}")
+        logger.info(f"- Beta2: {args.adam_beta2}")
+        logger.info(f"- Epsilon: {args.adam_epsilon}")
+
+def _log_vae_config(args):
+    """Log VAE configuration details."""
+    logger.info(f"VAE Finetuner settings:")
+    logger.info(f"- Learning rate: {args.vae_learning_rate}")
+    logger.info(f"- Channel scaling: {args.vae_use_channel_scaling}")
+    logger.info(f"- Adaptive loss scale: {args.vae_adaptive_loss_scale}")
+    logger.info(f"- KL weight: {args.vae_kl_weight}")
+    logger.info(f"- Perceptual weight: {args.vae_perceptual_weight}")
+    logger.info(f"- Initial scale factor: {args.vae_initial_scale_factor}")
+
+def _log_ema_config(args):
+    """Log EMA configuration details."""
+    logger.info(f"EMA settings:")
+    logger.info(f"- Decay: {args.ema_decay}")
+    logger.info(f"- Update after step: {args.ema_update_after_step}")
+    logger.info(f"- Update every: {args.ema_update_every}")
+    logger.info(f"- Power: {args.ema_power}")
+    logger.info(f"- Min/Max decay: {args.ema_min_decay}/{args.ema_max_decay}")
+
+@lru_cache(maxsize=32)
+def _get_training_config(args) -> Dict[str, Any]:
+    """Cache training configuration."""
+    return {
+        "mode": args.training_mode,
+        "min_snr_gamma": args.min_snr_gamma,
+        "sigma_data": args.sigma_data,
+        "sigma_min": args.sigma_min,
+        "sigma_max": args.sigma_max,
+        "scale_method": args.scale_method,
+        "scale_factor": args.scale_factor
+    }
+
+def initialize_training_components(args, device, dtype, models):
+    """Initialize all training components with proper error handling"""
+    components = {}
+    
+    try:
+        # Setup optimizer with validation
+        if not models.get("unet"):
+            raise ValueError("UNet model not found in models dictionary")
+        components["optimizer"] = setup_optimizer(args, models)
+        
+        # Setup data loader with validation
+        required_models = ["vae", "tokenizer", "tokenizer_2", "text_encoder", "text_encoder_2"]
+        if not all(k in models for k in required_models):
+            raise ValueError(f"Missing required models: {[k for k in required_models if k not in models]}")
+            
+        components["train_dataloader"] = create_dataloader(
+            data_dir=args.data_dir,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            no_caching_latents=args.no_caching,
+            all_ar=args.all_ar,
+            cache_dir=args.cache_dir,
+            vae=models["vae"],
+            tokenizer=models["tokenizer"],
+            tokenizer_2=models["tokenizer_2"],
+            text_encoder=models["text_encoder"],
+            text_encoder_2=models["text_encoder_2"]
+        )
+        
+        # Setup learning rate scheduler
+        num_training_steps = args.num_epochs * len(components["train_dataloader"])
+        components["lr_scheduler"] = get_cosine_schedule_with_warmup(
+            optimizer=components["optimizer"],
+            num_warmup_steps=args.warmup_steps,
+            num_training_steps=num_training_steps
+        )
+        
+        # Setup optional components with parallel initialization
+        optional_components = {
+            "ema": (setup_ema, args.use_ema, (args, models, device)),
+            "tag_weighter": (setup_tag_weighter, args.use_tag_weighting, (args,)),
+            "vae_finetuner": (setup_vae_finetuner, args.finetune_vae, (args, models))
+        }
+        
+        components.update({
+            name: setup_func(*setup_args) if use_flag else None
+            for name, (setup_func, use_flag, setup_args) in optional_components.items()
+        })
+        
+        # Cache and set training configuration
+        components["training_config"] = _get_training_config(args)
+        
+        # Validate components
+        _validate_components(components)
+        
+        return components
+        
+    except Exception as e:
+        logger.error(f"Failed to initialize training components: {str(e)}")
+        logger.error(traceback.format_exc())
+        _cleanup_failed_initialization(components)
+        raise
+
+def _validate_components(components: Dict[str, Any]) -> None:
+    """Validate initialized components."""
+    required = ["optimizer", "train_dataloader", "lr_scheduler", "training_config"]
+    if not all(k in components for k in required):
+        raise ValueError(f"Missing required components: {[k for k in required if k not in components]}")
+
+def _cleanup_failed_initialization(components: Dict[str, Any]) -> None:
+    """Clean up resources in case of failed initialization."""
+    try:
+        # Close data loader if it was created
+        if "train_dataloader" in components:
+            try:
+                components["train_dataloader"].dataset.cleanup()
+            except:
+                pass
+        
+        # Clear CUDA cache
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
+    except Exception as e:
+        logger.error(f"Error during cleanup: {str(e)}")
+
+@torch.no_grad()
+def train_epoch(epoch: int, args, models, components, device, dtype, wandb_run, global_step: int):
+    """Execute single training epoch with proper logging and memory management."""
+    try:
+        logger.info(f"Starting epoch {epoch + 1}/{args.num_epochs}")
+        
+        # Train for one epoch
+        epoch_metrics = train(args, models, components, device, dtype)
+        
+        # Log metrics if wandb is enabled
+        if wandb_run:
+            log_epoch_metrics(wandb_run, epoch_metrics, epoch, global_step)
+            log_model_gradients(models["unet"], step=global_step)
+            log_memory_stats(step=global_step)
+        
+        return epoch_metrics
+        
+    except Exception as e:
+        logger.error(f"Error in training epoch {epoch}: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise
+    finally:
+        # Clear cache after each epoch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+def train(args, models, components, device, dtype) -> Dict[str, float]:
+    """Execute training steps with proper error handling and logging."""
+    metrics = defaultdict(lambda: AverageMeter(name="default"))
+    models["unet"].train()
+    
+    start_time = time.time()
+    data_time = AverageMeter("data_time")
+    batch_time = AverageMeter("batch_time")
+    
+    progress_bar = tqdm(
+        components["train_dataloader"],
+        desc=f"Training",
+        dynamic_ncols=True,
+        leave=False
+    )
+    
+    try:
+        for batch_idx, batch in enumerate(progress_bar):
+            try:
+                # Update timing
+                data_time.update(time.time() - start_time)
+                
+                # Execute training step
+                batch_metrics = train_step(
+                    args=args,
+                    models=models,
+                    components=components,
+                    batch=batch,
+                    batch_idx=batch_idx,
+                    device=device,
+                    dtype=dtype
+                )
+                
+                # Update metrics
+                for k, v in batch_metrics.items():
+                    metrics[k].update(v)
+                
+                # Update progress bar
+                progress_bar.set_postfix({
+                    k: f"{v.avg:.4f}" for k, v in metrics.items()
+                })
+                
+                # Update timing
+                batch_time.update(time.time() - start_time)
+                start_time = time.time()
+                
+            except Exception as e:
+                logger.error(f"Error in training batch {batch_idx}: {str(e)}")
+                logger.error(traceback.format_exc())
+                continue
+                
+        return {k: v.avg for k, v in metrics.items()}
+        
+    finally:
+        progress_bar.close()
+
+def log_epoch_metrics(wandb_run, metrics: Dict[str, float], epoch: int, global_step: int) -> None:
+    """Log epoch metrics to W&B with proper error handling."""
+    try:
+        # Prepare metrics for logging
+        log_dict = {
+            f"train/{k}": v for k, v in metrics.items()
+        }
+        
+        # Add epoch info
+        log_dict.update({
+            "train/epoch": epoch,
+            "train/global_step": global_step
+        })
+        
+        # Log to W&B
+        wandb_run.log(log_dict, step=global_step)
+        
+        # Log to console
+        logger.info(
+            f"Epoch {epoch} metrics: " + 
+            ", ".join(f"{k}: {v:.4f}" for k, v in metrics.items())
+        )
+        
+    except Exception as e:
+        logger.error(f"Failed to log epoch metrics: {str(e)}")
+        logger.error(traceback.format_exc())
+
+def log_model_gradients(model: torch.nn.Module, step: int) -> None:
+    """Log model gradient statistics to W&B."""
+    try:
+        grad_dict = {}
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                # Compute gradient statistics
+                grad = param.grad.detach()
+                grad_dict.update({
+                    f"gradients/{name}/mean": grad.mean().item(),
+                    f"gradients/{name}/std": grad.std().item(),
+                    f"gradients/{name}/norm": grad.norm().item(),
+                    f"gradients/{name}/max": grad.max().item(),
+                    f"gradients/{name}/min": grad.min().item()
+                })
+                
+                # Log histogram if available
+                try:
+                    import wandb
+                    grad_dict[f"gradients/{name}/hist"] = wandb.Histogram(grad.cpu().numpy())
+                except:
+                    pass
+        
+        # Log to W&B
+        wandb.log(grad_dict, step=step)
+        
+    except Exception as e:
+        logger.error(f"Failed to log model gradients: {str(e)}")
+        logger.error(traceback.format_exc())
+
+def log_memory_stats(step: int) -> None:
+    """Log CUDA memory statistics to W&B."""
+    try:
+        if not torch.cuda.is_available():
+            return
+            
+        # Get memory statistics
+        memory_stats = {
+            "memory/allocated": torch.cuda.memory_allocated() / 1024**2,  # MB
+            "memory/cached": torch.cuda.memory_reserved() / 1024**2,      # MB
+            "memory/max_allocated": torch.cuda.max_memory_allocated() / 1024**2,
+            "memory/max_cached": torch.cuda.max_memory_reserved() / 1024**2
+        }
+        
+        # Get per-device statistics
+        for i in range(torch.cuda.device_count()):
+            stats = torch.cuda.memory_stats(i)
+            memory_stats.update({
+                f"memory/device_{i}/active": stats["active_bytes.all.current"] / 1024**2,
+                f"memory/device_{i}/inactive": stats["inactive_split_bytes.all.current"] / 1024**2,
+                f"memory/device_{i}/fragmentation": stats.get("fragmentation.all.current", 0)
+            })
+        
+        # Log to W&B
+        wandb.log(memory_stats, step=step)
+        
+        # Log to console
+        logger.debug(
+            "Memory stats: " + 
+            ", ".join(f"{k}: {v:.1f}MB" for k, v in memory_stats.items())
+        )
+        
+    except Exception as e:
+        logger.error(f"Failed to log memory stats: {str(e)}")
+        logger.error(traceback.format_exc())
+
+@lru_cache(maxsize=1)
+def _get_memory_stats_format() -> Dict[str, str]:
+    """Cache memory statistics format strings."""
+    return {
+        "allocated": "Allocated: {:.1f}MB",
+        "cached": "Cached: {:.1f}MB",
+        "max_allocated": "Max Allocated: {:.1f}MB",
+        "max_cached": "Max Cached: {:.1f}MB"
+    }
+
+def train_step(args, models, components, batch, batch_idx: int, device, dtype) -> Dict[str, float]:
+    """Execute single training step with proper error handling."""
+    try:
+        # Move batch to device
+        batch = {k: v.to(device=device, dtype=dtype) if isinstance(v, torch.Tensor) else v 
+                for k, v in batch.items()}
+        
+        # Zero gradients
+        components["optimizer"].zero_grad(set_to_none=True)
+        
+        # Forward pass with autocast
+        with torch.cuda.amp.autocast(enabled=args.mixed_precision):
+            # Get loss from model
+            loss = models["unet"](
+                x_0=batch["latents"],
+                sigma=batch["sigmas"],
+                text_embeddings=batch["text_embeddings"],
+                added_cond_kwargs=batch.get("added_cond_kwargs"),
+                sigma_data=args.sigma_data,
+                tag_weighter=components.get("tag_weighter"),
+                batch_tags=batch.get("tags"),
+                min_snr_gamma=args.min_snr_gamma,
+                rescale_cfg=args.rescale_cfg,
+                rescale_multiplier=args.rescale_multiplier,
+                scale_method=args.scale_method,
+                use_tag_weighting=args.use_tag_weighting,
+                device=device,
+                dtype=dtype
+            )
+            
+            # Scale loss for gradient accumulation
+            if args.gradient_accumulation_steps > 1:
+                loss = loss / args.gradient_accumulation_steps
+        
+        # Backward pass with gradient scaling
+        if args.mixed_precision:
+            components["scaler"].scale(loss).backward()
+            if (batch_idx + 1) % args.gradient_accumulation_steps == 0:
+                components["scaler"].unscale_(components["optimizer"])
+                torch.nn.utils.clip_grad_norm_(models["unet"].parameters(), args.max_grad_norm)
+                components["scaler"].step(components["optimizer"])
+                components["scaler"].update()
+                components["lr_scheduler"].step()
+        else:
+            loss.backward()
+            if (batch_idx + 1) % args.gradient_accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(models["unet"].parameters(), args.max_grad_norm)
+                components["optimizer"].step()
+                components["lr_scheduler"].step()
+        
+        # Update EMA model if enabled
+        if components.get("ema") is not None and (batch_idx + 1) % args.gradient_accumulation_steps == 0:
+            components["ema"].step(models["unet"])
+        
+        # Update VAE if enabled
+        if components.get("vae_finetuner") is not None:
+            vae_metrics = components["vae_finetuner"].train_step(batch)
+        else:
+            vae_metrics = {}
+        
+        # Compute metrics
+        metrics = {
+            "loss": loss.item(),
+            "lr": components["optimizer"].param_groups[0]["lr"],
+            "grad_norm": get_grad_norm(models["unet"]),
+            **vae_metrics
+        }
+        
+        if components.get("ema"):
+            metrics["ema_decay"] = components["ema"].cur_decay_value
+        
+        return metrics
+        
+    except Exception as e:
+        logger.error(f"Error in training step: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise
+
+def get_grad_norm(model: torch.nn.Module) -> float:
+    """Calculate gradient norm with proper error handling."""
+    try:
+        total_norm = 0.0
+        for p in model.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.detach().data.norm(2)
+                total_norm += param_norm.item() ** 2
+        return math.sqrt(total_norm)
+    except Exception as e:
+        logger.error(f"Failed to calculate gradient norm: {str(e)}")
+        return 0.0
