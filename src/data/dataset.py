@@ -41,7 +41,7 @@ class CustomDataset(Dataset):
         # Basic initialization
         self.data_dir = data_dir
         self.vae = vae
-        self.cache_dir = cache_dir
+        self.cache_dir = Path(cache_dir)
         self.no_caching_latents = no_caching_latents
         self.all_ar = all_ar
         
@@ -234,7 +234,7 @@ class CustomDataset(Dataset):
         
     def __del__(self):
         """Cleanup worker processes"""
-        if self.process_pool:
+        if hasattr(self, 'process_pool') and self.process_pool:
             # Send poison pills to workers
             for _ in range(self.num_workers):
                 self.task_queue.put(None)
