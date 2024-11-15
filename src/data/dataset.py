@@ -67,6 +67,12 @@ class CustomDataset(CustomDatasetBase):
                  adaptive_loss_scale=False, kl_weight=0.0, perceptual_weight=0.0,
                  **kwargs):
         super().__init__()
+         # Log initialization parameters
+        logger.info(f"Initializing dataset with:")
+        logger.info(f"  no_caching_latents: {no_caching_latents}")
+        logger.info(f"  all_ar: {all_ar}")
+        logger.info(f"  num_workers: {num_workers}")
+        logger.info(f"  use_tag_weighting: {use_tag_weighting}")
         
         # Data directory and paths
         self.data_dir = Path(data_dir)
@@ -1639,11 +1645,28 @@ def create_dataloader(
     enable_bucket_sampler=True,
     no_caching_latents=False,
     all_ar=False,
+    use_tag_weighting=False,
     **kwargs
 ):
     """
     Create a dataloader with the specified parameters
     """
+    # Log initialization parameters
+    logger.info("Creating dataloader with settings:")
+    logger.info(f"  batch_size: {batch_size}")
+    logger.info(f"  num_workers: {num_workers}")
+    logger.info(f"  no_caching_latents: {no_caching_latents}")
+    logger.info(f"  all_ar: {all_ar}")
+    logger.info(f"  use_tag_weighting: {use_tag_weighting}")
+
+    # Validate settings
+    if all_ar and not enable_bucket_sampler:
+        logger.warning("all_ar requires bucket_sampler - enabling bucket_sampler")
+        enable_bucket_sampler = True
+        
+    if no_caching_latents:
+        logger.info("Latent caching disabled - processing will be done on-the-fly")
+
     # Initialize dataset
     dataset = CustomDataset(
         data_dir=data_dir,
@@ -1656,6 +1679,7 @@ def create_dataloader(
         enable_bucket_sampler=enable_bucket_sampler,
         no_caching_latents=no_caching_latents,
         all_ar=all_ar,
+        use_tag_weighting=use_tag_weighting,
         **kwargs
     )
 
