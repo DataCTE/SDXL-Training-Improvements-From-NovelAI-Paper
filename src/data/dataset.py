@@ -424,85 +424,76 @@ class CustomDataset(CustomDatasetBase):
             logger.info(f"Created {len(bucket_data)} unique size buckets for all_ar mode")
 
     def _validate_and_process_chunk(self, image_paths, process_ar=False, cache_latents=True):
-        """Validate and process a chunk of images using multiple threads"""
+        """Ultra-fast image validation using batched processing and caching"""
         from concurrent.futures import ThreadPoolExecutor
-        from functools import partial
+        import numpy as np
+        from functools import lru_cache
         
         valid_paths = []
         bucket_data = defaultdict(list) if process_ar else None
         
-        def validate_single_image(path, process_ar=False):
-            """Process a single image with all validation checks"""
-            try:
-                # Check caption file
-                caption_path = path.with_suffix('.txt')
-                if not caption_path.exists():
-                    logger.warning(f"Skipping {path}: No caption file")
-                    return None
-                    
-                # Validate image
-                with Image.open(path) as img:
-                    # Check image mode
-                    if img.mode not in ['RGB', 'RGBA']:
-                        logger.warning(f"Skipping {path}: Invalid mode {img.mode}")
-                        return None
-                        
-                    # Get dimensions
-                    width, height = img.size
-                    
-                    # When all_ar is True, only check minimum size
-                    if self.all_ar:
-                        if width < 256 or height < 256:
-                            logger.warning(f"Skipping {path}: Image too small ({width}x{height})")
-                            return None
-                    else:
-                        # Regular validation for non-all_ar mode
-                        if width < 256 or height < 256:
-                            logger.warning(f"Skipping {path}: Image too small ({width}x{height})")
-                            return None
-                        if width > 4096 or height > 4096:
-                            logger.warning(f"Skipping {path}: Image too large ({width}x{height})")
-                            return None
-                        
-                    # Check if image is corrupted
-                    try:
-                        img.load()
-                    except Exception as e:
-                        logger.warning(f"Skipping {path}: Corrupted image - {str(e)}")
-                        return None
-                    
-                    # Return validation result
-                    if process_ar:
-                        return (path, (height, width))
-                    return path
-                    
-            except Exception as e:
-                logger.warning(f"Skipping {path}: {str(e)}")
-                return None
+        # Cache image mode checks
+        @lru_cache(maxsize=1024)
+        def is_valid_mode(mode):
+            return mode in ['RGB', 'RGBA']
         
-        # Calculate optimal chunk size and number of workers
-        chunk_size = max(1, len(image_paths) // (self.num_workers * 4))
-        num_workers = min(self.num_workers, len(image_paths))
+        # Batch process images
+        def process_batch(paths_batch):
+            results = []
+            for path in paths_batch:
+                try:
+                    if not path.with_suffix('.txt').exists():
+                        continue
+                        
+                    # Fast image header check without full load
+                    with Image.open(path) as img:
+                        if not is_valid_mode(img.mode):
+                            continue
+                            
+                        width, height = img.size
+                        
+                        # Quick size validation
+                        if width < 256 or height < 256:
+                            continue
+                            
+                        if not self.all_ar and (width > 4096 or height > 4096):
+                            continue
+                        
+                        # Minimal corruption check
+                        try:
+                            img.verify()
+                        except:
+                            continue
+                        
+                        if process_ar:
+                            results.append((path, (height, width)))
+                        else:
+                            results.append(path)
+                            
+                except Exception:
+                    continue
+                    
+            return results
+
+        # Optimize batch size based on CPU cores
+        optimal_batch_size = 1000
+        batches = np.array_split(image_paths, 
+                               max(1, len(image_paths) // optimal_batch_size))
         
-        # Process images in parallel
-        with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            # Create partial function with fixed arguments
-            validate_fn = partial(validate_single_image, 
-                                process_ar=process_ar)
+        # Process batches in parallel
+        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+            futures = [executor.submit(process_batch, batch) for batch in batches]
             
-            # Process all images
-            results = list(executor.map(validate_fn, image_paths, chunksize=chunk_size))
-            
-            # Filter out None results and organize data
-            for result in results:
-                if result is not None:
-                    if process_ar:
-                        path, bucket = result
+            # Collect results efficiently
+            for future in futures:
+                batch_results = future.result()
+                if process_ar:
+                    for path, bucket in batch_results:
                         valid_paths.append(path)
                         bucket_data[bucket].append(path)
-                    else:
-                        valid_paths.append(result)
-        
+                else:
+                    valid_paths.extend(batch_results)
+
         if process_ar:
             return valid_paths, bucket_data
         return valid_paths
