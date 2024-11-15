@@ -1,0 +1,499 @@
+{
+  "last_node_id": 126,
+  "last_link_id": 333,
+  "nodes": [
+    {
+      "id": 94,
+      "type": "CheckpointLoaderSimple",
+      "pos": {
+        "0": 408,
+        "1": 285
+      },
+      "size": {
+        "0": 315,
+        "1": 98
+      },
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            308
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "CLIP",
+          "type": "CLIP",
+          "links": [
+            291,
+            292
+          ],
+          "slot_index": 1
+        },
+        {
+          "name": "VAE",
+          "type": "VAE",
+          "links": [
+            315
+          ],
+          "slot_index": 2
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CheckpointLoaderSimple"
+      },
+      "widgets_values": [
+        "SDXL\\sdxl-ztsnr-sigma-10k.safetensors"
+      ]
+    },
+    {
+      "id": 69,
+      "type": "CLIPTextEncode",
+      "pos": {
+        "0": 848,
+        "1": 317
+      },
+      "size": {
+        "0": 400,
+        "1": 200
+      },
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 291
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "links": [
+            329
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CLIPTextEncode"
+      },
+      "widgets_values": [
+        "Photorealistic, full-body shot of a baby, around 1 year old, riding a baby Camarasaurus in a sunlit, grassy plain. The Camarasaurus is accurately depicted with a thick, sturdy body, a relatively short neck (compared to Brachiosaurus), and a rounded head with a blunt, herbivorous snout. Its skin features a scaly texture in muted green and brown tones, with subtle striping along its flanks. The baby sits securely in a fur-lined saddle positioned near the base of the dinosaur’s neck, holding onto simple leather straps for balance. The scene features tall grass gently swaying in a warm summer breeze, with a clear blue sky and distant rolling hills completing the serene atmosphere"
+      ]
+    },
+    {
+      "id": 70,
+      "type": "CLIPTextEncode",
+      "pos": {
+        "0": 854,
+        "1": 568
+      },
+      "size": {
+        "0": 400,
+        "1": 200
+      },
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 292
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "links": [
+            330
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CLIPTextEncode"
+      },
+      "widgets_values": [
+        ""
+      ]
+    },
+    {
+      "id": 116,
+      "type": "VAEDecode",
+      "pos": {
+        "0": 1764,
+        "1": 388
+      },
+      "size": {
+        "0": 210,
+        "1": 46
+      },
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "samples",
+          "type": "LATENT",
+          "link": 331
+        },
+        {
+          "name": "vae",
+          "type": "VAE",
+          "link": 315
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            317
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VAEDecode"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 117,
+      "type": "SaveImage",
+      "pos": {
+        "0": 2108,
+        "1": 334
+      },
+      "size": [
+        624.4869974000526,
+        1020.8414696717064
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 317
+        }
+      ],
+      "outputs": [],
+      "properties": {},
+      "widgets_values": [
+        "ComfyUI_zsnr"
+      ]
+    },
+    {
+      "id": 112,
+      "type": "CFGRescaleNode",
+      "pos": {
+        "0": 1167,
+        "1": 106
+      },
+      "size": {
+        "0": 315,
+        "1": 106
+      },
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 306
+        }
+      ],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            333
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CFGRescaleNode"
+      },
+      "widgets_values": [
+        "true",
+        "karras",
+        0.7000000000000001
+      ]
+    },
+    {
+      "id": 113,
+      "type": "ZsnrVpredConditioningNode",
+      "pos": {
+        "0": 787,
+        "1": 64
+      },
+      "size": {
+        "0": 315,
+        "1": 178
+      },
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 308
+        }
+      ],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            306
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "ZsnrVpredConditioningNode"
+      },
+      "widgets_values": [
+        "true",
+        "true",
+        0.0292,
+        1,
+        5,
+        "true"
+      ]
+    },
+    {
+      "id": 124,
+      "type": "EmptyLatentImage",
+      "pos": {
+        "0": 402,
+        "1": 491
+      },
+      "size": {
+        "0": 315,
+        "1": 106
+      },
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "LATENT",
+          "type": "LATENT",
+          "links": [
+            332
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "EmptyLatentImage"
+      },
+      "widgets_values": [
+        768,
+        1344,
+        1
+      ]
+    },
+    {
+      "id": 126,
+      "type": "Note",
+      "pos": {
+        "0": 1426,
+        "1": 698
+      },
+      "size": [
+        283.30583633754395,
+        67.02481958873784
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {},
+      "widgets_values": [
+        "cfg range trained\n(3-5.5)\n7 was a mistake in the previous workflow\n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 123,
+      "type": "KSampler",
+      "pos": {
+        "0": 1413,
+        "1": 394
+      },
+      "size": {
+        "0": 315,
+        "1": 262
+      },
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 333
+        },
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": 329
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "link": 330
+        },
+        {
+          "name": "latent_image",
+          "type": "LATENT",
+          "link": 332
+        }
+      ],
+      "outputs": [
+        {
+          "name": "LATENT",
+          "type": "LATENT",
+          "links": [
+            331
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "KSampler"
+      },
+      "widgets_values": [
+        42,
+        "fixed",
+        28,
+        5,
+        "dpmpp_2m",
+        "karras",
+        1
+      ]
+    }
+  ],
+  "links": [
+    [
+      291,
+      94,
+      1,
+      69,
+      0,
+      "CLIP"
+    ],
+    [
+      292,
+      94,
+      1,
+      70,
+      0,
+      "CLIP"
+    ],
+    [
+      306,
+      113,
+      0,
+      112,
+      0,
+      "MODEL"
+    ],
+    [
+      308,
+      94,
+      0,
+      113,
+      0,
+      "MODEL"
+    ],
+    [
+      315,
+      94,
+      2,
+      116,
+      1,
+      "VAE"
+    ],
+    [
+      317,
+      116,
+      0,
+      117,
+      0,
+      "IMAGE"
+    ],
+    [
+      329,
+      69,
+      0,
+      123,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      330,
+      70,
+      0,
+      123,
+      2,
+      "CONDITIONING"
+    ],
+    [
+      331,
+      123,
+      0,
+      116,
+      0,
+      "LATENT"
+    ],
+    [
+      332,
+      124,
+      0,
+      123,
+      3,
+      "LATENT"
+    ],
+    [
+      333,
+      112,
+      0,
+      123,
+      0,
+      "MODEL"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 1,
+      "offset": [
+        -236.44125872100182,
+        -10.427969910761462
+      ]
+    }
+  },
+  "version": 0.4
+}
