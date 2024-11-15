@@ -1216,7 +1216,7 @@ class CustomDataset(Dataset):
             
             # Load cached latents if available
             if not self.no_caching_latents and self.latent_paths[idx].exists():
-                cache_data_latents = torch.load(self.latent_paths[idx])
+                cache_data_latents = torch.load(self.latent_paths[idx], map_location='cpu')  # Load to CPU first
                 cache_data['latents'] = cache_data_latents['latents']
             
             return cache_data
@@ -1360,7 +1360,9 @@ def create_dataloader(
         sampler=sampler,
         collate_fn=dataset.collate_fn,
         pin_memory=True,
-        drop_last=True
+        drop_last=True,
+        persistent_workers=True if num_workers > 0 else False,
+        prefetch_factor=2
     )
     
     logger.info(f"Created DataLoader with {len(dataset)} samples")
