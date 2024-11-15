@@ -444,13 +444,19 @@ class CustomDataset(CustomDatasetBase):
                     # Get dimensions
                     width, height = img.size
                     
-                    # Check dimensions
-                    if width < 256 or height < 256:
-                        logger.warning(f"Skipping {path}: Image too small ({width}x{height})")
-                        continue
-                    if width > 4096 or height > 4096:
-                        logger.warning(f"Skipping {path}: Image too large ({width}x{height})")
-                        continue
+                    # When all_ar is True, only check minimum size
+                    if self.all_ar:
+                        if width < 256 or height < 256:
+                            logger.warning(f"Skipping {path}: Image too small ({width}x{height})")
+                            continue
+                    else:
+                        # Regular validation for non-all_ar mode
+                        if width < 256 or height < 256:
+                            logger.warning(f"Skipping {path}: Image too small ({width}x{height})")
+                            continue
+                        if width > 4096 or height > 4096:
+                            logger.warning(f"Skipping {path}: Image too large ({width}x{height})")
+                            continue
                         
                     # Check if image is corrupted
                     try:
