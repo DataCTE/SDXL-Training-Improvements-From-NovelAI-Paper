@@ -189,13 +189,15 @@ def setup_vae_finetuner(args, models) -> Optional[VAEFineTuner]:
 def _get_ema_config(
     decay: float = 0.9999,
     update_every: int = 10,
-    device: str = 'auto'
+    device: str = 'auto',
+    model_path: str = None
 ) -> Dict[str, Any]:
     """Get basic EMA configuration."""
     return {
         'decay': decay,
         'update_every': update_every,
-        'device': device
+        'device': device,
+        'model_path': model_path
     }
 
 def setup_ema(args, model, device=None):
@@ -216,7 +218,8 @@ def setup_ema(args, model, device=None):
         ema_config = _get_ema_config(
             decay=decay,
             update_every=getattr(args, 'ema_update_every', 10),
-            device=device
+            device=device,
+            model_path=args.model_path
         )
         
         if args.use_ema:
@@ -233,8 +236,8 @@ def setup_ema(args, model, device=None):
         return None
         
     except Exception as e:
-        logger.error(f"Failed to setup EMA: {str(e)}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
+        logger.error(f"Failed to setup EMA model: {str(e)}")
+        logger.debug(f"EMA setup error details: {traceback.format_exc()}")
         raise
 
 def setup_validator(args, models, device, dtype) -> Optional[Any]:
