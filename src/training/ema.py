@@ -188,3 +188,12 @@ class EMAModel:
         logger.info(f"- Update Every: {self.update_every}")
         logger.info(f"- EMA Warmup: {self.use_ema_warmup}")
         logger.info(f"- Min/Max Decay: {self.min_decay}/{self.max_decay}")
+
+    def to(self, device=None, dtype=None):
+        """Move the EMA model to specified device and dtype"""
+        if device is not None:
+            self.device = device
+            self.ema_model.to(device)
+        if dtype is not None:
+            self.ema_model.to(dtype=dtype)
+        return self
