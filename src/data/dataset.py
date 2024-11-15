@@ -99,6 +99,12 @@ class CustomDataset(Dataset):
         if not no_caching_latents:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
         
+        # Initialize tag weighter before processing images
+        self.tag_weighter = TagBasedLossWeighter(
+            min_weight=min_tag_weight,
+            max_weight=max_tag_weight
+        )
+        
         # Initialize image paths
         self._initialize_dataset()
         
@@ -116,12 +122,6 @@ class CustomDataset(Dataset):
         
         # Set collate function
         self.collate_fn = self.custom_collate
-        
-        # Initialize tag weighter
-        self.tag_weighter = TagBasedLossWeighter(
-            min_weight=min_tag_weight,
-            max_weight=max_tag_weight
-        )
         
         # Initialize multiprocessing components
         self.process_pool = None
