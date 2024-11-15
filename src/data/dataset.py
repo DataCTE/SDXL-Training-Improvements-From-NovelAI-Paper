@@ -2441,144 +2441,139 @@ class CustomDataset(CustomDatasetBase):
 
 
 class BucketSampler(CustomSamplerBase):
-    """
-    Sampler that creates batches of samples from the same bucket to ensure consistent tensor sizes.
-    """
-    def __init__(self, dataset, batch_size, drop_last=True):
-        super().__init__()
-        logger.info("Initializing bucket sampler...")
+    """Memory-efficient bucket sampler with resolution handling"""
+    
+    def __init__(
+        self,
+        dataset: CustomDatasetBase,
+        batch_size: int = 1,
+        drop_last: bool = False,
+        shuffle: bool = True,
+        seed: Optional[int] = None,
+        resolution_binning: bool = True
+    ):
+        # Initialize parent with dataset
+        super().__init__(data_source=dataset)
         
-        if not hasattr(dataset, 'bucket_data'):
-            raise ValueError("Dataset must have 'bucket_data' attribute for BucketSampler")
-        
-        self.batch_size = batch_size
-        self.drop_last = drop_last
-        self.all_ar = dataset.all_ar
-        self.num_workers = dataset.num_workers
-
-        # Create a lookup dictionary for faster index access
-        logger.info("Creating image path lookup table...")
-        self.path_to_idx = {str(path): idx for idx, path in enumerate(dataset.image_paths)}
-        
-        # Store (bucket, index) pairs for all valid samples
-        self.samples = []
-        
-        if self.all_ar:
-            logger.info("Processing all_ar mode buckets...")
-            from tqdm import tqdm
-            from concurrent.futures import ThreadPoolExecutor, as_completed
+        try:
+            self.dataset = dataset
+            self.batch_size = batch_size
+            self.drop_last = drop_last
+            self.shuffle = shuffle
+            self.seed = seed
+            self.epoch = 0
+            self.resolution_binning = resolution_binning
             
-            # Process buckets in larger chunks for better efficiency
-            chunk_size = max(1, len(dataset.bucket_data) // (self.num_workers * 4))
-            bucket_chunks = [
-                list(chunk) for chunk in self._chunks(
-                    dataset.bucket_data.items(), 
-                    chunk_size
-                )
-            ]
+            # Initialize buckets efficiently
+            self._initialize_buckets()
             
-            # Process chunks in parallel
-            with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-                futures = []
-                pbar = tqdm(total=len(dataset.bucket_data), desc="Processing buckets")
-                
-                # Submit chunks of buckets
-                for chunk in bucket_chunks:
-                    future = executor.submit(
-                        self._process_bucket_chunk, 
-                        chunk, 
-                        len(chunk)
-                    )
-                    futures.append(future)
-                
-                # Process completed chunks
-                for future in as_completed(futures):
-                    try:
-                        chunk_samples = future.result()
-                        self.samples.extend(chunk_samples)
-                        pbar.update(len(chunk_samples))
-                    except Exception as e:
-                        logger.error(f"Error processing chunk: {str(e)}")
-                
-                pbar.close()
+            logger.info(
+                f"Initialized BucketSampler with {len(self.buckets)} buckets, "
+                f"{self.total_samples} total samples"
+            )
             
-            logger.info(f"Processed {len(self.samples)} samples for all_ar mode")
-        
-        logger.info(f"BucketSampler initialized with {len(self.samples)} samples")
+        except Exception as e:
+            logger.error(f"Failed to initialize BucketSampler: {str(e)}")
+            raise
 
-    @staticmethod
-    def _chunks(iterable, size):
-        """Helper to split iterable into chunks"""
-        it = iter(iterable)
-        return iter(lambda: list(itertools.islice(it, size)), [])
-
-    def _process_bucket_chunk(self, bucket_items, chunk_size):
-        """Process a chunk of buckets efficiently"""
-        chunk_samples = []
-        for bucket, img_paths in bucket_items:
-            try:
-                # Process all images in this bucket
-                for img_path in img_paths:
-                    try:
-                        idx = self.path_to_idx[str(img_path)]
-                        chunk_samples.append((bucket, idx))
-                    except KeyError:
+    @torch.no_grad()
+    def _initialize_buckets(self):
+        """Initialize buckets with memory optimization"""
+        try:
+            # Use defaultdict for automatic bucket creation
+            from collections import defaultdict
+            self.buckets = defaultdict(list)
+            self.total_samples = 0
+            
+            # Process images in batches for memory efficiency
+            batch_size = 1000
+            for i in range(0, len(self.dataset), batch_size):
+                batch_indices = range(i, min(i + batch_size, len(self.dataset)))
+                
+                for idx in batch_indices:
+                    # Get image size efficiently
+                    size = self.dataset.get_image_size(idx)
+                    if size is None:
                         continue
-            except Exception as e:
-                logger.error(f"Error processing bucket {bucket}: {str(e)}")
-        return chunk_samples
+                        
+                    h, w = size
+                    if self.resolution_binning:
+                        # Round to nearest multiple of 64 for efficiency
+                        h = ((h + 31) // 64) * 64
+                        w = ((w + 31) // 64) * 64
+                    
+                    self.buckets[(h, w)].append(idx)
+                    self.total_samples += 1
+            
+            # Convert defaultdict to regular dict
+            self.buckets = dict(self.buckets)
+            
+            # Pre-calculate bucket weights
+            self._calculate_bucket_weights()
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize buckets: {str(e)}")
+            raise
+
+    @lru_cache(maxsize=1)
+    def _calculate_bucket_weights(self):
+        """Cache bucket weights calculation"""
+        try:
+            self.bucket_weights = {
+                res: len(indices) / self.total_samples 
+                for res, indices in self.buckets.items()
+            }
+        except Exception as e:
+            logger.error(f"Failed to calculate bucket weights: {str(e)}")
+            raise
 
     def __iter__(self):
-        if not self.samples:
-            raise RuntimeError("No samples available for iteration")
+        """Memory-efficient iterator implementation"""
+        try:
+            # Use generator for memory efficiency
+            generator = torch.Generator()
+            if self.seed is not None:
+                generator.manual_seed(self.seed + self.epoch)
             
-        if self.all_ar:
-            # Use numpy for faster shuffling
-            import numpy as np
-            indices = np.array([idx for _, idx in self.samples])
-            np.random.shuffle(indices)
+            # Pre-allocate indices array
+            indices = np.zeros(self.total_samples, dtype=np.int32)
+            current_idx = 0
             
-            # Create batches efficiently
-            batches = [
-                indices[i:i + self.batch_size] 
-                for i in range(0, len(indices), self.batch_size)
-                if len(indices[i:i + self.batch_size]) == self.batch_size or not self.drop_last
-            ]
-            
-            # Shuffle batches
-            np.random.shuffle(batches)
-            
-            # Flatten batches efficiently
-            return iter(np.concatenate(batches))
-        else:
-            # Group samples by bucket
-            bucket_groups = defaultdict(list)
-            for bucket, idx in self.samples:
-                bucket_groups[bucket].append(idx)
-            
-            # Create batches within each bucket
-            batches = []
-            for bucket_indices in bucket_groups.values():
-                # Shuffle indices within bucket
-                np.random.shuffle(bucket_indices)
+            # Process buckets efficiently
+            for bucket_indices in self.buckets.values():
+                bucket_size = len(bucket_indices)
+                if self.shuffle:
+                    # Use numpy for efficient shuffling
+                    bucket_indices = np.random.permutation(bucket_indices)
                 
-                # Create batches from this bucket
-                for i in range(0, len(bucket_indices), self.batch_size):
-                    batch = bucket_indices[i:i + self.batch_size]
-                    if len(batch) == self.batch_size or not self.drop_last:
-                        batches.append(batch)
+                indices[current_idx:current_idx + bucket_size] = bucket_indices
+                current_idx += bucket_size
             
-            # Shuffle all batches
-            np.random.shuffle(batches)
+            # Final shuffle if needed
+            if self.shuffle:
+                np.random.shuffle(indices)
             
-            # Flatten batches into single list of indices
-            return iter(np.concatenate(batches))
+            # Handle drop_last efficiently
+            if self.drop_last:
+                indices = indices[:(len(indices) // self.batch_size) * self.batch_size]
+            
+            return iter(indices)
+            
+        except Exception as e:
+            logger.error(f"Failed to create iterator: {str(e)}")
+            raise
 
-    def __len__(self):
+    def __len__(self) -> int:
+        """Efficient length calculation"""
         if self.drop_last:
-            return len(self.samples) - (len(self.samples) % self.batch_size)
-        return len(self.samples)
+            return self.total_samples // self.batch_size
+        return (self.total_samples + self.batch_size - 1) // self.batch_size
 
+    def set_epoch(self, epoch: int) -> None:
+        """Update epoch for reproducibility"""
+        self.epoch = epoch
+        # Clear cached weights
+        self._calculate_bucket_weights.cache_clear()
 
 class CustomDataLoader(CustomDataLoaderBase):
     """Optimized data loader with advanced batching and parallel processing"""
