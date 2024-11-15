@@ -1472,6 +1472,7 @@ class BucketSampler(CustomSamplerBase):
         self.batch_size = batch_size
         self.drop_last = drop_last
         self.all_ar = dataset.all_ar
+        self.num_workers = dataset.num_workers  # Get num_workers from dataset
         
         # Store (bucket, index) pairs for all valid samples
         self.samples = []
@@ -1479,13 +1480,31 @@ class BucketSampler(CustomSamplerBase):
         if self.all_ar:
             logger.info("Processing all_ar mode buckets...")
             from tqdm import tqdm
-            # Add progress bar for bucket processing
-            for bucket, img_paths in tqdm(dataset.bucket_data.items(), 
-                                        desc="Processing buckets",
-                                        total=len(dataset.bucket_data)):
-                for img_path in img_paths:
-                    idx = dataset.image_paths.index(img_path)
-                    self.samples.append((bucket, idx))
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            
+            # Process buckets in parallel
+            with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+                # Create progress bar
+                pbar = tqdm(total=len(dataset.bucket_data), desc="Processing buckets")
+                
+                # Submit tasks for each bucket
+                future_to_bucket = {
+                    executor.submit(self._process_bucket, bucket, img_paths, dataset): bucket 
+                    for bucket, img_paths in dataset.bucket_data.items()
+                }
+                
+                # Process completed tasks
+                for future in as_completed(future_to_bucket):
+                    bucket = future_to_bucket[future]
+                    try:
+                        bucket_samples = future.result()
+                        self.samples.extend(bucket_samples)
+                        pbar.update(1)
+                    except Exception as e:
+                        logger.error(f"Error processing bucket {bucket}: {str(e)}")
+                
+                pbar.close()
+            
             logger.info(f"Processed {len(self.samples)} samples for all_ar mode")
         else:
             # Original bucket validation logic with progress bar
@@ -1528,6 +1547,22 @@ class BucketSampler(CustomSamplerBase):
             self.samples.sort(key=lambda x: x[0][0] * x[0][1])
             
         logger.info(f"BucketSampler initialized with {len(self.samples)} samples")
+    
+    def _process_bucket(self, bucket, img_paths, dataset):
+        """Process a single bucket in a separate thread"""
+        bucket_samples = []
+        try:
+            for img_path in img_paths:
+                try:
+                    idx = dataset.image_paths.index(img_path)
+                    bucket_samples.append((bucket, idx))
+                except ValueError:
+                    logger.warning(f"Image {img_path} not found in dataset paths")
+                    continue
+        except Exception as e:
+            logger.error(f"Error processing bucket {bucket}: {str(e)}")
+        
+        return bucket_samples
     
     def __iter__(self):
         if not self.samples:
@@ -1721,7 +1756,7 @@ def create_dataloader(
         tokenizer_2=tokenizer_2,
         text_encoder_2=text_encoder_2,
         vae=vae,
-        num_workers=num_workers,
+        num_workers=num_workers,  # Pass num_workers to dataset
         enable_bucket_sampler=enable_bucket_sampler,
         no_caching_latents=no_caching_latents,
         all_ar=all_ar,
