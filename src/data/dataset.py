@@ -141,6 +141,10 @@ class CustomDataLoaderBase(ABC):
         self.prefetch_factor = prefetch_factor
         self.persistent_workers = persistent_workers
         
+        # Initialize batch_sampler and sampler
+        self.batch_sampler = None
+        self.sampler = None
+        
         # Handle sampler configuration
         if batch_sampler is not None:
             if batch_size > 1 or shuffle or sampler is not None or drop_last:
@@ -153,6 +157,13 @@ class CustomDataLoaderBase(ABC):
                 else:
                     sampler = torch.utils.data.SequentialSampler(dataset)
             self.sampler = sampler
+            
+            # Create batch sampler if not provided
+            self.batch_sampler = torch.utils.data.BatchSampler(
+                self.sampler,
+                batch_size=batch_size,
+                drop_last=drop_last
+            )
             
         self._initialized = False
         self._iterator = None
@@ -1474,13 +1485,13 @@ class CustomDataset(CustomDatasetBase):
             
             if self.all_ar:
                 # Minimal processing for all_ar mode
+                               # Minimal processing for all_ar mode
                 if width < self.min_size or height < self.min_size:
                     scale = max(self.min_size / width, self.min_size / height)
-                    new_width = int(round(width * scale / self.bucket_reso_steps) * self.bucket_reso_steps
-                    new_height = int(round(height * scale / self.bucket_reso_steps) * self.bucket_reso_steps
+                    new_width = int(round(width * scale / self.bucket_reso_steps) * self.bucket_reso_steps)
+                    new_height = int(round(height * scale / self.bucket_reso_steps) * self.bucket_reso_steps)
                     return image.resize((new_width, new_height), Image.Resampling.LANCZOS)
                 return image
-
             # Get target size for non-all_ar mode
             target_width, target_height = self._get_target_size(width, height)
             
@@ -1604,10 +1615,13 @@ class CustomDataset(CustomDatasetBase):
                 )
             
             # Pre-calculate sizes for progressive downscaling
-            sizes = [(
-                int(target_width + (image.width - target_width) * (1 - (step + 1) / num_steps)),
-                int(target_height + (image.height - target_height) * (1 - (step + 1) / num_steps))
-            ) for step in range(num_steps)]
+                       # Pre-calculate sizes for progressive downscaling
+            sizes = [
+                (   
+                    int(target_width + (image.width - target_width) * (1 - (step + 1) / num_steps)),
+                    int(target_height + (image.height - target_height) * (1 - (step + 1) / num_steps))
+                ) for step in range(num_steps)
+            ]
             
             # Progressive downscaling with optimized memory usage
             for i, (w, h) in enumerate(sizes):
@@ -2015,7 +2029,7 @@ class CustomDataset(CustomDatasetBase):
             if self.all_ar:
                 return (height, width)
             
-            # Get cached arrays
+                       # Get cached arrays
             buckets_array = get_buckets_array()
             bucket_areas = get_bucket_areas()
             target_area = width * height
@@ -2024,7 +2038,8 @@ class CustomDataset(CustomDatasetBase):
             exact_match = np.where(
                 (buckets_array[:, 0] == height) & 
                 (buckets_array[:, 1] == width)
-            if exact_match.size:
+            )
+            if exact_match[0].size:
                 return tuple(buckets_array[exact_match[0]])
             
             # Vectorized validity check
