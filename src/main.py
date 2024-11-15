@@ -223,7 +223,8 @@ def main(args):
         for model_name, model in models.items():
             if isinstance(model, torch.nn.Module):
                 model.to(device=device, dtype=dtype)
-                if args.gradient_checkpointing:
+                # Only enable gradient checkpointing for UNet
+                if args.gradient_checkpointing and model_name == "unet":
                     if hasattr(model, 'enable_gradient_checkpointing'):
                         model.enable_gradient_checkpointing()
                     else:
