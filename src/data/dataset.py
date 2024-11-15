@@ -161,9 +161,11 @@ class CustomDataset(CustomDatasetBase):
         self.image_paths = [str(p) for p in Path(data_dir).glob("*.png")]
         
         # Pre-compute bucket data efficiently
+        
         if self.all_ar:
             logger.info("Pre-computing bucket data...")
             from concurrent.futures import ThreadPoolExecutor
+            from tqdm import tqdm
             
             def process_image_batch(paths):
                 results = {}
@@ -187,9 +189,9 @@ class CustomDataset(CustomDatasetBase):
                     chunk = self.image_paths[i:i + chunk_size]
                     futures.append(executor.submit(process_image_batch, chunk))
                 
-                # Combine results
+                # Combine results with progress bar
                 self.bucket_data = defaultdict(list)
-                for future in futures:
+                for future in tqdm(futures, desc="Processing image buckets"):
                     for bucket, paths in future.result().items():
                         self.bucket_data[bucket].extend(paths)
 
