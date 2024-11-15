@@ -221,6 +221,10 @@ class CustomDataset(CustomDatasetBase):
                  use_tag_weighting=True, **kwargs):
         super().__init__()
         
+        # Store dropout rates as instance attributes
+        self.token_dropout_rate = token_dropout_rate
+        self.caption_dropout_rate = caption_dropout_rate
+        
         # Initialize flags first before any processing
         self.collate_fn = self.custom_collate 
         self.all_ar = all_ar
