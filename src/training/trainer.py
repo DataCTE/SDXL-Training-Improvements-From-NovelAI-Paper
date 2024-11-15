@@ -605,6 +605,7 @@ def train_epoch(epoch: int, args, models, components, device, dtype, wandb_run, 
 
 def train(args, models, components, device, dtype) -> Dict[str, float]:
     """Execute training steps with proper error handling and logging."""
+    # Create new metrics for each training run
     metrics = defaultdict(lambda: AverageMeter(name="default"))
     models["unet"].train()
     
@@ -716,11 +717,27 @@ def log_model_gradients(model: torch.nn.Module, step: int) -> None:
         logger.error(f"Failed to log model gradients: {str(e)}")
         logger.error(traceback.format_exc())
 
+@lru_cache(maxsize=1)
+def _get_memory_stats_format() -> Dict[str, str]:
+    """Cache memory statistics format strings."""
+    return {
+        "allocated": "Allocated: {:.1f}MB",
+        "cached": "Cached: {:.1f}MB",
+        "max_allocated": "Max Allocated: {:.1f}MB",
+        "max_cached": "Max Cached: {:.1f}MB",
+        "active": "Active: {:.1f}MB",
+        "inactive": "Inactive: {:.1f}MB",
+        "fragmentation": "Fragmentation: {:.1f}"
+    }
+
 def log_memory_stats(step: int) -> None:
     """Log CUDA memory statistics to W&B."""
     try:
         if not torch.cuda.is_available():
             return
+            
+        # Get format strings
+        format_strings = _get_memory_stats_format()
             
         # Get memory statistics
         memory_stats = {
@@ -742,25 +759,21 @@ def log_memory_stats(step: int) -> None:
         # Log to W&B
         wandb.log(memory_stats, step=step)
         
-        # Log to console
-        logger.debug(
-            "Memory stats: " + 
-            ", ".join(f"{k}: {v:.1f}MB" for k, v in memory_stats.items())
-        )
+        # Format and log to console using cached format strings
+        formatted_stats = []
+        for k, v in memory_stats.items():
+            # Get the base stat name without the path
+            stat_name = k.split('/')[-1]
+            if stat_name in format_strings:
+                formatted_stats.append(format_strings[stat_name].format(v))
+            else:
+                formatted_stats.append(f"{k}: {v:.1f}MB")
+        
+        logger.debug("Memory stats: " + ", ".join(formatted_stats))
         
     except Exception as e:
         logger.error(f"Failed to log memory stats: {str(e)}")
         logger.error(traceback.format_exc())
-
-@lru_cache(maxsize=1)
-def _get_memory_stats_format() -> Dict[str, str]:
-    """Cache memory statistics format strings."""
-    return {
-        "allocated": "Allocated: {:.1f}MB",
-        "cached": "Cached: {:.1f}MB",
-        "max_allocated": "Max Allocated: {:.1f}MB",
-        "max_cached": "Max Cached: {:.1f}MB"
-    }
 
 def train_step(args, models, components, batch, batch_idx: int, device, dtype) -> Dict[str, float]:
     """Execute single training step with proper error handling."""
