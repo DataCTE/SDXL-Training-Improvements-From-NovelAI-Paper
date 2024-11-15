@@ -75,6 +75,12 @@ def parse_args():
     parser.add_argument("--training_mode", type=str, default="v_prediction",
                       choices=["v_prediction", "epsilon"],
                       help="Training parameterization mode")
+    parser.add_argument("--use_ztsnr", action="store_true",
+                      help="Enable Zero Terminal SNR training")
+    parser.add_argument("--rescale_cfg", action="store_true",
+                      help="Enable CFG rescaling")
+    parser.add_argument("--rescale_multiplier", type=float, default=0.7,
+                      help="Multiplier for CFG rescaling")
     parser.add_argument("--min_snr_gamma", type=float, default=5.0,
                       help="Minimum SNR value for loss weighting")
     parser.add_argument("--sigma_data", type=float, default=1.0,
