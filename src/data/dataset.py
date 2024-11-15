@@ -802,79 +802,101 @@ class CustomDataset(Dataset):
             return image.resize((target_width, target_height), Image.LANCZOS)
 
     def _initialize_buckets(self):
-        """Initialize aspect ratio buckets according to NovelAI paper section 4.1.2"""
+        """Initialize buckets dynamically based on dataset content"""
         from concurrent.futures import ThreadPoolExecutor
         import math
         import logging
+        from collections import defaultdict
         
         logger = logging.getLogger(__name__)
         
-        # Initialize buckets with predefined sizes
-        buckets = []
-        
-        # Add landscape buckets with more granular steps
-        width = self.max_bucket_reso
-        while width >= self.min_bucket_reso:
-            height = self.min_bucket_reso
-            while height * width <= 1024 * 1024 and height <= self.max_bucket_reso:
-                buckets.append((height, width))
-                height += self.bucket_reso_steps
-            width -= self.bucket_reso_steps
-        
-        # Add portrait buckets
-        height = self.max_bucket_reso
-        while height >= self.min_bucket_reso:
-            width = self.min_bucket_reso
-            while height * width <= 1024 * 1024 and width <= self.max_bucket_reso:
-                if (height, width) not in buckets:
-                    buckets.append((height, width))
-                width += self.bucket_reso_steps
-            height -= self.bucket_reso_steps
-        
-        # Add square buckets at different resolutions
-        for size in range(self.min_bucket_reso, self.max_bucket_reso + 1, self.bucket_reso_steps):
-            bucket = (size, size)
-            if bucket not in buckets:
-                buckets.append(bucket)
-        
-        # Store bucket info
-        self.buckets = sorted(buckets, key=lambda x: x[0] * x[1])  # Sort by area for efficiency
-        self.bucket_data = {bucket: [] for bucket in buckets}
-        
-        # Calculate total number of images
+        # Initialize temporary storage for image sizes
+        image_sizes = []
         total_images = len(self.image_paths)
-        logger.info(f"Initializing {len(buckets)} buckets for {total_images} images using {self.num_workers} workers")
+        logger.info(f"Analyzing {total_images} images using {self.num_workers} workers")
         
-        def process_image(img_path):
+        def analyze_image(img_path):
+            try:
+                with Image.open(img_path) as img:
+                    width, height = img.size
+                    target_h, target_w = self._get_target_size(width, height)
+                    return target_h, target_w
+            except Exception as e:
+                logger.error(f"Error analyzing {img_path}: {str(e)}")
+                return None
+        
+        # First pass: collect all target sizes
+        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+            futures = [executor.submit(analyze_image, img_path) for img_path in self.image_paths]
+            
+            for i, future in enumerate(futures):
+                if i % 1000 == 0:
+                    logger.info(f"Analyzed {i}/{total_images} images")
+                try:
+                    result = future.result()
+                    if result:
+                        image_sizes.append(result)
+                except Exception as e:
+                    logger.error(f"Error getting result: {str(e)}")
+        
+        # Group similar sizes to create buckets
+        size_groups = defaultdict(list)
+        
+        for h, w in image_sizes:
+            # Round to nearest multiple of bucket_reso_steps
+            bucket_h = round(h / self.bucket_reso_steps) * self.bucket_reso_steps
+            bucket_w = round(w / self.bucket_reso_steps) * self.bucket_reso_steps
+            
+            # Ensure minimum size
+            bucket_h = max(self.min_bucket_reso, bucket_h)
+            bucket_w = max(self.min_bucket_reso, bucket_w)
+            
+            size_groups[(bucket_h, bucket_w)].append((h, w))
+        
+        # Create buckets from groups
+        self.buckets = sorted(size_groups.keys(), key=lambda x: x[0] * x[1])
+        self.bucket_data = {bucket: [] for bucket in self.buckets}
+        
+        logger.info(f"Created {len(self.buckets)} dynamic buckets")
+        
+        # Second pass: assign images to buckets
+        def assign_image(img_path):
             try:
                 with Image.open(img_path) as img:
                     width, height = img.size
                     target_h, target_w = self._get_target_size(width, height)
                     
-                    # Find the best matching bucket
-                    best_bucket = min(self.buckets, 
-                                    key=lambda b: abs(b[0] - target_h) + abs(b[1] - target_w))
+                    # Find best bucket based on aspect ratio and area
+                    target_ar = target_h / target_w
+                    target_area = target_h * target_w
+                    
+                    def bucket_score(bucket):
+                        bh, bw = bucket
+                        # Consider both aspect ratio difference and area difference
+                        ar_diff = abs((bh / bw) - target_ar)
+                        area_diff = abs((bh * bw) - target_area) / target_area
+                        return ar_diff + 0.5 * area_diff
+                    
+                    best_bucket = min(self.buckets, key=bucket_score)
                     return img_path, best_bucket
             except Exception as e:
                 logger.error(f"Error processing {img_path}: {str(e)}")
                 return None
         
-        # Process images in parallel
+        # Assign images to buckets
         with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-            futures = [executor.submit(process_image, img_path) for img_path in self.image_paths]
+            futures = [executor.submit(assign_image, img_path) for img_path in self.image_paths]
             
-            # Process results as they complete
             for i, future in enumerate(futures):
                 if i % 1000 == 0:
-                    logger.info(f"Processed {i}/{total_images} images")
-                    
+                    logger.info(f"Assigned {i}/{total_images} images to buckets")
                 try:
                     result = future.result()
                     if result:
                         img_path, bucket = result
                         self.bucket_data[bucket].append(img_path)
                 except Exception as e:
-                    logger.error(f"Error getting result: {str(e)}")
+                    logger.error(f"Error assigning image: {str(e)}")
         
         # Remove empty buckets
         empty_buckets = [bucket for bucket, images in self.bucket_data.items() if not images]
@@ -882,17 +904,18 @@ class CustomDataset(Dataset):
             del self.bucket_data[bucket]
             self.buckets.remove(bucket)
         
-        # Log bucket statistics
+        # Log statistics
         num_buckets = len(self.bucket_data)
         total_assigned = sum(len(imgs) for imgs in self.bucket_data.values())
-        logger.info(f"Created {num_buckets} buckets with {total_assigned}/{total_images} images assigned")
+        logger.info(f"Final bucket count: {num_buckets} with {total_assigned}/{total_images} images assigned")
         
-        # Log distribution of bucket sizes
+        # Log bucket distribution
         bucket_sizes = {bucket: len(imgs) for bucket, imgs in self.bucket_data.items()}
-        top_buckets = sorted(bucket_sizes.items(), key=lambda x: x[1], reverse=True)[:5]
-        logger.info("Top 5 bucket sizes:")
-        for bucket, size in top_buckets:
-            logger.info(f"  {bucket}: {size} images")
+        top_buckets = sorted(bucket_sizes.items(), key=lambda x: x[1], reverse=True)[:10]
+        logger.info("Top 10 bucket sizes:")
+        for (h, w), count in top_buckets:
+            aspect_ratio = f"{w/math.gcd(w,h)}:{h/math.gcd(w,h)}"
+            logger.info(f"  {w}x{h} ({aspect_ratio}): {count} images")
 
     def _assign_to_bucket(self, img_path):
         """Assign an image to the most appropriate bucket with optimized comparison"""
