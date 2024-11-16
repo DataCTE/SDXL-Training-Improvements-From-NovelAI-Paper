@@ -182,7 +182,7 @@ def _get_ema_config(
     }
 
 
-def setup_ema(args: EMAModel, model, device=None):
+def setup_ema(args: EMAModel, model, model_path: str, device=None):
     """Setup EMA model with proper error handling.
     
     Args:
@@ -209,7 +209,7 @@ def setup_ema(args: EMAModel, model, device=None):
 
         ema = EMAModel(
             model=model,
-            model_path="",  # Empty string as we're not loading from a path
+            model_path=args.model, 
             decay=args.ema_decay,
             update_after_step=args.ema_update_after_step,
             device=device,
@@ -503,7 +503,7 @@ def initialize_training_components(args, models):
             "ema": (
                 setup_ema, 
                 args.ema.use_ema, 
-                (args.ema, models["unet"])  # Pass EMAArgs directly
+                (args.ema, models["unet"], args.model.model_path)  # Pass model path from config
             ),
             "tag_weighter": (
                 setup_tag_weighter, 
