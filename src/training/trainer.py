@@ -258,8 +258,8 @@ def setup_ema(
 
     try:
         # Get UNet model for EMA
-        if "unet" not in models:
-            raise ValueError("UNet model not found in models dictionary")
+        if not isinstance(models, dict) or "unet" not in models:
+            raise ValueError("Models must be a dictionary containing 'unet' key")
         model = models["unet"]
 
         # Validate configuration and model

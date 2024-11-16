@@ -82,7 +82,7 @@ def main() -> None:
         if config.vae.finetune_vae:
             setup_vae_finetuner(config.vae, models)
         if config.ema.use_ema:
-            setup_ema(config.ema, models["unet"])
+            setup_ema(config.ema, {"unet": models["unet"]}, config.model.model_path)
         
         # Resume from checkpoint if specified
         if config.logging.resume_from_checkpoint:
