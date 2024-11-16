@@ -149,7 +149,14 @@ class CustomDataset(CustomDatasetBase):
             self.tag_weighter = None
             
         # Convert image paths to strings once
-        self.image_paths = [str(p) for p in Path(data_dir).glob("*.png")]
+        image_extensions = ["*.png", "*.jpg", "*.jpeg", "*.webp", "*.bmp"]
+        self.image_paths = []
+        for ext in image_extensions:
+            self.image_paths.extend([str(p) for p in Path(data_dir).glob(ext)])
+            self.image_paths.extend([str(p) for p in Path(data_dir).glob(ext.upper())])  # Also check uppercase extensions
+        
+        if not self.image_paths:
+            raise RuntimeError(f"No images found in {data_dir}. Supported formats: {', '.join(image_extensions)}")
         
         # Initialize dataset structure
         self.bucket_data = defaultdict(list)  # Initialize bucket_data in __init__
