@@ -125,30 +125,30 @@ class VAEArgs:
 
     Attributes:
         use_vae: Whether to use the VAE component.
-        vae_path: The path to the pre-trained VAE model.
-        vae_decay: The decay rate for the VAE's EMA.
-        vae_update_after_step: The number of steps after which the VAE's EMA is updated.
+        path: The path to the pre-trained VAE model.
+        decay: The decay rate for the VAE's EMA.
+        update_after_step: The number of steps after which the VAE's EMA is updated.
         finetune_vae: Whether to finetune the VAE during training.
-        vae_learning_rate: The learning rate for the VAE's optimizer.
-        vae_train_freq: The frequency at which the VAE is trained.
+        learning_rate: The learning rate for the VAE's optimizer.
+        train_freq: The frequency at which the VAE is trained.
         adaptive_loss_scale: Whether to use an adaptive loss scale for the VAE.
         kl_weight: The weighting of the KL loss for the VAE.
         perceptual_weight: The weighting of the perceptual loss for the VAE.
-        vae_use_channel_scaling: Whether to use channel scaling for the VAE.
-        vae_initial_scale_factor: The initial scale factor for channel scaling.
+        use_channel_scaling: Whether to use channel scaling for the VAE.
+        initial_scale_factor: The initial scale factor for channel scaling.
     """
     use_vae: bool = True
-    vae_path: Optional[str] = None
-    vae_decay: float = 0.9999
-    vae_update_after_step: int = 100
+    path: Optional[str] = None
+    decay: float = 0.9999
+    update_after_step: int = 100
     finetune_vae: bool = False
-    vae_learning_rate: float = 1e-6
-    vae_train_freq: int = 10
+    learning_rate: float = 1e-6
+    train_freq: int = 10
     adaptive_loss_scale: bool = True
     kl_weight: float = 0.0
     perceptual_weight: float = 0.0
-    vae_use_channel_scaling: bool = True
-    vae_initial_scale_factor: float = 1.0
+    use_channel_scaling: bool = True
+    initial_scale_factor: float = 1.0
 
 @dataclass
 class DataArgs:
