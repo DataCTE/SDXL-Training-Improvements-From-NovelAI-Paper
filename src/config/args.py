@@ -95,15 +95,21 @@ class SystemArgs:
     compile_mode: str = "default"
     gradient_checkpointing: bool = False
     verbose: bool = False
+    all_ar: bool = False
+    num_workers: int = 4
 
 @dataclass
 class LoggingArgs:
     """Logging and monitoring configuration."""
     use_wandb: bool = False
     wandb_project: str = "sdxl-training"
+    wandb_run_name: Optional[str] = None
     save_checkpoints: bool = False
+    save_epochs: int = 1
     resume_from_checkpoint: Optional[str] = None
     push_to_hub: bool = False
+    logging_steps: int = 100
+    validation_steps: int = 500
 
 @dataclass
 class TrainingConfig:
@@ -197,13 +203,19 @@ def parse_args() -> TrainingConfig:
                        default="default")
     parser.add_argument("--gradient_checkpointing", action="store_true")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--all_ar", action="store_true")
+    parser.add_argument("--num_workers", type=int, default=4)
     
     # Logging arguments
     parser.add_argument("--use_wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="sdxl-training")
+    parser.add_argument("--wandb_run_name", type=str)
     parser.add_argument("--save_checkpoints", action="store_true")
+    parser.add_argument("--save_epochs", type=int, default=1)
     parser.add_argument("--resume_from_checkpoint", type=str)
     parser.add_argument("--push_to_hub", action="store_true")
+    parser.add_argument("--logging_steps", type=int, default=100)
+    parser.add_argument("--validation_steps", type=int, default=500)
     
     args = parser.parse_args()
     
@@ -279,14 +291,20 @@ def parse_args() -> TrainingConfig:
             enable_compile=args.enable_compile,
             compile_mode=args.compile_mode,
             gradient_checkpointing=args.gradient_checkpointing,
-            verbose=args.verbose
+            verbose=args.verbose,
+            all_ar=args.all_ar,
+            num_workers=args.num_workers
         ),
         logging=LoggingArgs(
             use_wandb=args.use_wandb,
             wandb_project=args.wandb_project,
+            wandb_run_name=args.wandb_run_name,
             save_checkpoints=args.save_checkpoints,
+            save_epochs=args.save_epochs,
             resume_from_checkpoint=args.resume_from_checkpoint,
-            push_to_hub=args.push_to_hub
+            push_to_hub=args.push_to_hub,
+            logging_steps=args.logging_steps,
+            validation_steps=args.validation_steps
         )
     )
     
