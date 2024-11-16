@@ -367,6 +367,135 @@ class CustomDataset(CustomDatasetBase):
         with ThreadPoolExecutor(max_workers=self.init_params['num_workers']) as executor:
             list(executor.map(write_caption, formatted_paths))
 
+    def _preprocess_image_worker(self, image_path: str, target_height: int, target_width: int) -> Optional[torch.Tensor]:
+        """Worker function for parallel image preprocessing"""
+        try:
+            with Image.open(image_path) as img:
+                img = img.convert('RGB')
+                
+                # Resize if needed
+                if (img.size[1], img.size[0]) != (target_height, target_width):
+                    img = img.resize((target_width, target_height), Image.Resampling.LANCZOS)
+                
+                # Convert to tensor and normalize
+                image = torch.from_numpy(
+                    np.array(img, dtype=np.float32)
+                ).permute(2, 0, 1) / 127.5 - 1
+                
+                return image
+                
+        except Exception as e:
+            logger.debug(f"Failed to preprocess image {image_path}: {str(e)}")
+            return None
+
+    def _batch_process_latents_efficient(self):
+        """Process latents in batches efficiently using worker pool"""
+        try:
+            total_images = len(self.image_paths)
+            batch_size = 32  # Process larger batches for GPU efficiency
+            max_loaded_latents = 1000  # Maximum number of latents to keep in memory
+            
+            # Group images by their bucket sizes
+            bucket_groups = defaultdict(list)
+            
+            logger.info("Grouping images by bucket sizes...")
+            for image_path in tqdm(self.image_paths, desc="Grouping images"):
+                try:
+                    with Image.open(image_path) as img:
+                        img = img.convert('RGB')
+                        # Get original dimensions
+                        orig_height, orig_width = img.size[1], img.size[0]
+                        
+                        # Find closest bucket resolution
+                        target_height, target_width = self.bucket_manager.find_closest_bucket(orig_height, orig_width)
+                        bucket_groups[(target_height, target_width)].append(image_path)
+                except Exception as e:
+                    logger.debug(f"Failed to process image {image_path} for grouping: {str(e)}")
+                    continue
+            
+            # Process each bucket group
+            total_batches = sum((len(group) + batch_size - 1) // batch_size 
+                              for group in bucket_groups.values())
+            logger.info(f"Processing {total_images} images in {total_batches} batches across {len(bucket_groups)} bucket sizes")
+            
+            processed_count = 0
+            latents_in_memory = 0
+            
+            # Create process pool for parallel preprocessing
+            with ThreadPoolExecutor(max_workers=self.num_workers) as preprocessing_pool:
+                with tqdm(total=total_images, desc="Processing latents") as pbar:
+                    for (bucket_height, bucket_width), image_paths in bucket_groups.items():
+                        for i in range(0, len(image_paths), batch_size):
+                            batch_paths = image_paths[i:i + batch_size]
+                            
+                            # Check if we need to offload latents to disk
+                            if latents_in_memory >= max_loaded_latents:
+                                self._offload_latents_to_disk()
+                                latents_in_memory = 0
+                                torch.cuda.empty_cache()
+                            
+                            try:
+                                # Parallel preprocessing of images
+                                preprocess_futures = [
+                                    preprocessing_pool.submit(
+                                        self._preprocess_image_worker,
+                                        path, bucket_height, bucket_width
+                                    )
+                                    for path in batch_paths
+                                ]
+                                
+                                # Collect preprocessed images
+                                images = []
+                                valid_paths = []
+                                
+                                for path, future in zip(batch_paths, preprocess_futures):
+                                    try:
+                                        image = future.result()
+                                        if image is not None:
+                                            images.append(image)
+                                            valid_paths.append(path)
+                                    except Exception as e:
+                                        logger.debug(f"Failed to preprocess image {path}: {str(e)}")
+                                        continue
+                                
+                                if not images:
+                                    continue
+                                
+                                # Stack images into a single batch tensor
+                                image_batch = torch.stack(images, dim=0)
+                                
+                                # Process batch through VAE with mixed precision
+                                with torch.amp.autocast('cuda'):
+                                    with torch.no_grad():
+                                        image_batch = image_batch.to(self.device, non_blocking=True)
+                                        latents = self.vae.encode(image_batch).latent_dist.sample()
+                                        latents = latents.cpu()  # Move to CPU immediately
+                                
+                                # Store latents in cache
+                                for path, latent in zip(valid_paths, latents):
+                                    self.latents_cache[path] = latent
+                                    latents_in_memory += 1
+                                
+                                processed_count += len(valid_paths)
+                                pbar.update(len(valid_paths))
+                                
+                                # Clean up GPU memory
+                                del image_batch, latents, images
+                                torch.cuda.empty_cache()
+                                
+                            except Exception as e:
+                                logger.error(f"Failed to process batch for bucket {bucket_height}x{bucket_width}: {str(e)}")
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+                                continue
+            
+            logger.info(f"Completed latent processing for {processed_count} images")
+            
+        except Exception as e:
+            logger.error("Failed to process latents: %s", str(e))
+            logger.error(traceback.format_exc())
+            raise
+
     def _initialize_worker(self):
         """Initialize worker process state"""
         if torch.cuda.is_available():
@@ -614,99 +743,24 @@ class CustomDataset(CustomDatasetBase):
                 torch.cuda.empty_cache()
             return None
 
-    def _batch_process_latents_efficient(self):
-        """Process latents in batches efficiently using worker pool"""
+    def _offload_latents_to_disk(self):
+        """Offload latents from memory to disk"""
         try:
-            total_images = len(self.image_paths)
-            batch_size = 32  # Process larger batches for GPU efficiency
+            # Create a temporary directory for latent storage if it doesn't exist
+            latents_dir = self.cache_dir / "latents"
+            latents_dir.mkdir(exist_ok=True)
             
-            # Group images by their bucket sizes
-            bucket_groups = defaultdict(list)
+            # Save latents to disk and clear from memory
+            for path, latent in self.latents_cache.items():
+                latent_path = latents_dir / f"{hash(path)}.pt"
+                torch.save(latent, latent_path)
             
-            logger.info("Grouping images by bucket sizes...")
-            for image_path in tqdm(self.image_paths, desc="Grouping images"):
-                try:
-                    with Image.open(image_path) as img:
-                        img = img.convert('RGB')
-                        # Get original dimensions
-                        orig_height, orig_width = img.size[1], img.size[0]
-                        
-                        # Find closest bucket resolution
-                        target_height, target_width = self.bucket_manager.find_closest_bucket(orig_height, orig_width)
-                        bucket_groups[(target_height, target_width)].append(image_path)
-                except Exception as e:
-                    logger.debug(f"Failed to process image {image_path} for grouping: {str(e)}")
-                    continue
-            
-            # Process each bucket group
-            total_batches = sum((len(group) + batch_size - 1) // batch_size 
-                              for group in bucket_groups.values())
-            logger.info(f"Processing {total_images} images in {total_batches} batches across {len(bucket_groups)} bucket sizes")
-            
-            processed_count = 0
-            with tqdm(total=total_images, desc="Processing latents") as pbar:
-                for (bucket_height, bucket_width), image_paths in bucket_groups.items():
-                    for i in range(0, len(image_paths), batch_size):
-                        batch_paths = image_paths[i:i + batch_size]
-                        
-                        try:
-                            # Load and preprocess all images in batch
-                            images = []
-                            valid_paths = []
-                            
-                            for image_path in batch_paths:
-                                try:
-                                    with Image.open(image_path) as img:
-                                        img = img.convert('RGB')
-                                        # Resize image to target bucket resolution
-                                        if (img.size[1], img.size[0]) != (bucket_height, bucket_width):
-                                            img = img.resize((bucket_width, bucket_height), Image.Resampling.LANCZOS)
-                                        
-                                        # Optimize image processing for GPU
-                                        image = torch.from_numpy(
-                                            np.array(img, dtype=np.float32)
-                                        ).permute(2, 0, 1) / 127.5 - 1
-                                        images.append(image)
-                                        valid_paths.append(image_path)
-                                except Exception as e:
-                                    logger.debug(f"Failed to load/resize image {image_path}: {str(e)}")
-                                    continue
-                            
-                            if not images:
-                                continue
-                                
-                            # Stack images into a single batch tensor
-                            image_batch = torch.stack(images, dim=0)
-                            
-                            # Process batch through VAE with mixed precision
-                            with torch.amp.autocast('cuda'):
-                                with torch.no_grad():
-                                    image_batch = image_batch.to(self.device, non_blocking=True)
-                                    latents = self.vae.encode(image_batch).latent_dist.sample()
-                                    latents = latents.cpu()  # Move to CPU immediately
-                                    
-                            # Store latents in cache
-                            for path, latent in zip(valid_paths, latents):
-                                self.latents_cache[path] = latent
-                            
-                            processed_count += len(valid_paths)
-                            pbar.update(len(valid_paths))
-                            
-                            # Clean up GPU memory
-                            del image_batch, latents, images
-                            torch.cuda.empty_cache()
-                            
-                        except Exception as e:
-                            logger.error(f"Failed to process batch for bucket {bucket_height}x{bucket_width}: {str(e)}")
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-                            continue
-            
-            logger.info(f"Completed latent processing for {processed_count} images")
+            # Clear memory cache
+            self.latents_cache.clear()
+            torch.cuda.empty_cache()
             
         except Exception as e:
-            logger.error("Failed to process latents: %s", str(e))
-            logger.error(traceback.format_exc())
+            logger.error(f"Failed to offload latents to disk: {str(e)}")
             raise
 
     def custom_collate(self, batch):
