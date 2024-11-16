@@ -79,7 +79,7 @@ def main() -> None:
         
         # Setup training components
         setup_optimizer(config, models)
-        if config.vae.use_vae:
+        if config.vae.finetune_vae:
             setup_vae_finetuner(config.vae, models)
         if config.ema.use_ema:
             setup_ema(config.ema, models["unet"])
