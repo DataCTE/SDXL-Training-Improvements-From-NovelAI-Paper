@@ -323,75 +323,38 @@ class TagBasedLossWeighter:
         return tags, special_tags
 
     def _process_weighted_tag(self, tag: str) -> Tuple[Optional[str], float]:
-        """Process a weighted tag format (tag::weight)."""
+        """Process a weighted tag format (tag:weight)."""
         try:
-            if "::" not in tag:
-                return tag, 1.0
+            if ':' not in tag:
+                return self._clean_tag(tag), 1.0
                 
-            tag_part, weight_part = tag.split("::", 1)
+            tag_part, weight_part = tag.rsplit(':', 1)
             tag_part = self._clean_tag(tag_part)
-            
+            if not tag_part:
+                return None, 1.0
+                
             try:
-                weight = float(weight_part)
-                # Clamp weight to valid range
-                weight = max(self.min_weight, min(self.max_weight, weight))
+                weight = float(weight_part.strip())
+                # Apply class-based weight modifiers
+                tag_class = self._classify_tag(tag_part)
+                if tag_class:
+                    class_stats = self.stats.frequencies.get(tag_class, {})
+                    tag_count = class_stats.get(tag_part, 0)
+                    total_count = sum(class_stats.values())
+                    
+                    if total_count > 0:
+                        # Calculate rarity factor based on tag frequency within its class
+                        rarity = 1.0 - (tag_count / total_count)
+                        weight *= (1.0 + (rarity * self.rarity_factor))
+                
+                return tag_part, max(self.min_weight, min(self.max_weight, weight))
             except (ValueError, TypeError):
                 logger.warning(f"Invalid weight value in tag '{tag}', using default")
-                weight = 1.0
+                return tag_part, 1.0
                 
-            return tag_part, weight
         except Exception as e:
             logger.warning(f"Error processing weighted tag '{tag}': {str(e)}")
             return None, 1.0
-
-    def _process_mj_tag(
-        self,
-        tag: str, index: int, total_tags: int, special_tags: Dict[str, Any]
-    ) -> Optional[str]:
-        """Process Midjourney-specific tags."""
-        try:
-            # Don't treat long descriptive phrases as parameter tags
-            if len(tag.split()) > 5:
-                return tag
-
-            # Check for parameter format
-            if ":" in tag and not tag.startswith(("http:", "https:", "ftp:")):
-                param, value = tag.split(":", 1)
-                param = param.strip().lower()
-                value = value.strip()
-                
-                try:
-                    # Handle numeric parameters
-                    if any(c.isdigit() for c in value):
-                        try:
-                            numeric_value = float(''.join(c for c in value if c.isdigit() or c == '.'))
-                            special_tags[param] = numeric_value
-                            return None
-                        except ValueError:
-                            pass
-                    
-                    # Handle boolean/flag parameters
-                    if value.lower() in ('true', 'yes', 'on', '1'):
-                        special_tags[param] = True
-                        return None
-                    if value.lower() in ('false', 'no', 'off', '0'):
-                        special_tags[param] = False
-                        return None
-                        
-                except (ValueError, TypeError) as e:
-                    logger.debug(f"Non-numeric parameter value in tag '{tag}': {str(e)}")
-                    
-            return tag
-
-        except Exception as e:
-            logger.warning(f"Error processing MJ tag '{tag}': {str(e)}")
-            return tag
-
-    def _clean_tag(self, tag: str) -> Optional[str]:
-        """Clean and normalize a tag."""
-        if tag.startswith(("a ", "an ", "the ")):
-            tag = " ".join(tag.split()[1:])
-        return tag.strip() if tag.strip() else None
 
     def process_caption(self, caption: str) -> Tuple[List[str], Dict[str, float]]:
         """Process a caption to extract tags and special tags with weights."""
@@ -415,55 +378,29 @@ class TagBasedLossWeighter:
                     tags = []
                     special_tags = {}
                     for chunk_tags, chunk_special in results:
-                        tags.extend(chunk_tags)
-                        special_tags.update(chunk_special)
+                        if chunk_tags:  # Only extend if there are tags
+                            tags.extend(chunk_tags)
+                        if chunk_special:  # Only update if there are special tags
+                            special_tags.update(chunk_special)
             else:
                 # Process sequentially for small inputs
                 tags = []
                 special_tags = {}
                 for chunk in chunks:
                     chunk_tags, chunk_special = self._process_tag_chunk(chunk)
-                    tags.extend(chunk_tags)
-                    special_tags.update(chunk_special)
+                    if chunk_tags:  # Only extend if there are tags
+                        tags.extend(chunk_tags)
+                    if chunk_special:  # Only update if there are special tags
+                        special_tags.update(chunk_special)
 
             # Remove duplicates while preserving order
             seen = set()
-            tags = [tag for tag in tags if not (tag in seen or seen.add(tag))]
+            tags = [tag for tag in tags if tag and not (tag in seen or seen.add(tag))]
 
             return tags, special_tags
 
         except Exception as e:
             logger.error(f"Error processing caption: {str(e)}")
-            return [], {}
-
-    def _process_tag_chunk(self, chunk: str) -> Tuple[List[str], Dict[str, float]]:
-        """Process a single chunk of tags."""
-        try:
-            tags = []
-            special_tags = {}
-            
-            # Clean and normalize the chunk
-            chunk = self._clean_tag(chunk)
-            if not chunk:
-                return [], {}
-                
-            # Check for weighted tag format
-            if "::" in chunk:
-                tag, weight = self._process_weighted_tag(chunk)
-                if tag:
-                    tags.append(tag)
-                    special_tags[tag] = weight
-                return tags, special_tags
-                
-            # Check for special Midjourney-style tags
-            processed_tag = self._process_mj_tag(chunk, 0, 1, special_tags)
-            if processed_tag:
-                tags.append(processed_tag)
-                
-            return tags, special_tags
-            
-        except Exception as e:
-            logger.warning(f"Error processing tag chunk '{chunk}': {str(e)}")
             return [], {}
 
     def calculate_caption_weight(self, caption: str) -> float:
@@ -526,23 +463,35 @@ class TagBasedLossWeighter:
                 if not tag:
                     continue
                     
-                # Get tag class and base weight
-                tag_class = self._classify_tag(tag)
-                class_weight = self.class_base_weights.get(tag_class, 1.0)
-                
-                # Calculate emphasis and rarity factors
-                emphasis = self.stats.get_emphasis(tag, 1.0)
-                rarity = self.stats.get_rarity(tag, 1.0)
-                
-                # Apply emphasis and rarity modifiers
-                final_weight = (
-                    class_weight * 
-                    (1.0 + (emphasis - 1.0) * self.emphasis_factor) * 
-                    (1.0 + (rarity - 1.0) * self.rarity_factor)
-                )
-                
-                # Clamp to valid range
-                weights[tag] = max(self.min_weight, min(self.max_weight, final_weight))
+                # Get base weight (from explicit weighting or default 1.0)
+                tag_clean = self._clean_tag(tag)
+                if not tag_clean:
+                    continue
+                    
+                base_weight = 1.0
+                if ':' in tag:
+                    tag_part, weight = self._process_weighted_tag(tag)
+                    if tag_part:
+                        base_weight = weight
+                        tag_clean = tag_part
+
+                # Apply class-based weighting
+                tag_class = self._classify_tag(tag_clean)
+                if tag_class:
+                    class_stats = self.stats.frequencies.get(tag_class, {})
+                    tag_count = class_stats.get(tag_clean, 0)
+                    total_count = sum(class_stats.values())
+                    
+                    if total_count > 0:
+                        # Calculate rarity factor
+                        rarity = 1.0 - (tag_count / total_count)
+                        # Apply emphasis and rarity factors
+                        final_weight = base_weight * (1.0 + (rarity * self.rarity_factor))
+                        weights[tag_clean] = max(self.min_weight, min(self.max_weight, final_weight))
+                    else:
+                        weights[tag_clean] = base_weight
+                else:
+                    weights[tag_clean] = base_weight
 
             # Add special tag weights
             for tag, weight in special_tags.items():
@@ -716,10 +665,6 @@ class TagBasedLossWeighter:
             except Exception as nlp_error:
                 logger.warning(f"NLP analysis failed for tag '{tag}': {str(nlp_error)}")
                 
-            return "default"
-            
-        except Exception as e:
-            logger.error(f"Tag classification failed for '{tag}': {str(e)}")
             return "default"  # Fallback to default category
 
     def _calculate_tag_importance(self, tag: str, tags: List[str]) -> float:
@@ -839,7 +784,7 @@ class TagBasedLossWeighter:
 
         try:
             # Split into tags
-            tags = [t.strip() for t in caption.split(',') if t.strip()]
+            tags = [t.strip() for t in caption.split(',')]
             
             # Remove empty tags
             tags = [t for t in tags if t]
