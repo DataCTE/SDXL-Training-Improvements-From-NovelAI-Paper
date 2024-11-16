@@ -579,26 +579,46 @@ class CustomDataset(CustomDatasetBase):
 
     def _initialize_workers(self) -> None:
         """Initialize worker processes for parallel latent computation"""
+        if not self.no_caching_latents:
+            # Use ProcessPoolExecutor instead of multiprocessing for better GPU handling
+            self.process_pool = ThreadPoolExecutor(max_workers=1)  # Single worker for GPU
+            logger.info("Initialized latent processing worker")
+
+    def _process_single_latent(self, image_path: str) -> Optional[Tuple[str, torch.Tensor]]:
+        """Process a single image into latent space"""
         try:
-            # Determine number of workers
-            num_workers = min(os.cpu_count() or 1, 8)  # Cap at 8 workers
-            self.process_pool = ThreadPoolExecutor(max_workers=num_workers)
+            # Load and preprocess image
+            image = Image.open(image_path).convert('RGB')
             
-            logger.info("Initialized %d workers for latent computation", num_workers)
+            # Convert to tensor and normalize
+            image_tensor = torch.from_numpy(
+                np.array(image, dtype=np.float32) / 255.0
+            ).permute(2, 0, 1).unsqueeze(0)
+            
+            # Move to GPU and process through VAE encoder
+            with torch.cuda.amp.autocast():
+                with torch.no_grad():
+                    image_tensor = image_tensor.to(self.device)
+                    latent = self.vae.encode(image_tensor).latent_dist.sample()
+                    latent = latent.cpu()  # Move back to CPU for storage
+                    
+            # Clean up GPU memory
+            del image_tensor
+            torch.cuda.empty_cache()
+                
+            return image_path, latent
             
         except Exception as e:
-            logger.error("Failed to initialize workers: %s", str(e))
-            logger.error(traceback.format_exc())
-            raise
+            logger.error("Failed to process latent for %s: %s", image_path, str(e))
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            return None
 
-    def _batch_process_latents_efficient(self) -> None:
+    def _batch_process_latents_efficient(self):
         """Process latents in batches efficiently using worker pool"""
         try:
-            # Get total number of images
             total_images = len(self.image_paths)
-            
-            # Process in batches
-            batch_size = 32  # Adjust based on memory constraints
+            batch_size = 1  # Process one image at a time to manage GPU memory
             num_batches = (total_images + batch_size - 1) // batch_size
             
             logger.info("Processing %d images in %d batches", total_images, num_batches)
@@ -608,17 +628,12 @@ class CustomDataset(CustomDatasetBase):
                 end_idx = min(start_idx + batch_size, total_images)
                 batch_paths = self.image_paths[start_idx:end_idx]
                 
-                # Submit batch to worker pool
-                futures = []
+                # Process single image
                 for image_path in batch_paths:
                     future = self.process_pool.submit(
                         self._process_single_latent,
                         image_path
                     )
-                    futures.append(future)
-                
-                # Wait for batch completion and store results
-                for future in futures:
                     try:
                         result = future.result()
                         if result is not None:
@@ -627,6 +642,10 @@ class CustomDataset(CustomDatasetBase):
                     except Exception as e:
                         logger.error("Failed to process latent: %s", str(e))
                         continue
+                
+                # Clean up GPU memory after each batch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             
             logger.info("Completed latent processing")
             
@@ -634,52 +653,6 @@ class CustomDataset(CustomDatasetBase):
             logger.error("Failed to process latents: %s", str(e))
             logger.error(traceback.format_exc())
             raise
-
-    def _process_single_latent(self, image_path: str) -> Optional[Tuple[str, torch.Tensor]]:
-        """Process a single image into latent space
-        
-        Args:
-            image_path: Path to the image file
-            
-        Returns:
-            Tuple of (image_path, latent_tensor) if successful, None otherwise
-            
-        Raises:
-            FileNotFoundError: If image file doesn't exist
-            Image.UnidentifiedImageError: If image format is invalid
-            Image.DecompressionBombError: If image is too large
-            IOError, OSError: If there are file system errors
-            ValueError, TypeError: If image data is invalid or corrupted
-            torch.cuda.CudaError: If there are CUDA-specific errors
-            RuntimeError: If other VAE encoding errors occur
-        """
-        try:
-            # Load and preprocess image
-            image = Image.open(image_path).convert('RGB')
-            
-            # Convert to tensor and normalize
-            image_tensor = torch.from_numpy(
-                np.array(image, dtype=np.float32) / 255.0
-            ).permute(2, 0, 1)
-            
-            # Process through VAE encoder
-            with torch.no_grad():
-                latent = self.vae.encode(
-                    image_tensor.unsqueeze(0).to(self.device)
-                ).latent_dist.sample()
-                latent = latent.cpu()  # Move to CPU immediately
-                
-            # Clean up GPU memory
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                
-            return image_path, latent
-            
-        except Exception as e:
-            logger.error("Failed to process latent for %s: %s", image_path, str(e))
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            return None
 
     def custom_collate(self, batch):
         """Custom collate function for DataLoader to handle batched data.
@@ -753,26 +726,38 @@ class CustomDataset(CustomDatasetBase):
                 try:
                     with Image.open(image_path) as img:
                         img = img.convert('RGB')
-                        # Move image processing to GPU
-                        image = torch.from_numpy(np.array(img)).float() / 127.5 - 1
-                        image = image.permute(2, 0, 1).unsqueeze(0).to(self.device)
+                        # Optimize image processing for GPU
+                        image = torch.from_numpy(
+                            np.array(img, dtype=np.float32)
+                        ).permute(2, 0, 1).unsqueeze(0) / 127.5 - 1
                         
-                        # Process through VAE
-                        with torch.no_grad():
-                            latent = self.vae.encode(
-                                image
-                            ).latent_dist.sample()
-                            
-                        if not self.no_caching_latents:
-                            # Only cache if caching is enabled
-                            self.latents_cache[image_path] = latent.cpu()
+                        # Move to GPU and use automatic mixed precision
+                        with torch.cuda.amp.autocast():
+                            with torch.no_grad():
+                                image = image.to(self.device, non_blocking=True)
+                                latent = self.vae.encode(image).latent_dist.sample()
+                                
+                                if not self.no_caching_latents:
+                                    # Only cache if caching is enabled
+                                    self.latents_cache[image_path] = latent.cpu()
+                                    latent = latent.cpu()  # Move to CPU for storage
+                                
+                        # Clean up GPU memory
+                        del image
+                        torch.cuda.empty_cache()
                         
                 except Exception as e:
                     logger.debug("Failed to process image %s: %s", image_path, str(e))
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                     continue
             
+            # Ensure latent is on CPU for return
+            if latent.device.type == 'cuda':
+                latent = latent.cpu()
+                
             return {
-                'latent': latent.cpu() if latent.device.type == 'cuda' else latent,
+                'latent': latent,
                 'caption': caption,
                 'tag_weight': tag_weight,
                 'metadata': {
