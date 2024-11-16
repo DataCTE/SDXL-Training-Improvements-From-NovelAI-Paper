@@ -120,13 +120,13 @@ def setup_optimizer(args, models) -> torch.optim.Optimizer:
     except (ValueError, RuntimeError, AttributeError) as e:
         raise type(e)(f"Failed to setup optimizer: {str(e)}") from e
 
-def setup_vae_finetuner(args, models) -> Optional[VAEFineTuner]:
+def setup_vae_finetuner(args, model_dict) -> Optional[VAEFineTuner]:
     """
     Set up the VAE FineTuner if fine-tuning is enabled in the arguments.
 
     Args:
-        args: A configuration object containing various training parameters.
-        models: A dictionary of models, expected to include the 'vae' model.
+        args: The complete training configuration object.
+        model_dict: A dictionary containing models and training configs.
 
     Returns:
         An instance of VAEFineTuner if fine-tuning is enabled, otherwise None.
@@ -139,18 +139,18 @@ def setup_vae_finetuner(args, models) -> Optional[VAEFineTuner]:
 
     try:
         vae_finetuner = VAEFineTuner(
-            vae=models["vae"],
-            device=args.training.device,
-            mixed_precision=args.training.mixed_precision,
-            use_amp=args.training.use_amp,
+            vae=model_dict["vae"],
+            device=model_dict["training"].device,
+            mixed_precision=model_dict["training"].mixed_precision,
+            use_amp=model_dict["training"].use_amp,
             learning_rate=args.learning_rate,
-            adam_beta1=args.optimizer.adam_beta1,
-            adam_beta2=args.optimizer.adam_beta2,
-            adam_epsilon=args.optimizer.adam_epsilon,
+            adam_beta1=model_dict["optimizer"].adam_beta1,
+            adam_beta2=model_dict["optimizer"].adam_beta2,
+            adam_epsilon=model_dict["optimizer"].adam_epsilon,
             weight_decay=args.weight_decay,
             max_grad_norm=args.max_grad_norm,
             gradient_checkpointing=args.gradient_checkpointing,
-            use_8bit_adam=args.optimizer.use_8bit_adam,
+            use_8bit_adam=model_dict["optimizer"].use_8bit_adam,
             use_channel_scaling=args.use_channel_scaling,
             adaptive_loss_scale=args.adaptive_loss_scale,
             kl_weight=args.kl_weight,
@@ -489,15 +489,17 @@ def initialize_training_components(args, models):
                 args.tag_weighting.use_tag_weighting, 
                 (args,)
             ),
-            # Updated VAE finetuner setup to access properties correctly
             "vae_finetuner": (
                 setup_vae_finetuner, 
                 args.vae.finetune_vae, 
-                (args.vae, {
-                    **models,
-                    "training": args.training,
-                    "optimizer": args.optimizer
-                })
+                (
+                    args.vae, 
+                    {
+                        "vae": models["vae"],
+                        "training": args.training,
+                        "optimizer": args.optimizer
+                    }
+                )
             ),
         }
 
@@ -509,6 +511,7 @@ def initialize_training_components(args, models):
                 else:
                     components[name] = None
             except Exception as e:
+                logger.error(f"Failed to initialize {name}: {str(e)}")
                 raise RuntimeError(f"Failed to initialize {name}: {str(e)}") from e
 
         # Setup metrics tracking
