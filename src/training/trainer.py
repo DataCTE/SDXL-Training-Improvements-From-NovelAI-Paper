@@ -542,8 +542,9 @@ def train_epoch(
     components: Dict[str, Any],
     device: torch.device,
     dtype: torch.dtype,
-) -> None:
-    """Train for one epoch."""
+    global_step: int = 0,
+) -> Dict[str, float]:
+    """Train for one epoch and return metrics."""
     models["unet"].train()
     
     # Initialize progress bar
@@ -627,15 +628,18 @@ def train_epoch(
     progress.close()
 
     # Log epoch metrics
+    epoch_metrics = {k: v / samples_seen for k, v in epoch_metrics.items()} if samples_seen > 0 else {}
     if components.get("metrics"):
         components["metrics"].log_epoch_metrics(
             epoch=epoch,
-            metrics={k: v / samples_seen for k, v in epoch_metrics.items()},
+            metrics=epoch_metrics,
         )
 
     # Save checkpoint if needed
     if epoch % args.logging.save_epochs == 0:
         save_checkpoint(args, epoch, models, components)
+        
+    return epoch_metrics
 
 
 def train(args, models, components, device, dtype) -> Dict[str, float]:
