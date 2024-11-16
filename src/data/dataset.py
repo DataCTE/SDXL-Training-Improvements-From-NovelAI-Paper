@@ -221,7 +221,13 @@ class CustomDataset(CustomDatasetBase):
                  use_tag_weighting=True, **kwargs):
         super().__init__()
         
-        # Store dropout rates as instance attributes
+        # Store 
+        self.tokenizer = tokenizer
+        self.tokenizer_2 = tokenizer_2
+        self.text_encoder = text_encoder
+        self.text_encoder_2 = text_encoder_2
+        self.vae = vae
+
         self.token_dropout_rate = token_dropout_rate
         self.caption_dropout_rate = caption_dropout_rate
         
@@ -2861,77 +2867,90 @@ class CustomDataLoader(CustomDataLoaderBase):
 
 def create_dataloader(
     data_dir,
-    batch_size,
+    batch_size=1,
     num_workers=None,
-    tokenizer=None,
-    text_encoder=None,
-    tokenizer_2=None,
-    text_encoder_2=None,
-    vae=None,
-    enable_bucket_sampler=True,
     no_caching_latents=False,
     all_ar=False,
-    use_tag_weighting=False,
+    cache_dir="latents_cache",
+    vae=None,
+    tokenizer=None,
+    tokenizer_2=None,
+    text_encoder=None,
+    text_encoder_2=None,
     **kwargs
 ):
-    """
-    Create a dataloader with the specified parameters
-    """
-    # Log initialization parameters
-    logger.info("Creating dataloader with settings:")
-    logger.info(f"  batch_size: {batch_size}")
-    logger.info(f"  num_workers: {num_workers}")
-    logger.info(f"  no_caching_latents: {no_caching_latents}")
-    logger.info(f"  all_ar: {all_ar}")
-    logger.info(f"  use_tag_weighting: {use_tag_weighting}")
+    """Create a dataloader with proper model initialization."""
+    try:
+        # Validate required models are provided
+        if any(m is None for m in [vae, tokenizer, tokenizer_2, text_encoder, text_encoder_2]):
+            raise ValueError("All models (vae, tokenizer, tokenizer_2, text_encoder, text_encoder_2) must be provided")
 
-    # Validate settings
-    if all_ar and not enable_bucket_sampler:
-        logger.warning("all_ar requires bucket_sampler - enabling bucket_sampler")
-        enable_bucket_sampler = True
+        # Add model verification logging
+        logger.info("Verifying models:")
+        logger.info(f"  VAE: {type(vae).__name__}")
+        logger.info(f"  Tokenizer: {type(tokenizer).__name__}")
+        logger.info(f"  Tokenizer 2: {type(tokenizer_2).__name__}")
+        logger.info(f"  Text Encoder: {type(text_encoder).__name__}")
+        logger.info(f"  Text Encoder 2: {type(text_encoder_2).__name__}")
+
+        # Log initialization parameters
+        logger.info("Creating dataloader with settings:")
+        logger.info(f"  batch_size: {batch_size}")
+        logger.info(f"  num_workers: {num_workers}")
+        logger.info(f"  no_caching_latents: {no_caching_latents}")
+        logger.info(f"  all_ar: {all_ar}")
+        logger.info(f"  use_tag_weighting: {kwargs.get('use_tag_weighting', False)}")
+
+        # Validate settings
+        if all_ar and not kwargs.get('enable_bucket_sampler', True):
+            logger.warning("all_ar requires bucket_sampler - enabling bucket_sampler")
+            kwargs['enable_bucket_sampler'] = True
+            
+        if no_caching_latents:
+            logger.info("Latent caching disabled - processing will be done on-the-fly")
+
+        # Initialize dataset with progress reporting
+        dataset = CustomDataset(
+            data_dir=data_dir,
+            tokenizer=tokenizer,
+            text_encoder=text_encoder,
+            tokenizer_2=tokenizer_2,
+            text_encoder_2=text_encoder_2,
+            vae=vae,
+            num_workers=num_workers,  # Pass num_workers to dataset
+            cache_dir=cache_dir,
+            no_caching_latents=no_caching_latents,
+            all_ar=all_ar,
+            **kwargs
+        )
         
-    if no_caching_latents:
-        logger.info("Latent caching disabled - processing will be done on-the-fly")
+        logger.info("Setting up bucket sampler...")
+        if kwargs.get('enable_bucket_sampler', True):
+            sampler = BucketSampler(
+                dataset=dataset,
+                batch_size=batch_size,
+                drop_last=True
+            )
+            logger.info(f"Bucket sampler initialized with {len(sampler)} samples")
+        else:
+            sampler = None
+            logger.info("No bucket sampler used")
 
-    # Initialize dataset with progress reporting
-    dataset = CustomDataset(
-        data_dir=data_dir,
-        tokenizer=tokenizer,
-        text_encoder=text_encoder,
-        tokenizer_2=tokenizer_2,
-        text_encoder_2=text_encoder_2,
-        vae=vae,
-        num_workers=num_workers,  # Pass num_workers to dataset
-        enable_bucket_sampler=enable_bucket_sampler,
-        no_caching_latents=no_caching_latents,
-        all_ar=all_ar,
-        use_tag_weighting=use_tag_weighting,
-        **kwargs
-    )
-    
-    logger.info("Setting up bucket sampler...")
-    if enable_bucket_sampler:
-        sampler = BucketSampler(
+        logger.info("Initializing dataloader...")
+        dataloader = CustomDataLoader(
             dataset=dataset,
             batch_size=batch_size,
-            drop_last=True
+            sampler=sampler,
+            num_workers=num_workers if num_workers is not None else 0,
+            pin_memory=True,
+            drop_last=True,
+            timeout=0,
+            prefetch_factor=2
         )
-        logger.info(f"Bucket sampler initialized with {len(sampler)} samples")
-    else:
-        sampler = None
-        logger.info("No bucket sampler used")
+        logger.info(f"Dataloader initialized with {len(dataloader)} batches")
+        
+        return dataloader
+    except Exception as e:
+        logger.error(f"Failed to create dataloader: {str(e)}")
+        raise
 
-    logger.info("Initializing dataloader...")
-    dataloader = CustomDataLoader(
-        dataset=dataset,
-        batch_size=batch_size,
-        sampler=sampler,
-        num_workers=num_workers if num_workers is not None else 0,
-        pin_memory=True,
-        drop_last=True,
-        timeout=0,
-        prefetch_factor=2
-    )
-    logger.info(f"Dataloader initialized with {len(dataloader)} batches")
-    
-    return dataloader
