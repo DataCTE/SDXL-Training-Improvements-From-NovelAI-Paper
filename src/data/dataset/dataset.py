@@ -434,7 +434,9 @@ class CustomDataset(CustomDatasetBase):
             """Cache tag parsing results for repeated captions"""
             if not self.tag_weighter:
                 return [], {}
-            return self.tag_weighter.parse_tags(caption_text)
+            # Split caption into tags and process them
+            tags = [tag.strip() for tag in caption_text.split(",") if tag.strip()]
+            return tags, self.tag_weighter.process_tag_batch(tags)
         
         if not caption:
             return [], {}
@@ -534,7 +536,8 @@ class CustomDataset(CustomDatasetBase):
             for tag, weight in special_tags_tuple:
                 if isinstance(weight, (int, float)):
                     weighted_tags.append(f"{tag}::{weight}")
-            return self.tag_weighter.calculate_weights(weighted_tags)
+            # Process tags in batch to get their weights
+            return self.tag_weighter.process_tag_batch(weighted_tags)
         
         # Convert inputs to hashable types for caching
         tags_tuple = tuple(sorted(tags))
@@ -733,7 +736,7 @@ class CustomDataset(CustomDatasetBase):
                 if not caption:
                     continue
             except (IOError, OSError) as e:
-                logger.debug("Failed to read caption file %s: %s", caption_path, str(e))
+                logger.debug(f"Failed to read caption file %s: %s", caption_path, str(e))
                 continue
             
             # Always get tag weight from cache since tag caching is always enabled
