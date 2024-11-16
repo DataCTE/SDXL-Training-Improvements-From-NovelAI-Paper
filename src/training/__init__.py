@@ -13,19 +13,22 @@ from .trainer import (
     train_epoch,
     initialize_training_components,
     run_validation,
-    _log_optimizer_config,
-    _log_vae_config,
-    _log_ema_config,
     AverageMeter,
     MetricsManager
 )
 
+from src.utils.logging import (
+    _log_optimizer_config,
+    _log_vae_config,
+    _log_ema_config
+)
+
 from .ema import EMAModel
-from .vae_finetuner import VAEFinetuner
+from .vae_finetuner import VAEFineTuner
 from .loss import (
-    compute_snr_weight,
-    compute_loss,
-    compute_vae_loss
+    compute_loss_weights,
+    training_loss_v_prediction,
+    PerceptualLoss
 )
 
 __all__ = [
@@ -45,10 +48,10 @@ __all__ = [
     
     # Models
     'EMAModel',
-    'VAEFinetuner',
+    'VAEFineTuner',
     
     # Loss functions
-    'compute_snr_weight',
-    'compute_loss',
-    'compute_vae_loss'
+    'compute_loss_weights',
+    'training_loss_v_prediction',
+    'PerceptualLoss'
 ]
