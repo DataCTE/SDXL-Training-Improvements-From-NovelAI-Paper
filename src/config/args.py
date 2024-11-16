@@ -29,13 +29,12 @@ class TrainingArgs:
 
     This class provides a structured way to define and parse the training-related
     command line arguments for the SDXL training pipeline.
-
+    
     Attributes:
         learning_rate: The learning rate for the optimizer.
         num_epochs: The number of training epochs.
         batch_size: The batch size for training.
-        gradient_accumulation_steps: The number of steps to accumulate gradients before
-            applying them.
+        gradient_accumulation_steps: The number of steps to accumulate gradients before applying them.
         max_grad_norm: The maximum gradient norm for gradient clipping.
         warmup_steps: The number of warmup steps.
         training_mode: The training mode, either 'v_prediction' or 'kl'.
@@ -49,6 +48,9 @@ class TrainingArgs:
         sigma_max: The maximum standard deviation for the noise schedule.
         scale_method: The scaling method, either 'karras' or 'linear'.
         scale_factor: The scaling factor.
+        device: The device to use for training.
+        mixed_precision: The mixed precision mode to use.
+        use_amp: Whether to use automatic mixed precision.
     """
     learning_rate: float = 1e-6
     num_epochs: int = 1
@@ -69,6 +71,7 @@ class TrainingArgs:
     scale_factor: float = 0.7
     device: str = "cuda"
     mixed_precision: str = "fp16"
+    use_amp: bool = False
 
 @dataclass
 class OptimizerArgs:
