@@ -393,11 +393,8 @@ class CustomDataset(CustomDatasetBase):
         """Optimized tag weight calculation with caching"""
         from functools import lru_cache
         
-        @lru_cache(maxsize=10000)
+        @lru_cache(maxsize=1024)
         def cached_calculate_weights(tags_tuple, special_tags_tuple):
-            """Cache weight calculations for repeated tag combinations"""
-            if not self.tag_weighter:
-                return 1.0
             # Convert special tags back to regular tags with weights
             weighted_tags = list(tags_tuple)
             for tag, weight in special_tags_tuple:
@@ -407,6 +404,9 @@ class CustomDataset(CustomDatasetBase):
         
         # Convert inputs to hashable types for caching
         tags_tuple = tuple(sorted(tags))
+        # Ensure special_tags is a dictionary before calling items()
+        if not isinstance(special_tags, dict):
+            special_tags = {tag: 1.0 for tag in special_tags}
         special_tags_tuple = tuple(sorted(special_tags.items()))
         
         return cached_calculate_weights(tags_tuple, special_tags_tuple)
@@ -623,8 +623,9 @@ class CustomDataset(CustomDatasetBase):
         tag_weight = 1.0
         if self.use_tag_weighting and caption:
             tags, special_tags = self._parse_tags(caption)
-            special_tags = [tag for tag in tags if isinstance(tag, str) and tag.startswith('_')]
-            tag_weight = self._calculate_tag_weights(tags, special_tags)
+            # Convert special tags to a dict with default weight of 1.0
+            special_tags_dict = {tag: 1.0 for tag in tags if isinstance(tag, str) and tag.startswith('_')}
+            tag_weight = self._calculate_tag_weights(tags, special_tags_dict)
         
         return {
             'latent': latent,
