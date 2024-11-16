@@ -393,32 +393,71 @@ class TagBasedLossWeighter:
             if not caption:
                 return [], {}
 
-            # Extract tags and special tags
+            # Split caption into chunks for parallel processing
+            chunks = [t.strip() for t in caption.split(',') if t.strip()]
+            if not chunks:
+                return [], {}
+
+            # Process chunks in parallel if enough chunks
+            if len(chunks) > 10 and self.num_workers > 1:  # Only parallelize for larger inputs
+                with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+                    # Process each chunk in parallel
+                    futures = [executor.submit(self._process_tag_chunk, chunk) for chunk in chunks]
+                    results = [future.result() for future in futures]
+                    
+                    # Combine results
+                    tags = []
+                    special_tags = {}
+                    for chunk_tags, chunk_special in results:
+                        tags.extend(chunk_tags)
+                        special_tags.update(chunk_special)
+            else:
+                # Process sequentially for small inputs
+                tags = []
+                special_tags = {}
+                for chunk in chunks:
+                    chunk_tags, chunk_special = self._process_tag_chunk(chunk)
+                    tags.extend(chunk_tags)
+                    special_tags.update(chunk_special)
+
+            # Remove duplicates while preserving order
+            seen = set()
+            tags = [tag for tag in tags if not (tag in seen or seen.add(tag))]
+
+            return tags, special_tags
+
+        except Exception as e:
+            logger.error(f"Error processing caption: {str(e)}")
+            return [], {}
+
+    def _process_tag_chunk(self, chunk: str) -> Tuple[List[str], Dict[str, float]]:
+        """Process a single chunk of tags."""
+        try:
             tags = []
             special_tags = {}
             
-            # Split caption into individual tags
-            raw_tags = [t.strip() for t in caption.split(',') if t.strip()]
-            
-            for tag in raw_tags:
-                if tag.startswith('_'):
-                    # Handle special tags with weights
-                    parts = tag[1:].split(':')
-                    if len(parts) == 2:
-                        tag_name, weight = parts
-                        try:
-                            weight = float(weight)
-                            special_tags[f"_{tag_name}"] = weight
-                        except ValueError:
-                            special_tags[tag] = 1.0
-                    else:
-                        special_tags[tag] = 1.0
-                else:
+            # Clean and normalize the chunk
+            chunk = self._clean_tag(chunk)
+            if not chunk:
+                return [], {}
+                
+            # Check for weighted tag format
+            if "::" in chunk:
+                tag, weight = self._process_weighted_tag(chunk)
+                if tag:
                     tags.append(tag)
-
+                    special_tags[tag] = weight
+                return tags, special_tags
+                
+            # Check for special Midjourney-style tags
+            processed_tag = self._process_mj_tag(chunk, 0, 1, special_tags)
+            if processed_tag:
+                tags.append(processed_tag)
+                
             return tags, special_tags
+            
         except Exception as e:
-            logger.warning(f"Error processing caption: {str(e)}")
+            logger.warning(f"Error processing tag chunk '{chunk}': {str(e)}")
             return [], {}
 
     def calculate_caption_weight(self, caption: str) -> float:
