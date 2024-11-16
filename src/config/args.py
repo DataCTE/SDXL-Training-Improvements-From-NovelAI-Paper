@@ -67,6 +67,7 @@ class TrainingArgs:
     sigma_max: float = 160.0
     scale_method: str = "karras"
     scale_factor: float = 0.7
+    device: str = "cuda"
 
 @dataclass
 class OptimizerArgs:
