@@ -96,27 +96,30 @@ class OptimizerArgs:
 
 @dataclass
 class EMAArgs:
-    """
-    Configuration arguments for Exponential Moving Average (EMA).
+    """Configuration arguments for Exponential Moving Average (EMA).
 
     Attributes:
         use_ema: Whether to use EMA.
-        ema_decay: The decay rate for EMA.
-        ema_update_after_step: The number of steps after which EMA is updated.
-        ema_power: The power to which the decay is raised.
-        ema_min_decay: The minimum decay rate.
-        ema_max_decay: The maximum decay rate.
-        ema_update_every: The number of steps between EMA updates.
+        decay: The decay rate for EMA.
+        update_after_step: The number of steps after which EMA is updated.
+        power: The power to which the decay is raised.
+        min_decay: The minimum decay rate.
+        max_decay: The maximum decay rate.
+        update_every: The number of steps between EMA updates.
         use_ema_warmup: Whether to use a warmup schedule for EMA.
+        mixed_precision: Mixed precision mode for EMA model ('no', 'fp16', or 'bf16').
+        gradient_checkpointing: Whether to use gradient checkpointing for memory efficiency.
     """
     use_ema: bool = True
-    ema_decay: float = 0.9999
-    ema_update_after_step: int = 100
-    ema_power: float = 0.6667
-    ema_min_decay: float = 0.0
-    ema_max_decay: float = 0.9999
-    ema_update_every: int = 1
+    decay: float = 0.9999
+    update_after_step: int = 100
+    power: float = 0.6667
+    min_decay: float = 0.0
+    max_decay: float = 0.9999
+    update_every: int = 1
     use_ema_warmup: bool = True
+    mixed_precision: str = "bf16"
+    gradient_checkpointing: bool = True
 
 @dataclass
 class VAEArgs:
@@ -308,13 +311,15 @@ def parse_args() -> TrainingConfig:
     
     # EMA arguments
     parser.add_argument("--use_ema", action="store_true", default=True)
-    parser.add_argument("--ema_decay", type=float, default=0.9999)
-    parser.add_argument("--ema_update_after_step", type=int, default=100)
-    parser.add_argument("--ema_power", type=float, default=0.6667)
-    parser.add_argument("--ema_min_decay", type=float, default=0.0)
-    parser.add_argument("--ema_max_decay", type=float, default=0.9999)
-    parser.add_argument("--ema_update_every", type=int, default=1)
+    parser.add_argument("--decay", type=float, default=0.9999)
+    parser.add_argument("--update_after_step", type=int, default=100)
+    parser.add_argument("--power", type=float, default=0.6667)
+    parser.add_argument("--min_decay", type=float, default=0.0)
+    parser.add_argument("--max_decay", type=float, default=0.9999)
+    parser.add_argument("--update_every", type=int, default=1)
     parser.add_argument("--use_ema_warmup", action="store_true", default=True)
+    parser.add_argument("--mixed_precision", type=str, default="bf16", choices=["no", "fp16", "bf16"])
+    parser.add_argument("--gradient_checkpointing", action="store_true", default=True)
     
     # VAE arguments
     parser.add_argument("--use_vae", action="store_true", default=True)
@@ -398,14 +403,15 @@ def parse_args() -> TrainingConfig:
             use_8bit_adam=args.use_8bit_adam
         ),
         ema=EMAArgs(
-            use_ema=args.use_ema,
-            ema_decay=args.ema_decay,
-            ema_update_after_step=args.ema_update_after_step,
-            ema_power=args.ema_power,
-            ema_min_decay=args.ema_min_decay,
-            ema_max_decay=args.ema_max_decay,
-            ema_update_every=args.ema_update_every,
-            use_ema_warmup=args.use_ema_warmup
+            decay=args.ema_decay,
+            update_after_step=args.ema_update_after_step,
+            power=args.ema_power,
+            min_decay=args.ema_min_decay,
+            max_decay=args.ema_max_decay,
+            update_every=args.ema_update_every,
+            use_ema_warmup=args.use_ema_warmup,
+            mixed_precision=args.ema_mixed_precision,
+            gradient_checkpointing=args.ema_gradient_checkpointing
         ),
         vae=VAEArgs(
             use_vae=args.use_vae,

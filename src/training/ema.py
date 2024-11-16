@@ -6,48 +6,7 @@ from diffusers import StableDiffusionXLPipeline
 logger = logging.getLogger(__name__)
 
 class EMAModel:
-    """Exponential Moving Average (EMA) model implementation for SDXL training.
-
-    This class provides an optimized EMA implementation with features including:
-    - Configurable decay rate with warmup and bounds
-    - Mixed precision support (fp16, bf16)
-    - Memory-efficient operations with xformers
-    - Gradient checkpointing support
-    - JIT compilation option
-    - Automated device placement
-    - Efficient parameter updates
-
-    Args:
-        model (torch.nn.Module): Source model to initialize EMA from
-        model_path (str): Path to pretrained model weights
-        decay (float, optional): Base EMA decay rate. Defaults to 0.9999.
-        update_after_step (int, optional): Start EMA updates after this many steps. Defaults to 100.
-        device (Union[str, torch.device], optional): Device to place model on. Defaults to None (auto).
-        update_every (int, optional): Update EMA every N steps. Defaults to 1.
-        use_ema_warmup (bool, optional): Enable decay rate warmup. Defaults to True.
-        power (float, optional): Power factor for warmup. Defaults to 2/3.
-        min_decay (float, optional): Minimum decay rate. Defaults to 0.0.
-        max_decay (float, optional): Maximum decay rate. Defaults to 0.9999.
-        mixed_precision (str, optional): Mixed precision mode ('fp16'/'bf16'). Defaults to "bf16".
-        jit_compile (bool, optional): Enable torch.compile(). Defaults to False.
-        gradient_checkpointing (bool, optional): Enable gradient checkpointing. Defaults to True.
-
-    Attributes:
-        ema_model (torch.nn.Module): The EMA model instance
-        device (torch.device): Device the model is on
-        optimization_step (int): Current optimization step
-
-    Example:
-        >>> model = create_model()
-        >>> ema = EMAModel(
-        ...     model=model,
-        ...     model_path="stabilityai/stable-diffusion-xl-base-1.0",
-        ...     decay=0.9999,
-        ...     use_ema_warmup=True
-        ... )
-        >>> # During training:
-        >>> ema.step(model)  # Update EMA weights
-    """    
+    
     def __init__(
         self,
         model: torch.nn.Module,

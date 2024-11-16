@@ -19,8 +19,7 @@ from src.training.trainer import (
     initialize_training_components,
     run_validation,
     setup_optimizer,
-    setup_vae_finetuner,
-    setup_ema
+    setup_vae_finetuner
 )
 from src.utils.checkpoint import load_checkpoint, save_checkpoint, save_final_outputs
 from src.utils.hub import create_model_card, save_model_card, push_to_hub
@@ -81,8 +80,7 @@ def main() -> None:
         setup_optimizer(config, models)
         if config.vae.finetune_vae:
             setup_vae_finetuner(config.vae, models)
-        if config.ema.use_ema:
-            setup_ema(config.ema, {"unet": models["unet"]}, config.model.model_path)
+        # EMA setup is handled by initialize_training_components
         
         # Resume from checkpoint if specified
         if config.logging.resume_from_checkpoint:
