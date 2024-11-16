@@ -322,64 +322,70 @@ class TagBasedLossWeighter:
 
         return tags, special_tags
 
-    def _process_weighted_tag(self, tag: str) -> Tuple[str, Optional[float]]:
+    def _process_weighted_tag(self, tag: str) -> Tuple[Optional[str], float]:
         """Process a weighted tag format (tag::weight)."""
-        parts = tag.split("::")
         try:
-            return parts[0].strip(), float(parts[1])
-        except (IndexError, ValueError):
-            return parts[0].strip(), None
+            if "::" not in tag:
+                return tag, 1.0
+                
+            tag_part, weight_part = tag.split("::", 1)
+            tag_part = self._clean_tag(tag_part)
+            
+            try:
+                weight = float(weight_part)
+                # Clamp weight to valid range
+                weight = max(self.min_weight, min(self.max_weight, weight))
+            except (ValueError, TypeError):
+                logger.warning(f"Invalid weight value in tag '{tag}', using default")
+                weight = 1.0
+                
+            return tag_part, weight
+        except Exception as e:
+            logger.warning(f"Error processing weighted tag '{tag}': {str(e)}")
+            return None, 1.0
 
     def _process_mj_tag(
         self,
         tag: str, index: int, total_tags: int, special_tags: Dict[str, Any]
     ) -> Optional[str]:
-        """Process Midjourney-specific tags.
+        """Process Midjourney-specific tags."""
+        try:
+            # Don't treat long descriptive phrases as parameter tags
+            if len(tag.split()) > 5:
+                return tag
 
-        Args:
-            tag (str): The tag to process
-            index (int): Position of tag in the sequence
-            total_tags (int): Total number of tags
-            special_tags (Dict[str, Any]): Dictionary to store special tag parameters
-
-        Returns:
-            Optional[str]: Processed tag or None if tag was consumed
-
-        Raises:
-            ValueError: If numeric parameter parsing fails
-            AttributeError: If regex pattern matching fails
-            TypeError: If parameter type conversion fails
-        """
-        # Handle style/version tags
-        if index == 0 and ("anime style" in tag or "niji" in tag):
-            special_tags["niji"] = True
-            return None
-        if index == total_tags - 1 and tag in ["4", "5", "6"]:
-            return "masterpiece"
-
-        # Handle parameters
-        for param in ["stylize", "chaos", "sw", "sv"]:
-            if param in tag:
+            # Check for parameter format
+            if ":" in tag and not tag.startswith(("http:", "https:", "ftp:")):
+                param, value = tag.split(":", 1)
+                param = param.strip().lower()
+                value = value.strip()
+                
                 try:
-                    match = re.search(r"[\d.]+", tag)
-                    if match is None:
-                        logger.warning(
-                            "No numeric value found in parameter tag: %s", tag
-                        )
-                        continue
-                    value = float(match.group())
-                    special_tags[param] = value
-                    return None
-                except (ValueError, AttributeError, TypeError) as e:
-                    logger.warning(
-                        "Failed to parse parameter %s from tag %s: %s",
-                        param,
-                        tag,
-                        str(e),
-                    )
-                    continue
+                    # Handle numeric parameters
+                    if any(c.isdigit() for c in value):
+                        try:
+                            numeric_value = float(''.join(c for c in value if c.isdigit() or c == '.'))
+                            special_tags[param] = numeric_value
+                            return None
+                        except ValueError:
+                            pass
+                    
+                    # Handle boolean/flag parameters
+                    if value.lower() in ('true', 'yes', 'on', '1'):
+                        special_tags[param] = True
+                        return None
+                    if value.lower() in ('false', 'no', 'off', '0'):
+                        special_tags[param] = False
+                        return None
+                        
+                except (ValueError, TypeError) as e:
+                    logger.debug(f"Non-numeric parameter value in tag '{tag}': {str(e)}")
+                    
+            return tag
 
-        return tag
+        except Exception as e:
+            logger.warning(f"Error processing MJ tag '{tag}': {str(e)}")
+            return tag
 
     def _clean_tag(self, tag: str) -> Optional[str]:
         """Clean and normalize a tag."""
@@ -488,6 +494,25 @@ class TagBasedLossWeighter:
             logger.warning(f"Error calculating caption weight: {str(e)}")
             return 1.0
 
+    def calculate_weights(
+        self, tags: List[str], special_tags: Dict[str, any] = None
+    ) -> Dict[str, float]:
+        """Calculate weights with proper no_cache handling"""
+        try:
+            if not tags:
+                return {tag: 1.0 for tag in tags}
+                
+            special_tags = special_tags or {}
+            
+            if self.no_cache:
+                return self._calculate_weights_no_cache(tags, special_tags)
+            else:
+                return self._calculate_weights_cached(tags, special_tags)
+                
+        except Exception as e:
+            logger.warning(f"Error calculating weights: {str(e)}")
+            return {tag: 1.0 for tag in tags}
+
     def _calculate_weights_no_cache(
         self, tags: List[str], special_tags: Optional[Dict[str, float]] = None
     ) -> Dict[str, float]:
@@ -506,8 +531,8 @@ class TagBasedLossWeighter:
                 class_weight = self.class_base_weights.get(tag_class, 1.0)
                 
                 # Calculate emphasis and rarity factors
-                emphasis = self.stats.get_emphasis(tag)
-                rarity = self.stats.get_rarity(tag)
+                emphasis = self.stats.get_emphasis(tag, 1.0)
+                rarity = self.stats.get_rarity(tag, 1.0)
                 
                 # Apply emphasis and rarity modifiers
                 final_weight = (
@@ -521,7 +546,10 @@ class TagBasedLossWeighter:
 
             # Add special tag weights
             for tag, weight in special_tags.items():
-                weights[tag] = max(self.min_weight, min(self.max_weight, weight))
+                if isinstance(weight, (int, float)):
+                    weights[tag] = max(self.min_weight, min(self.max_weight, float(weight)))
+                else:
+                    weights[tag] = 1.0
 
             return weights
 
@@ -567,17 +595,6 @@ class TagBasedLossWeighter:
             self.MIN_WEIGHT,
             min(self.MAX_WEIGHT, base_weight),
         )
-
-    def calculate_weights(
-        self, tags: List[str], special_tags: Dict[str, any] = None
-    ) -> Dict[str, float]:
-        """Calculate weights with proper no_cache handling"""
-        if self.no_cache:
-            # Calculate weights directly without caching
-            return self._calculate_weights_no_cache(tags, special_tags)
-        else:
-            # Use cached calculation
-            return self._calculate_weights_cached(tags, special_tags)
 
     def _calculate_weights_cached(
         self, tags: List[str], special_tags: Dict[str, any] = None
