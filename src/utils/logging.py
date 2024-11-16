@@ -53,8 +53,6 @@ def setup_logging(log_dir=None, log_level=logging.INFO):
 
 def log_system_info():
     """Log system and environment information"""
-    logger = logging.getLogger(__name__)
-    
     # PyTorch version and CUDA info
     logger.info("PyTorch version: %s", torch.__version__)
     logger.info("CUDA available: %s", torch.cuda.is_available())
@@ -72,8 +70,6 @@ def log_training_setup(args, models, train_components):
         models: Dictionary of model components
         train_components: Dictionary of training components
     """
-    logger = logging.getLogger(__name__)
-    
     # Log arguments
     logger.info("\n=== Training Configuration ===")
     for key, value in vars(args).items():
@@ -114,14 +110,14 @@ def setup_wandb(args):
     Returns:
         wandb.Run or None: Initialized W&B run
     """
-    if not args.use_wandb:
+    if not args.logging.use_wandb:
         return None
         
     try:
         # Use more robust wandb initialization with additional configuration
         run = wandb.init(
-            project=args.wandb_project,
-            name=args.wandb_run_name or f"sdxl_training_%d" % time.time(),
+            project=args.logging.wandb_project,
+            name=args.logging.wandb_run_name or "sdxl_training_%d" % int(time.time()),
             config=vars(args),
             resume='allow',  # Allow resuming previous runs
             save_code=True,  # Save code snapshot for reproducibility
@@ -133,33 +129,23 @@ def setup_wandb(args):
             )
         )
         
-        # Define loss metrics
+        # Define metrics (no changes needed for these strings as they are static)
         wandb.define_metric("loss/*", summary="min", step_metric="global_step")
         wandb.define_metric("train/loss", summary="min", step_metric="global_step")
         wandb.define_metric("val/loss", summary="min", step_metric="global_step")
-        
-        # Define learning rate metrics
         wandb.define_metric("lr/*", summary="last", step_metric="global_step")
         wandb.define_metric("train/lr", summary="last", step_metric="global_step")
-        
-        # Define epoch metrics
         wandb.define_metric("epoch", summary="max")
         wandb.define_metric("epoch/*", step_metric="epoch")
-        
-        # Define validation metrics
         wandb.define_metric("validation/*", summary="last", step_metric="epoch")
-        
-        # Define performance metrics
         wandb.define_metric("performance/*", summary="mean", step_metric="global_step")
         wandb.define_metric("memory/*", summary="max", step_metric="global_step")
-        
-        # Define gradient metrics
         wandb.define_metric("gradients/*", summary="mean", step_metric="global_step")
         
         logger.info("Initialized W&B run: %s", run.name)
         return run
         
-    except Exception as e:
+    except (wandb.Error, RuntimeError, ValueError, AttributeError) as e:
         logger.error("Failed to initialize W&B: %s", str(e))
         return None
 
@@ -176,8 +162,8 @@ def log_metrics_batch(metrics_dict, step=None):
         
     try:
         wandb.log(metrics_dict, step=step)
-    except Exception as e:
-        logger.warning("Failed to log metrics batch: %s", str(e))
+    except (wandb.Error, RuntimeError, ValueError) as e:
+        logger.warning(f"Failed to log metrics batch: {str(e)}")
 
 def log_model_gradients(model, step):
     """
@@ -194,33 +180,29 @@ def log_model_gradients(model, step):
         grad_dict = {}
         for name, param in model.named_parameters():
             if param.grad is not None:
-                grad_dict["gradients/%s/mean" % name] = param.grad.mean().item()
-                grad_dict["gradients/%s/std" % name] = param.grad.std().item()
-                grad_dict["gradients/%s/norm" % name] = param.grad.norm().item()
+                grad_dict[f"gradients/{name}/mean"] = param.grad.mean().item()
+                grad_dict[f"gradients/{name}/std"] = param.grad.std().item()
+                grad_dict[f"gradients/{name}/norm"] = param.grad.norm().item()
         
         if grad_dict:
             wandb.log(grad_dict, step=step)
-    except Exception as e:
-        logger.warning("Failed to log model gradients: %s", str(e))
+    except (wandb.Error, RuntimeError, ValueError, torch.cuda.CudaError) as e:
+        logger.warning(f"Failed to log model gradients: {str(e)}")
 
-def log_memory_stats(step):
-    """
-    Log GPU memory statistics
-    
-    Args:
-        step (int): Global training step
-    """
+def log_memory_stats(step: int) -> None:
+    """Log CUDA memory statistics to W&B."""
     if not wandb.run or not torch.cuda.is_available():
         return
-        
+
     try:
         memory_stats = {
             "memory/allocated": torch.cuda.memory_allocated() / 1024**2,  # MB
             "memory/reserved": torch.cuda.memory_reserved() / 1024**2,    # MB
             "memory/max_allocated": torch.cuda.max_memory_allocated() / 1024**2,  # MB
+            "memory/max_reserved": torch.cuda.max_memory_reserved() / 1024**2,    # MB
         }
         wandb.log(memory_stats, step=step)
-    except Exception as e:
+    except (wandb.Error, RuntimeError, torch.cuda.CudaError) as e:
         logger.warning("Failed to log memory stats: %s", str(e))
 
 def cleanup_wandb(run):
@@ -238,7 +220,7 @@ def cleanup_wandb(run):
                 "system/peak_gpu_memory": torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0
             })
             run.finish(quiet=True)  # Suppress verbose output
-        except Exception as e:
+        except (wandb.Error, RuntimeError, ValueError, torch.cuda.CudaError) as e:
             logger.error("Error closing W&B run: %s", str(e))
 
 def log_epoch_metrics(wandb_run, metrics: Dict[str, float], epoch: int, global_step: int) -> None:
@@ -252,86 +234,10 @@ def log_epoch_metrics(wandb_run, metrics: Dict[str, float], epoch: int, global_s
         wandb_run.log(log_dict, step=global_step)
         
         # Log to console
-        logger.info("Epoch %d metrics: %s", epoch, ", ".join("%s: %.6f" % (k, v) for k, v in metrics.items()))
+        metrics_str = ", ".join("%s: %.6f" % (k, v) for k, v in metrics.items())
+        logger.info("Epoch %d metrics: %s", epoch, metrics_str)
     except (ValueError, RuntimeError, AttributeError) as e:
         logger.error("Failed to log epoch metrics: %s", str(e))
-        logger.error(traceback.format_exc())
-
-def log_model_gradients(model: torch.nn.Module, step: int) -> None:
-    """Log model gradient statistics to W&B."""
-    try:
-        grad_dict = {}
-        for name, param in model.named_parameters():
-            if param.grad is not None:
-                grad = param.grad.detach()
-                grad_dict.update({
-                    "gradients/%s/mean" % name: grad.mean().item(),
-                    "gradients/%s/std" % name: grad.std().item(),
-                    "gradients/%s/norm" % name: grad.norm().item(),
-                    "gradients/%s/max" % name: grad.max().item(),
-                    "gradients/%s/min" % name: grad.min().item(),
-                })
-
-                try:
-                    grad_dict["gradients/%s/hist" % name] = wandb.Histogram(
-                        grad.cpu().numpy()
-                    )
-                except (RuntimeError, ValueError, TypeError) as e:
-                    logger.debug("Failed to create histogram for %s: %s", name, str(e))
-
-        wandb.log(grad_dict, step=step)
-    except (ValueError, RuntimeError, AttributeError) as e:
-        logger.error("Failed to log model gradients: %s", str(e))
-        logger.error(traceback.format_exc())
-
-@lru_cache(maxsize=1)
-def _get_memory_stats_format() -> Dict[str, str]:
-    """Cache memory statistics format strings."""
-    return {
-        "allocated": "Allocated: %.1fMB",
-        "cached": "Cached: %.1fMB",
-        "max_allocated": "Max Allocated: %.1fMB",
-        "max_cached": "Max Cached: %.1fMB",
-        "active": "Active: %.1fMB",
-        "inactive": "Inactive: %.1fMB",
-        "fragmentation": "Fragmentation: %.1f",
-    }
-
-def log_memory_stats(step: int) -> None:
-    """Log CUDA memory statistics to W&B."""
-    try:
-        if not torch.cuda.is_available():
-            return
-
-        format_strings = _get_memory_stats_format()
-        memory_stats = {
-            "memory/allocated": torch.cuda.memory_allocated() / 1024**2,
-            "memory/cached": torch.cuda.memory_reserved() / 1024**2,
-            "memory/max_allocated": torch.cuda.max_memory_allocated() / 1024**2,
-            "memory/max_cached": torch.cuda.max_memory_reserved() / 1024**2,
-        }
-
-        for i in range(torch.cuda.device_count()):
-            stats = torch.cuda.memory_stats(i)
-            memory_stats.update({
-                "memory/device_%d/active" % i: stats["active_bytes.all.current"] / 1024**2,
-                "memory/device_%d/inactive" % i: stats["inactive_split_bytes.all.current"] / 1024**2,
-                "memory/device_%d/fragmentation" % i: stats.get("fragmentation.all.current", 0),
-            })
-
-        wandb.log(memory_stats, step=step)
-
-        formatted_stats = []
-        for k, v in memory_stats.items():
-            stat_name = k.split("/")[-1]
-            if stat_name in format_strings:
-                formatted_stats.append(format_strings[stat_name] % v)
-            else:
-                formatted_stats.append("%s: %.1fMB" % (k, v))
-
-        logger.debug("Memory stats: %s", ", ".join(formatted_stats))
-    except (ValueError, RuntimeError, AttributeError) as e:
-        logger.error("Failed to log memory stats: %s", str(e))
         logger.error(traceback.format_exc())
 
 def log_optimizer_config(args) -> None:
@@ -360,3 +266,16 @@ def log_ema_config(args) -> None:
     logger.info("EMA config:")
     logger.info("  Decay: %f", args.ema_decay)
     logger.info("  Update every: %d", args.ema_update_every)
+
+@lru_cache(maxsize=1)
+def _get_memory_stats_format() -> Dict[str, str]:
+    """Cache memory statistics format strings."""
+    return {
+        "allocated": "Allocated: %.1fMB",
+        "cached": "Cached: %.1fMB",
+        "max_allocated": "Max Allocated: %.1fMB",
+        "max_cached": "Max Cached: %.1fMB",
+        "active": "Active: %.1fMB",
+        "inactive": "Inactive: %.1fMB",
+        "fragmentation": "Fragmentation: %.1f",
+    }
