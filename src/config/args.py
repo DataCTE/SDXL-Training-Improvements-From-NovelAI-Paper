@@ -108,7 +108,6 @@ class EMAArgs:
         update_every: The number of steps between EMA updates.
         use_ema_warmup: Whether to use a warmup schedule for EMA.
         mixed_precision: Mixed precision mode for EMA model ('no', 'fp16', or 'bf16').
-        gradient_checkpointing: Whether to use gradient checkpointing for memory efficiency.
     """
     use_ema: bool = True
     decay: float = 0.9999
@@ -119,7 +118,6 @@ class EMAArgs:
     update_every: int = 1
     use_ema_warmup: bool = True
     mixed_precision: str = "bf16"
-    gradient_checkpointing: bool = True
 
 @dataclass
 class VAEArgs:
@@ -201,14 +199,12 @@ class SystemArgs:
     Attributes:
         enable_compile: Whether to enable model compilation.
         compile_mode: The mode of compilation to use.
-        gradient_checkpointing: Whether to enable gradient checkpointing.
         verbose: Whether to enable verbose logging.
         all_ar: Whether to use all_ar setting.
         num_workers: Number of worker threads to use.
     """
     enable_compile: bool = False
     compile_mode: str = "default"
-    gradient_checkpointing: bool = False
     verbose: bool = False
     all_ar: bool = False
     num_workers: int = 4
@@ -320,6 +316,12 @@ def parse_args() -> TrainingConfig:
     parser.add_argument("--use_ema_warmup", action="store_true", default=True)
     parser.add_argument("--mixed_precision", type=str, default="bf16", choices=["no", "fp16", "bf16"])
     
+    # System arguments
+    parser.add_argument("--enable_compile", action="store_true")
+    parser.add_argument("--compile_mode", type=str, choices=["default", "reduce-overhead", "max-autotune"], default="default")
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--all_ar", action="store_true")
+    parser.add_argument("--num_workers", type=int, default=4)
     
     # VAE arguments
     parser.add_argument("--use_vae", action="store_true", default=True)
@@ -345,16 +347,6 @@ def parse_args() -> TrainingConfig:
     parser.add_argument("--use_tag_weighting", action="store_true", default=True)
     parser.add_argument("--min_tag_weight", type=float, default=0.1)
     parser.add_argument("--max_tag_weight", type=float, default=3.0)
-    
-    # System arguments
-    parser.add_argument("--enable_compile", action="store_true")
-    parser.add_argument("--compile_mode", type=str,
-                       choices=["default", "reduce-overhead", "max-autotune"],
-                       default="default")
-    parser.add_argument("--gradient_checkpointing", action="store_true")
-    parser.add_argument("--verbose", action="store_true")
-    parser.add_argument("--all_ar", action="store_true")
-    parser.add_argument("--num_workers", type=int, default=4)
     
     # Logging arguments
     parser.add_argument("--use_wandb", action="store_true")
@@ -392,7 +384,10 @@ def parse_args() -> TrainingConfig:
             sigma_min=args.sigma_min,
             sigma_max=args.sigma_max,
             scale_method=args.scale_method,
-            scale_factor=args.scale_factor
+            scale_factor=args.scale_factor,
+            device="cuda",
+            mixed_precision="fp16",
+            use_amp=False,
         ),
         optimizer=OptimizerArgs(
             adam_beta1=args.adam_beta1,
@@ -403,15 +398,15 @@ def parse_args() -> TrainingConfig:
             use_8bit_adam=args.use_8bit_adam
         ),
         ema=EMAArgs(
-            decay=args.ema_decay,
-            update_after_step=args.ema_update_after_step,
-            power=args.ema_power,
-            min_decay=args.ema_min_decay,
-            max_decay=args.ema_max_decay,
-            update_every=args.ema_update_every,
+            use_ema=args.use_ema,
+            decay=args.decay,
+            update_after_step=args.update_after_step,
+            power=args.power,
+            min_decay=args.min_decay,
+            max_decay=args.max_decay,
+            update_every=args.update_every,
             use_ema_warmup=args.use_ema_warmup,
-            mixed_precision=args.ema_mixed_precision,
-            gradient_checkpointing=args.ema_gradient_checkpointing
+            mixed_precision=args.mixed_precision,
         ),
         vae=VAEArgs(
             use_vae=args.use_vae,
@@ -428,7 +423,7 @@ def parse_args() -> TrainingConfig:
             initial_scale_factor=args.vae_initial_scale_factor,
             weight_decay=args.weight_decay,
             max_grad_norm=args.max_grad_norm,
-            gradient_checkpointing=args.gradient_checkpointing,
+            gradient_checkpointing=False,
             min_snr_gamma=args.min_snr_gamma
         ),
         data=DataArgs(
@@ -445,7 +440,6 @@ def parse_args() -> TrainingConfig:
         system=SystemArgs(
             enable_compile=args.enable_compile,
             compile_mode=args.compile_mode,
-            gradient_checkpointing=args.gradient_checkpointing,
             verbose=args.verbose,
             all_ar=args.all_ar,
             num_workers=args.num_workers
