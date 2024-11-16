@@ -544,7 +544,17 @@ def train_epoch(
     dtype: torch.dtype,
     global_step: int = 0,
 ) -> Dict[str, float]:
-    """Train for one epoch and return metrics."""
+    """Train for one epoch and return metrics.
+    
+    Args:
+        epoch: Current epoch number
+        args: Training configuration
+        models: Dictionary of models (unet, vae, etc.)
+        components: Dictionary of training components (optimizer, scheduler, etc.)
+        device: Device to train on
+        dtype: Data type for training
+        global_step: Global training step counter
+    """
     models["unet"].train()
     
     # Initialize progress bar
@@ -557,6 +567,7 @@ def train_epoch(
     # Initialize metrics for this epoch
     epoch_metrics = defaultdict(float)
     samples_seen = 0
+    current_step = global_step
 
     for batch_idx, batch in enumerate(components["train_dataloader"]):
         with components.get("metrics", nullcontext()) as metrics:
@@ -582,6 +593,7 @@ def train_epoch(
                     components["scaler"].update()
                     components["scheduler"].step()
                     components["optimizer"].zero_grad()
+                    current_step += 1
             else:
                 loss.backward()
                 if (batch_idx + 1) % args.training.gradient_accumulation_steps == 0:
@@ -591,6 +603,7 @@ def train_epoch(
                     components["optimizer"].step()
                     components["scheduler"].step()
                     components["optimizer"].zero_grad()
+                    current_step += 1
 
             # Update EMA model if enabled
             if (
@@ -602,7 +615,7 @@ def train_epoch(
             # Log progress
             if metrics and batch_idx % args.logging.logging_steps == 0:
                 metrics.log_metrics(
-                    step=batch_idx,
+                    step=current_step,
                     epoch=epoch,
                     learning_rate=components["scheduler"].get_last_lr()[0],
                 )
@@ -610,10 +623,10 @@ def train_epoch(
             # Run validation if needed
             if (
                 args.validation.validation_steps > 0
-                and batch_idx > 0
-                and batch_idx % args.validation.validation_steps == 0
+                and current_step > 0
+                and current_step % args.validation.validation_steps == 0
             ):
-                run_validation(args, models, components, device, dtype, global_step=batch_idx)
+                run_validation(args, models, components, device, dtype, global_step=current_step)
 
         # Update progress bar
         progress.update(1)
@@ -622,6 +635,7 @@ def train_epoch(
                 {
                     "loss": epoch_metrics["loss"] / samples_seen if samples_seen > 0 else 0,
                     "lr": components["scheduler"].get_last_lr()[0],
+                    "step": current_step,
                 }
             )
 
@@ -633,11 +647,21 @@ def train_epoch(
         components["metrics"].log_epoch_metrics(
             epoch=epoch,
             metrics=epoch_metrics,
+            step=current_step,
         )
 
     # Save checkpoint if needed
     if epoch % args.logging.save_epochs == 0:
-        save_checkpoint(args, epoch, models, components)
+        training_history = {
+            'loss_history': epoch_metrics,
+            'total_steps': current_step
+        }
+        save_checkpoint(
+            args.logging.checkpoint_dir,
+            models,
+            components,
+            training_history
+        )
         
     return epoch_metrics
 
