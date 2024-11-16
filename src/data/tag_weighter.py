@@ -267,94 +267,76 @@ class TagBasedLossWeighter:
         logger.info("- Cache size: %s", self.cache_size)
         logger.info("- Workers: %s", self.num_workers)
 
-    def parse_tags(self, caption: str) -> Tuple[List[str], Dict[str, Any]]:
+    def parse_tags(self, caption: str) -> Tuple[List[str], Dict[str, float]]:
         """
-        Parse caption into tags and special tags with improved error handling.
+        Parse caption into tags and their weights following NovelAI paper specifications.
 
         Args:
             caption (str): The caption text to parse
 
         Returns:
-            Tuple[List[str], Dict[str, Any]]: A tuple containing:
-                - List of parsed tags
-                - Dictionary of special tag parameters
+            Tuple[List[str], Dict[str, float]]: A tuple containing:
+                - List of normalized tags
+                - Dictionary of tag weights
 
         Raises:
-            TypeError: If caption is not a string
-            ValueError: If tag weight parsing fails
-            AttributeError: If string operations fail
-            IndexError: If list operations fail
+            ValueError: If caption is invalid or parsing fails
         """
-        if not isinstance(caption, str):
-            raise TypeError("Caption must be a string")
-
-        if not caption:
-            return [], {}
-
-        tags = []
-        special_tags = {}
-
-        # Process tags in a single pass
-        raw_tags = [t.strip().lower() for t in caption.split(",")]
-
-        # Early processing for MJ tags
-        has_mj_tags = any("niji" in t or t in ["4", "5", "6"] for t in raw_tags)
-
-        for i, tag in enumerate(raw_tags):
-            # Skip empty tags
-            if not tag:
-                continue
-
-            # Process special tag formats
-            if "::" in tag:
-                tag, weight = self._process_weighted_tag(tag)
-                if weight is not None:
-                    special_tags[f"{tag}_weight"] = weight
-
-            elif has_mj_tags:
-                tag = self._process_mj_tag(
-                    tag, i, len(raw_tags), special_tags
-                )
-
-            # Clean and add tag
-            if tag := self._clean_tag(tag):
-                tags.append(tag)
-
-        return tags, special_tags
-
-    def _process_weighted_tag(self, tag: str) -> Tuple[Optional[str], float]:
-        """Process a weighted tag format (tag:weight)."""
         try:
-            if ':' not in tag:
-                return self._clean_tag(tag), 1.0
-                
-            tag_part, weight_part = tag.rsplit(':', 1)
-            tag_part = self._clean_tag(tag_part)
-            if not tag_part:
-                return None, 1.0
-                
-            try:
-                weight = float(weight_part.strip())
-                # Apply class-based weight modifiers
-                tag_class = self._classify_tag(tag_part)
-                if tag_class:
-                    class_stats = self.stats.frequencies.get(tag_class, {})
-                    tag_count = class_stats.get(tag_part, 0)
-                    total_count = sum(class_stats.values())
-                    
-                    if total_count > 0:
-                        # Calculate rarity factor based on tag frequency within its class
-                        rarity = 1.0 - (tag_count / total_count)
-                        weight *= (1.0 + (rarity * self.rarity_factor))
-                
-                return tag_part, max(self.min_weight, min(self.max_weight, weight))
-            except (ValueError, TypeError):
-                logger.warning(f"Invalid weight value in tag '{tag}', using default")
-                return tag_part, 1.0
-                
+            if not isinstance(caption, str):
+                raise ValueError("Caption must be a string")
+
+            if not caption:
+                return [], {}
+
+            tags = []
+            weights = {}
+
+            # Split and clean tags
+            raw_tags = [t.strip() for t in caption.split(",") if t.strip()]
+            
+            for tag in raw_tags:
+                # Handle weighted tags (tag:weight format)
+                if ':' in tag:
+                    tag_part, weight = self._process_weighted_tag(tag)
+                    if tag_part:
+                        clean_tag = self._clean_tag(tag_part)
+                        if clean_tag:
+                            tags.append(clean_tag)
+                            weights[clean_tag] = weight
+                else:
+                    # Process regular tag
+                    clean_tag = self._clean_tag(tag)
+                    if clean_tag:
+                        tags.append(clean_tag)
+                        
+                        # Get tag class and calculate base weight
+                        tag_class = self._classify_tag(clean_tag)
+                        if tag_class:
+                            # Get class statistics
+                            class_stats = self.stats.frequencies.get(tag_class, {})
+                            tag_count = class_stats.get(clean_tag, 0)
+                            total_count = sum(class_stats.values()) if class_stats else 0
+                            
+                            if total_count > 0:
+                                # Calculate rarity-based weight
+                                rarity = 1.0 - (tag_count / total_count)
+                                weight = 1.0 + (rarity * self.rarity_factor)
+                                weights[clean_tag] = max(self.min_weight, min(self.max_weight, weight))
+
+            # Remove duplicates while preserving order
+            seen = set()
+            unique_tags = []
+            for tag in tags:
+                if tag not in seen:
+                    seen.add(tag)
+                    unique_tags.append(tag)
+
+            return unique_tags, weights
+
         except Exception as e:
-            logger.warning(f"Error processing weighted tag '{tag}': {str(e)}")
-            return None, 1.0
+            logger.error(f"Error parsing tags from caption: {str(e)}")
+            return [], {}
 
     def process_caption(self, caption: str) -> Tuple[List[str], Dict[str, float]]:
         """Process a caption to extract tags and special tags with weights."""
@@ -401,6 +383,77 @@ class TagBasedLossWeighter:
 
         except Exception as e:
             logger.error(f"Error processing caption: {str(e)}")
+            return [], {}
+
+    def _process_weighted_tag(self, tag: str) -> Tuple[Optional[str], float]:
+        """Process a weighted tag format (tag:weight)."""
+        try:
+            if ':' not in tag:
+                return self._clean_tag(tag), 1.0
+                
+            tag_part, weight_part = tag.rsplit(':', 1)
+            tag_part = self._clean_tag(tag_part)
+            if not tag_part:
+                return None, 1.0
+                
+            try:
+                weight = float(weight_part.strip())
+                # Apply class-based weight modifiers
+                tag_class = self._classify_tag(tag_part)
+                if tag_class:
+                    class_stats = self.stats.frequencies.get(tag_class, {})
+                    tag_count = class_stats.get(tag_part, 0)
+                    total_count = sum(class_stats.values())
+                    
+                    if total_count > 0:
+                        # Calculate rarity factor based on tag frequency within its class
+                        rarity = 1.0 - (tag_count / total_count)
+                        weight *= (1.0 + (rarity * self.rarity_factor))
+                
+                return tag_part, max(self.min_weight, min(self.max_weight, weight))
+            except (ValueError, TypeError):
+                logger.warning(f"Invalid weight value in tag '{tag}', using default")
+                return tag_part, 1.0
+                
+        except Exception as e:
+            logger.warning(f"Error processing weighted tag '{tag}': {str(e)}")
+            return None, 1.0
+
+    def _process_tag_chunk(self, chunk: str) -> Tuple[List[str], Dict[str, float]]:
+        """
+        Process a single chunk of tags.
+        
+        Args:
+            chunk (str): Comma-separated chunk of tags to process
+            
+        Returns:
+            Tuple[List[str], Dict[str, float]]: Processed tags and their weights
+        """
+        try:
+            if not isinstance(chunk, str):
+                return [], {}
+                
+            tags = []
+            weights = {}
+            
+            # Process weighted tag format first
+            if ':' in chunk:
+                tag_part, weight = self._process_weighted_tag(chunk)
+                if tag_part:
+                    clean_tag = self._clean_tag(tag_part)
+                    if clean_tag:
+                        tags.append(clean_tag)
+                        weights[clean_tag] = weight
+            else:
+                # Process as regular tag
+                clean_tag = self._clean_tag(chunk)
+                if clean_tag:
+                    tags.append(clean_tag)
+                
+            return tags, weights
+            
+        except Exception as e:
+            logger.warning(f"Error processing tag chunk '{chunk}': {str(e)}")
             return [], {}
 
     def calculate_caption_weight(self, caption: str) -> float:
@@ -630,42 +683,93 @@ class TagBasedLossWeighter:
         if hasattr(self, "executor"):
             self.executor.shutdown(wait=True)
 
-    @lru_cache(maxsize=1024)
-    def _classify_tag(self, tag: str) -> str:
-        """Classify a tag into its category."""
+    def _clean_tag(self, tag: str) -> Optional[str]:
+        """
+        Clean and normalize a tag.
+        
+        Args:
+            tag (str): Tag to clean
+            
+        Returns:
+            Optional[str]: Cleaned tag or None if invalid
+        """
         try:
-            # Input validation
-            if not isinstance(tag, str):
-                raise TypeError(f"Tag must be a string, got {type(tag)}")
-            if not tag:
-                return "default"
-
-            # First check explicit mappings
-            if tag in self.tag_to_class:
-                return self.tag_to_class[tag]
-
-            # Then try pattern matching
-            for class_name, category in self.TAG_CATEGORIES.items():
-                # Check keywords
-                if any(keyword in tag.lower() for keyword in category["keywords"]):
-                    return class_name
-                # Check patterns
-                if any(re.match(pattern, tag, re.IGNORECASE) for pattern in category["patterns"]):
-                    return class_name
-
-            # Default classification based on NLP analysis
-            try:
-                doc = self.nlp(tag)
+            if not tag or not isinstance(tag, str):
+                return None
                 
-                # Basic NLP-based classification
-                if doc[0].pos_ in ["NOUN", "PROPN"]:
-                    if any(ent.label_ == "PERSON" for ent in doc.ents):
-                        return "character"
-                    return "object"
-            except Exception as nlp_error:
-                logger.warning(f"NLP analysis failed for tag '{tag}': {str(nlp_error)}")
+            # Convert to lowercase and strip whitespace
+            tag = tag.lower().strip()
+            
+            # Remove common article prefixes
+            if tag.startswith(("a ", "an ", "the ")):
+                tag = " ".join(tag.split()[1:])
                 
-            return "default"  # Fallback to default category
+            # Remove any extra whitespace
+            tag = " ".join(tag.split())
+            
+            # Remove any special characters except spaces and hyphens
+            tag = "".join(c for c in tag if c.isalnum() or c in [" ", "-"])
+            
+            return tag if tag else None
+            
+        except Exception as e:
+            logger.warning(f"Error cleaning tag '{tag}': {str(e)}")
+            return None
+
+    @lru_cache(maxsize=1024)
+    def _classify_tag(self, tag: str) -> Optional[str]:
+        """
+        Classify a tag into its type category.
+        
+        Args:
+            tag (str): Tag to classify
+            
+        Returns:
+            Optional[str]: Tag class name or None if classification fails
+        """
+        try:
+            if not tag or not isinstance(tag, str):
+                return None
+                
+            tag = tag.lower().strip()
+            
+            # Quality tags
+            if any(q in tag for q in ["masterpiece", "quality", "highres", "best"]):
+                return "quality"
+                
+            # Character features
+            if any(t in tag for t in ["hair", "eyes", "face", "smile", "expression"]):
+                return "character_trait"
+                
+            # Clothing
+            if any(c in tag for c in ["dress", "shirt", "hat", "shoes", "outfit", "uniform"]):
+                return "clothing"
+                
+            # Poses and actions
+            if any(p in tag for p in ["standing", "sitting", "running", "walking", "pose"]):
+                return "pose"
+                
+            # Backgrounds and settings
+            if any(b in tag for b in ["background", "sky", "indoor", "outdoor", "room"]):
+                return "background"
+                
+            # Art style
+            if any(s in tag for s in ["style", "colored", "monochrome", "sketch"]):
+                return "style"
+                
+            # Emphasized tags (important descriptors)
+            if any(e in tag for e in ["1girl", "1boy", "solo", "portrait"]):
+                return "emphasis"
+                
+            # Character tags
+            if any(c in tag for c in ["girl", "boy", "man", "woman", "character"]):
+                return "character"
+                
+            return "general"
+
+        except Exception as e:
+            logger.warning(f"Error classifying tag '{tag}': {str(e)}")
+            return None
 
     def _calculate_tag_importance(self, tag: str, tags: List[str]) -> float:
         """
@@ -678,32 +782,37 @@ class TagBasedLossWeighter:
         Returns:
             float: Importance score
         """
-        class_name = self._classify_tag(tag)
-        if not class_name:
+        try:
+            class_name = self._classify_tag(tag)
+            if not class_name:
+                return 1.0
+
+            # Get base class weight
+            importance = self.class_base_weights.get(class_name, 1.0)
+
+            # Apply character emphasis
+            if class_name == "character":
+                importance *= self.character_emphasis
+
+            # Apply emphasis for emphasized tags
+            if class_name == "emphasis" or tag in self.tag_classes.get("emphasis", set()):
+                importance *= self.emphasis_factor
+
+            # Apply rarity bonus
+            rarity_score = self.cache.get_rarity(tag, 1.0)
+            importance *= rarity_score
+
+            # Apply quality bonus for high-quality images
+            if class_name == "quality" and any(
+                q in tags for q in ["masterpiece", "best quality", "high quality"]
+            ):
+                importance *= 1.0 + self.quality_bonus
+
+            return importance
+
+        except Exception as e:
+            logger.warning(f"Error calculating tag importance for '{tag}': {str(e)}")
             return 1.0
-
-        # Get base class weight
-        importance = self.class_base_weights.get(class_name, 1.0)
-
-        # Apply character emphasis
-        if class_name == "character":
-            importance *= self.character_emphasis
-
-        # Apply emphasis for emphasized tags
-        if class_name == "emphasis" or tag in self.tag_classes.get("emphasis", set()):
-            importance *= self.emphasis_factor
-
-        # Apply rarity bonus
-        rarity_score = self.cache.get_rarity(tag, 1.0)
-        importance *= rarity_score
-
-        # Apply quality bonus for high-quality images
-        if class_name == "quality" and any(
-            q in tags for q in ["masterpiece", "best quality", "high quality"]
-        ):
-            importance *= 1.0 + self.quality_bonus
-
-        return importance
 
     def _calculate_tag_weights(self, tags_tuple: Tuple[str, ...]) -> float:
         """
