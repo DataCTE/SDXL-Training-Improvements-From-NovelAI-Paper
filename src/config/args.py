@@ -199,12 +199,14 @@ class SystemArgs:
     Attributes:
         enable_compile: Whether to enable model compilation.
         compile_mode: The mode of compilation to use.
+        gradient_checkpointing: Whether to use gradient checkpointing for memory efficiency.
         verbose: Whether to enable verbose logging.
         all_ar: Whether to use all_ar setting.
         num_workers: Number of worker threads to use.
     """
     enable_compile: bool = False
     compile_mode: str = "default"
+    gradient_checkpointing: bool = True
     verbose: bool = False
     all_ar: bool = False
     num_workers: int = 4
@@ -319,6 +321,7 @@ def parse_args() -> TrainingConfig:
     # System arguments
     parser.add_argument("--enable_compile", action="store_true")
     parser.add_argument("--compile_mode", type=str, choices=["default", "reduce-overhead", "max-autotune"], default="default")
+    parser.add_argument("--gradient_checkpointing", action="store_true", default=True)
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--all_ar", action="store_true")
     parser.add_argument("--num_workers", type=int, default=4)
@@ -440,6 +443,7 @@ def parse_args() -> TrainingConfig:
         system=SystemArgs(
             enable_compile=args.enable_compile,
             compile_mode=args.compile_mode,
+            gradient_checkpointing=args.gradient_checkpointing,
             verbose=args.verbose,
             all_ar=args.all_ar,
             num_workers=args.num_workers
