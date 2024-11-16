@@ -1,15 +1,53 @@
 import torch
 import logging
-from typing import Optional, Dict, Any, Union
+from typing import Optional, Union
 from diffusers import StableDiffusionXLPipeline
-from functools import lru_cache
 
 logger = logging.getLogger(__name__)
 
 class EMAModel:
-    """
-    Enhanced EMA model with optimized parameter averaging and memory management.
-    """
+    """Exponential Moving Average (EMA) model implementation for SDXL training.
+
+    This class provides an optimized EMA implementation with features including:
+    - Configurable decay rate with warmup and bounds
+    - Mixed precision support (fp16, bf16)
+    - Memory-efficient operations with xformers
+    - Gradient checkpointing support
+    - JIT compilation option
+    - Automated device placement
+    - Efficient parameter updates
+
+    Args:
+        model (torch.nn.Module): Source model to initialize EMA from
+        model_path (str): Path to pretrained model weights
+        decay (float, optional): Base EMA decay rate. Defaults to 0.9999.
+        update_after_step (int, optional): Start EMA updates after this many steps. Defaults to 100.
+        device (Union[str, torch.device], optional): Device to place model on. Defaults to None (auto).
+        update_every (int, optional): Update EMA every N steps. Defaults to 1.
+        use_ema_warmup (bool, optional): Enable decay rate warmup. Defaults to True.
+        power (float, optional): Power factor for warmup. Defaults to 2/3.
+        min_decay (float, optional): Minimum decay rate. Defaults to 0.0.
+        max_decay (float, optional): Maximum decay rate. Defaults to 0.9999.
+        mixed_precision (str, optional): Mixed precision mode ('fp16'/'bf16'). Defaults to "bf16".
+        jit_compile (bool, optional): Enable torch.compile(). Defaults to False.
+        gradient_checkpointing (bool, optional): Enable gradient checkpointing. Defaults to True.
+
+    Attributes:
+        ema_model (torch.nn.Module): The EMA model instance
+        device (torch.device): Device the model is on
+        optimization_step (int): Current optimization step
+
+    Example:
+        >>> model = create_model()
+        >>> ema = EMAModel(
+        ...     model=model,
+        ...     model_path="stabilityai/stable-diffusion-xl-base-1.0",
+        ...     decay=0.9999,
+        ...     use_ema_warmup=True
+        ... )
+        >>> # During training:
+        >>> ema.step(model)  # Update EMA weights
+    """    
     def __init__(
         self,
         model: torch.nn.Module,
@@ -44,7 +82,7 @@ class EMAModel:
         self.mixed_precision = mixed_precision
         
         # Load and optimize EMA model
-        logger.info(f"Loading EMA model from {model_path}")
+        logger.info("Loading EMA model from %s", model_path)
         try:
             self._initialize_ema_model(
                 model_path=model_path,
@@ -54,7 +92,7 @@ class EMAModel:
             )
             self._log_config()
         except Exception as e:
-            logger.error(f"Failed to load EMA model: {str(e)}")
+            logger.error("Failed to load EMA model: %s", str(e))
             raise
             
         self.optimization_step = 0
@@ -150,13 +188,13 @@ class EMAModel:
     def _log_config(self) -> None:
         """Log current configuration with enhanced details."""
         logger.info("\nEMA Model Configuration:")
-        logger.info(f"- Device: {self.device}")
-        logger.info(f"- Mixed Precision: {self.mixed_precision}")
-        logger.info(f"- Base Decay Rate: {self.decay}")
-        logger.info(f"- Update After Step: {self.update_after_step}")
-        logger.info(f"- Update Every: {self.update_every}")
-        logger.info(f"- EMA Warmup: {self.use_ema_warmup}")
-        logger.info(f"- Min/Max Decay: {self.min_decay}/{self.max_decay}")
+        logger.info("- Device: %s", self.device)
+        logger.info("- Mixed Precision: %s", self.mixed_precision)
+        logger.info("- Base Decay Rate: %s", self.decay)
+        logger.info("- Update After Step: %s", self.update_after_step)
+        logger.info("- Update Every: %s", self.update_every)
+        logger.info("- EMA Warmup: %s", self.use_ema_warmup)
+        logger.info("- Min/Max Decay: %s/%s", self.min_decay, self.max_decay)
 
     @torch.no_grad()
     def copy_to(self, model: torch.nn.Module) -> None:
@@ -170,9 +208,10 @@ class EMAModel:
                     model_dict[key].copy_(ema_dict[key])
                 else:
                     logger.warning(
-                        f"Shape mismatch for parameter {key}: "
-                        f"EMA shape {ema_dict[key].shape}, "
-                        f"Model shape {model_dict[key].shape}"
+                        "Shape mismatch for parameter %s: "
+                        "EMA shape %s, "
+                        "Model shape %s",
+                        key, ema_dict[key].shape, model_dict[key].shape
                     )
         model.load_state_dict(model_dict)
 
@@ -188,9 +227,10 @@ class EMAModel:
                     ema_dict[key].copy_(model_dict[key])
                 else:
                     logger.warning(
-                        f"Shape mismatch for parameter {key}: "
-                        f"EMA shape {ema_dict[key].shape}, "
-                        f"Model shape {model_dict[key].shape}"
+                        "Shape mismatch for parameter %s: "
+                        "EMA shape %s, "
+                        "Model shape %s",
+                        key, ema_dict[key].shape, model_dict[key].shape
                     )
         self.ema_model.load_state_dict(ema_dict)
 

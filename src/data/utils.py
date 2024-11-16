@@ -2,7 +2,7 @@ import torch
 import numpy as np
 from PIL import Image
 import logging
-from typing import Union, Optional, Tuple, List
+from typing import Optional, Tuple
 from functools import lru_cache
 from threading import Lock
 import traceback
@@ -91,7 +91,7 @@ class ImageConverter:
             return image
             
         except Exception as e:
-            logger.error(f"Failed to convert tensor to PIL: {str(e)}")
+            logger.error("Failed to convert tensor to PIL: %s", str(e))
             logger.error(traceback.format_exc())
             raise
 
@@ -154,7 +154,7 @@ class ImageConverter:
             return tensor
             
         except Exception as e:
-            logger.error(f"Failed to convert PIL to tensor: {str(e)}")
+            logger.error("Failed to convert PIL to tensor: %s", str(e))
             logger.error(traceback.format_exc())
             raise
 

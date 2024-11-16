@@ -30,7 +30,7 @@ class UltimateUpscaler:
         self.device = device
         self.dtype = dtype
         
-        logger.info(f"Loading DreamShaper model from {model_path}")
+        logger.info("Loading DreamShaper model from %s", model_path)
         self.pipe = StableDiffusionInpaintPipeline.from_pretrained(
             model_path,
             torch_dtype=dtype,
@@ -302,14 +302,14 @@ class UltimateUpscaler:
         target_height = int(image.height * upscale_factor)
         
         # Initial upscale
-        logger.info(f"Initial upscale from {image.size} to {target_width}x{target_height}")
+        logger.info("Initial upscale from %s to %dx%d", image.size, target_width, target_height)
         upscaled = image.resize((target_width, target_height), Image.LANCZOS)
         
         if mode == USDUMode.NONE:
             return upscaled
             
         # Process tiles
-        logger.info(f"Processing tiles using {mode.name} mode")
+        logger.info("Processing tiles using %s mode", mode.name)
         if mode == USDUMode.LINEAR:
             processed = self._process_linear(
                 upscaled, prompt, negative_prompt,
@@ -325,7 +325,7 @@ class UltimateUpscaler:
             
         # Fix seams if requested
         if seam_fix_mode != USDUSFMode.NONE:
-            logger.info(f"Fixing seams using {seam_fix_mode.name} mode")
+            logger.info("Fixing seams using %s mode", seam_fix_mode.name)
             processed = self._fix_seams(
                 processed, prompt, negative_prompt,
                 num_steps, guidance_scale, seam_fix_mode,
@@ -386,7 +386,7 @@ class UltimateUpscaler:
                 )
                 results.append(result)
             except Exception as e:
-                logger.error(f"Failed to process image: {str(e)}")
+                logger.error("Failed to process image: %s", str(e))
                 # Append original image if processing fails
                 results.append(image)
         

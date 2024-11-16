@@ -1,7 +1,9 @@
 """Utilities for latent space operations."""
 
 import torch
+import logging
 
+logger = logging.getLogger(__name__)
 
 def apply_noise_offset(latents, noise_offset):
     """
@@ -17,6 +19,8 @@ def apply_noise_offset(latents, noise_offset):
     if noise_offset > 0:
         noise = torch.randn_like(latents)
         latents = latents + noise_offset * noise
+        
+    logger.debug("Latents shape after noise offset: %s", str(latents.shape))
     
     return latents
 
@@ -61,5 +65,7 @@ def get_latents_from_seed(
         device=device,
         dtype=dtype
     )
+    
+    logger.debug("Generated latents shape: %s", str(latents.shape))
     
     return latents

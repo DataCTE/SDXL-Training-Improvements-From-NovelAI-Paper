@@ -9,9 +9,9 @@ from diffusers import (
     EulerDiscreteScheduler,
     AutoencoderKL
 )
-from training.loss import get_sigmas
-from utils.prompt_utils import process_prompt, get_prompt_embeds
-from utils.latent_utils import apply_noise_offset, get_latents_from_seed
+from src.training.loss import get_sigmas
+from src.utils.prompt_utils import process_prompt, get_prompt_embeds
+from src.utils.latent_utils import  get_latents_from_seed
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +65,7 @@ class SDXLInference:
         
         # Only load pipeline if model_path is provided
         if model_path is not None:
-            logger.info(f"Initializing SDXL inference with model: {model_path}")
+            logger.info("Initializing SDXL inference with model: %s", model_path)
             try:
                 # Initialize scheduler with NovelAI improvements
                 scheduler = EulerDiscreteScheduler(
@@ -109,7 +109,7 @@ class SDXLInference:
                 logger.info("Model loaded successfully")
                 
             except Exception as e:
-                logger.error(f"Failed to load model: {str(e)}")
+                logger.error("Failed to load model: %s", str(e), exc_info=True)
                 raise
 
     def generate_images(
@@ -160,7 +160,7 @@ class SDXLInference:
                 sigmas = get_sigmas(
                     num_inference_steps=num_inference_steps,
                     sigma_min=self.sigma_min,
-                    sigma_max=self.sigma_max,
+                    sigma_max_base=self.sigma_max,
                     height=height,
                     width=width
                 ).to(self.device)
@@ -257,7 +257,7 @@ class SDXLInference:
             return results
             
         except Exception as e:
-            logger.error(f"Error during image generation: {str(e)}")
+            logger.error("Error during image generation: %s", str(e), exc_info=True)
             raise
             
         finally:
@@ -322,5 +322,5 @@ class SDXLInference:
             return metrics
             
         except Exception as e:
-            logger.error(f"Validation failed: {str(e)}")
+            logger.error("Validation failed: %s", str(e), exc_info=True)
             raise

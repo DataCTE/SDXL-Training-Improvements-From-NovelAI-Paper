@@ -2,10 +2,10 @@ import torch
 import torch.nn.functional as F
 import logging
 import traceback
-from torchvision import transforms, models
+from torchvision import models
 import numpy as np
-from typing import Optional, Dict, Any, Tuple, Union, Callable
-from functools import partial, lru_cache
+from typing import Optional, Dict, Any, Tuple
+from functools import lru_cache
 import math
 
 logger = logging.getLogger(__name__)
@@ -24,7 +24,7 @@ def calculate_scale_factor(
             return float(current_res / base_res)
         return float(np.sqrt(current_res / base_res))
     except Exception as e:
-        logger.error(f"Scale factor calculation failed: {str(e)}")
+        logger.error("Scale factor calculation failed: %s", str(e))
         raise
 
 @torch.jit.script
@@ -39,10 +39,34 @@ def compute_sigma_schedule(
     inv_rho = 1.0 / rho
     return (sigma_max ** inv_rho + t * (sigma_min ** inv_rho - sigma_max ** inv_rho)) ** rho
 
+class SigmaCache:
+    """Cache manager for sigma schedules."""
+    def __init__(self):
+        self.cache = {}
+
+    def get(self, key: str) -> Optional[torch.Tensor]:
+        """Get cached sigma schedule."""
+        return self.cache.get(key)
+
+    def set(self, key: str, value: torch.Tensor) -> None:
+        """Cache sigma schedule."""
+        self.cache[key] = value
+
+    def clear(self) -> None:
+        """Clear the cache."""
+        self.cache.clear()
+
+# Global cache instance
+_sigma_cache = SigmaCache()
+
+def clear_sigma_cache():
+    """Clear the sigma schedule cache"""
+    _sigma_cache.clear()
+
 def get_sigmas(
-    num_inference_steps: int = 28, 
-    sigma_min: float = 0.0292, 
-    height: int = 1024, 
+    num_inference_steps: int = 28,
+    sigma_min: float = 0.0292,
+    height: int = 1024,
     width: int = 1024,
     resolution_scaling: bool = True,
     scale_method: str = "karras",
@@ -56,44 +80,32 @@ def get_sigmas(
 ) -> torch.Tensor:
     """Enhanced sigma schedule generation with caching and optimizations"""
     try:
-        # Input validation
-        if num_inference_steps < 1:
-            raise ValueError(f"Invalid number of steps: {num_inference_steps}")
-        if sigma_min <= 0:
-            raise ValueError(f"Invalid minimum sigma: {sigma_min}")
-        if not isinstance(height, int) or not isinstance(width, int):
-            raise TypeError("Height and width must be integers")
-        if scale_method not in ["karras", "simple"]:
-            raise ValueError(f"Invalid scaling method: {scale_method}")
-        
-        # Use cache if available
+        # Check cache first
         if cache_key is not None:
-            cache_dict = getattr(get_sigmas, '_cache', {})
-            if cache_key in cache_dict:
-                return cache_dict[cache_key]
-        
-        # Calculate scale factor
-        scale_factor = (
-            calculate_scale_factor(height, width, base_res, scale_method)
-            if resolution_scaling else 1.0
-        )
-        
-        # Compute sigma max
-        sigma_max = sigma_max_base * scale_factor
-        
+            cached_sigmas = _sigma_cache.get(cache_key)
+            if cached_sigmas is not None:
+                return cached_sigmas
+
+        # Calculate sigma_max based on resolution if needed
+        sigma_max = sigma_max_base
+        if resolution_scaling:
+            scale_factor = calculate_scale_factor(height, width, base_res, scale_method)
+            sigma_max = sigma_max_base * scale_factor
+
         # Log configuration if verbose
         if verbose:
             log_config = {
-                "Resolution": f"{width}x{height} (scale: {scale_factor:.3f})",
-                "Scaling method": scale_method,
-                "Sigma range": f"{sigma_min:.4f} to {sigma_max:.1f}",
+                "Sigma Max": sigma_max,
+                "Sigma Min": sigma_min,
+                "Resolution": f"{height}x{width}",
+                "Base Resolution": f"{int(np.sqrt(base_res))}x{int(np.sqrt(base_res))}",
                 "Steps": num_inference_steps,
                 "Rho": rho
             }
             logger.info("Generating sigma schedule:")
             for key, value in log_config.items():
-                logger.info(f"- {key}: {value}")
-        
+                logger.info("- %s: %s", key, value)
+
         # Compute schedule
         sigmas = compute_sigma_schedule(num_inference_steps, sigma_min, sigma_max, rho)
         
@@ -102,30 +114,22 @@ def get_sigmas(
             sigmas = sigmas.to(device)
         if dtype is not None:
             sigmas = sigmas.to(dtype)
-        
+
         # Log schedule details if verbose
         if verbose:
-            logger.info(f"- First 3 sigmas: {sigmas[:3].tolist()}")
-            logger.info(f"- Last 3 sigmas: {sigmas[-3:].tolist()}")
-        
+            logger.info("- First 3 sigmas: %s", sigmas[:3].tolist())
+            logger.info("- Last 3 sigmas: %s", sigmas[-3:].tolist())
+
         # Cache result if requested
         if cache_key is not None:
-            if not hasattr(get_sigmas, '_cache'):
-                get_sigmas._cache = {}
-            get_sigmas._cache[cache_key] = sigmas
-        
+            _sigma_cache.set(cache_key, sigmas)
+
         return sigmas
         
     except Exception as e:
-        logger.error(f"Failed to generate sigmas: {str(e)}")
+        logger.error("Failed to generate sigmas: %s", str(e))
         logger.error(traceback.format_exc())
         raise
-
-def clear_sigma_cache():
-    """Clear the sigma schedule cache"""
-    if hasattr(get_sigmas, '_cache'):
-        get_sigmas._cache.clear()
-    calculate_scale_factor.cache_clear()
 
 @torch.jit.script
 def compute_v_prediction_scaling(
@@ -227,7 +231,7 @@ def training_loss_v_prediction(
                 added_cond_kwargs=added_cond_kwargs
             ).sample
         except Exception as e:
-            logger.error(f"Model forward pass failed: {str(e)}")
+            logger.error("Model forward pass failed: %s", str(e))
             raise
         
         # Compute loss components with fused operations
@@ -248,13 +252,14 @@ def training_loss_v_prediction(
             try:
                 tag_weight = tag_weighter(batch_tags).mean()
                 loss = loss * tag_weight
-            except Exception as e:
-                logger.warning(f"Tag weighting failed, skipping: {str(e)}")
+            except (TypeError, ValueError, RuntimeError, KeyError, AttributeError) as e:
+                logger.warning("Tag weighting failed: %s (type: %s)", str(e), type(e).__name__)
+                # Continue with unweighted loss
         
         return loss
         
     except Exception as e:
-        logger.error(f"Loss computation failed: {str(e)}")
+        logger.error("Loss computation failed: %s", str(e))
         logger.error(traceback.format_exc())
         raise
 
@@ -282,7 +287,7 @@ def get_resolution_dependent_sigma_max(
         scale_factor = (current_res / base_res) ** scale_power
         return base_sigma * scale_factor
     except Exception as e:
-        logger.error(f"Failed to calculate resolution-dependent sigma: {str(e)}")
+        logger.error("Failed to calculate resolution-dependent sigma: %s", str(e))
         raise
 
 @lru_cache(maxsize=1)
@@ -351,14 +356,14 @@ def get_cosine_schedule_with_warmup(
                 cosine = math.cos(pi_cycles * progress)
                 return max(0.0, 0.5 * (1.0 + cosine))
                 
-            except Exception as e:
-                logger.error(f"Error in lr_lambda calculation: {str(e)}")
-                return 0.0  # Safe fallback
+            except (TypeError, ValueError, ArithmeticError) as e:
+                logger.error("Learning rate calculation failed: %s (type: %s)", str(e), type(e).__name__)
+                raise
         
         return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda, last_epoch)
         
     except Exception as e:
-        logger.error(f"Failed to create cosine schedule: {str(e)}")
+        logger.error("Failed to create cosine schedule: %s", str(e))
         logger.error(traceback.format_exc())
         raise
 
@@ -418,7 +423,7 @@ class PerceptualLoss(torch.nn.Module):
             logger.info("Perceptual loss initialized successfully")
             
         except Exception as e:
-            logger.error(f"Failed to initialize perceptual loss: {str(e)}")
+            logger.error("Failed to initialize perceptual loss: %s", str(e))
             logger.error(traceback.format_exc())
             raise
     
@@ -434,7 +439,7 @@ class PerceptualLoss(torch.nn.Module):
             return x
             
         except Exception as e:
-            logger.error(f"Preprocessing failed: {str(e)}")
+            logger.error("Preprocessing failed: %s", str(e))
             raise
     
     def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -467,7 +472,7 @@ class PerceptualLoss(torch.nn.Module):
             return loss
             
         except Exception as e:
-            logger.error(f"Forward pass failed: {str(e)}")
+            logger.error("Forward pass failed: %s", str(e))
             logger.error(traceback.format_exc())
             raise
     
@@ -485,5 +490,5 @@ class PerceptualLoss(torch.nn.Module):
             return features
             
         except Exception as e:
-            logger.error(f"Feature extraction failed: {str(e)}")
+            logger.error("Feature extraction failed: %s", str(e))
             raise

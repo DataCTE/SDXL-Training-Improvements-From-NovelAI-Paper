@@ -1,81 +1,13 @@
-from training import (
-    EMAModel,
-    training_loss_v_prediction,
-    get_sigmas,
-    PerceptualLoss,
-    get_resolution_dependent_sigma_max,
-    VAEFineTuner
-)
+"""SDXL Training Improvements Package.
 
-from data import (
-    CustomDataset,
-    TagBasedLossWeighter,
-    UltimateUpscaler,
-    USDUMode,
-    USDUSFMode
-)
+This package provides a comprehensive training infrastructure for
+Stable Diffusion XL models, with improvements from the NovelAI paper.
+"""
 
-from utils import (
-    save_checkpoint,
-    load_checkpoint,
-    save_final_outputs,
-    cleanup,
-    get_device,
-    to_device,
-    push_to_hub,
-    setup_logging,
-    log_system_info,
-    log_training_setup,
-    log_gpu_memory,
-    setup_wandb,
-    cleanup_wandb,
-    create_model_card,
-    save_model_card,
-    setup_models,
-    verify_models,
-    validate_dataset
-)
+__all__ = ['training', 'data', 'utils', 'config', 'models']
 
-from inference import SDXLInference
-
-__version__ = "0.1.0"
-
-__all__ = [
-    # Training
-    'EMAModel',
-    'training_loss_v_prediction',
-    'get_sigmas',
-    'PerceptualLoss',
-    'get_resolution_dependent_sigma_max',
-    'VAEFineTuner',
-    
-    # Data
-    'CustomDataset',
-    'TagBasedLossWeighter',
-    'UltimateUpscaler',
-    'USDUMode',
-    'USDUSFMode',
-    
-    # Utils
-    'save_checkpoint',
-    'load_checkpoint',
-    'save_final_outputs',
-    'cleanup',
-    'get_device',
-    'to_device',
-    'push_to_hub',
-    'setup_logging',
-    'log_system_info',
-    'log_training_setup',
-    'log_gpu_memory',
-    'setup_wandb',
-    'cleanup_wandb',
-    'create_model_card',
-    'save_model_card',
-    'setup_models',
-    'verify_models',
-    'validate_dataset',
-    
-    # Inference
-    'SDXLInference'
-]
+from . import training
+from . import data
+from . import utils
+from . import config
+from . import models

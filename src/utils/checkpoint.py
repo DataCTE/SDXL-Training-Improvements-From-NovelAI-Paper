@@ -1,31 +1,62 @@
+"""Checkpoint management utilities for SDXL model training.
+
+This module provides functionality for loading, saving, and managing model checkpoints
+during the SDXL training process. It handles both full model checkpoints and intermediate
+training state.
+
+Key Features:
+- Model loading with custom VAE support
+- Safe checkpoint saving with error handling
+- Training state management
+- Final model output generation
+"""
+
+import json
 import logging
-import torch
 import os
 import traceback
+from pathlib import Path
+from typing import Dict, Any, Tuple, Optional
+
+import torch
 from diffusers import StableDiffusionXLPipeline
-from transformers import CLIPTextModel
-import json
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
-def load_checkpoint(args):
-    """Load model using diffusers"""
+def load_checkpoint(
+    model_path: str,
+    vae_path: Optional[str] = None,
+    dtype: torch.dtype = torch.float16,
+) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    """Load SDXL model checkpoint and initialize training components.
+    
+    Args:
+        model_path (str): Path to the pretrained SDXL model checkpoint
+        vae_path (Optional[str], optional): Path to a custom VAE model. Defaults to None.
+        dtype (torch.dtype, optional): Model precision type. Defaults to torch.float16.
+        
+    Returns:
+        Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]: A tuple containing:
+            - models: Dictionary of model components (unet, text_encoders, vae, etc.)
+            - train_components: Dictionary of training-related components
+            - training_history: Dictionary tracking training metrics and state
+            
+    Raises:
+        Exception: If model loading fails, with detailed error logging
+    """
     try:
-        logger.info(f"Loading model from {args.model_path}")
+        logger.info("Loading model from %s", model_path)
         
         # Load the pipeline
         pipeline = StableDiffusionXLPipeline.from_pretrained(
-            args.model_path,
-            torch_dtype=torch.float16
+            model_path,
+            torch_dtype=dtype
         )
         
         # Extract models
         models = {
             "unet": pipeline.unet,
-            "vae": pipeline.vae if not args.vae_path else StableDiffusionXLPipeline.from_pretrained(
-                args.vae_path,
-                torch_dtype=torch.float16
-            ).vae,
             "text_encoder": pipeline.text_encoder,
             "text_encoder_2": pipeline.text_encoder_2,
             "tokenizer": pipeline.tokenizer,
@@ -33,161 +64,141 @@ def load_checkpoint(args):
             "scheduler": pipeline.scheduler
         }
         
-        if args.vae_path:
-            logger.info(f"Using custom VAE from {args.vae_path}")
+        # Handle VAE loading
+        if vae_path:
+            logger.info("Using custom VAE from %s", vae_path)
+            vae_pipeline = StableDiffusionXLPipeline.from_pretrained(
+                vae_path,
+                torch_dtype=dtype
+            )
+            models["vae"] = vae_pipeline.vae
+        else:
+            models["vae"] = pipeline.vae
         
-        # Initialize training components
-        train_components = {}
+        # Initialize training components and history
+        train_components: Dict[str, Any] = {}
         training_history = {
             'loss_history': [],
             'validation_scores': [],
-            'best_score': float('inf')
+            'best_score': float('inf'),
+            'total_steps': 0
         }
         
         return models, train_components, training_history
         
     except Exception as e:
-        logger.error(f"Failed to load model: {str(e)}")
+        logger.error("Failed to load model: %s", str(e))
+        logger.debug("Traceback: %s", traceback.format_exc())
         raise
 
-def save_checkpoint(checkpoint_dir, models, train_components, training_state):
-    """Save checkpoint in diffusers format with safetensors support"""
+def save_checkpoint(
+    save_path: str,
+    models: Dict[str, Any],
+    train_components: Dict[str, Any],
+    training_history: Dict[str, Any],
+    is_final: bool = False
+) -> None:
+    """Save training checkpoint with all model components and training state.
+    
+    Args:
+        save_path (str): Directory path to save the checkpoint
+        models (Dict[str, Any]): Dictionary containing all model components (unet, text_encoders, vae, etc.)
+        train_components (Dict[str, Any]): Dictionary of training-related components (optimizer, scheduler, etc.)
+        training_history (Dict[str, Any]): Dictionary containing training metrics and state
+        is_final (bool, optional): Whether this is the final checkpoint. Defaults to False.
+        
+    Raises:
+        Exception: If checkpoint saving fails, with detailed error logging
+        
+    Note:
+        Saves both the model pipeline in diffusers format and the training state.
+        The training state includes optimizer state, scheduler state, and training metrics.
+    """
     try:
-        logger.info(f"Saving checkpoint to {checkpoint_dir}")
-        os.makedirs(checkpoint_dir, exist_ok=True)
+        save_dir = Path(save_path)
+        save_dir.mkdir(parents=True, exist_ok=True)
         
-        # Save model configs first
-        os.makedirs(os.path.join(checkpoint_dir, "unet"), exist_ok=True)
-        os.makedirs(os.path.join(checkpoint_dir, "vae"), exist_ok=True)
-        os.makedirs(os.path.join(checkpoint_dir, "text_encoder"), exist_ok=True)
-        os.makedirs(os.path.join(checkpoint_dir, "text_encoder_2"), exist_ok=True)
-        os.makedirs(os.path.join(checkpoint_dir, "scheduler"), exist_ok=True)
+        logger.info("Saving %s checkpoint to %s", 
+                   'final' if is_final else 'intermediate', 
+                   save_path)
         
-        with open(os.path.join(checkpoint_dir, "unet/config.json"), "w") as f:
-            json.dump(models["unet"].config.to_dict(), f, indent=2)
-        with open(os.path.join(checkpoint_dir, "vae/config.json"), "w") as f:
-            json.dump(models["vae"].config.to_dict(), f, indent=2)
-        with open(os.path.join(checkpoint_dir, "text_encoder/config.json"), "w") as f:
-            json.dump(models["text_encoder"].config.to_dict(), f, indent=2)
-        with open(os.path.join(checkpoint_dir, "text_encoder_2/config.json"), "w") as f:
-            json.dump(models["text_encoder_2"].config.to_dict(), f, indent=2)
-        with open(os.path.join(checkpoint_dir, "scheduler/scheduler_config.json"), "w") as f:
-            json.dump(models["scheduler"].config, f, indent=2)
-            
-        # Save model_index.json
-        model_index = {
-            "_class_name": "StableDiffusionXLPipeline",
-            "_diffusers_version": "0.21.4",
-            "force_zeros_for_empty_prompt": True,
-            "add_watermarker": False,
-            "requires_safety_checker": False
-        }
-        with open(os.path.join(checkpoint_dir, "model_index.json"), "w") as f:
-            json.dump(model_index, f, indent=2)
-            
-        # Save pipeline with weights
+        # Save models
         pipeline = StableDiffusionXLPipeline(
-            unet=models["unet"],
             vae=models["vae"],
+            unet=models["unet"],
             text_encoder=models["text_encoder"],
             text_encoder_2=models["text_encoder_2"],
             tokenizer=models["tokenizer"],
             tokenizer_2=models["tokenizer_2"],
-            scheduler=models["scheduler"],
-            torch_dtype=torch.float16
+            scheduler=models["scheduler"]
         )
-        pipeline.save_pretrained(checkpoint_dir, safe_serialization=True)
+        pipeline.save_pretrained(save_dir)
         
         # Save training state
-        if training_state is not None:
-            training_state_path = os.path.join(checkpoint_dir, "training_state.pt")
-            torch.save(training_state, training_state_path)
-            
+        state_path = save_dir / 'training_state.pt'
+        torch.save({
+            'train_components': train_components,
+            'training_history': training_history
+        }, state_path)
+        
+        logger.info("Checkpoint saved successfully")
+        
     except Exception as e:
-        logger.error(f"Failed to save checkpoint: {str(e)}")
-        logger.error(f"Checkpoint directory: {checkpoint_dir}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
+        logger.error("Failed to save checkpoint: %s", str(e))
+        logger.debug("Traceback: %s", traceback.format_exc())
         raise
 
-def save_final_outputs(args, models, training_history, train_components):
-    """Save final model outputs in proper diffusers format"""
+def save_final_outputs(
+    output_dir: str,
+    models: Dict[str, Any],
+    training_history: Dict[str, Any],
+    train_components: Dict[str, Any]
+) -> None:
+    """Save final model outputs including checkpoint and training metrics.
+    
+    Args:
+        output_dir (str): Directory to save final outputs
+        models (Dict[str, Any]): Dictionary containing all model components (unet, text_encoders, vae, etc.)
+        training_history (Dict[str, Any]): Dictionary containing training metrics and state including:
+            - loss_history: List of training losses
+            - validation_scores: List of validation metrics
+            - best_score: Best validation score achieved
+            - total_steps: Total number of training steps
+        train_components (Dict[str, Any]): Dictionary of training-related components
+        
+    Raises:
+        Exception: If saving final outputs fails, with detailed error logging
+        
+    Note:
+        Saves:
+        - Final model checkpoint in diffusers format
+        - Training metrics in JSON format including:
+            * Final loss
+            * Best validation loss
+            * Total training steps
+    """
     try:
-        logger.info("Saving final model outputs...")
-        final_path = os.path.join(args.output_dir, "final")
-        os.makedirs(final_path, exist_ok=True)
-        
-        # Save model configs first
-        os.makedirs(os.path.join(final_path, "unet"), exist_ok=True)
-        os.makedirs(os.path.join(final_path, "vae"), exist_ok=True)
-        os.makedirs(os.path.join(final_path, "text_encoder"), exist_ok=True)
-        os.makedirs(os.path.join(final_path, "text_encoder_2"), exist_ok=True)
-        os.makedirs(os.path.join(final_path, "scheduler"), exist_ok=True)
-        
-        with open(os.path.join(final_path, "unet/config.json"), "w") as f:
-            json.dump(models["unet"].config.to_dict(), f, indent=2)
-        with open(os.path.join(final_path, "vae/config.json"), "w") as f:
-            json.dump(models["vae"].config.to_dict(), f, indent=2)
-        with open(os.path.join(final_path, "text_encoder/config.json"), "w") as f:
-            json.dump(models["text_encoder"].config.to_dict(), f, indent=2)
-        with open(os.path.join(final_path, "text_encoder_2/config.json"), "w") as f:
-            json.dump(models["text_encoder_2"].config.to_dict(), f, indent=2)
-        with open(os.path.join(final_path, "scheduler/scheduler_config.json"), "w") as f:
-            json.dump(models["scheduler"].config, f, indent=2)
-            
-        # Save model_index.json
-        model_index = {
-            "_class_name": "StableDiffusionXLPipeline",
-            "_diffusers_version": "0.21.4",
-            "force_zeros_for_empty_prompt": True,
-            "add_watermarker": False,
-            "requires_safety_checker": False
-        }
-        with open(os.path.join(final_path, "model_index.json"), "w") as f:
-            json.dump(model_index, f, indent=2)
-        
-        # Save final pipeline with weights
-        pipeline = StableDiffusionXLPipeline(
-            unet=models["unet"],
-            vae=models["vae"],
-            text_encoder=models["text_encoder"],
-            text_encoder_2=models["text_encoder_2"],
-            tokenizer=models["tokenizer"],
-            tokenizer_2=models["tokenizer_2"],
-            scheduler=models["scheduler"],
-            torch_dtype=torch.float16
+        # Save final checkpoint
+        save_checkpoint(
+            output_dir,
+            models,
+            train_components,
+            training_history,
+            is_final=True
         )
-        pipeline.save_pretrained(final_path, safe_serialization=True)
         
-        # Save final EMA model if it exists
-        if models.get("ema_model") is not None:
-            logger.info("Saving final EMA model...")
-            ema_path = os.path.join(args.output_dir, "final_ema")
-            os.makedirs(ema_path, exist_ok=True)
+        # Save training metrics
+        metrics_path = Path(output_dir) / 'training_metrics.json'
+        with open(metrics_path, 'w', encoding='utf-8') as f:
+            json.dump({
+                'final_loss': training_history.get('loss_history', [])[-1] if training_history.get('loss_history') else None,
+                'best_validation_loss': min(training_history.get('validation_scores', [float('inf')])),
+                'total_steps': training_history.get('total_steps', 0)
+            }, f, indent=2)
             
-            # Save EMA configs
-            os.makedirs(os.path.join(ema_path, "unet"), exist_ok=True)
-            with open(os.path.join(ema_path, "unet/config.json"), "w") as f:
-                json.dump(models["ema_model"].config.to_dict(), f, indent=2)
-                
-            # Save EMA pipeline
-            ema_pipeline = StableDiffusionXLPipeline(
-                unet=models["ema_model"],
-                vae=models["vae"],
-                text_encoder=models["text_encoder"],
-                text_encoder_2=models["text_encoder_2"],
-                tokenizer=models["tokenizer"],
-                tokenizer_2=models["tokenizer_2"],
-                scheduler=models["scheduler"],
-                torch_dtype=torch.float16
-            )
-            ema_pipeline.save_pretrained(ema_path, safe_serialization=True)
-        
-        # Save final training metrics
-        with open(os.path.join(args.output_dir, "training_history.json"), "w") as f:
-            json.dump(training_history, f, indent=2)
-            
-        logger.info("Final outputs saved successfully")
+        logger.info("Final outputs saved to %s", output_dir)
         
     except Exception as e:
-        logger.error(f"Error saving final outputs: {str(e)}")
+        logger.error("Failed to save final outputs: %s", str(e))
+        logger.debug("Traceback: %s", traceback.format_exc())
         raise

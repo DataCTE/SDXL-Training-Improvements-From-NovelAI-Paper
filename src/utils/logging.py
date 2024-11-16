@@ -5,6 +5,12 @@ from pathlib import Path
 import torch
 import wandb
 import time
+import traceback
+import numpy as np
+from typing import Dict, Any, Union
+from functools import lru_cache
+
+logger = logging.getLogger(__name__)
 
 def setup_logging(log_dir=None, log_level=logging.INFO):
     """
@@ -50,12 +56,12 @@ def log_system_info():
     logger = logging.getLogger(__name__)
     
     # PyTorch version and CUDA info
-    logger.info(f"PyTorch version: {torch.__version__}")
-    logger.info(f"CUDA available: {torch.cuda.is_available()}")
+    logger.info("PyTorch version: %s", torch.__version__)
+    logger.info("CUDA available: %s", torch.cuda.is_available())
     if torch.cuda.is_available():
-        logger.info(f"CUDA version: {torch.version.cuda}")
-        logger.info(f"GPU device: {torch.cuda.get_device_name(0)}")
-        logger.info(f"GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f}GB")
+        logger.info("CUDA version: %s", torch.version.cuda)
+        logger.info("GPU device: %s", torch.cuda.get_device_name(0))
+        logger.info("GPU memory: %.2fGB", torch.cuda.get_device_properties(0).total_memory / 1e9)
 
 def log_training_setup(args, models, train_components):
     """
@@ -71,7 +77,7 @@ def log_training_setup(args, models, train_components):
     # Log arguments
     logger.info("\n=== Training Configuration ===")
     for key, value in vars(args).items():
-        logger.info(f"{key}: {value}")
+        logger.info("%s: %s", key, value)
     
     # Log model information
     logger.info("\n=== Model Information ===")
@@ -79,23 +85,23 @@ def log_training_setup(args, models, train_components):
         if hasattr(model, 'parameters'):
             num_params = sum(p.numel() for p in model.parameters())
             trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            logger.info(f"{name}:")
-            logger.info(f"  Total parameters: {num_params:,}")
-            logger.info(f"  Trainable parameters: {trainable_params:,}")
+            logger.info("%s:", name)
+            logger.info("  Total parameters: %d", num_params)
+            logger.info("  Trainable parameters: %d", trainable_params)
     
     # Log dataset information
     if 'dataset' in train_components:
         logger.info("\n=== Dataset Information ===")
-        logger.info(f"Number of training samples: {len(train_components['dataset'])}")
-        logger.info(f"Batch size: {args.batch_size}")
-        logger.info(f"Steps per epoch: {len(train_components['train_dataloader'])}")
+        logger.info("Number of training samples: %d", len(train_components['dataset']))
+        logger.info("Batch size: %d", args.batch_size)
+        logger.info("Steps per epoch: %d", len(train_components['train_dataloader']))
 
 def log_gpu_memory():
     """Log current GPU memory usage"""
     if torch.cuda.is_available():
         allocated = torch.cuda.memory_allocated() / 1e9
         reserved = torch.cuda.memory_reserved() / 1e9
-        return f"GPU Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
+        return "GPU Memory: %.2fGB allocated, %.2fGB reserved" % (allocated, reserved)
     return "GPU not available"
 
 def setup_wandb(args):
@@ -115,7 +121,7 @@ def setup_wandb(args):
         # Use more robust wandb initialization with additional configuration
         run = wandb.init(
             project=args.wandb_project,
-            name=args.wandb_run_name or f"sdxl_training_{time.time()}",
+            name=args.wandb_run_name or f"sdxl_training_%d" % time.time(),
             config=vars(args),
             resume='allow',  # Allow resuming previous runs
             save_code=True,  # Save code snapshot for reproducibility
@@ -150,11 +156,11 @@ def setup_wandb(args):
         # Define gradient metrics
         wandb.define_metric("gradients/*", summary="mean", step_metric="global_step")
         
-        logging.info(f"Initialized W&B run: {run.name}")
+        logger.info("Initialized W&B run: %s", run.name)
         return run
         
     except Exception as e:
-        logging.error(f"Failed to initialize W&B: {str(e)}")
+        logger.error("Failed to initialize W&B: %s", str(e))
         return None
 
 def log_metrics_batch(metrics_dict, step=None):
@@ -171,7 +177,7 @@ def log_metrics_batch(metrics_dict, step=None):
     try:
         wandb.log(metrics_dict, step=step)
     except Exception as e:
-        logging.warning(f"Failed to log metrics batch: {str(e)}")
+        logger.warning("Failed to log metrics batch: %s", str(e))
 
 def log_model_gradients(model, step):
     """
@@ -188,14 +194,14 @@ def log_model_gradients(model, step):
         grad_dict = {}
         for name, param in model.named_parameters():
             if param.grad is not None:
-                grad_dict[f"gradients/{name}/mean"] = param.grad.mean().item()
-                grad_dict[f"gradients/{name}/std"] = param.grad.std().item()
-                grad_dict[f"gradients/{name}/norm"] = param.grad.norm().item()
+                grad_dict["gradients/%s/mean" % name] = param.grad.mean().item()
+                grad_dict["gradients/%s/std" % name] = param.grad.std().item()
+                grad_dict["gradients/%s/norm" % name] = param.grad.norm().item()
         
         if grad_dict:
             wandb.log(grad_dict, step=step)
     except Exception as e:
-        logging.warning(f"Failed to log model gradients: {str(e)}")
+        logger.warning("Failed to log model gradients: %s", str(e))
 
 def log_memory_stats(step):
     """
@@ -215,7 +221,7 @@ def log_memory_stats(step):
         }
         wandb.log(memory_stats, step=step)
     except Exception as e:
-        logging.warning(f"Failed to log memory stats: {str(e)}")
+        logger.warning("Failed to log memory stats: %s", str(e))
 
 def cleanup_wandb(run):
     """
@@ -233,4 +239,124 @@ def cleanup_wandb(run):
             })
             run.finish(quiet=True)  # Suppress verbose output
         except Exception as e:
-            logging.error(f"Error closing W&B run: {str(e)}")
+            logger.error("Error closing W&B run: %s", str(e))
+
+def log_epoch_metrics(wandb_run, metrics: Dict[str, float], epoch: int, global_step: int) -> None:
+    """Log epoch metrics to W&B with proper error handling."""
+    try:
+        # Prepare metrics for logging
+        log_dict = {"train/%s" % k: v for k, v in metrics.items()}
+        log_dict.update({"train/epoch": epoch, "train/global_step": global_step})
+        
+        # Log to W&B
+        wandb_run.log(log_dict, step=global_step)
+        
+        # Log to console
+        logger.info("Epoch %d metrics: %s", epoch, ", ".join("%s: %.6f" % (k, v) for k, v in metrics.items()))
+    except (ValueError, RuntimeError, AttributeError) as e:
+        logger.error("Failed to log epoch metrics: %s", str(e))
+        logger.error(traceback.format_exc())
+
+def log_model_gradients(model: torch.nn.Module, step: int) -> None:
+    """Log model gradient statistics to W&B."""
+    try:
+        grad_dict = {}
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                grad = param.grad.detach()
+                grad_dict.update({
+                    "gradients/%s/mean" % name: grad.mean().item(),
+                    "gradients/%s/std" % name: grad.std().item(),
+                    "gradients/%s/norm" % name: grad.norm().item(),
+                    "gradients/%s/max" % name: grad.max().item(),
+                    "gradients/%s/min" % name: grad.min().item(),
+                })
+
+                try:
+                    grad_dict["gradients/%s/hist" % name] = wandb.Histogram(
+                        grad.cpu().numpy()
+                    )
+                except (RuntimeError, ValueError, TypeError) as e:
+                    logger.debug("Failed to create histogram for %s: %s", name, str(e))
+
+        wandb.log(grad_dict, step=step)
+    except (ValueError, RuntimeError, AttributeError) as e:
+        logger.error("Failed to log model gradients: %s", str(e))
+        logger.error(traceback.format_exc())
+
+@lru_cache(maxsize=1)
+def _get_memory_stats_format() -> Dict[str, str]:
+    """Cache memory statistics format strings."""
+    return {
+        "allocated": "Allocated: %.1fMB",
+        "cached": "Cached: %.1fMB",
+        "max_allocated": "Max Allocated: %.1fMB",
+        "max_cached": "Max Cached: %.1fMB",
+        "active": "Active: %.1fMB",
+        "inactive": "Inactive: %.1fMB",
+        "fragmentation": "Fragmentation: %.1f",
+    }
+
+def log_memory_stats(step: int) -> None:
+    """Log CUDA memory statistics to W&B."""
+    try:
+        if not torch.cuda.is_available():
+            return
+
+        format_strings = _get_memory_stats_format()
+        memory_stats = {
+            "memory/allocated": torch.cuda.memory_allocated() / 1024**2,
+            "memory/cached": torch.cuda.memory_reserved() / 1024**2,
+            "memory/max_allocated": torch.cuda.max_memory_allocated() / 1024**2,
+            "memory/max_cached": torch.cuda.max_memory_reserved() / 1024**2,
+        }
+
+        for i in range(torch.cuda.device_count()):
+            stats = torch.cuda.memory_stats(i)
+            memory_stats.update({
+                "memory/device_%d/active" % i: stats["active_bytes.all.current"] / 1024**2,
+                "memory/device_%d/inactive" % i: stats["inactive_split_bytes.all.current"] / 1024**2,
+                "memory/device_%d/fragmentation" % i: stats.get("fragmentation.all.current", 0),
+            })
+
+        wandb.log(memory_stats, step=step)
+
+        formatted_stats = []
+        for k, v in memory_stats.items():
+            stat_name = k.split("/")[-1]
+            if stat_name in format_strings:
+                formatted_stats.append(format_strings[stat_name] % v)
+            else:
+                formatted_stats.append("%s: %.1fMB" % (k, v))
+
+        logger.debug("Memory stats: %s", ", ".join(formatted_stats))
+    except (ValueError, RuntimeError, AttributeError) as e:
+        logger.error("Failed to log memory stats: %s", str(e))
+        logger.error(traceback.format_exc())
+
+def log_optimizer_config(args) -> None:
+    """Log optimizer configuration details."""
+    logger.info("Optimizer config:")
+    logger.info("  Type: %s", args.optimizer_type)
+    logger.info("  Learning rate: %f", args.learning_rate)
+    logger.info("  Weight decay: %f", args.weight_decay)
+    logger.info("  Adam beta1: %f", args.adam_beta1)
+    logger.info("  Adam beta2: %f", args.adam_beta2)
+    logger.info("  Adam epsilon: %f", args.adam_epsilon)
+
+def log_vae_config(args) -> None:
+    """Log VAE configuration details."""
+    logger.info("VAE config:")
+    logger.info("  Learning rate: %f", args.vae_learning_rate)
+    logger.info("  Weight decay: %f", args.vae_weight_decay)
+    logger.info("  Adam beta1: %f", args.vae_adam_beta1)
+    logger.info("  Adam beta2: %f", args.vae_adam_beta2)
+    logger.info("  Adam epsilon: %f", args.vae_adam_epsilon)
+    logger.info("  Max grad norm: %f", args.vae_max_grad_norm)
+    logger.info("  Gradient checkpointing: %s", args.vae_gradient_checkpointing)
+
+def log_ema_config(args) -> None:
+    """Log EMA configuration details."""
+    logger.info("EMA config:")
+    logger.info("  Decay: %f", args.ema_decay)
+    logger.info("  Update every: %d", args.ema_update_every)
