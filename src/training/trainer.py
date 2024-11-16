@@ -120,45 +120,46 @@ def setup_optimizer(args, models) -> torch.optim.Optimizer:
     except (ValueError, RuntimeError, AttributeError) as e:
         raise type(e)(f"Failed to setup optimizer: {str(e)}") from e
 
-def setup_vae_finetuner(args, model_dict) -> Optional[VAEFineTuner]:
+def setup_vae_finetuner(vae_args, models) -> Optional[VAEFineTuner]:
     """
     Set up the VAE FineTuner if fine-tuning is enabled in the arguments.
 
     Args:
-        args: The complete training configuration object.
-        model_dict: A dictionary containing models and training configs.
+        vae_args: VAEArgs configuration object
+        models: Dictionary containing models and training configs
 
     Returns:
-        An instance of VAEFineTuner if fine-tuning is enabled, otherwise None.
-
-    Raises:
-        Exception: If the setup of the VAE FineTuner fails.
+        Optional[VAEFineTuner]: Configured VAE finetuner if enabled, None otherwise.
     """
-    if not args.finetune_vae:
+    if not vae_args.finetune_vae:
         return None
 
     try:
+        # Determine device
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
         vae_finetuner = VAEFineTuner(
-            vae=model_dict["vae"],
-            device=model_dict["training"].device,
-            mixed_precision=model_dict["training"].mixed_precision,
-            use_amp=model_dict["training"].use_amp,
-            learning_rate=args.learning_rate,
-            adam_beta1=model_dict["optimizer"].adam_beta1,
-            adam_beta2=model_dict["optimizer"].adam_beta2,
-            adam_epsilon=model_dict["optimizer"].adam_epsilon,
-            weight_decay=args.weight_decay,
-            max_grad_norm=args.max_grad_norm,
-            gradient_checkpointing=args.gradient_checkpointing,
-            use_8bit_adam=model_dict["optimizer"].use_8bit_adam,
-            use_channel_scaling=args.use_channel_scaling,
-            adaptive_loss_scale=args.adaptive_loss_scale,
-            kl_weight=args.kl_weight,
-            perceptual_weight=args.perceptual_weight,
-            min_snr_gamma=args.min_snr_gamma,
-            initial_scale_factor=args.initial_scale_factor,
-            decay=args.decay,
-            update_after_step=args.update_after_step,
+            vae=models["vae"],
+            device=device,
+            mixed_precision="fp16" if torch.cuda.is_available() else "no",
+            use_amp=torch.cuda.is_available(),
+            learning_rate=vae_args.learning_rate,
+            # Use the VAE's own config values
+            adam_beta1=0.9,  # Default Adam beta1
+            adam_beta2=0.999,  # Default Adam beta2
+            adam_epsilon=1e-8,  # Default Adam epsilon
+            weight_decay=vae_args.weight_decay,
+            max_grad_norm=vae_args.max_grad_norm,
+            gradient_checkpointing=vae_args.gradient_checkpointing,
+            use_8bit_adam=False,  # Default to standard Adam for VAE
+            use_channel_scaling=vae_args.use_channel_scaling,
+            adaptive_loss_scale=vae_args.adaptive_loss_scale,
+            kl_weight=vae_args.kl_weight,
+            perceptual_weight=vae_args.perceptual_weight,
+            min_snr_gamma=vae_args.min_snr_gamma,
+            initial_scale_factor=vae_args.initial_scale_factor,
+            decay=vae_args.decay,
+            update_after_step=vae_args.update_after_step,
         )
         return vae_finetuner
     except Exception as e:
@@ -481,7 +482,6 @@ def initialize_training_components(args, models):
             num_training_steps=num_update_steps_per_epoch * args.training.num_epochs,
         )
 
-        # Setup optional components with parallel initialization
         optional_components = {
             "ema": (setup_ema, args.ema.use_ema, (args, models["unet"])),
             "tag_weighter": (
@@ -492,14 +492,7 @@ def initialize_training_components(args, models):
             "vae_finetuner": (
                 setup_vae_finetuner, 
                 args.vae.finetune_vae, 
-                (
-                    args.vae, 
-                    {
-                        "vae": models["vae"],
-                        "training": args.training,
-                        "optimizer": args.optimizer
-                    }
-                )
+                (args.vae, models)  # Pass just the VAE args and models
             ),
         }
 
