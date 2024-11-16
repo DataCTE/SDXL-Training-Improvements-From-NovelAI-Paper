@@ -401,17 +401,17 @@ def parse_args() -> TrainingConfig:
         ),
         vae=VAEArgs(
             use_vae=args.use_vae,
-            vae_path=args.vae_path,
-            vae_decay=args.vae_decay,
-            vae_update_after_step=args.vae_update_after_step,
+            path=args.vae_path,
+            decay=args.vae_decay,
+            update_after_step=args.vae_update_after_step,
             finetune_vae=args.finetune_vae,
-            vae_learning_rate=args.vae_learning_rate,
-            vae_train_freq=args.vae_train_freq,
+            learning_rate=args.vae_learning_rate,
+            train_freq=args.vae_train_freq,
             adaptive_loss_scale=args.adaptive_loss_scale,
             kl_weight=args.kl_weight,
             perceptual_weight=args.perceptual_weight,
-            vae_use_channel_scaling=args.vae_use_channel_scaling,
-            vae_initial_scale_factor=args.vae_initial_scale_factor
+            use_channel_scaling=args.vae_use_channel_scaling,
+            initial_scale_factor=args.vae_initial_scale_factor
         ),
         data=DataArgs(
             data_dir=args.data_dir,

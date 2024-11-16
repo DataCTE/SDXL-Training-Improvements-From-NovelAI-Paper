@@ -143,19 +143,22 @@ def setup_vae_finetuner(args, models) -> Optional[VAEFineTuner]:
             device=args.training.device,
             mixed_precision=args.training.mixed_precision,
             use_amp=args.training.use_amp,
-            learning_rate=args.vae.vae_learning_rate,
+            learning_rate=args.vae.learning_rate,
             adam_beta1=args.optimizer.adam_beta1,
             adam_beta2=args.optimizer.adam_beta2,
             adam_epsilon=args.optimizer.adam_epsilon,
-            weight_decay=args.optimizer.weight_decay,
+            weight_decay=args.vae.weight_decay,
+            max_grad_norm=args.vae.max_grad_norm,
+            gradient_checkpointing=args.vae.gradient_checkpointing,
             use_8bit_adam=args.optimizer.use_8bit_adam,
-            use_channel_scaling=args.vae.vae_use_channel_scaling,
+            use_channel_scaling=args.vae.use_channel_scaling,
             adaptive_loss_scale=args.vae.adaptive_loss_scale,
             kl_weight=args.vae.kl_weight,
             perceptual_weight=args.vae.perceptual_weight,
-            initial_scale_factor=args.vae.vae_initial_scale_factor,
-            decay=args.vae.vae_decay,
-            update_after_step=args.vae.vae_update_after_step,
+            min_snr_gamma=args.vae.min_snr_gamma,
+            initial_scale_factor=args.vae.initial_scale_factor,
+            decay=args.vae.decay,
+            update_after_step=args.vae.update_after_step,
         )
         return vae_finetuner
     except Exception as e:
@@ -494,6 +497,7 @@ def initialize_training_components(args, models):
             }
         )
 
+       
         # Setup metrics tracking
         components["metrics"] = MetricsManager()
 
