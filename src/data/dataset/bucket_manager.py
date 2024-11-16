@@ -1,6 +1,6 @@
 import logging
 import math
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Set
 from collections import defaultdict
 
 logger = logging.getLogger(__name__)
@@ -19,7 +19,7 @@ class BucketManager:
     
     def __init__(self, 
                  min_size: int = 512,
-                 max_size: int = 2048,  # Updated to 2048 per SDXL requirements
+                 max_size: int = 4096,  # Updated to 2048 per SDXL requirements
                  step_size: int = 64,
                  max_area: int = 1024 * 1024,  # Updated to match SDXL's typical training resolution
                  add_square: bool = True,
@@ -28,7 +28,7 @@ class BucketManager:
         
         Args:
             min_size: Minimum dimension size (default: 512)
-            max_size: Maximum dimension size (default: 2048)
+            max_size: Maximum dimension size (default: 4096)
             step_size: Size increment between buckets (default: 64)
             max_area: Maximum area constraint (default: 1024*1024)
             add_square: Whether to add square buckets (default: True)
@@ -67,8 +67,11 @@ class BucketManager:
             )
             # Round down to nearest step size
             height = (height // self.step_size) * self.step_size
-            if height >= self.min_size:
-                buckets.add((height, width))
+            
+            # Enforce minimum size and only require one dimension to be below 1024
+            if height >= self.min_size and width >= self.min_size:
+                if height <= 1024 or width <= 1024:  
+                    buckets.add((height, width))
         
         # Add portrait buckets (swap height/width)
         for height in range(self.min_size, self.max_size + 1, self.step_size):
@@ -77,12 +80,15 @@ class BucketManager:
                 math.floor(self.max_area / height)
             )
             width = (width // self.step_size) * self.step_size
-            if width >= self.min_size:
-                buckets.add((height, width))
+            
+            # Enforce minimum size and only require one dimension to be below 1024
+            if height >= self.min_size and width >= self.min_size:
+                if height <= 1024 or width <= 1024:  
+                    buckets.add((height, width))
         
-        # Add square buckets if requested
+        # Add square buckets if requested (must have at least one dimension below 1024)
         if self.add_square:
-            for size in range(self.min_size, self.max_size + 1, self.step_size):
+            for size in range(self.min_size, min(1024 + self.step_size, self.max_size + 1), self.step_size):
                 if size * size <= self.max_area:
                     buckets.add((size, size))
         
@@ -97,7 +103,7 @@ class BucketManager:
         
         return buckets
 
-    def _generate_adaptive_buckets(self) -> set[Tuple[int, int]]:
+    def _generate_adaptive_buckets(self) -> Set[Tuple[int, int]]:
         """Generate adaptive buckets based on dataset statistics"""
         adaptive_buckets = set()
         
@@ -119,8 +125,12 @@ class BucketManager:
                 height = base_size
                 width = round(height * ar / self.step_size) * self.step_size
                 
-                if width >= self.min_size and width <= self.max_size and height * width <= self.max_area:
-                    adaptive_buckets.add((height, width))
+                # Enforce at least one dimension >= 1024
+                if height >= 1024 or width >= 1024:
+                    if (width >= self.min_size and width <= self.max_size and 
+                        height >= self.min_size and height <= self.max_size and 
+                        height * width <= self.max_area):
+                        adaptive_buckets.add((height, width))
         
         return adaptive_buckets
 

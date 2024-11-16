@@ -3,7 +3,7 @@ import os
 import traceback
 from collections import defaultdict
 from pathlib import Path
-from typing import Optional, Tuple, Union, Any
+from typing import Optional, Tuple, Union, Any, Dict, List
 import numpy as np
 import torch
 from concurrent.futures import ThreadPoolExecutor
@@ -91,6 +91,10 @@ class CustomDataset(CustomDatasetBase):
             max_area=max_bucket_area,
             add_square=True
         )
+        
+        # Initialize bucket lookup cache
+        self._bucket_cache = {}
+        self._build_bucket_lookup_cache()
         
         # Set up workers
         self.num_workers = num_workers or min(8, os.cpu_count() or 1)
@@ -193,24 +197,180 @@ class CustomDataset(CustomDatasetBase):
         logger.info(f"Found {len(self.image_paths)} valid image-caption pairs out of {len(all_image_paths)} total images")
         
         # Initialize dataset structure
-        self.bucket_data = defaultdict(list)  # Initialize bucket_data in __init__
-        self._initialize_dataset()
+        self.bucket_data = self.group_images_by_bucket(self.image_paths)  # Initialize bucket_data in __init__
+
+    def _precompute_ar_buckets(self):
+        """Pre-compute aspect ratio based buckets using parallel processing.
+        This method groups images by their aspect ratio instead of absolute dimensions.
+        """
+        logger.info("Computing aspect ratio buckets...")
         
+        def get_ar_bucket(height: int, width: int) -> Tuple[int, int]:
+            """Get bucket dimensions based on aspect ratio while maintaining area constraints"""
+            ar = width / height
+            
+            # Calculate dimensions that maintain AR and fit within max_area
+            if ar >= 1:  # Wider than tall
+                w = min(self.bucket_manager.max_size, 
+                       int((self.bucket_manager.max_area * ar)**0.5))
+                w = (w // self.bucket_manager.step_size) * self.bucket_manager.step_size
+                h = int(w / ar)
+                h = (h // self.bucket_manager.step_size) * self.bucket_manager.step_size
+            else:  # Taller than wide
+                h = min(self.bucket_manager.max_size, 
+                       int((self.bucket_manager.max_area / ar)**0.5))
+                h = (h // self.bucket_manager.step_size) * self.bucket_manager.step_size
+                w = int(h * ar)
+                w = (w // self.bucket_manager.step_size) * self.bucket_manager.step_size
+            
+            # Ensure minimum size
+            h = max(h, self.bucket_manager.min_size)
+            w = max(w, self.bucket_manager.min_size)
+            
+            # Ensure one dimension is below 1024
+            if h > 1024 and w > 1024:
+                if ar >= 1:
+                    h = 1024
+                else:
+                    w = 1024
+            
+            return (h, w)
+        
+        def process_ar_chunk(chunk: List[str]) -> Dict[Tuple[int, int], List[str]]:
+            """Process a chunk of images for AR-based bucket assignment"""
+            local_bucket_groups = defaultdict(list)
+            
+            for image_path in chunk:
+                try:
+                    with Image.open(image_path) as img:
+                        if img.mode != 'RGB':
+                            img = img.convert('RGB')
+                        orig_height, orig_width = img.size[1], img.size[0]
+                        
+                        # Get bucket based on aspect ratio
+                        target_height, target_width = get_ar_bucket(orig_height, orig_width)
+                        local_bucket_groups[(target_height, target_width)].append(image_path)
+                except Exception as e:
+                    logger.debug(f"Failed to process image {image_path} for AR grouping: {str(e)}")
+                    continue
+            
+            return dict(local_bucket_groups)
+        
+        # Split images into chunks for parallel processing
+        num_workers = 24  # Use same number of workers as regular bucket assignment
+        chunk_size = max(1, len(self.image_paths) // num_workers)
+        chunks = [self.image_paths[i:i + chunk_size] for i in range(0, len(self.image_paths), chunk_size)]
+        
+        # Process chunks in parallel
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = [executor.submit(process_ar_chunk, chunk) for chunk in chunks]
+            results = [future.result() for future in futures]
+        
+        # Merge results
+        self.bucket_data = self._merge_bucket_results(results)
+        
+        # Log statistics
+        total_images = sum(len(paths) for paths in self.bucket_data.values())
+        logger.info(f"Grouped {total_images} images into {len(self.bucket_data)} aspect ratio buckets")
+
+    def _process_image_chunk(self, chunk: List[str]) -> Dict[Tuple[int, int], List[str]]:
+        """Process a chunk of images for bucket assignment in parallel.
+        
+        Args:
+            chunk: List of image paths to process
+            
+        Returns:
+            Dictionary mapping bucket dimensions to lists of image paths
+        """
+        local_bucket_groups = defaultdict(list)
+        
+        for image_path in chunk:
+            try:
+                with Image.open(image_path) as img:
+                    if img.mode != 'RGB':
+                        img = img.convert('RGB')
+                    # Get original dimensions
+                    orig_height, orig_width = img.size[1], img.size[0]
+                    
+                    # Find closest bucket resolution using cache
+                    target_height, target_width = self._find_bucket(orig_height, orig_width)
+                    local_bucket_groups[(target_height, target_width)].append(image_path)
+            except Exception as e:
+                logger.debug(f"Failed to process image {image_path} for grouping: {str(e)}")
+                continue
+                
+        return dict(local_bucket_groups)
+
+    def _merge_bucket_results(self, results: List[Dict[Tuple[int, int], List[str]]]) -> Dict[Tuple[int, int], List[str]]:
+        """Merge bucket assignment results from multiple workers.
+        
+        Args:
+            results: List of bucket group dictionaries from workers
+            
+        Returns:
+            Merged dictionary of bucket groups
+        """
+        merged = defaultdict(list)
+        for result in results:
+            for bucket, paths in result.items():
+                merged[bucket].extend(paths)
+        return dict(merged)
+
+    def group_images_by_bucket(self, image_paths: List[str]) -> Dict[Tuple[int, int], List[str]]:
+        """Group images by their closest bucket resolution using parallel processing.
+        
+        Args:
+            image_paths: List of paths to images
+            
+        Returns:
+            Dictionary mapping bucket dimensions to lists of image paths
+        """
+        # Use 24 workers for parallel processing
+        num_workers = 24
+        chunk_size = max(1, len(image_paths) // num_workers)
+        chunks = [image_paths[i:i + chunk_size] for i in range(0, len(image_paths), chunk_size)]
+        
+        # Process chunks in parallel using ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = [executor.submit(self._process_image_chunk, chunk) for chunk in chunks]
+            results = [future.result() for future in futures]
+        
+        # Merge results from all workers
+        bucket_groups = self._merge_bucket_results(results)
+        
+        # Log statistics
+        total_images = sum(len(paths) for paths in bucket_groups.values())
+        logger.info(f"Grouped {total_images} images into {len(bucket_groups)} buckets using {num_workers} workers")
+        
+        return bucket_groups
+
     def _initialize_dataset(self):
         """Initialize dataset structure with proper error handling"""
         try:
-            # Pre-compute bucket data efficiently using ThreadPoolExecutor
-            if self.init_params['all_ar']:
-                logger.info("Pre-computing bucket data...")
-                self._precompute_bucket_data()
-                
+            # Initialize bucket data based on all_ar setting
+            if self.init_params.get('all_ar', False):  # Use get() with default
+                logger.info("Using aspect ratio bucketing...")
+                self._precompute_ar_buckets()
+            else:
+                logger.info("Using standard bucket assignment...")
+                self.bucket_data = self.group_images_by_bucket(self.image_paths)
+            
             # Pre-compute tag weights if enabled
             if self.use_tag_weighting:
                 logger.info("Pre-computing tag weights...")
                 self._precompute_tag_weights()
                 
-            # Initialize workers and process latents only if caching is enabled
-            if not self.init_params['no_caching_latents']:
+            # Log bucket statistics
+            total_images = sum(len(paths) for paths in self.bucket_data.values())
+            num_buckets = len(self.bucket_data)
+            logger.info(f"Dataset initialized with {total_images} images in {num_buckets} buckets")
+            
+            # Validate that we have enough data
+            if total_images == 0:
+                raise RuntimeError("No valid images found after bucket assignment")
+            
+            # Initialize latent caching if enabled
+            if not self.init_params.get('no_caching_latents', False):
                 logger.info("Pre-computing latents...")
                 self._initialize_workers()
                 self._batch_process_latents_efficient()
@@ -218,10 +378,9 @@ class CustomDataset(CustomDatasetBase):
                 logger.info("Latent caching disabled, will process latents on-the-fly")
                 
         except Exception as e:
-            logger.error("Dataset initialization failed: %s", str(e))
-            logger.error(traceback.format_exc())
-            self.cleanup()
-            raise
+            logger.error(f"Failed to initialize dataset: {str(e)}")
+            traceback.print_exc()
+            raise RuntimeError("Dataset initialization failed") from e
 
     def _precompute_bucket_data(self):
         """Pre-compute bucket data using thread pool"""
@@ -407,7 +566,7 @@ class CustomDataset(CustomDatasetBase):
                         orig_height, orig_width = img.size[1], img.size[0]
                         
                         # Find closest bucket resolution
-                        target_height, target_width = self.bucket_manager.find_closest_bucket(orig_height, orig_width)
+                        target_height, target_width = self._find_bucket(orig_height, orig_width)
                         bucket_groups[(target_height, target_width)].append(image_path)
                 except Exception as e:
                     logger.debug(f"Failed to process image {image_path} for grouping: {str(e)}")
@@ -564,7 +723,7 @@ class CustomDataset(CustomDatasetBase):
             if not self.tag_weighter:
                 return [], {}
             # Split caption into tags and process them
-            tags = [tag.strip() for tag in caption_text.split(",") if tag.strip()]
+            tags = [tag.strip() for tag in caption_text.split(',') if tag.strip()]
             return tags, self.tag_weighter.process_tag_batch(tags)
         
         if not caption:
@@ -874,7 +1033,7 @@ class CustomDataset(CustomDatasetBase):
                         orig_height, orig_width = img.size[1], img.size[0]
                         
                         # Find closest bucket resolution
-                        target_height, target_width = self.bucket_manager.find_closest_bucket(orig_height, orig_width)
+                        target_height, target_width = self._find_bucket(orig_height, orig_width)
                         
                         # Resize image to target bucket resolution
                         if (orig_height, orig_width) != (target_height, target_width):
@@ -924,3 +1083,43 @@ class CustomDataset(CustomDatasetBase):
             f"No valid items found in dataset after trying {max_attempts} items. "
             "Check that your dataset contains valid images and captions."
         )
+
+    def _build_bucket_lookup_cache(self):
+        """Build an efficient lookup cache for bucket assignment"""
+        buckets = self.bucket_manager.buckets
+        for bucket in buckets:
+            h, w = bucket
+            # Cache exact matches
+            self._bucket_cache[(h, w)] = bucket
+            self._bucket_cache[(w, h)] = bucket  # Cache rotated version too
+
+    def _find_bucket(self, height: int, width: int) -> Tuple[int, int]:
+        """Find the best bucket for given dimensions using cache for speed.
+        
+        Args:
+            height: Image height
+            width: Image width
+            
+        Returns:
+            Tuple of (bucket_height, bucket_width)
+        """
+        # Check cache first
+        if (height, width) in self._bucket_cache:
+            return self._bucket_cache[(height, width)]
+            
+        # Find closest bucket
+        min_area_diff = float('inf')
+        best_bucket = None
+        target_area = height * width
+        
+        for bucket in self.bucket_manager.buckets:
+            bh, bw = bucket
+            if bh >= height and bw >= width:
+                area_diff = (bh * bw) - target_area
+                if area_diff < min_area_diff:
+                    min_area_diff = area_diff
+                    best_bucket = bucket
+                    
+        # Cache result for future lookups
+        self._bucket_cache[(height, width)] = best_bucket
+        return best_bucket
