@@ -18,9 +18,9 @@ from .trainer import (
 )
 
 from src.utils.logging import (
-    _log_optimizer_config,
-    _log_vae_config,
-    _log_ema_config
+    log_optimizer_config,
+    log_vae_config,
+    log_ema_config
 )
 
 from .ema import EMAModel
@@ -38,9 +38,9 @@ __all__ = [
     'run_validation',
     
     # Logging utilities
-    '_log_optimizer_config',
-    '_log_vae_config',
-    '_log_ema_config',
+    'log_optimizer_config',
+    'log_vae_config',
+    'log_ema_config',
     
     # Metrics
     'AverageMeter',
