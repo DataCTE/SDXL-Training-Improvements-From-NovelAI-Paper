@@ -229,6 +229,14 @@ class CustomDataset(CustomDatasetBase):
 
     def _precompute_tag_weights(self):
         """Pre-compute tag weights for all captions using thread pool"""
+        if not self.use_tag_weighting or not hasattr(self, 'tag_weighter'):
+            logger.warning("Tag weighting is disabled or tag weighter not initialized")
+            return
+            
+        # Ensure tag_weight_cache is initialized
+        if self.tag_weight_cache is None:
+            self.tag_weight_cache = {}
+            
         def process_caption_batch(paths):
             results = {}
             for path in paths:
@@ -250,6 +258,7 @@ class CustomDataset(CustomDatasetBase):
 
         # Process in parallel using ThreadPoolExecutor
         chunk_size = max(1, len(self.image_paths) // (self.init_params['num_workers'] * 4))
+        failed_batches = []
         
         with ThreadPoolExecutor(max_workers=self.init_params['num_workers']) as executor:
             futures = []
@@ -264,7 +273,11 @@ class CustomDataset(CustomDatasetBase):
                     self.tag_weight_cache.update(results)
                 except Exception as e:
                     logger.error("Failed to process tag weight batch: %s", str(e))
+                    failed_batches.append(future)
                     continue
+                    
+        if failed_batches:
+            logger.warning("%d tag weight batches failed to process", len(failed_batches))
 
     def write_captions(self, formatted_paths):
         """Write formatted captions using thread pool"""
@@ -580,36 +593,18 @@ class CustomDataset(CustomDatasetBase):
                 latent = self.vae.encode(
                     image_tensor.unsqueeze(0).to(self.device)
                 ).latent_dist.sample()
-            
-            return image_path, latent.cpu()
-            
-        except FileNotFoundError as e:
-            logger.error("Image file not found %s: %s", image_path, str(e))
-            return None
-        except Image.UnidentifiedImageError as e:
-            logger.error("Invalid image format in %s: %s", image_path, str(e))
-            return None
-        except Image.DecompressionBombError as e:
-            logger.error("Image %s is too large to process: %s", image_path, str(e))
-            return None
-        except (IOError, OSError) as e:
-            logger.error("Failed to open or read image %s: %s", image_path, str(e))
-            return None
-        except (ValueError, TypeError) as e:
-            logger.error("Failed to convert image to tensor %s: %s", image_path, str(e))
-            return None
-        except torch.cuda.CudaError as e:
-            logger.error("CUDA error processing %s: %s", image_path, str(e))
+                latent = latent.cpu()  # Move to CPU immediately
+                
+            # Clean up GPU memory
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            return None
-        except RuntimeError as e:
-            if "out of memory" in str(e):
-                logger.error("CUDA out of memory while processing %s", image_path)
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            else:
-                logger.error("VAE encoding error for %s: %s", image_path, str(e))
+                
+            return image_path, latent
+            
+        except Exception as e:
+            logger.error("Failed to process latent for %s: %s", image_path, str(e))
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             return None
 
     def custom_collate(self, batch):
@@ -649,35 +644,57 @@ class CustomDataset(CustomDatasetBase):
         if isinstance(idx, slice):
             return [self[i] for i in range(*idx.indices(len(self)))]
         
-        image_path = self.image_paths[idx]
+        # Add safety counter to prevent infinite loops
+        max_attempts = len(self)
+        attempts = 0
         
-        # Get latent from cache if available
-        latent = self.latents_cache.get(image_path)
-        if latent is None and not self.no_caching_latents:
-            # Process latent if not in cache
-            result = self._process_single_latent(image_path)
-            if result is not None:
-                _, latent = result
-                self.latents_cache[image_path] = latent
-        
-        # Get caption and process it
-        caption_path = Path(image_path).with_suffix('.txt')
-        try:
-            with open(caption_path, 'r', encoding='utf-8') as f:
-                caption = f.read().strip()
-        except (IOError, OSError) as e:
-            logger.error("Failed to read caption file %s: %s", caption_path, str(e))
-            caption = ""
-        
-        # Get pre-computed tag weight from cache
-        tag_weight = self.tag_weight_cache.get(image_path, 1.0) if self.use_tag_weighting else 1.0
-        
-        return {
-            'latent': latent,
-            'caption': caption,
-            'tag_weight': tag_weight,
-            'metadata': {
-                'image_path': image_path,
-                'caption_path': str(caption_path)
+        while attempts < max_attempts:
+            current_idx = (idx + attempts) % len(self)
+            attempts += 1
+            
+            image_path = self.image_paths[current_idx]
+            
+            # Get latent from cache if available
+            latent = self.latents_cache.get(image_path)
+            if latent is None and not self.no_caching_latents:
+                # Process latent if not in cache
+                result = self._process_single_latent(image_path)
+                if result is not None:
+                    _, latent = result
+                    self.latents_cache[image_path] = latent
+            
+            # Skip this item if latent is None
+            if latent is None:
+                continue
+            
+            # Get caption and process it
+            caption_path = Path(image_path).with_suffix('.txt')
+            try:
+                with open(caption_path, 'r', encoding='utf-8') as f:
+                    caption = f.read().strip()
+            except (IOError, OSError) as e:
+                logger.error("Failed to read caption file %s: %s", caption_path, str(e))
+                continue
+            
+            # Skip empty captions
+            if not caption.strip():
+                continue
+            
+            # Get pre-computed tag weight from cache
+            tag_weight = self.tag_weight_cache.get(image_path, 1.0) if self.use_tag_weighting else 1.0
+            
+            return {
+                'latent': latent,
+                'caption': caption,
+                'tag_weight': tag_weight,
+                'metadata': {
+                    'image_path': image_path,
+                    'caption_path': str(caption_path)
+                }
             }
-        }
+            
+        # If we've tried all items and found none valid, raise an error
+        raise RuntimeError(
+            f"No valid items found in dataset after trying {max_attempts} items. "
+            "Check that your dataset contains valid images and captions."
+        )
