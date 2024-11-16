@@ -237,7 +237,11 @@ class CustomDataset(CustomDatasetBase):
                     with open(caption_path, 'r', encoding='utf-8') as f:
                         caption = f.read().strip()
                     if caption:
-                        weight = self.tag_weighter.calculate_caption_weight(caption)
+                        # Split caption into tags and calculate weights for each
+                        tags = [tag.strip() for tag in caption.split(',') if tag.strip()]
+                        tag_weights = [self.tag_weighter.calculate_tag_weight(tag) for tag in tags]
+                        # Use mean of tag weights as the overall weight
+                        weight = sum(tag_weights) / len(tag_weights) if tag_weights else 1.0
                         results[path] = weight
                 except Exception as e:
                     logger.error("Failed to calculate tag weight for %s: %s", path, str(e))
