@@ -182,30 +182,47 @@ def _get_ema_config(
     }
 
 
-def setup_ema(args, model, device=None):
-    """Setup EMA model with proper error handling"""
+def setup_ema(args: EMAModel, model, device=None):
+    """Setup EMA model with proper error handling.
+    
+    Args:
+        args: EMAArgs configuration object
+        model: The model to apply EMA to
+        device: Optional device to place the EMA model on
+
+    Returns:
+        Optional[EMAModel]: The configured EMA model or None if not enabled
+
+    Raises:
+        Exception: If the setup of the EMA model fails
+    """
     try:
         # Use provided device or default to CUDA/CPU
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        decay = args.ema.ema_decay
+        if not args.use_ema:
+            return None
 
-        # Basic validation
-        if not 0.0 <= decay <= 1.0:
-            raise ValueError(f"EMA decay must be between 0 and 1, got {decay:.6f}")
+        # Get appropriate mixed precision mode
+        mixed_precision = "bf16" if torch.cuda.is_available() else "no"
 
-        ema_config = _get_ema_config(
-            decay=decay,
-            update_every=args.ema.ema_update_every,
+        ema = EMAModel(
+            model=model,
+            model_path="",  # Empty string as we're not loading from a path
+            decay=args.ema_decay,
+            update_after_step=args.ema_update_after_step,
             device=device,
-            model_path=args.model.model_path,
+            update_every=args.ema_update_every,
+            use_ema_warmup=args.use_ema_warmup,
+            power=args.ema_power,
+            min_decay=args.ema_min_decay,
+            max_decay=args.ema_max_decay,
+            mixed_precision=mixed_precision,
+            jit_compile=False,  # Default to False for better compatibility
+            gradient_checkpointing=True  # Enable for memory efficiency
         )
-
-        if args.ema.use_ema:
-            ema = EMAModel(model, **ema_config)
-            return ema
-        return None
+        return ema
 
     except (ValueError, RuntimeError, AttributeError) as e:
         raise type(e)(f"Failed to setup EMA model: {str(e)}") from e
@@ -483,7 +500,11 @@ def initialize_training_components(args, models):
         )
 
         optional_components = {
-            "ema": (setup_ema, args.ema.use_ema, (args, models["unet"])),
+            "ema": (
+                setup_ema, 
+                args.ema.use_ema, 
+                (args.ema, models["unet"])  # Pass EMAArgs directly
+            ),
             "tag_weighter": (
                 setup_tag_weighter, 
                 args.tag_weighting.use_tag_weighting, 
@@ -492,9 +513,11 @@ def initialize_training_components(args, models):
             "vae_finetuner": (
                 setup_vae_finetuner, 
                 args.vae.finetune_vae, 
-                (args.vae, models)  # Pass just the VAE args and models
+                (args.vae, models)
             ),
         }
+
+
 
         # Initialize optional components
         for name, (setup_func, use_flag, setup_args) in optional_components.items():
