@@ -148,15 +148,45 @@ class CustomDataset(CustomDatasetBase):
         else:
             self.tag_weighter = None
             
-        # Convert image paths to strings once
+        # Convert image paths to strings once and validate caption files
         image_extensions = ["*.png", "*.jpg", "*.jpeg", "*.webp", "*.bmp"]
-        self.image_paths = []
+        all_image_paths = []
         for ext in image_extensions:
-            self.image_paths.extend([str(p) for p in Path(data_dir).glob(ext)])
-            self.image_paths.extend([str(p) for p in Path(data_dir).glob(ext.upper())])  # Also check uppercase extensions
+            all_image_paths.extend([str(p) for p in Path(data_dir).glob(ext)])
+            all_image_paths.extend([str(p) for p in Path(data_dir).glob(ext.upper())])
+
+        if not all_image_paths:
+            raise RuntimeError(f"No images found in {data_dir}. Supported formats: {', '.join(image_extensions)}")
+
+        # Validate image-caption pairs and only keep valid ones
+        self.image_paths = []
+        skipped_count = 0
+        
+        for img_path in all_image_paths:
+            caption_path = Path(img_path).with_suffix('.txt')
+            try:
+                # Verify the image can be opened
+                with Image.open(img_path) as img:
+                    img.verify()
+                # Verify the caption file exists and is not empty
+                if caption_path.exists():
+                    with open(caption_path, 'r', encoding='utf-8') as f:
+                        caption = f.read().strip()
+                    if caption:  # Only add if caption is not empty
+                        self.image_paths.append(img_path)
+                        continue
+            except Exception as e:
+                logger.debug(f"Skipping {img_path}: {str(e)}")
+            
+            skipped_count += 1
+        
+        if skipped_count > 0:
+            logger.warning(f"Skipped {skipped_count} images due to missing or invalid caption files")
         
         if not self.image_paths:
-            raise RuntimeError(f"No images found in {data_dir}. Supported formats: {', '.join(image_extensions)}")
+            raise RuntimeError(f"No valid image-caption pairs found in {data_dir}. Found {len(all_image_paths)} images but none had valid caption files.")
+        
+        logger.info(f"Found {len(self.image_paths)} valid image-caption pairs out of {len(all_image_paths)} total images")
         
         # Initialize dataset structure
         self.bucket_data = defaultdict(list)  # Initialize bucket_data in __init__
@@ -175,10 +205,13 @@ class CustomDataset(CustomDatasetBase):
                 logger.info("Pre-computing tag weights...")
                 self._precompute_tag_weights()
                 
-            # Initialize workers if needed
+            # Initialize workers and process latents only if caching is enabled
             if not self.init_params['no_caching_latents']:
+                logger.info("Pre-computing latents...")
                 self._initialize_workers()
                 self._batch_process_latents_efficient()
+            else:
+                logger.info("Latent caching disabled, will process latents on-the-fly")
                 
         except Exception as e:
             logger.error("Dataset initialization failed: %s", str(e))
@@ -249,23 +282,40 @@ class CustomDataset(CustomDatasetBase):
             for path in paths:
                 try:
                     caption_path = Path(path).with_suffix('.txt')
+                    if not caption_path.exists():
+                        logger.debug(f"Caption file not found for {path}, using default weight")
+                        results[path] = 1.0
+                        continue
+
                     with open(caption_path, 'r', encoding='utf-8') as f:
                         caption = f.read().strip()
-                    if caption:
-                        # Split caption into tags and calculate weights for each
-                        tags = [tag.strip() for tag in caption.split(',') if tag.strip()]
-                        tag_weights = [self.tag_weighter.calculate_tag_weight(tag) for tag in tags]
-                        # Use mean of tag weights as the overall weight
-                        weight = sum(tag_weights) / len(tag_weights) if tag_weights else 1.0
-                        results[path] = weight
+                    
+                    if not caption:
+                        logger.debug(f"Empty caption file for {path}, using default weight")
+                        results[path] = 1.0
+                        continue
+
+                    # Split caption into tags and calculate weights for each
+                    tags = [tag.strip() for tag in caption.split(',') if tag.strip()]
+                    if not tags:
+                        logger.debug(f"No valid tags found in caption for {path}, using default weight")
+                        results[path] = 1.0
+                        continue
+
+                    tag_weights = [self.tag_weighter.calculate_tag_weight(tag) for tag in tags]
+                    # Use mean of tag weights as the overall weight
+                    weight = sum(tag_weights) / len(tag_weights) if tag_weights else 1.0
+                    results[path] = weight
+
                 except Exception as e:
-                    logger.error("Failed to calculate tag weight for %s: %s", path, str(e))
+                    logger.debug(f"Failed to calculate tag weight for {path}: {str(e)}, using default weight")
                     results[path] = 1.0  # Default weight on error
             return results
 
         # Process in parallel using ThreadPoolExecutor
         chunk_size = max(1, len(self.image_paths) // (self.init_params['num_workers'] * 4))
-        failed_batches = []
+        processed_count = 0
+        error_count = 0
         
         with ThreadPoolExecutor(max_workers=self.init_params['num_workers']) as executor:
             futures = []
@@ -278,13 +328,15 @@ class CustomDataset(CustomDatasetBase):
                 try:
                     results = future.result()
                     self.tag_weight_cache.update(results)
+                    processed_count += len(results)
                 except Exception as e:
-                    logger.error("Failed to process tag weight batch: %s", str(e))
-                    failed_batches.append(future)
+                    logger.error(f"Failed to process tag weight batch: {str(e)}")
+                    error_count += 1
                     continue
-                    
-        if failed_batches:
-            logger.warning("%d tag weight batches failed to process", len(failed_batches))
+
+        if error_count > 0:
+            logger.warning(f"{error_count} tag weight batches failed to process")
+        logger.info(f"Successfully processed tag weights for {processed_count} images")
 
     def write_captions(self, formatted_paths):
         """Write formatted captions using thread pool"""
@@ -661,37 +713,50 @@ class CustomDataset(CustomDatasetBase):
             
             image_path = self.image_paths[current_idx]
             
-            # Get latent from cache if available
-            latent = self.latents_cache.get(image_path)
-            if latent is None and not self.no_caching_latents:
-                # Process latent if not in cache
-                result = self._process_single_latent(image_path)
-                if result is not None:
-                    _, latent = result
-                    self.latents_cache[image_path] = latent
-            
-            # Skip this item if latent is None
-            if latent is None:
-                continue
-            
-            # Get caption and process it
+            # Get caption and process it first (faster to check)
             caption_path = Path(image_path).with_suffix('.txt')
             try:
                 with open(caption_path, 'r', encoding='utf-8') as f:
                     caption = f.read().strip()
+                if not caption:
+                    continue
             except (IOError, OSError) as e:
-                logger.error("Failed to read caption file %s: %s", caption_path, str(e))
-                continue
-            
-            # Skip empty captions
-            if not caption.strip():
+                logger.debug("Failed to read caption file %s: %s", caption_path, str(e))
                 continue
             
             # Get pre-computed tag weight from cache
             tag_weight = self.tag_weight_cache.get(image_path, 1.0) if self.use_tag_weighting else 1.0
             
+            # Process latent
+            latent = None
+            if not self.no_caching_latents:
+                # Try to get from cache first
+                latent = self.latents_cache.get(image_path)
+            
+            if latent is None:
+                # Process latent on-the-fly if not in cache or caching is disabled
+                try:
+                    with Image.open(image_path) as img:
+                        img = img.convert('RGB')
+                        # Move image processing to GPU
+                        image = torch.from_numpy(np.array(img)).float() / 127.5 - 1
+                        image = image.permute(2, 0, 1).unsqueeze(0).to(self.device)
+                        
+                        # Process through VAE
+                        with torch.no_grad():
+                            latent = self.vae.encode(
+                                image
+                            ).latent_dist.sample()
+                            
+                        if not self.no_caching_latents:
+                            self.latents_cache[image_path] = latent.cpu()  # Cache if enabled
+                        
+                except Exception as e:
+                    logger.debug("Failed to process image %s: %s", image_path, str(e))
+                    continue
+            
             return {
-                'latent': latent,
+                'latent': latent.cpu() if latent.device.type == 'cuda' else latent,  # Ensure latent is on CPU
                 'caption': caption,
                 'tag_weight': tag_weight,
                 'metadata': {
