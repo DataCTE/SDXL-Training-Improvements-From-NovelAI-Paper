@@ -124,14 +124,14 @@ def setup_optimizer(args, models) -> torch.optim.Optimizer:
 def setup_vae_finetuner(args, models) -> Optional[VAEFineTuner]:
     """Initialize VAE finetuner with proper configuration."""
     try:
-        if not args.vae.finetune_vae:
+        if not args.finetune_vae:
             return None
 
         vae_config = {
             "device": getattr(args.system, "device", "cuda"),
             "mixed_precision": getattr(args.system, "mixed_precision", "no"),
             "use_amp": getattr(args.system, "use_amp", False),
-            "learning_rate": args.vae.vae_learning_rate,
+            "learning_rate": args.vae_learning_rate,
             "adam_beta1": args.optimizer.adam_beta1,
             "adam_beta2": args.optimizer.adam_beta2,
             "adam_epsilon": args.optimizer.adam_epsilon,
@@ -139,14 +139,14 @@ def setup_vae_finetuner(args, models) -> Optional[VAEFineTuner]:
             "max_grad_norm": args.training.max_grad_norm,
             "gradient_checkpointing": args.system.gradient_checkpointing,
             "use_8bit_adam": args.optimizer.use_8bit_adam,
-            "use_channel_scaling": args.vae.vae_use_channel_scaling,
-            "adaptive_loss_scale": args.vae.adaptive_loss_scale,
-            "kl_weight": args.vae.kl_weight,
-            "perceptual_weight": args.vae.perceptual_weight,
+            "use_channel_scaling": args.vae_use_channel_scaling,
+            "adaptive_loss_scale": args.adaptive_loss_scale,
+            "kl_weight": args.kl_weight,
+            "perceptual_weight": args.perceptual_weight,
             "min_snr_gamma": args.training.min_snr_gamma,
-            "initial_scale_factor": args.vae.vae_initial_scale_factor,
-            "decay": args.vae.vae_decay,
-            "update_after_step": args.vae.vae_update_after_step,
+            "initial_scale_factor": args.vae_initial_scale_factor,
+            "decay": args.vae_decay,
+            "update_after_step": args.vae_update_after_step,
             "model_path": args.model.model_path,
         }
         vae_finetuner = VAEFineTuner(vae=models["vae"], **vae_config)
