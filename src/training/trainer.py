@@ -1,12 +1,14 @@
 import logging
-import math
-import os
-import time
 import gc
+import os
+import math
+import time
 from typing import Dict, Any, Union, Optional, List
 from functools import lru_cache
 from multiprocessing import Manager
 from dataclasses import dataclass
+from collections import defaultdict
+from contextlib import nullcontext
 
 import torch
 import numpy as np
@@ -14,11 +16,15 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers.optimization import Adafactor
 from bitsandbytes.optim import AdamW8bit
+from diffusers import AutoencoderKL
 
 from src.inference.text_to_image import SDXLInference
 from src.training.ema import EMAModel
+from src.training.loss import training_loss_v_prediction, get_cosine_schedule_with_warmup
 from src.data.tag_weighter import TagBasedLossWeighter
 from src.training.vae_finetuner import VAEFineTuner
+from src.data.dataset.dataset import CustomDataset
+from src.utils.checkpoint import save_checkpoint
 
 logger = logging.getLogger(__name__)
 
@@ -81,23 +87,23 @@ def setup_optimizer(args, models) -> torch.optim.Optimizer:
 
         # Get cached optimizer config
         opt_config = _get_optimizer_config(
-            getattr(args, "optimizer_type", "adamw"),
-            args.learning_rate,
-            args.weight_decay,
-            args.adam_beta1,
-            args.adam_beta2,
-            args.adam_epsilon,
+            getattr(args.optimizer, "optimizer_type", "adamw"),
+            args.training.learning_rate,
+            args.optimizer.weight_decay,
+            args.optimizer.adam_beta1,
+            args.optimizer.adam_beta2,
+            args.optimizer.adam_epsilon,
         )
 
         # Initialize optimizer based on type
-        if args.use_8bit_adam:
+        if args.optimizer.use_8bit_adam:
             try:
                 optimizer = AdamW8bit(params_to_optimize, **opt_config)
             except ImportError as e:
                 logger.warning("Failed to import 8-bit AdamW: %s. Falling back to regular AdamW.", str(e))
-                args.use_8bit_adam = False
+                args.optimizer.use_8bit_adam = False
                 optimizer = torch.optim.AdamW(params_to_optimize, **opt_config)
-        elif args.use_adafactor:
+        elif args.optimizer.use_adafactor:
             optimizer = Adafactor(
                 params_to_optimize,
                 lr=opt_config["lr"],
@@ -118,30 +124,30 @@ def setup_optimizer(args, models) -> torch.optim.Optimizer:
 def setup_vae_finetuner(args, models) -> Optional[VAEFineTuner]:
     """Initialize VAE finetuner with proper configuration."""
     try:
-        if not getattr(args, "finetune_vae", False):
+        if not args.vae.finetune_vae:
             return None
 
         vae_config = {
-            "device": getattr(args, "device", "cuda"),
-            "mixed_precision": getattr(args, "mixed_precision", "no"),
-            "use_amp": getattr(args, "use_amp", False),
-            "learning_rate": getattr(args, "vae_learning_rate", 1e-6),
-            "adam_beta1": getattr(args, "adam_beta1", 0.9),
-            "adam_beta2": getattr(args, "adam_beta2", 0.999),
-            "adam_epsilon": getattr(args, "adam_epsilon", 1e-8),
-            "weight_decay": getattr(args, "weight_decay", 1e-2),
-            "max_grad_norm": getattr(args, "max_grad_norm", 1.0),
-            "gradient_checkpointing": getattr(args, "gradient_checkpointing", False),
-            "use_8bit_adam": getattr(args, "use_8bit_adam", False),
-            "use_channel_scaling": getattr(args, "vae_use_channel_scaling", False),
-            "adaptive_loss_scale": getattr(args, "vae_adaptive_loss_scale", False),
-            "kl_weight": getattr(args, "vae_kl_weight", 0.0),
-            "perceptual_weight": getattr(args, "vae_perceptual_weight", 0.0),
-            "min_snr_gamma": getattr(args, "min_snr_gamma", 5.0),
-            "initial_scale_factor": getattr(args, "vae_initial_scale_factor", 1.0),
-            "decay": getattr(args, "vae_decay", 0.9999),
-            "update_after_step": getattr(args, "vae_update_after_step", 100),
-            "model_path": getattr(args, "vae_model_path", None),
+            "device": getattr(args.system, "device", "cuda"),
+            "mixed_precision": getattr(args.system, "mixed_precision", "no"),
+            "use_amp": getattr(args.system, "use_amp", False),
+            "learning_rate": args.vae.vae_learning_rate,
+            "adam_beta1": args.optimizer.adam_beta1,
+            "adam_beta2": args.optimizer.adam_beta2,
+            "adam_epsilon": args.optimizer.adam_epsilon,
+            "weight_decay": args.optimizer.weight_decay,
+            "max_grad_norm": args.training.max_grad_norm,
+            "gradient_checkpointing": args.system.gradient_checkpointing,
+            "use_8bit_adam": args.optimizer.use_8bit_adam,
+            "use_channel_scaling": args.vae.vae_use_channel_scaling,
+            "adaptive_loss_scale": args.vae.adaptive_loss_scale,
+            "kl_weight": args.vae.kl_weight,
+            "perceptual_weight": args.vae.perceptual_weight,
+            "min_snr_gamma": args.training.min_snr_gamma,
+            "initial_scale_factor": args.vae.vae_initial_scale_factor,
+            "decay": args.vae.vae_decay,
+            "update_after_step": args.vae.vae_update_after_step,
+            "model_path": args.model.model_path,
         }
         vae_finetuner = VAEFineTuner(vae=models["vae"], **vae_config)
 
@@ -174,7 +180,7 @@ def setup_ema(args, model, device=None):
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        decay = getattr(args, "ema_decay", 0.9999)
+        decay = args.ema.ema_decay
 
         # Basic validation
         if not 0.0 <= decay <= 1.0:
@@ -182,14 +188,13 @@ def setup_ema(args, model, device=None):
 
         ema_config = _get_ema_config(
             decay=decay,
-            update_every=getattr(args, "ema_update_every", 10),
+            update_every=args.ema.ema_update_every,
             device=device,
-            model_path=args.model_path,
+            model_path=args.model.model_path,
         )
 
-        if args.use_ema:
+        if args.ema.use_ema:
             ema = EMAModel(model, **ema_config)
-
             return ema
         return None
 
@@ -200,7 +205,7 @@ def setup_ema(args, model, device=None):
 def setup_validator(args, models, device, dtype) -> Optional[Any]:
     """Initialize validation components."""
     try:
-        if args.skip_validation:
+        if getattr(args.system, "skip_validation", False):
             return None
 
         validator = SDXLInference(None, device, dtype)
@@ -233,15 +238,15 @@ def _get_tag_weighter_config(
 def setup_tag_weighter(args) -> Optional[Any]:
     """Initialize tag weighting system."""
     try:
-        if not getattr(args, "use_tag_weighting", False):
+        if not args.tag_weighting.use_tag_weighting:
             return None
 
         weighter_config = _get_tag_weighter_config(
-            base_weight=getattr(args, "tag_base_weight", 1.0),
-            min_weight=getattr(args, "min_tag_weight", 0.1),
-            max_weight=getattr(args, "max_tag_weight", 3.0),
-            window_size=getattr(args, "tag_window_size", 100),
-            no_cache=getattr(args, "no_caching", False),
+            base_weight=getattr(args.tag_weighting, "tag_base_weight", 1.0),
+            min_weight=args.tag_weighting.min_tag_weight,
+            max_weight=args.tag_weighting.max_tag_weight,
+            window_size=getattr(args.tag_weighting, "tag_window_size", 100),
+            no_cache=args.data.no_caching,
         )
         weighter = TagBasedLossWeighter(config=weighter_config)
 
@@ -311,18 +316,38 @@ class AverageMeter:
 
     @property
     def val(self) -> float:
+        """Get the most recent value added to the meter.
+
+        Returns:
+            float: The last value that was added
+        """
         return self._val
 
     @property
     def avg(self) -> float:
+        """Get the average of all values in the meter.
+
+        Returns:
+            float: The running average value
+        """
         return self._avg
 
     @property
     def sum(self) -> float:
+        """Get the sum of all values added to the meter.
+
+        Returns:
+            float: The total sum of values
+        """
         return self._sum
 
     @property
     def count(self) -> int:
+        """Get the count of values that have been added.
+
+        Returns:
+            int: The total number of updates
+        """
         return self._count
 
 
@@ -334,20 +359,40 @@ class MetricsManager:
         self._metrics = self._manager.dict()
 
     def get_metric(self, name: str) -> AverageMeter:
+        """Retrieve or create a metric by name.
+
+        Args:
+            name (str): The name of the metric to retrieve
+
+        Returns:
+            AverageMeter: The metric object associated with the given name
+        """
         if name not in self._metrics:
             self._metrics[name] = AverageMeter(name=name)
         return self._metrics[name]
 
     def update_metric(self, name: str, value: float, n: int = 1) -> None:
+        """Update a metric with a new value.
+
+        Args:
+            name (str): The name of the metric to update
+            value (float): The value to update the metric with
+            n (int, optional): The weight of the update. Defaults to 1.
+        """
         metric = self.get_metric(name)
         metric.update(value, n)
         self._metrics[name] = metric  # Update in shared dict
 
     def get_all_metrics(self) -> Dict[str, float]:
+        """Get all metrics as a dictionary of averages.
+
+        Returns:
+            Dict[str, float]: A dictionary mapping metric names to their current average values
+        """
         return {name: meter.avg for name, meter in dict(self._metrics).items()}
 
 
-def initialize_training_components(args, device, dtype, models):
+def initialize_training_components(args, models):
     """Initialize all training components with proper error handling"""
     components = {}
 
@@ -376,7 +421,7 @@ def initialize_training_components(args, device, dtype, models):
             model = models[key]
             if key == "vae":
                 # Special handling for VAE
-                from diffusers import AutoencoderKL
+                
 
                 dataloader_models[key] = AutoencoderKL.from_config(model.config)
                 dataloader_models[key].load_state_dict(model.state_dict())
@@ -398,55 +443,54 @@ def initialize_training_components(args, device, dtype, models):
                 # For tokenizers and other objects that don't need special handling
                 dataloader_models[key] = model
 
+        # Initialize data loader
         components["train_dataloader"] = DataLoader(
-            dataset=dataloader_models["vae"].dataset,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
+            dataset=CustomDataset(
+                data_dir=args.data.data_dir,
+                tokenizer=dataloader_models["tokenizer"],
+                tokenizer_2=dataloader_models["tokenizer_2"],
+                text_encoder=dataloader_models["text_encoder"],
+                text_encoder_2=dataloader_models["text_encoder_2"],
+                vae=dataloader_models["vae"],
+                cache_dir=args.data.cache_dir,
+                no_caching_latents=args.data.no_caching,
+                use_tag_weighting=args.tag_weighting.use_tag_weighting,
+                num_workers=args.system.num_workers,
+            ),
+            batch_size=args.training.batch_size,
             shuffle=True,
+            num_workers=args.system.num_workers,
+            pin_memory=True,
+            drop_last=True,
         )
 
-        # Setup metrics manager
-        components["metrics_manager"] = MetricsManager()
-
-        # Setup learning rate scheduler
-        num_training_steps = args.num_epochs * len(components["train_dataloader"])
-        components["lr_scheduler"] = torch.optim.lr_scheduler.CosineAnnealingLR(
+        # Setup scheduler
+        num_update_steps_per_epoch = (
+            len(components["train_dataloader"])
+            // args.training.gradient_accumulation_steps
+        )
+        components["scheduler"] = get_cosine_schedule_with_warmup(
             optimizer=components["optimizer"],
-            T_max=num_training_steps,
-            eta_min=1e-6,
+            num_warmup_steps=args.training.warmup_steps,
+            num_training_steps=num_update_steps_per_epoch * args.training.num_epochs,
         )
 
         # Setup optional components with parallel initialization
         optional_components = {
-            "ema": (setup_ema, args.use_ema, (args, models["unet"])),
-            "tag_weighter": (setup_tag_weighter, args.use_tag_weighting, (args,)),
-            "vae_finetuner": (setup_vae_finetuner, args.finetune_vae, (args, models)),
+            "ema": (setup_ema, args.ema.use_ema, (args, models["unet"])),
+            "tag_weighter": (setup_tag_weighter, args.tag_weighting.use_tag_weighting, (args,)),
+            "vae_finetuner": (setup_vae_finetuner, args.vae.finetune_vae, (args, models)),
         }
 
         components.update(
             {
                 name: setup_func(*setup_args) if use_flag else None
-                for name, (
-                    setup_func,
-                    use_flag,
-                    setup_args,
-                ) in optional_components.items()
+                for name, (setup_func, use_flag, setup_args) in optional_components.items()
             }
         )
 
-        # Cache and set training configuration
-        components["training_config"] = {
-            "mode": getattr(args, "training_mode", "v_prediction"),
-            "min_snr_gamma": getattr(args, "min_snr_gamma", 5.0),
-            "sigma_data": getattr(args, "sigma_data", 1.0),
-            "sigma_min": getattr(args, "sigma_min", 0.002),
-            "sigma_max": getattr(args, "sigma_max", 80.0),
-            "scale_method": getattr(args, "scale_method", "v"),
-            "scale_factor": getattr(args, "scale_factor", 1.0),
-        }
-
-        # Setup validator
-        components["validator"] = setup_validator(args, models, device, dtype)
+        # Setup metrics tracking
+        components["metrics"] = MetricsManager()
 
         # Validate components
         _validate_components(components)
@@ -454,12 +498,13 @@ def initialize_training_components(args, device, dtype, models):
         return components
 
     except (ValueError, RuntimeError, AttributeError) as e:
+        _cleanup_failed_initialization(components)
         raise type(e)(f"Failed to initialize training components: {str(e)}") from e
 
 
 def _validate_components(components: Dict[str, Any]) -> None:
     """Validate initialized components."""
-    required = ["optimizer", "train_dataloader", "lr_scheduler", "training_config"]
+    required = ["optimizer", "train_dataloader", "scheduler", "metrics"]
     if not all(k in components for k in required):
         raise ValueError(
             f"Missing required components: {[k for k in required if k not in components]}"
@@ -490,30 +535,107 @@ def _cleanup_failed_initialization(components: Dict[str, Any]) -> None:
         raise type(e)(f"Failed to cleanup training resources: {str(e)}") from e
 
 
-@torch.no_grad()
 def train_epoch(
-    epoch: int, args, models, components, device, dtype, global_step: int
-) -> Dict[str, float]:
-    """Execute single training epoch with proper logging and memory management."""
-    try:
-        # Create metrics manager here in the main process
-        metrics_manager = MetricsManager()
-        components["metrics_manager"] = metrics_manager
+    epoch: int,
+    args,
+    models: Dict[str, Any],
+    components: Dict[str, Any],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> None:
+    """Train for one epoch."""
+    models["unet"].train()
+    
+    # Initialize progress bar
+    progress = tqdm(
+        total=len(components["train_dataloader"]),
+        desc=f"Training epoch {epoch}",
+        leave=False,
+    )
 
-        # Train for one epoch
-        epoch_metrics = train(args, models, components, device, dtype)
+    # Initialize metrics for this epoch
+    epoch_metrics = defaultdict(float)
+    samples_seen = 0
 
-        # Run validation if configured
-        if hasattr(args, "validation_epochs") and epoch % args.validation_epochs == 0:
-            validation_metrics = run_validation(
-                args, models, components, device, dtype, global_step
+    for batch_idx, batch in enumerate(components["train_dataloader"]):
+        with components.get("metrics", nullcontext()) as metrics:
+            # Forward pass
+            with torch.cuda.amp.autocast(enabled=args.system.mixed_precision):
+                loss = forward_pass(args, models, batch, device, dtype, components)
+                loss = loss / args.training.gradient_accumulation_steps
+
+            # Update metrics
+            if metrics:
+                metrics.update("loss", loss.item() * args.training.gradient_accumulation_steps)
+                epoch_metrics["loss"] += loss.item() * args.training.gradient_accumulation_steps
+                samples_seen += 1
+
+            # Backward pass and optimization
+            if args.system.mixed_precision:
+                components["scaler"].scale(loss).backward()
+                if (batch_idx + 1) % args.training.gradient_accumulation_steps == 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        models["unet"].parameters(), args.training.max_grad_norm
+                    )
+                    components["scaler"].step(components["optimizer"])
+                    components["scaler"].update()
+                    components["scheduler"].step()
+                    components["optimizer"].zero_grad()
+            else:
+                loss.backward()
+                if (batch_idx + 1) % args.training.gradient_accumulation_steps == 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        models["unet"].parameters(), args.training.max_grad_norm
+                    )
+                    components["optimizer"].step()
+                    components["scheduler"].step()
+                    components["optimizer"].zero_grad()
+
+            # Update EMA model if enabled
+            if (
+                components.get("ema") is not None
+                and (batch_idx + 1) % args.training.gradient_accumulation_steps == 0
+            ):
+                components["ema"].step(models["unet"])
+
+            # Log progress
+            if metrics and batch_idx % args.logging.logging_steps == 0:
+                metrics.log_metrics(
+                    step=batch_idx,
+                    epoch=epoch,
+                    learning_rate=components["scheduler"].get_last_lr()[0],
+                )
+
+            # Run validation if needed
+            if (
+                args.validation.validation_steps > 0
+                and batch_idx > 0
+                and batch_idx % args.validation.validation_steps == 0
+            ):
+                run_validation(args, models, components, device, dtype, global_step=batch_idx)
+
+        # Update progress bar
+        progress.update(1)
+        if batch_idx % args.logging.logging_steps == 0:
+            progress.set_postfix(
+                {
+                    "loss": epoch_metrics["loss"] / samples_seen if samples_seen > 0 else 0,
+                    "lr": components["scheduler"].get_last_lr()[0],
+                }
             )
-            epoch_metrics.update(validation_metrics)
 
-        return epoch_metrics
+    progress.close()
 
-    except (ValueError, RuntimeError, AttributeError) as e:
-        raise type(e)(f"Failed during training epoch: {str(e)}") from e
+    # Log epoch metrics
+    if components.get("metrics"):
+        components["metrics"].log_epoch_metrics(
+            epoch=epoch,
+            metrics={k: v / samples_seen for k, v in epoch_metrics.items()},
+        )
+
+    # Save checkpoint if needed
+    if epoch % args.logging.save_epochs == 0:
+        save_checkpoint(args, epoch, models, components)
 
 
 def train(args, models, components, device, dtype) -> Dict[str, float]:
@@ -629,7 +751,7 @@ def train_step(
                 )
                 components["scaler"].step(components["optimizer"])
                 components["scaler"].update()
-                components["lr_scheduler"].step()
+                components["scheduler"].step()
         else:
             loss.backward()
             if (batch_idx + 1) % args.gradient_accumulation_steps == 0:
@@ -637,7 +759,7 @@ def train_step(
                     models["unet"].parameters(), args.max_grad_norm
                 )
                 components["optimizer"].step()
-                components["lr_scheduler"].step()
+                components["scheduler"].step()
 
         # Update EMA model if enabled
         if (
@@ -737,3 +859,47 @@ def run_validation(
         # Clear CUDA cache
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+
+def forward_pass(args, models, batch, device, dtype, components) -> torch.Tensor:
+    """Execute forward pass with proper error handling."""
+    try:
+        # Move batch to device
+        batch = {k: v.to(device=device, dtype=dtype) if torch.is_tensor(v) else v for k, v in batch.items()}
+
+        # Get model predictions
+        latents = batch["latents"]
+        timesteps = batch["timesteps"]
+        
+        # Get noise prediction using v-prediction loss
+        loss = training_loss_v_prediction(
+            model=models["unet"],
+            x_0=latents,
+            sigma=timesteps,
+            text_embeddings=batch["prompt_embeds"],
+            added_cond_kwargs={
+                "text_embeds": batch["pooled_prompt_embeds"],
+                "time_ids": batch["add_text_embeds"],
+            },
+            sigma_data=args.training.sigma_data,
+            tag_weighter=components.get("tag_weighter"),
+            batch_tags=batch.get("tags"),
+            min_snr_gamma=args.training.min_snr_gamma,
+            rescale_cfg=args.training.rescale_cfg,
+            rescale_multiplier=args.training.rescale_multiplier,
+            scale_method=args.training.scale_method,
+            use_tag_weighting=args.tag_weighting.use_tag_weighting,
+            device=device,
+            dtype=dtype
+        )
+
+        # Apply VAE finetuning loss if enabled
+        if components.get("vae_finetuner") is not None:
+            vae_loss = components["vae_finetuner"].compute_loss(batch)
+            loss = loss + vae_loss * args.vae.vae_loss_weight
+
+        return loss
+
+    except (ValueError, RuntimeError, KeyError) as e:
+        logger.error("Forward pass failed: %s", str(e))
+        raise type(e)(f"Failed during forward pass: {str(e)}") from e
