@@ -201,16 +201,23 @@ class TagBasedLossWeighter:
         """Initialize tag classification system."""
         try:
             # Initialize base mapping
-            self.tag_to_class = {}
+            self.tag_classes = tag_classes or {
+                "quality": set(),
+                "style": set(),
+                "character": set(),
+                "action": set(),
+                "setting": set(),
+                "object": set(),
+                "emphasis": set(),
+                "meta": set()
+            }
             
-            # Update from provided classes
-            if tag_classes:
-                self.tag_to_class.update({
-                    tag: cls 
-                    for cls, tags in tag_classes.items() 
-                    for tag in tags
-                })
-                
+            # Create reverse mapping
+            self.tag_to_class = {}
+            for class_name, tags in self.tag_classes.items():
+                for tag in tags:
+                    self.tag_to_class[tag] = class_name
+                    
             # Validate categories
             for category in self.TAG_CATEGORIES.values():
                 if not isinstance(category, dict):
@@ -232,6 +239,14 @@ class TagBasedLossWeighter:
             # Initialize caches
             if not hasattr(self, 'tag_weight_cache'):
                 self.tag_weight_cache = {}
+                
+            # Configure caching behavior for calculate_tag_weights
+            if not self.no_cache:
+                self.calculate_tag_weights = lru_cache(maxsize=self.cache_size)(
+                    self._calculate_tag_weights
+                )
+            else:
+                self.calculate_tag_weights = self._calculate_tag_weights
                 
             logger.info("Statistics and caches initialized successfully")
         except Exception as e:
@@ -371,121 +386,6 @@ class TagBasedLossWeighter:
         if tag.startswith(("a ", "an ", "the ")):
             tag = " ".join(tag.split()[1:])
         return tag.strip() if tag.strip() else None
-
-    def calculate_static_weights(
-        self,
-        tags: List[str], special_tags: Dict[str, any] = None
-    ) -> float:
-        """
-        Static method to calculate basic weights without instance-specific data.
-
-        Args:
-            tags (List[str]): List of tags
-            special_tags (Dict): Special tag parameters
-
-        Returns:
-            float: Basic weight value
-        """
-        if special_tags is None:
-            special_tags = {}
-
-        base_weight = 1.0
-
-        # Apply basic modifiers
-        if "masterpiece" in tags:
-            base_weight *= 1.3
-        if special_tags.get("niji", False):
-            base_weight *= 1.2
-        if "stylize" in special_tags:
-            stylize_value = special_tags["stylize"]
-            stylize_weight = 1.0 + (math.log10(stylize_value) / 3.0)
-            base_weight *= stylize_weight
-        if "chaos" in special_tags:
-            chaos_value = special_tags["chaos"]
-            chaos_factor = 1.0 + (chaos_value / 200.0)
-            base_weight *= chaos_factor
-
-        # Clamp between min and max
-        return max(
-            self.MIN_WEIGHT,
-            min(self.MAX_WEIGHT, base_weight),
-        )
-
-    def format_caption(self, caption: str) -> str:
-        """
-        Static method to format caption text with standardized formatting.
-
-        Args:
-            caption (str): Raw caption text
-
-        Returns:
-            str: Formatted caption text
-
-        Raises:
-            TypeError: If caption is not a string
-            AttributeError: If string operations fail
-            IndexError: If list operations fail
-        """
-        if not isinstance(caption, str):
-            logger.error("Caption must be a string, got %s", type(caption))
-            return ""
-
-        if not caption:
-            return ""
-
-        try:
-            # Split into tags
-            tags = [t.strip() for t in caption.split(',') if t.strip()]
-            
-            # Remove empty tags
-            tags = [t for t in tags if t]
-
-            # Basic cleanup for each tag
-            formatted_tags = []
-            for tag in tags:
-                # Convert to lowercase
-                tag = tag.lower()
-
-                # Remove extra spaces
-                tag = " ".join(tag.split())
-
-                # Remove articles from start
-                if tag.startswith(("a ", "an ", "the ")):
-                    tag = " ".join(tag.split()[1:])
-
-                # Handle special formatting for quality tags
-                if any(
-                    q in tag for q in ["masterpiece", "best quality", "high quality"]
-                ):
-                    formatted_tags.insert(0, tag)  # Move to front
-                    continue
-
-                # Handle special formatting for negative tags
-                if tag.startswith(("no ", "bad ", "worst ")):
-                    if not any(
-                        neg in tag for neg in ["negative space", "negative prompt"]
-                    ):
-                        tag = (
-                            tag.replace("no ", "")
-                            .replace("bad ", "")
-                            .replace("worst ", "")
-                        )
-                        tag = f"lowquality {tag}"
-
-                formatted_tags.append(tag)
-
-            # Join tags with standardized separator
-            return ", ".join(formatted_tags)
-
-        except AttributeError as e:
-            logger.error("String operation error in caption formatting: %s", str(e))
-            return caption  # Return original if formatting fails
-        except IndexError as e:
-            logger.error("List operation error in caption formatting: %s", str(e))
-            return caption  # Return original if formatting fails
-        except TypeError as e:
-            logger.error("Type error in caption formatting: %s", str(e))
-            return caption  # Return original if formatting fails
 
     def process_caption(self, caption: str) -> Tuple[List[str], Dict[str, float]]:
         """Process a caption to extract tags and special tags with weights."""
@@ -789,7 +689,7 @@ class TagBasedLossWeighter:
             importance *= self.character_emphasis
 
         # Apply emphasis for emphasized tags
-        if tag in self.tag_classes["emphasis"]:
+        if class_name == "emphasis" or tag in self.tag_classes.get("emphasis", set()):
             importance *= self.emphasis_factor
 
         # Apply rarity bonus
@@ -858,3 +758,79 @@ class TagBasedLossWeighter:
             return [future.result() for future in futures]
         else:
             return [self._calculate_tag_weights(tuple(tags)) for tags in batch_tags]
+
+    def format_caption(self, caption: str) -> str:
+        """
+        Static method to format caption text with standardized formatting.
+
+        Args:
+            caption (str): Raw caption text
+
+        Returns:
+            str: Formatted caption text
+
+        Raises:
+            TypeError: If caption is not a string
+            AttributeError: If string operations fail
+            IndexError: If list operations fail
+        """
+        if not isinstance(caption, str):
+            logger.error("Caption must be a string, got %s", type(caption))
+            return ""
+
+        if not caption:
+            return ""
+
+        try:
+            # Split into tags
+            tags = [t.strip() for t in caption.split(',') if t.strip()]
+            
+            # Remove empty tags
+            tags = [t for t in tags if t]
+
+            # Basic cleanup for each tag
+            formatted_tags = []
+            for tag in tags:
+                # Convert to lowercase
+                tag = tag.lower()
+
+                # Remove extra spaces
+                tag = " ".join(tag.split())
+
+                # Remove articles from start
+                if tag.startswith(("a ", "an ", "the ")):
+                    tag = " ".join(tag.split()[1:])
+
+                # Handle special formatting for quality tags
+                if any(
+                    q in tag for q in ["masterpiece", "best quality", "high quality"]
+                ):
+                    formatted_tags.insert(0, tag)  # Move to front
+                    continue
+
+                # Handle special formatting for negative tags
+                if tag.startswith(("no ", "bad ", "worst ")):
+                    if not any(
+                        neg in tag for neg in ["negative space", "negative prompt"]
+                    ):
+                        tag = (
+                            tag.replace("no ", "")
+                            .replace("bad ", "")
+                            .replace("worst ", "")
+                        )
+                        tag = f"lowquality {tag}"
+
+                formatted_tags.append(tag)
+
+            # Join tags with standardized separator
+            return ", ".join(formatted_tags)
+
+        except AttributeError as e:
+            logger.error("String operation error in caption formatting: %s", str(e))
+            return caption  # Return original if formatting fails
+        except IndexError as e:
+            logger.error("List operation error in caption formatting: %s", str(e))
+            return caption  # Return original if formatting fails
+        except TypeError as e:
+            logger.error("Type error in caption formatting: %s", str(e))
+            return caption  # Return original if formatting fails
