@@ -503,7 +503,7 @@ def initialize_training_components(args, models):
             "ema": (
                 setup_ema, 
                 args.ema.use_ema, 
-                (args.ema, models["unet"], args.model.model_path)  # Pass model path from config
+                (args.ema, models["unet"]) 
             ),
             "tag_weighter": (
                 setup_tag_weighter, 
