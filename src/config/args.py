@@ -68,6 +68,7 @@ class TrainingArgs:
     scale_method: str = "karras"
     scale_factor: float = 0.7
     device: str = "cuda"
+    mixed_precision: str = "fp16"
 
 @dataclass
 class OptimizerArgs:
