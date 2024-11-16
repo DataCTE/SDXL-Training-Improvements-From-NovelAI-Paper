@@ -136,6 +136,10 @@ class VAEArgs:
         perceptual_weight: The weighting of the perceptual loss for the VAE.
         use_channel_scaling: Whether to use channel scaling for the VAE.
         initial_scale_factor: The initial scale factor for channel scaling.
+        weight_decay: The weight decay for the VAE's optimizer.
+        max_grad_norm: The maximum gradient norm for the VAE.
+        gradient_checkpointing: Whether to use gradient checkpointing for the VAE.
+        min_snr_gamma: The minimum SNR gamma for the VAE.
     """
     use_vae: bool = True
     path: Optional[str] = None
@@ -149,6 +153,10 @@ class VAEArgs:
     perceptual_weight: float = 0.0
     use_channel_scaling: bool = True
     initial_scale_factor: float = 1.0
+    weight_decay: float = 1e-2
+    max_grad_norm: float = 1.0
+    gradient_checkpointing: bool = False
+    min_snr_gamma: float = 5.0
 
 @dataclass
 class DataArgs:
@@ -411,7 +419,11 @@ def parse_args() -> TrainingConfig:
             kl_weight=args.kl_weight,
             perceptual_weight=args.perceptual_weight,
             use_channel_scaling=args.vae_use_channel_scaling,
-            initial_scale_factor=args.vae_initial_scale_factor
+            initial_scale_factor=args.vae_initial_scale_factor,
+            weight_decay=args.weight_decay,
+            max_grad_norm=args.max_grad_norm,
+            gradient_checkpointing=args.gradient_checkpointing,
+            min_snr_gamma=args.min_snr_gamma
         ),
         data=DataArgs(
             data_dir=args.data_dir,
