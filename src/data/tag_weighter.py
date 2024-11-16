@@ -221,8 +221,7 @@ class TagBasedLossWeighter:
         logger.info("- Cache size: %s", self.cache_size)
         logger.info("- Workers: %s", self.num_workers)
 
-    @staticmethod
-    def parse_tags(caption: str) -> Tuple[List[str], Dict[str, Any]]:
+    def parse_tags(self, caption: str) -> Tuple[List[str], Dict[str, Any]]:
         """
         Parse caption into tags and special tags with improved error handling.
 
@@ -262,23 +261,22 @@ class TagBasedLossWeighter:
 
             # Process special tag formats
             if "::" in tag:
-                tag, weight = TagBasedLossWeighter._process_weighted_tag(tag)
+                tag, weight = self._process_weighted_tag(tag)
                 if weight is not None:
                     special_tags[f"{tag}_weight"] = weight
 
             elif has_mj_tags:
-                tag = TagBasedLossWeighter._process_mj_tag(
+                tag = self._process_mj_tag(
                     tag, i, len(raw_tags), special_tags
                 )
 
             # Clean and add tag
-            if tag := TagBasedLossWeighter._clean_tag(tag):
+            if tag := self._clean_tag(tag):
                 tags.append(tag)
 
         return tags, special_tags
 
-    @staticmethod
-    def _process_weighted_tag(tag: str) -> Tuple[str, Optional[float]]:
+    def _process_weighted_tag(self, tag: str) -> Tuple[str, Optional[float]]:
         """Process a weighted tag format (tag::weight)."""
         parts = tag.split("::")
         try:
@@ -286,8 +284,8 @@ class TagBasedLossWeighter:
         except (IndexError, ValueError):
             return parts[0].strip(), None
 
-    @staticmethod
     def _process_mj_tag(
+        self,
         tag: str, index: int, total_tags: int, special_tags: Dict[str, Any]
     ) -> Optional[str]:
         """Process Midjourney-specific tags.
@@ -337,15 +335,14 @@ class TagBasedLossWeighter:
 
         return tag
 
-    @staticmethod
-    def _clean_tag(tag: str) -> Optional[str]:
+    def _clean_tag(self, tag: str) -> Optional[str]:
         """Clean and normalize a tag."""
         if tag.startswith(("a ", "an ", "the ")):
             tag = " ".join(tag.split()[1:])
         return tag.strip() if tag.strip() else None
 
-    @staticmethod
     def calculate_static_weights(
+        self,
         tags: List[str], special_tags: Dict[str, any] = None
     ) -> float:
         """
@@ -379,12 +376,11 @@ class TagBasedLossWeighter:
 
         # Clamp between min and max
         return max(
-            TagBasedLossWeighter.MIN_WEIGHT,
-            min(TagBasedLossWeighter.MAX_WEIGHT, base_weight),
+            self.MIN_WEIGHT,
+            min(self.MAX_WEIGHT, base_weight),
         )
 
-    @staticmethod
-    def format_caption(caption: str) -> str:
+    def format_caption(self, caption: str) -> str:
         """
         Static method to format caption text with standardized formatting.
 
@@ -672,7 +668,7 @@ class TagBasedLossWeighter:
             if f"{tag}_weight" in special_tags:
                 final_weight *= special_tags[f"{tag}_weight"]
 
-            weights[tag] = max(self.min_weight, min(self.max_weight, final_weight))
+            weights[tag] = max(self.MIN_WEIGHT, min(self.MAX_WEIGHT, final_weight))
 
         return weights
 
@@ -686,6 +682,78 @@ class TagBasedLossWeighter:
             tags_tuple, frozenset(special_tags.items()) if special_tags else None
         )
 
+    def process_caption(self, caption: str) -> Tuple[List[str], Dict[str, float]]:
+        """Process a caption to extract tags and weights.
+        
+        Args:
+            caption (str): The caption text to process
+            
+        Returns:
+            Tuple[List[str], Dict[str, float]]: A tuple containing:
+                - List of regular tags
+                - Dictionary mapping special tags to their weights
+        """
+        if not caption:
+            return [], {}
+            
+        try:
+            # Parse tags and special tags
+            tags, special_tags = self.parse_tags(caption)
+            
+            # Convert special tags to a proper dictionary
+            if isinstance(special_tags, dict):
+                special_tags_dict = special_tags
+            else:
+                special_tags_dict = {}
+                for tag in special_tags:
+                    if isinstance(tag, str):
+                        if "::" in tag:
+                            tag_name, weight = tag.split("::", 1)
+                            try:
+                                special_tags_dict[tag_name] = float(weight)
+                            except ValueError:
+                                special_tags_dict[tag_name] = 1.0
+                        else:
+                            special_tags_dict[tag] = 1.0
+                            
+            return tags, special_tags_dict
+            
+        except Exception as e:
+            logger.warning(f"Error processing caption: {str(e)}")
+            return [], {}
+
+    def calculate_caption_weight(self, caption: str) -> float:
+        """Calculate the weight for a caption.
+        
+        Args:
+            caption (str): The caption text
+            
+        Returns:
+            float: The calculated weight, clamped between MIN_WEIGHT and MAX_WEIGHT
+        """
+        if not caption:
+            return 1.0
+            
+        try:
+            # Process caption to get tags and weights
+            tags, special_tags = self.process_caption(caption)
+            
+            # Calculate weights
+            weights = self.calculate_weights(tags, special_tags)
+            
+            if isinstance(weights, dict):
+                # Average the weights if multiple were returned
+                tag_weight = sum(weights.values()) / len(weights) if weights else 1.0
+            else:
+                # Single weight value
+                tag_weight = float(weights) if weights else 1.0
+                
+            # Clamp weight to valid range
+            return max(self.MIN_WEIGHT, min(self.MAX_WEIGHT, tag_weight))
+            
+        except Exception as e:
+            logger.warning(f"Error calculating caption weight: {str(e)}")
+            return 1.0
 
     def update_training_loss(self, loss: torch.Tensor, tags: List[str]) -> torch.Tensor:
         """

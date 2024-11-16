@@ -622,10 +622,7 @@ class CustomDataset(CustomDatasetBase):
         # Calculate tag weights if enabled
         tag_weight = 1.0
         if self.use_tag_weighting and caption:
-            tags, special_tags = self._parse_tags(caption)
-            # Convert special tags to a dict with default weight of 1.0
-            special_tags_dict = {tag: 1.0 for tag in tags if isinstance(tag, str) and tag.startswith('_')}
-            tag_weight = self._calculate_tag_weights(tags, special_tags_dict)
+            tag_weight = self.tag_weighter.calculate_caption_weight(caption)
         
         return {
             'latent': latent,
