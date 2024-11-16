@@ -148,14 +148,32 @@ class TagBasedLossWeighter:
 
     def _init_config(self, config: Dict[str, Any]) -> None:
         """Initialize configuration parameters."""
-        self.min_weight = config.get("min_weight", self.MIN_WEIGHT)
-        self.max_weight = config.get("max_weight", self.MAX_WEIGHT)
-        self.emphasis_factor = config.get("emphasis_factor", self.DEFAULT_EMPHASIS_FACTOR)
-        self.rarity_factor = config.get("rarity_factor", self.DEFAULT_RARITY_FACTOR)
-        self.quality_bonus = config.get("quality_bonus", self.DEFAULT_QUALITY_BONUS)
-        self.character_emphasis = config.get("character_emphasis", self.DEFAULT_CHARACTER_EMPHASIS)
-        self.cache_size = config.get("cache_size", self.DEFAULT_CACHE_SIZE)
-        self.no_cache = config.get("no_cache", False)
+        # Core parameters
+        self.min_weight = self.MIN_WEIGHT = float(config.get('min_weight', 0.1))
+        self.max_weight = self.MAX_WEIGHT = float(config.get('max_weight', 3.0))
+        self.emphasis_factor = float(config.get('emphasis_factor', self.DEFAULT_EMPHASIS_FACTOR))
+        self.rarity_factor = float(config.get('rarity_factor', self.DEFAULT_RARITY_FACTOR))
+        self.quality_bonus = float(config.get('quality_bonus', self.DEFAULT_QUALITY_BONUS))
+        self.character_emphasis = float(config.get('character_emphasis', self.DEFAULT_CHARACTER_EMPHASIS))
+        self.cache_size = int(config.get('cache_size', self.DEFAULT_CACHE_SIZE))
+        self.num_workers = int(config.get('num_workers', min(32, (os.cpu_count() or 1) + 4)))
+        self.no_cache = bool(config.get('no_cache', False))
+        
+        # Initialize base weights for tag classes
+        self.class_base_weights = {
+            'quality': 1.2,
+            'style': 1.1,
+            'character': 1.3,
+            'action': 1.0,
+            'setting': 0.9,
+            'object': 0.8,
+            'emphasis': 1.2,
+            'meta': 0.5
+        }
+        
+        # Update class weights from config if provided
+        if 'class_weights' in config:
+            self.class_base_weights.update(config['class_weights'])
 
     def _init_tag_classes(self, tag_classes: Optional[Dict[str, Set[str]]]) -> None:
         """Initialize tag classification system."""
@@ -168,18 +186,6 @@ class TagBasedLossWeighter:
             "quality": set(),
             "emphasis": set(),
             "meta": set(),
-        }
-
-        # Initialize class weights
-        self.class_base_weights = {
-            "character": 1.2,
-            "style": 1.1,
-            "setting": 0.9,
-            "action": 1.0,
-            "object": 0.8,
-            "quality": 1.3,
-            "emphasis": 1.4,
-            "meta": 0.7,
         }
 
         # Create tag to class mapping
@@ -208,7 +214,6 @@ class TagBasedLossWeighter:
 
     def _init_executor(self) -> None:
         """Initialize thread pool executor."""
-        self.num_workers = min(8, os.cpu_count() or 1)
         self.executor = ThreadPoolExecutor(max_workers=self.num_workers)
 
     def _log_config(self) -> None:
@@ -676,7 +681,7 @@ class TagBasedLossWeighter:
         self, tags: List[str], special_tags: Dict[str, any] = None
     ) -> Dict[str, float]:
         """Cached weight calculation"""
-        # Convert tags to tuple for caching
+        # Convert inputs to hashable types for caching
         tags_tuple = tuple(sorted(tags))
         return self.calculate_tag_weights(
             tags_tuple, frozenset(special_tags.items()) if special_tags else None
