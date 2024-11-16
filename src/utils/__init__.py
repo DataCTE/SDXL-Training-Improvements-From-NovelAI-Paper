@@ -1,5 +1,5 @@
 from .checkpoint import save_checkpoint, load_checkpoint, save_final_outputs
-from .device import cleanup, get_device, to_device
+from .device import cleanup_memory as cleanup, get_device, to_device
 from .hub import push_to_hub, create_model_card, save_model_card
 from .logging import (
     setup_logging,
