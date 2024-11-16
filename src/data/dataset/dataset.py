@@ -92,10 +92,7 @@ class CustomDataset(CustomDatasetBase):
         self.latents_cache = {}
         
         # Initialize tag weight cache
-        if use_tag_weighting:
-            self.tag_weight_cache = {}
-        else:
-            self.tag_weight_cache = None
+        self.tag_weight_cache = {}
         
         # Store initialization parameters for workers
         self.init_params = {
@@ -724,13 +721,13 @@ class CustomDataset(CustomDatasetBase):
                 logger.debug("Failed to read caption file %s: %s", caption_path, str(e))
                 continue
             
-            # Get pre-computed tag weight from cache
+            # Always get tag weight from cache since tag caching is always enabled
             tag_weight = self.tag_weight_cache.get(image_path, 1.0) if self.use_tag_weighting else 1.0
             
-            # Process latent
+            # Process latent based on caching setting
             latent = None
             if not self.no_caching_latents:
-                # Try to get from cache first
+                # Try to get from cache first if caching is enabled
                 latent = self.latents_cache.get(image_path)
             
             if latent is None:
@@ -749,14 +746,15 @@ class CustomDataset(CustomDatasetBase):
                             ).latent_dist.sample()
                             
                         if not self.no_caching_latents:
-                            self.latents_cache[image_path] = latent.cpu()  # Cache if enabled
+                            # Only cache if caching is enabled
+                            self.latents_cache[image_path] = latent.cpu()
                         
                 except Exception as e:
                     logger.debug("Failed to process image %s: %s", image_path, str(e))
                     continue
             
             return {
-                'latent': latent.cpu() if latent.device.type == 'cuda' else latent,  # Ensure latent is on CPU
+                'latent': latent.cpu() if latent.device.type == 'cuda' else latent,
                 'caption': caption,
                 'tag_weight': tag_weight,
                 'metadata': {
@@ -765,7 +763,6 @@ class CustomDataset(CustomDatasetBase):
                 }
             }
             
-        # If we've tried all items and found none valid, raise an error
         raise RuntimeError(
             f"No valid items found in dataset after trying {max_attempts} items. "
             "Check that your dataset contains valid images and captions."
