@@ -58,43 +58,33 @@ class BucketManager:
             # Generate adaptive buckets based on dataset statistics
             buckets.update(self._generate_adaptive_buckets())
         
-        # Add standard buckets from NovelAI algorithm
+        # Add landscape buckets (width >= 1024)
         for width in range(1024, self.max_size + 1, self.step_size):
-            # Find largest height that satisfies area constraint
-            height = min(
-                self.max_size,  # Don't exceed max_size
-                math.floor(self.max_area / width)  # Height from area constraint
+            # Find heights that satisfy area constraint
+            max_height = min(
+                self.max_size,
+                math.floor(self.max_area / width)
             )
-            # Round down to nearest step size
-            height = (height // self.step_size) * self.step_size
+            max_height = (max_height // self.step_size) * self.step_size
             
-            # Ensure minimum size
-            if height >= self.min_size:
-                buckets.add((height, width))
-            
-            # Add corresponding smaller height if width is large enough
-            if width >= 1024 and height >= 1024:
-                for h in range(self.min_size, 1024, self.step_size):
-                    if h * width <= self.max_area:
-                        buckets.add((h, width))
+            # Add valid height combinations
+            for height in range(self.min_size, max_height + 1, self.step_size):
+                if height * width <= self.max_area:
+                    buckets.add((height, width))
         
-        # Add portrait buckets (swap height/width)
+        # Add portrait buckets (height >= 1024)
         for height in range(1024, self.max_size + 1, self.step_size):
-            width = min(
+            # Find widths that satisfy area constraint
+            max_width = min(
                 self.max_size,
                 math.floor(self.max_area / height)
             )
-            width = (width // self.step_size) * self.step_size
+            max_width = (max_width // self.step_size) * self.step_size
             
-            # Ensure minimum size
-            if width >= self.min_size:
-                buckets.add((height, width))
-            
-            # Add corresponding smaller width if height is large enough
-            if height >= 1024 and width >= 1024:
-                for w in range(self.min_size, 1024, self.step_size):
-                    if height * w <= self.max_area:
-                        buckets.add((height, w))
+            # Add valid width combinations
+            for width in range(self.min_size, max_width + 1, self.step_size):
+                if height * width <= self.max_area:
+                    buckets.add((height, width))
         
         # Add square buckets if requested (must be 1024 or larger)
         if self.add_square:

@@ -74,7 +74,7 @@ class CustomDataset(CustomDatasetBase):
             self.device = next(self.vae.parameters()).device
         
         # Initialize flags first before any processing
-        self.collate_fn = self.custom_collate
+        self.collate_fn = self.collate_fn
         self.all_ar = all_ar
         self.no_caching_latents = no_caching_latents
         self.min_size = min_size
@@ -922,33 +922,100 @@ class CustomDataset(CustomDatasetBase):
             logger.error(f"Failed to offload latents to disk: {str(e)}")
             raise
 
-    def custom_collate(self, batch):
-        """Custom collate function for DataLoader to handle batched data.
+    def collate_fn(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        """Custom collate function to handle batches of different sizes.
         
         Args:
-            batch: List of data items from dataset
+            batch: List of dictionaries containing batch items
             
         Returns:
-            Dict containing batched tensors and metadata
+            Dictionary containing batched tensors
         """
-        batch_dict = {
-            'latents': [],
-            'captions': [],
-            'tag_weights': [],
-            'metadata': []
-        }
-        
+        # Group items by bucket size
+        bucket_groups = defaultdict(list)
         for item in batch:
-            batch_dict['latents'].append(item.get('latent'))
-            batch_dict['captions'].append(item.get('caption', ''))
-            batch_dict['tag_weights'].append(item.get('tag_weight', 1.0))
-            batch_dict['metadata'].append(item.get('metadata', {}))
-            
-        # Stack tensors and convert to appropriate formats
-        batch_dict['latents'] = torch.stack(batch_dict['latents'])
-        batch_dict['tag_weights'] = torch.tensor(batch_dict['tag_weights'], dtype=torch.float32)
+            bucket_size = item['bucket_size']
+            bucket_groups[bucket_size].append(item)
         
-        return batch_dict
+        # Process largest group if we have multiple sizes
+        if len(bucket_groups) > 1:
+            largest_group = max(bucket_groups.items(), key=lambda x: len(x[1]))
+            batch = largest_group[1]
+        
+        # Now all items in batch have same dimensions
+        return {
+            'image': torch.stack([item['image'] for item in batch]),
+            'latents': torch.stack([item['latents'] for item in batch]),
+            'caption': [item['caption'] for item in batch],
+            'tags': [item['tags'] for item in batch],
+            'tag_weights': [item['tag_weights'] for item in batch],
+            'bucket_size': batch[0]['bucket_size'],  # All same now
+            'image_path': [item['image_path'] for item in batch]
+        }
+
+    def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
+        """Get a single item from the dataset.
+        
+        Args:
+            index: Index of the item to get
+            
+        Returns:
+            Dictionary containing the item data
+        """
+        try:
+            # Get bucket and index within bucket
+            bucket_idx = index % len(self.bucket_data)
+            bucket = list(self.bucket_data.keys())[bucket_idx]
+            image_idx = index // len(self.bucket_data)
+            
+            # Get image path from bucket
+            bucket_images = self.bucket_data[bucket]
+            if image_idx >= len(bucket_images):
+                # Wrap around if we've exhausted this bucket
+                image_idx = image_idx % len(bucket_images)
+            image_path = bucket_images[image_idx]
+            
+            # Load and process image
+            target_height, target_width = bucket
+            
+            # Get caption
+            caption = self._load_caption(image_path)
+            if not caption:
+                caption = ""
+            
+            # Process tags if using tag weighting
+            tags, tag_weights = self._process_caption_tags(caption)
+            
+            # Load image and convert to RGB
+            with Image.open(image_path) as img:
+                if img.mode != 'RGB':
+                    img = img.convert('RGB')
+                
+                # Resize to target bucket size
+                if img.size != (target_width, target_height):
+                    img = img.resize((target_width, target_height), Image.Resampling.LANCZOS)
+                
+                # Convert to tensor
+                image = self.image_transforms(img)
+            
+            # Get or compute latents
+            latents = self._get_latents(image_path, image)
+            
+            # Return processed data
+            return {
+                'image': image,
+                'latents': latents,
+                'caption': caption,
+                'tags': tags,
+                'tag_weights': tag_weights,
+                'bucket_size': (target_height, target_width),
+                'image_path': image_path
+            }
+            
+        except Exception as e:
+            logger.error(f"Error processing item {index}: {str(e)}")
+            # Return next valid item
+            return self.__getitem__((index + 1) % len(self))
 
     def shuffle_dataset(self, seed: Optional[int] = None):
         """Shuffle the dataset while maintaining image-caption pairs.
@@ -988,102 +1055,6 @@ class CustomDataset(CustomDatasetBase):
         """Return the total number of items in the dataset"""
         return len(self.image_paths)
     
-    def __getitem__(self, idx: Union[int, slice]) -> Any:
-        """Get a single item or slice of items from the dataset"""
-        if isinstance(idx, slice):
-            return [self[i] for i in range(*idx.indices(len(self)))]
-        
-        # Add safety counter to prevent infinite loops
-        max_attempts = len(self)
-        attempts = 0
-        
-        while attempts < max_attempts:
-            current_idx = (idx + attempts) % len(self)
-            attempts += 1
-            
-            image_path = self.image_paths[current_idx]
-            
-            # Get caption and process it first (faster to check)
-            caption_path = Path(image_path).with_suffix('.txt')
-            try:
-                with open(caption_path, 'r', encoding='utf-8') as f:
-                    caption = f.read().strip()
-                if not caption:
-                    continue
-            except (IOError, OSError) as e:
-                logger.debug(f"Failed to read caption file %s: %s", caption_path, str(e))
-                continue
-            
-            # Always get tag weight from cache since tag caching is always enabled
-            tag_weight = self.tag_weight_cache.get(image_path, 1.0) if self.use_tag_weighting else 1.0
-            
-            # Process latent based on caching setting
-            latent = None
-            if not self.no_caching_latents:
-                # Try to get from cache first if caching is enabled
-                latent = self.latents_cache.get(image_path)
-            
-            if latent is None:
-                # Process latent on-the-fly if not in cache or caching is disabled
-                try:
-                    with Image.open(image_path) as img:
-                        img = img.convert('RGB')
-                        
-                        # Get original dimensions
-                        orig_height, orig_width = img.size[1], img.size[0]
-                        
-                        # Find closest bucket resolution
-                        target_height, target_width = self._find_bucket(orig_height, orig_width)
-                        
-                        # Resize image to target bucket resolution
-                        if (orig_height, orig_width) != (target_height, target_width):
-                            img = img.resize((target_width, target_height), Image.Resampling.LANCZOS)
-                        
-                        # Optimize image processing for GPU
-                        image = torch.from_numpy(
-                            np.array(img, dtype=np.float32)
-                        ).permute(2, 0, 1).unsqueeze(0) / 127.5 - 1
-                        
-                        # Move to GPU and use automatic mixed precision
-                        with torch.cuda.amp.autocast():
-                            with torch.no_grad():
-                                image = image.to(self.device)
-                                latent = self.vae.encode(image).latent_dist.sample()
-                                
-                                if not self.no_caching_latents:
-                                    # Only cache if caching is enabled
-                                    self.latents_cache[image_path] = latent.cpu()
-                                    latent = latent.cpu()  # Move to CPU for storage
-                                
-                        # Clean up GPU memory
-                        del image
-                        torch.cuda.empty_cache()
-                        
-                except Exception as e:
-                    logger.debug("Failed to process image %s: %s", image_path, str(e))
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    continue
-            
-            # Ensure latent is on CPU for return
-            if latent.device.type == 'cuda':
-                latent = latent.cpu()
-                
-            return {
-                'latent': latent,
-                'caption': caption,
-                'tag_weight': tag_weight,
-                'metadata': {
-                    'image_path': image_path,
-                    'caption_path': str(caption_path)
-                }
-            }
-            
-        raise RuntimeError(
-            f"No valid items found in dataset after trying {max_attempts} items. "
-            "Check that your dataset contains valid images and captions."
-        )
-
     def _build_bucket_lookup_cache(self):
         """Build an efficient lookup cache for bucket assignment"""
         buckets = self.bucket_manager.buckets
