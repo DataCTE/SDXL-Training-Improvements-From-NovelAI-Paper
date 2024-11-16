@@ -319,7 +319,7 @@ def parse_args() -> TrainingConfig:
     parser.add_argument("--update_every", type=int, default=1)
     parser.add_argument("--use_ema_warmup", action="store_true", default=True)
     parser.add_argument("--mixed_precision", type=str, default="bf16", choices=["no", "fp16", "bf16"])
-    parser.add_argument("--gradient_checkpointing", action="store_true", default=True)
+    
     
     # VAE arguments
     parser.add_argument("--use_vae", action="store_true", default=True)
