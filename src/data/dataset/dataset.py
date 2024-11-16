@@ -725,7 +725,7 @@ class CustomDataset(CustomDatasetBase):
             ).permute(2, 0, 1).unsqueeze(0)
             
             # Move to GPU and process through VAE encoder
-            with torch.cuda.amp.autocast():
+            with torch.cuda.amp.autocast('cuda'):
                 with torch.no_grad():
                     image_tensor = image_tensor.to(self.device)
                     latent = self.vae.encode(image_tensor).latent_dist.sample()
@@ -790,6 +790,40 @@ class CustomDataset(CustomDatasetBase):
         batch_dict['tag_weights'] = torch.tensor(batch_dict['tag_weights'], dtype=torch.float32)
         
         return batch_dict
+
+    def shuffle_dataset(self, seed: Optional[int] = None):
+        """Shuffle the dataset while maintaining image-caption pairs.
+        
+        Args:
+            seed: Optional random seed for reproducibility
+        """
+        if seed is not None:
+            torch.manual_seed(seed)
+            
+        # Create indices array
+        indices = torch.randperm(len(self.image_paths)).tolist()
+        
+        # Shuffle image paths using the indices
+        self.image_paths = [self.image_paths[i] for i in indices]
+        
+        # Shuffle cached data if present
+        if self.latents_cache:
+            new_latents_cache = {}
+            for i, idx in enumerate(indices):
+                path = self.image_paths[i]
+                if path in self.latents_cache:
+                    new_latents_cache[path] = self.latents_cache[path]
+            self.latents_cache = new_latents_cache
+            
+        if self.tag_weight_cache:
+            new_tag_cache = {}
+            for i, idx in enumerate(indices):
+                path = self.image_paths[i]
+                if path in self.tag_weight_cache:
+                    new_tag_cache[path] = self.tag_weight_cache[path]
+            self.tag_weight_cache = new_tag_cache
+            
+        logger.info(f"Shuffled dataset with {len(self.image_paths)} images")
 
     def __len__(self) -> int:
         """Return the total number of items in the dataset"""

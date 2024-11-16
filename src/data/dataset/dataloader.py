@@ -139,6 +139,18 @@ class CustomDataLoader(CustomDataLoaderBase):
         # Initialize if needed
         self.initialize()
         
+        # Shuffle dataset if enabled and sampler supports shuffling
+        should_shuffle = (
+            hasattr(self.sampler, 'shuffle') and 
+            getattr(self.sampler, 'shuffle', False)
+        )
+        if should_shuffle and hasattr(self.dataset, 'shuffle_dataset'):
+            # Use epoch from sampler if available
+            seed = None
+            if hasattr(self.sampler, '_epoch'):
+                seed = self.sampler._epoch
+            self.dataset.shuffle_dataset(seed=seed)
+        
         # Get iterator from sampler
         self._iterator = iter(self.batch_sampler)
         
