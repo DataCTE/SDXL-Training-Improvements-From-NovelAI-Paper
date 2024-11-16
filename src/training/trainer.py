@@ -134,7 +134,7 @@ def setup_vae_finetuner(args, models) -> Optional[VAEFineTuner]:
     Raises:
         Exception: If the setup of the VAE FineTuner fails.
     """
-    if not args.vae.finetune_vae:
+    if not args.finetune_vae:
         return None
 
     try:
@@ -143,22 +143,22 @@ def setup_vae_finetuner(args, models) -> Optional[VAEFineTuner]:
             device=args.training.device,
             mixed_precision=args.training.mixed_precision,
             use_amp=args.training.use_amp,
-            learning_rate=args.vae.learning_rate,
+            learning_rate=args.learning_rate,
             adam_beta1=args.optimizer.adam_beta1,
             adam_beta2=args.optimizer.adam_beta2,
             adam_epsilon=args.optimizer.adam_epsilon,
-            weight_decay=args.vae.weight_decay,
-            max_grad_norm=args.vae.max_grad_norm,
-            gradient_checkpointing=args.vae.gradient_checkpointing,
+            weight_decay=args.weight_decay,
+            max_grad_norm=args.max_grad_norm,
+            gradient_checkpointing=args.gradient_checkpointing,
             use_8bit_adam=args.optimizer.use_8bit_adam,
-            use_channel_scaling=args.vae.use_channel_scaling,
-            adaptive_loss_scale=args.vae.adaptive_loss_scale,
-            kl_weight=args.vae.kl_weight,
-            perceptual_weight=args.vae.perceptual_weight,
-            min_snr_gamma=args.vae.min_snr_gamma,
-            initial_scale_factor=args.vae.initial_scale_factor,
-            decay=args.vae.decay,
-            update_after_step=args.vae.update_after_step,
+            use_channel_scaling=args.use_channel_scaling,
+            adaptive_loss_scale=args.adaptive_loss_scale,
+            kl_weight=args.kl_weight,
+            perceptual_weight=args.perceptual_weight,
+            min_snr_gamma=args.min_snr_gamma,
+            initial_scale_factor=args.initial_scale_factor,
+            decay=args.decay,
+            update_after_step=args.update_after_step,
         )
         return vae_finetuner
     except Exception as e:
@@ -429,8 +429,6 @@ def initialize_training_components(args, models):
             model = models[key]
             if key == "vae":
                 # Special handling for VAE
-                
-
                 dataloader_models[key] = AutoencoderKL.from_config(model.config)
                 dataloader_models[key].load_state_dict(model.state_dict())
             elif hasattr(model, "state_dict"):
@@ -486,18 +484,33 @@ def initialize_training_components(args, models):
         # Setup optional components with parallel initialization
         optional_components = {
             "ema": (setup_ema, args.ema.use_ema, (args, models["unet"])),
-            "tag_weighter": (setup_tag_weighter, args.tag_weighting.use_tag_weighting, (args,)),
-            "vae_finetuner": (setup_vae_finetuner, args.vae.finetune_vae, (args, models)),
+            "tag_weighter": (
+                setup_tag_weighter, 
+                args.tag_weighting.use_tag_weighting, 
+                (args,)
+            ),
+            # Updated VAE finetuner setup to access properties correctly
+            "vae_finetuner": (
+                setup_vae_finetuner, 
+                args.vae.finetune_vae, 
+                (args.vae, {
+                    **models,
+                    "training": args.training,
+                    "optimizer": args.optimizer
+                })
+            ),
         }
 
-        components.update(
-            {
-                name: setup_func(*setup_args) if use_flag else None
-                for name, (setup_func, use_flag, setup_args) in optional_components.items()
-            }
-        )
+        # Initialize optional components
+        for name, (setup_func, use_flag, setup_args) in optional_components.items():
+            try:
+                if use_flag:
+                    components[name] = setup_func(*setup_args)
+                else:
+                    components[name] = None
+            except Exception as e:
+                raise RuntimeError(f"Failed to initialize {name}: {str(e)}") from e
 
-       
         # Setup metrics tracking
         components["metrics"] = MetricsManager()
 
