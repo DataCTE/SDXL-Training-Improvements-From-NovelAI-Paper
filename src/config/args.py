@@ -8,15 +8,48 @@ import argparse
 from dataclasses import dataclass
 from typing import Optional
 
+
 @dataclass
 class ModelArgs:
-    """Model-related arguments."""
+    """Model loading and saving configuration.
+
+    This class provides a structured way to define and parse the model-related
+    command line arguments for the SDXL training pipeline.
+
+    Attributes:
+        model_path: Path to the pre-trained model checkpoint to load.
+        output_dir: Directory to save the model checkpoint and other output files.
+    """
     model_path: str
     output_dir: str = "./output"
 
 @dataclass
 class TrainingArgs:
-    """Training hyperparameters and configuration."""
+    """Training hyperparameters and configuration.
+
+    This class provides a structured way to define and parse the training-related
+    command line arguments for the SDXL training pipeline.
+
+    Attributes:
+        learning_rate: The learning rate for the optimizer.
+        num_epochs: The number of training epochs.
+        batch_size: The batch size for training.
+        gradient_accumulation_steps: The number of steps to accumulate gradients before
+            applying them.
+        max_grad_norm: The maximum gradient norm for gradient clipping.
+        warmup_steps: The number of warmup steps.
+        training_mode: The training mode, either 'v_prediction' or 'kl'.
+        use_ztsnr: Whether to use ztsnr for training.
+        rescale_cfg: Whether to rescale the generator configuration.
+        rescale_multiplier: The rescaling multiplier.
+        resolution_scaling: Whether to perform resolution scaling.
+        min_snr_gamma: The minimum SNR gamma.
+        sigma_data: The standard deviation of the data.
+        sigma_min: The minimum standard deviation for the noise schedule.
+        sigma_max: The maximum standard deviation for the noise schedule.
+        scale_method: The scaling method, either 'karras' or 'linear'.
+        scale_factor: The scaling factor.
+    """
     learning_rate: float = 1e-6
     num_epochs: int = 1
     batch_size: int = 1
@@ -37,7 +70,17 @@ class TrainingArgs:
 
 @dataclass
 class OptimizerArgs:
-    """Optimizer configuration."""
+    """
+    Configuration arguments for the optimizer.
+
+    Attributes:
+        adam_beta1: The beta1 parameter for the Adam optimizer.
+        adam_beta2: The beta2 parameter for the Adam optimizer.
+        adam_epsilon: The epsilon value for numerical stability in Adam.
+        weight_decay: The weight decay (L2 penalty) applied during optimization.
+        use_adafactor: Whether to use the Adafactor optimizer.
+        use_8bit_adam: Whether to use 8-bit Adam optimizer for reduced memory usage.
+    """
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
     adam_epsilon: float = 1e-8
@@ -45,9 +88,22 @@ class OptimizerArgs:
     use_adafactor: bool = False
     use_8bit_adam: bool = False
 
+
 @dataclass
 class EMAArgs:
-    """EMA model configuration."""
+    """
+    Configuration arguments for Exponential Moving Average (EMA).
+
+    Attributes:
+        use_ema: Whether to use EMA.
+        ema_decay: The decay rate for EMA.
+        ema_update_after_step: The number of steps after which EMA is updated.
+        ema_power: The power to which the decay is raised.
+        ema_min_decay: The minimum decay rate.
+        ema_max_decay: The maximum decay rate.
+        ema_update_every: The number of steps between EMA updates.
+        use_ema_warmup: Whether to use a warmup schedule for EMA.
+    """
     use_ema: bool = True
     ema_decay: float = 0.9999
     ema_update_after_step: int = 100
@@ -59,7 +115,23 @@ class EMAArgs:
 
 @dataclass
 class VAEArgs:
-    """VAE configuration and finetuning parameters."""
+    """
+    Configuration arguments for the VAE component.
+
+    Attributes:
+        use_vae: Whether to use the VAE component.
+        vae_path: The path to the pre-trained VAE model.
+        vae_decay: The decay rate for the VAE's EMA.
+        vae_update_after_step: The number of steps after which the VAE's EMA is updated.
+        finetune_vae: Whether to finetune the VAE during training.
+        vae_learning_rate: The learning rate for the VAE's optimizer.
+        vae_train_freq: The frequency at which the VAE is trained.
+        adaptive_loss_scale: Whether to use an adaptive loss scale for the VAE.
+        kl_weight: The weighting of the KL loss for the VAE.
+        perceptual_weight: The weighting of the perceptual loss for the VAE.
+        vae_use_channel_scaling: Whether to use channel scaling for the VAE.
+        vae_initial_scale_factor: The initial scale factor for channel scaling.
+    """
     use_vae: bool = True
     vae_path: Optional[str] = None
     vae_decay: float = 0.9999
@@ -75,7 +147,16 @@ class VAEArgs:
 
 @dataclass
 class DataArgs:
-    """Data loading and processing configuration."""
+    """
+    Configuration arguments for data handling.
+
+    Attributes:
+        data_dir: Directory containing the dataset.
+        cache_dir: Directory for caching intermediate data.
+        no_caching: Whether to disable caching.
+        num_inference_steps: Number of inference steps to use in processing.
+    """
+    
     data_dir: str
     cache_dir: str = "latents_cache"
     no_caching: bool = False
@@ -83,14 +164,32 @@ class DataArgs:
 
 @dataclass
 class TagWeightingArgs:
-    """Tag-based loss weighting configuration."""
+    """
+    Configuration arguments for tag weighting.
+
+    Attributes:
+        use_tag_weighting: Whether to use tag weighting.
+        min_tag_weight: The minimum tag weight.
+        max_tag_weight: The maximum tag weight.
+    """
     use_tag_weighting: bool = True
     min_tag_weight: float = 0.1
     max_tag_weight: float = 3.0
 
+
 @dataclass
 class SystemArgs:
-    """System and optimization settings."""
+    """
+    System configuration arguments.
+
+    Attributes:
+        enable_compile: Whether to enable model compilation.
+        compile_mode: The mode of compilation to use.
+        gradient_checkpointing: Whether to enable gradient checkpointing.
+        verbose: Whether to enable verbose logging.
+        all_ar: Whether to use all_ar setting.
+        num_workers: Number of worker threads to use.
+    """
     enable_compile: bool = False
     compile_mode: str = "default"
     gradient_checkpointing: bool = False
@@ -98,9 +197,23 @@ class SystemArgs:
     all_ar: bool = False
     num_workers: int = 4
 
+
 @dataclass
 class LoggingArgs:
-    """Logging and monitoring configuration."""
+    """
+    Configuration arguments for logging and checkpointing.
+
+    Attributes:
+        use_wandb: Whether to use W&B for logging.
+        wandb_project: The W&B project name to use.
+        wandb_run_name: The W&B run name to use, or None to autogenerate.
+        save_checkpoints: Whether to save model checkpoints.
+        save_epochs: The number of epochs between checkpoint saves.
+        resume_from_checkpoint: The path to a checkpoint to resume training from, or None to train from scratch.
+        push_to_hub: Whether to push the final model to the Hugging Face Hub.
+        logging_steps: The number of steps between logging updates.
+        validation_steps: The number of steps between validation checks.
+    """
     use_wandb: bool = False
     wandb_project: str = "sdxl-training"
     wandb_run_name: Optional[str] = None
@@ -113,7 +226,21 @@ class LoggingArgs:
 
 @dataclass
 class TrainingConfig:
-    """Complete training configuration."""
+    """
+    Configuration class for training.
+
+    Attributes:
+        model: Configuration arguments for the model.
+        training: Parameters related to the training process.
+        optimizer: Configuration for the optimizer used in training.
+        ema: Exponential Moving Average settings.
+        vae: Configuration for the VAE component.
+        data: Data handling parameters.
+        tag_weighting: Configuration for tag-based weighting.
+        system: System-level settings and resources.
+        logging: Logging and checkpointing configurations.
+    """
+
     model: ModelArgs
     training: TrainingArgs
     optimizer: OptimizerArgs
@@ -125,7 +252,12 @@ class TrainingConfig:
     logging: LoggingArgs
 
 def parse_args() -> TrainingConfig:
-    """Parse command line arguments and return structured configuration."""
+    """
+    Parse command line arguments and convert them into a structured config.
+
+    Returns:
+        TrainingConfig: The parsed configuration.
+    """
     parser = argparse.ArgumentParser(description="Train a Stable Diffusion XL model")
     
     # Model arguments

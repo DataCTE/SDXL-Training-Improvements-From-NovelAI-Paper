@@ -120,42 +120,47 @@ def setup_optimizer(args, models) -> torch.optim.Optimizer:
     except (ValueError, RuntimeError, AttributeError) as e:
         raise type(e)(f"Failed to setup optimizer: {str(e)}") from e
 
-
 def setup_vae_finetuner(args, models) -> Optional[VAEFineTuner]:
-    """Initialize VAE finetuner with proper configuration."""
+    """
+    Set up the VAE FineTuner if fine-tuning is enabled in the arguments.
+
+    Args:
+        args: A configuration object containing various training parameters.
+        models: A dictionary of models, expected to include the 'vae' model.
+
+    Returns:
+        An instance of VAEFineTuner if fine-tuning is enabled, otherwise None.
+
+    Raises:
+        Exception: If the setup of the VAE FineTuner fails.
+    """
+    if not args.vae.finetune_vae:
+        return None
+
     try:
-        if not args.vae.finetune_vae:
-            return None
-
-        vae_config = {
-            "device": getattr(args.system, "device", "cuda"),
-            "mixed_precision": getattr(args.system, "mixed_precision", "no"),
-            "use_amp": getattr(args.system, "use_amp", False),
-            "learning_rate": args.vae.vae_learning_rate,
-            "adam_beta1": args.optimizer.adam_beta1,
-            "adam_beta2": args.optimizer.adam_beta2,
-            "adam_epsilon": args.optimizer.adam_epsilon,
-            "weight_decay": args.optimizer.weight_decay,
-            "max_grad_norm": args.training.max_grad_norm,
-            "gradient_checkpointing": args.system.gradient_checkpointing,
-            "use_8bit_adam": args.optimizer.use_8bit_adam,
-            "use_channel_scaling": args.vae.vae_use_channel_scaling,
-            "adaptive_loss_scale": args.vae.adaptive_loss_scale,
-            "kl_weight": args.vae.kl_weight,
-            "perceptual_weight": args.vae.perceptual_weight,
-            "min_snr_gamma": args.training.min_snr_gamma,
-            "initial_scale_factor": args.vae.vae_initial_scale_factor,
-            "decay": args.vae.vae_decay,
-            "update_after_step": args.vae.vae_update_after_step,
-            "model_path": args.model.model_path,
-        }
-        vae_finetuner = VAEFineTuner(vae=models["vae"], **vae_config)
-
+        vae_finetuner = VAEFineTuner(
+            vae=models["vae"],
+            device=args.training.device,
+            mixed_precision=args.training.mixed_precision,
+            use_amp=args.training.use_amp,
+            learning_rate=args.vae.vae_learning_rate,
+            adam_beta1=args.optimizer.adam_beta1,
+            adam_beta2=args.optimizer.adam_beta2,
+            adam_epsilon=args.optimizer.adam_epsilon,
+            weight_decay=args.optimizer.weight_decay,
+            use_8bit_adam=args.optimizer.use_8bit_adam,
+            use_channel_scaling=args.vae.vae_use_channel_scaling,
+            adaptive_loss_scale=args.vae.adaptive_loss_scale,
+            kl_weight=args.vae.kl_weight,
+            perceptual_weight=args.vae.perceptual_weight,
+            initial_scale_factor=args.vae.vae_initial_scale_factor,
+            decay=args.vae.vae_decay,
+            update_after_step=args.vae.vae_update_after_step,
+        )
         return vae_finetuner
-
-    except (ValueError, RuntimeError, AttributeError) as e:
-        raise type(e)(f"Failed to setup VAE finetuner: {str(e)}") from e
-
+    except Exception as e:
+        logger.error("Failed to setup VAE finetuner: %s", str(e))
+        raise
 
 @lru_cache(maxsize=1)
 def _get_ema_config(
