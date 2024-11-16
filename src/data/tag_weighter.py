@@ -409,8 +409,8 @@ class TagBasedLossWeighter:
 
         try:
             # Split into tags
-            tags = [t.strip() for t in caption.split(",")]
-
+            tags = [t.strip() for t in caption.split(',') if t.strip()]
+            
             # Remove empty tags
             tags = [t for t in tags if t]
 
@@ -462,69 +462,136 @@ class TagBasedLossWeighter:
             return caption  # Return original if formatting fails
 
     @lru_cache(maxsize=1024)
-    def _classify_tag(self, tag: str) -> Optional[str]:
-        """
-        Classify a tag using NLP-based semantic analysis and pattern matching.
-        
-        Args:
-            tag (str): The tag to classify
-            
-        Returns:
-            Optional[str]: The most likely category for the tag, or None if uncertain
-            
-        Raises:
-            ValueError: If tag is empty or invalid
-        """
-        if not isinstance(tag, str):
-            raise ValueError(f"Tag must be a string, got {type(tag)}")
-        
-        tag = tag.strip().lower()
-        if not tag:
-            raise ValueError("Tag cannot be empty")
+    def _classify_tag(self, tag: str) -> str:
+        """Classify a tag into its category."""
+        try:
+            if not tag:
+                return "default"
 
-        # First check explicit mapping
-        if tag in self.tag_to_class:
-            return self.tag_to_class[tag]
+            # First check explicit mappings
+            if tag in self.tag_to_class:
+                return self.tag_to_class[tag]
 
-        # Process tag with spaCy
-        doc = self.nlp(tag)
-        
-        # Calculate scores for each category
-        scores = {}
-        for category, info in self.TAG_CATEGORIES.items():
-            score = 0.0
+            # Then try pattern matching
+            for class_name, patterns in self.tag_classes.items():
+                if any(pattern in tag for pattern in patterns):
+                    return class_name
+
+            # Default classification based on NLP analysis
+            doc = self.nlp(tag)
             
-            # Check exact keyword matches
-            if any(keyword in tag for keyword in info["keywords"]):
-                score += 1.0
+            # Basic NLP-based classification
+            if doc[0].pos_ in ["NOUN", "PROPN"]:
+                if any(ent.label_ == "PERSON" for ent in doc.ents):
+                    return "character"
+                return "object"
+            elif doc[0].pos_ == "ADJ":
+                return "quality"
+            elif doc[0].pos_ == "VERB":
+                return "action"
                 
-            # Check regex patterns
-            if any(re.search(pattern, tag) for pattern in info["patterns"]):
-                score += 0.5
-                
-            # Check semantic similarity with keywords
-            keyword_docs = [self.nlp(keyword) for keyword in info["keywords"]]
-            semantic_scores = [doc.similarity(keyword_doc) for keyword_doc in keyword_docs]
-            if semantic_scores:
-                score += max(semantic_scores) * 0.8
-                
-            # Consider part of speech
-            if doc[0].pos_ == "VERB" and category == "action":
-                score += 0.3
-            elif doc[0].pos_ == "NOUN" and category in ["object", "character", "setting"]:
-                score += 0.3
-            elif doc[0].pos_ == "ADJ" and category in ["quality", "emphasis"]:
-                score += 0.3
-                
-            scores[category] = score
-        
-        # Get category with highest score if it exceeds threshold
-        best_category = max(scores.items(), key=lambda x: x[1])
-        if best_category[1] > 0.5:  # Confidence threshold
-            return best_category[0]
+            return "default"
+
+        except Exception as e:
+            logger.warning(f"Error classifying tag: {str(e)}")
+            return "default"
+
+    def process_caption(self, caption: str) -> Tuple[List[str], Dict[str, float]]:
+        """Process a caption to extract tags and special tags with weights."""
+        try:
+            if not caption:
+                return [], {}
+
+            # Extract tags and special tags
+            tags = []
+            special_tags = {}
             
-        logger.debug("Could not confidently classify tag: %s (scores: %s)", tag, scores)
-        return None
+            # Split caption into individual tags
+            raw_tags = [t.strip() for t in caption.split(',') if t.strip()]
+            
+            for tag in raw_tags:
+                if tag.startswith('_'):
+                    # Handle special tags with weights
+                    parts = tag[1:].split(':')
+                    if len(parts) == 2:
+                        tag_name, weight = parts
+                        try:
+                            weight = float(weight)
+                            special_tags[f"_{tag_name}"] = weight
+                        except ValueError:
+                            special_tags[tag] = 1.0
+                    else:
+                        special_tags[tag] = 1.0
+                else:
+                    tags.append(tag)
+
+            return tags, special_tags
+        except Exception as e:
+            logger.warning(f"Error processing caption: {str(e)}")
+            return [], {}
+
+    def calculate_caption_weight(self, caption: str) -> float:
+        """Calculate the overall weight for a caption."""
+        try:
+            if not caption:
+                return 1.0
+
+            tags, special_tags = self.process_caption(caption)
+            if not tags and not special_tags:
+                return 1.0
+
+            weights = self._calculate_weights_no_cache(tags, special_tags)
+            if not weights:
+                return 1.0
+
+            # Calculate final weight as average of individual tag weights
+            total_weight = sum(weights.values())
+            num_weights = len(weights)
+            
+            if num_weights == 0:
+                return 1.0
+                
+            avg_weight = total_weight / num_weights
+            return max(self.min_weight, min(self.max_weight, avg_weight))
+
+        except Exception as e:
+            logger.warning(f"Error calculating caption weight: {str(e)}")
+            return 1.0
+
+    def _calculate_weights_no_cache(
+        self, tags: List[str], special_tags: Optional[Dict[str, float]] = None
+    ) -> Dict[str, float]:
+        """Calculate weights for tags without using cache."""
+        try:
+            weights = {}
+            special_tags = special_tags or {}
+
+            # Process regular tags
+            for tag in tags:
+                if not tag:
+                    continue
+                    
+                # Get tag class and base weight
+                tag_class = self._classify_tag(tag)
+                class_weight = self.class_base_weights.get(tag_class, 1.0)
+                
+                # Calculate emphasis based on tag statistics
+                emphasis = self.stats.get_emphasis(tag) if hasattr(self, 'stats') else 1.0
+                rarity = self.stats.get_rarity(tag) if hasattr(self, 'stats') else 1.0
+                
+                # Combine factors
+                final_weight = class_weight * emphasis * rarity
+                weights[tag] = max(self.min_weight, min(self.max_weight, final_weight))
+
+            # Add special tag weights
+            for tag, weight in special_tags.items():
+                weights[tag] = max(self.min_weight, min(self.max_weight, weight))
+
+            return weights
+
+        except Exception as e:
+            logger.warning(f"Error calculating weights: {str(e)}")
+            return {tag: 1.0 for tag in tags}
 
     def _calculate_tag_importance(self, tag: str, tags: List[str]) -> float:
         """
@@ -630,53 +697,6 @@ class TagBasedLossWeighter:
             # Use cached calculation
             return self._calculate_weights_cached(tags, special_tags)
 
-    def _calculate_weights_no_cache(
-        self, tags: List[str], special_tags: Dict[str, any] = None
-    ) -> Dict[str, float]:
-        """Direct weight calculation without caching"""
-        if special_tags is None:
-            special_tags = {}
-
-        weights = {}
-        base_weight = 1.0
-
-        # Apply modifiers directly without caching
-        if "masterpiece" in tags:
-            base_weight *= 1.3
-        if special_tags.get("niji", False):
-            base_weight *= 1.2
-        if "stylize" in special_tags:
-            stylize_value = special_tags["stylize"]
-            stylize_weight = 1.0 + (math.log10(stylize_value) / 3.0)
-            base_weight *= stylize_weight
-        if "chaos" in special_tags:
-            chaos_value = special_tags["chaos"]
-            chaos_factor = 1.0 + (chaos_value / 200.0)
-            base_weight *= chaos_factor
-
-        # Calculate individual weights
-        for i, tag in enumerate(tags):
-            # Get tag class importance
-            class_name = self._classify_tag(tag)
-            class_weight = self.class_base_weights.get(class_name, 1.0)
-
-            # Apply position decay
-            position_weight = 1.0 - (i * 0.05)
-
-            # Apply rarity bonus
-            rarity_score = self.cache.get_rarity(tag, 1.0)
-
-            # Combine all factors
-            final_weight = base_weight * class_weight * position_weight * rarity_score
-
-            # Apply any explicit tag weights
-            if f"{tag}_weight" in special_tags:
-                final_weight *= special_tags[f"{tag}_weight"]
-
-            weights[tag] = max(self.MIN_WEIGHT, min(self.MAX_WEIGHT, final_weight))
-
-        return weights
-
     def _calculate_weights_cached(
         self, tags: List[str], special_tags: Dict[str, any] = None
     ) -> Dict[str, float]:
@@ -686,79 +706,6 @@ class TagBasedLossWeighter:
         return self.calculate_tag_weights(
             tags_tuple, frozenset(special_tags.items()) if special_tags else None
         )
-
-    def process_caption(self, caption: str) -> Tuple[List[str], Dict[str, float]]:
-        """Process a caption to extract tags and weights.
-        
-        Args:
-            caption (str): The caption text to process
-            
-        Returns:
-            Tuple[List[str], Dict[str, float]]: A tuple containing:
-                - List of regular tags
-                - Dictionary mapping special tags to their weights
-        """
-        if not caption:
-            return [], {}
-            
-        try:
-            # Parse tags and special tags
-            tags, special_tags = self.parse_tags(caption)
-            
-            # Convert special tags to a proper dictionary
-            if isinstance(special_tags, dict):
-                special_tags_dict = special_tags
-            else:
-                special_tags_dict = {}
-                for tag in special_tags:
-                    if isinstance(tag, str):
-                        if "::" in tag:
-                            tag_name, weight = tag.split("::", 1)
-                            try:
-                                special_tags_dict[tag_name] = float(weight)
-                            except ValueError:
-                                special_tags_dict[tag_name] = 1.0
-                        else:
-                            special_tags_dict[tag] = 1.0
-                            
-            return tags, special_tags_dict
-            
-        except Exception as e:
-            logger.warning(f"Error processing caption: {str(e)}")
-            return [], {}
-
-    def calculate_caption_weight(self, caption: str) -> float:
-        """Calculate the weight for a caption.
-        
-        Args:
-            caption (str): The caption text
-            
-        Returns:
-            float: The calculated weight, clamped between MIN_WEIGHT and MAX_WEIGHT
-        """
-        if not caption:
-            return 1.0
-            
-        try:
-            # Process caption to get tags and weights
-            tags, special_tags = self.process_caption(caption)
-            
-            # Calculate weights
-            weights = self.calculate_weights(tags, special_tags)
-            
-            if isinstance(weights, dict):
-                # Average the weights if multiple were returned
-                tag_weight = sum(weights.values()) / len(weights) if weights else 1.0
-            else:
-                # Single weight value
-                tag_weight = float(weights) if weights else 1.0
-                
-            # Clamp weight to valid range
-            return max(self.MIN_WEIGHT, min(self.MAX_WEIGHT, tag_weight))
-            
-        except Exception as e:
-            logger.warning(f"Error calculating caption weight: {str(e)}")
-            return 1.0
 
     def update_training_loss(self, loss: torch.Tensor, tags: List[str]) -> torch.Tensor:
         """
@@ -770,13 +717,53 @@ class TagBasedLossWeighter:
 
         Returns:
             torch.Tensor: Weighted loss value
+
+        Raises:
+            TypeError: If loss is not a torch.Tensor or tags is not a list
+            ValueError: If loss tensor has invalid shape or tags are malformed
+            RuntimeError: If weight calculation fails due to computational error
         """
+        # Input validation
+        if not isinstance(loss, torch.Tensor):
+            raise TypeError(f"Loss must be a torch.Tensor, got {type(loss)}")
+        if not isinstance(tags, list):
+            raise TypeError(f"Tags must be a list, got {type(tags)}")
+        if not loss.numel():
+            raise ValueError("Loss tensor is empty")
+            
         try:
+            # Calculate weights with specific error handling
             weight = self.calculate_weights(tags)
-            return loss * weight
-        except Exception as e:
-            logger.error("Loss update failed: %s", str(e))
-            raise
+            
+            # Validate weight before applying
+            if not isinstance(weight, (float, int, torch.Tensor)):
+                raise TypeError(f"Invalid weight type: {type(weight)}")
+            if isinstance(weight, torch.Tensor) and not weight.numel():
+                raise ValueError("Weight tensor is empty")
+                
+            # Apply weight to loss
+            weighted_loss = loss * weight
+            
+            # Verify result
+            if not torch.isfinite(weighted_loss).all():
+                raise RuntimeError(f"Weighted loss contains invalid values: {weighted_loss}")
+                
+            return weighted_loss
+            
+        except (KeyError, IndexError) as e:
+            logger.error("Tag processing failed: %s", str(e))
+            raise ValueError(f"Failed to process tags: {str(e)}")
+        except torch.cuda.CudaError as e:
+            logger.error("CUDA error during loss weighting: %s", str(e))
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            raise RuntimeError(f"CUDA error in loss weighting: {str(e)}")
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                logger.error("Out of memory during loss weighting")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            raise RuntimeError(f"Runtime error in loss weighting: {str(e)}")
 
     def reset_statistics(self):
         """Reset all statistical tracking"""
