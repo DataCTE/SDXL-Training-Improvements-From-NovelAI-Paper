@@ -58,6 +58,86 @@ class TagStats:
             return default / (math.log1p(total_freq) + 1.0)
 
 
+@dataclass
+class TagCache:
+    """Thread-safe cache for preprocessed tag weights and metadata."""
+    
+    # LRU cache for tag weights with size limit
+    _weight_cache: Dict[str, float] = field(
+        default_factory=lambda: {}
+    )
+    
+    # Cache for preprocessed tag embeddings
+    _embedding_cache: Dict[str, torch.Tensor] = field(
+        default_factory=lambda: {}
+    )
+    
+    # Track cache statistics
+    _hits: int = field(default=0)
+    _misses: int = field(default=0)
+    
+    # Thread safety
+    _lock: Lock = field(default_factory=Lock)
+    
+    # Cache size limits
+    _max_weight_entries: int = field(default=10000)
+    _max_embedding_entries: int = field(default=5000)
+    
+    def get_weight(self, tag: str, default: float = 1.0) -> float:
+        """Get cached weight for a tag with thread safety."""
+        with self._lock:
+            if tag in self._weight_cache:
+                self._hits += 1
+                return self._weight_cache[tag]
+            self._misses += 1
+            return default
+    
+    def set_weight(self, tag: str, weight: float) -> None:
+        """Set weight for a tag with cache size management."""
+        with self._lock:
+            if len(self._weight_cache) >= self._max_weight_entries:
+                # Remove random entry if cache is full
+                key_to_remove = next(iter(self._weight_cache))
+                del self._weight_cache[key_to_remove]
+            self._weight_cache[tag] = weight
+    
+    def get_embedding(self, tag: str) -> Optional[torch.Tensor]:
+        """Get cached embedding for a tag."""
+        with self._lock:
+            if tag in self._embedding_cache:
+                self._hits += 1
+                return self._embedding_cache[tag]
+            self._misses += 1
+            return None
+    
+    def set_embedding(self, tag: str, embedding: torch.Tensor) -> None:
+        """Set embedding for a tag with cache size management."""
+        with self._lock:
+            if len(self._embedding_cache) >= self._max_embedding_entries:
+                # Remove random entry if cache is full
+                key_to_remove = next(iter(self._embedding_cache))
+                del self._embedding_cache[key_to_remove]
+            self._embedding_cache[tag] = embedding
+    
+    def clear(self) -> None:
+        """Clear all cached data."""
+        with self._lock:
+            self._weight_cache.clear()
+            self._embedding_cache.clear()
+            self._hits = 0
+            self._misses = 0
+    
+    def get_stats(self) -> Dict[str, int]:
+        """Get cache statistics."""
+        with self._lock:
+            return {
+                "hits": self._hits,
+                "misses": self._misses,
+                "weight_entries": len(self._weight_cache),
+                "embedding_entries": len(self._embedding_cache)
+            }
+
+
 class TagBasedLossWeighter:
     """Tag-based loss weighting system following NovelAI paper specifications."""
     
@@ -120,8 +200,12 @@ class TagBasedLossWeighter:
         self.emphasis_factor = float(self.config.get('emphasis_factor', self.DEFAULT_EMPHASIS_FACTOR))
         self.cache_size = int(self.config.get('cache_size', self.DEFAULT_CACHE_SIZE))
         
-        # Initialize statistics tracking
+        # Initialize statistics tracking and caching
         self.stats = TagStats()
+        self.cache = TagCache(
+            _max_weight_entries=self.cache_size,
+            _max_embedding_entries=self.cache_size // 2
+        )
         
         # Initialize thread pool for parallel processing
         self.num_workers = min(32, (os.cpu_count() or 1) + 4)
@@ -160,20 +244,21 @@ class TagBasedLossWeighter:
     
     def calculate_tag_weight(self, tag: str, class_name: str = "general") -> float:
         """Calculate final weight for a tag combining category, rarity and emphasis."""
-        # Get base category weight
+        # Check cache first
+        cached_weight = self.cache.get_weight(tag)
+        if cached_weight is not None:
+            return cached_weight
+            
+        # Calculate weight if not in cache
         category_weight = self.get_category_weight(tag)
-        
-        # Calculate rarity component
         rarity_weight = self.stats.get_rarity(tag) * self.rarity_factor
-        
-        # Calculate emphasis component
         emphasis_weight = self.calculate_emphasis_weight(tag)
         
-        # Combine weights with proper scaling
         combined_weight = category_weight * rarity_weight * emphasis_weight
-        
-        # Clamp to boundaries
         final_weight = max(self.min_weight, min(self.max_weight, combined_weight))
+        
+        # Cache the result
+        self.cache.set_weight(tag, final_weight)
         
         logger.debug(f"Tag weight calculation for '{tag}':")
         logger.debug(f"- Category weight: {category_weight:.3f}")
