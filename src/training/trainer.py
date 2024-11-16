@@ -124,14 +124,14 @@ def setup_optimizer(args, models) -> torch.optim.Optimizer:
 def setup_vae_finetuner(args, models) -> Optional[VAEFineTuner]:
     """Initialize VAE finetuner with proper configuration."""
     try:
-        if not args.vae.finetune_vae:
+        if not args.finetune_vae:
             return None
 
         vae_config = {
             "device": getattr(args.system, "device", "cuda"),
             "mixed_precision": getattr(args.system, "mixed_precision", "no"),
             "use_amp": getattr(args.system, "use_amp", False),
-            "learning_rate": args.vae.vae_learning_rate,
+            "learning_rate": args.vae_learning_rate,
             "adam_beta1": args.optimizer.adam_beta1,
             "adam_beta2": args.optimizer.adam_beta2,
             "adam_epsilon": args.optimizer.adam_epsilon,
@@ -139,14 +139,14 @@ def setup_vae_finetuner(args, models) -> Optional[VAEFineTuner]:
             "max_grad_norm": args.training.max_grad_norm,
             "gradient_checkpointing": args.system.gradient_checkpointing,
             "use_8bit_adam": args.optimizer.use_8bit_adam,
-            "use_channel_scaling": args.vae.vae_use_channel_scaling,
-            "adaptive_loss_scale": args.vae.adaptive_loss_scale,
-            "kl_weight": args.vae.kl_weight,
-            "perceptual_weight": args.vae.perceptual_weight,
+            "use_channel_scaling": args.vae_use_channel_scaling,
+            "adaptive_loss_scale": args.adaptive_loss_scale,
+            "kl_weight": args.kl_weight,
+            "perceptual_weight": args.perceptual_weight,
             "min_snr_gamma": args.training.min_snr_gamma,
-            "initial_scale_factor": args.vae.vae_initial_scale_factor,
-            "decay": args.vae.vae_decay,
-            "update_after_step": args.vae.vae_update_after_step,
+            "initial_scale_factor": args.vae_initial_scale_factor,
+            "decay": args.vae_decay,
+            "update_after_step": args.vae_update_after_step,
             "model_path": args.model.model_path,
         }
         vae_finetuner = VAEFineTuner(vae=models["vae"], **vae_config)
@@ -746,7 +746,7 @@ def train_step(
         components["optimizer"].zero_grad(set_to_none=True)
 
         # Forward pass with autocast
-        with torch.cuda.amp.autocast(enabled=args.mixed_precision):
+        with torch.cuda.amp.autocast(enabled=args.system.mixed_precision):
             # Get loss from model
             loss = models["unet"](
                 x_0=batch["latents"],
@@ -766,25 +766,25 @@ def train_step(
             )
 
             # Scale loss for gradient accumulation
-            if args.gradient_accumulation_steps > 1:
-                loss = loss / args.gradient_accumulation_steps
+            if args.training.gradient_accumulation_steps > 1:
+                loss = loss / args.training.gradient_accumulation_steps
 
         # Backward pass with gradient scaling
-        if args.mixed_precision:
+        if args.system.mixed_precision:
             components["scaler"].scale(loss).backward()
-            if (batch_idx + 1) % args.gradient_accumulation_steps == 0:
+            if (batch_idx + 1) % args.training.gradient_accumulation_steps == 0:
                 components["scaler"].unscale_(components["optimizer"])
                 torch.nn.utils.clip_grad_norm_(
-                    models["unet"].parameters(), args.max_grad_norm
+                    models["unet"].parameters(), args.training.max_grad_norm
                 )
                 components["scaler"].step(components["optimizer"])
                 components["scaler"].update()
                 components["scheduler"].step()
         else:
             loss.backward()
-            if (batch_idx + 1) % args.gradient_accumulation_steps == 0:
+            if (batch_idx + 1) % args.training.gradient_accumulation_steps == 0:
                 torch.nn.utils.clip_grad_norm_(
-                    models["unet"].parameters(), args.max_grad_norm
+                    models["unet"].parameters(), args.training.max_grad_norm
                 )
                 components["optimizer"].step()
                 components["scheduler"].step()
@@ -792,7 +792,7 @@ def train_step(
         # Update EMA model if enabled
         if (
             components.get("ema") is not None
-            and (batch_idx + 1) % args.gradient_accumulation_steps == 0
+            and (batch_idx + 1) % args.training.gradient_accumulation_steps == 0
         ):
             components["ema"].step(models["unet"])
 
@@ -924,7 +924,7 @@ def forward_pass(args, models, batch, device, dtype, components) -> torch.Tensor
         # Apply VAE finetuning loss if enabled
         if components.get("vae_finetuner") is not None:
             vae_loss = components["vae_finetuner"].compute_loss(batch)
-            loss = loss + vae_loss * args.vae.vae_loss_weight
+            loss = loss + vae_loss * args.vae_loss_weight
 
         return loss
 
