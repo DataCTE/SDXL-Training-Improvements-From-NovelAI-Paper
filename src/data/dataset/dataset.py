@@ -40,10 +40,10 @@ class CustomDataset(CustomDatasetBase):
         all_ar (bool, optional): Use aspect ratio for all images. Defaults to False.
         num_workers (int, optional): Number of worker processes. Defaults to min(8, cpu_count).
         prefetch_factor (int, optional): Number of batches to prefetch. Defaults to 2.
-        min_size (int, optional): Minimum image size. Defaults to 256.
+        min_size (int, optional): Minimum image size. Defaults to 512.
         max_size (int, optional): Maximum image size. Defaults to 2048.
         bucket_step_size (int, optional): Resolution step size for buckets. Defaults to 64.
-        max_bucket_area (int, optional): Maximum area for buckets. Defaults to 512*768.
+        max_bucket_area (int, optional): Maximum area for buckets. Defaults to 1024*1024.
         token_dropout_rate (float, optional): Token dropout probability. Defaults to 0.1.
         caption_dropout_rate (float, optional): Caption dropout probability. Defaults to 0.1.
         min_tag_weight (float, optional): Minimum weight for tags. Defaults to 0.1.
@@ -54,8 +54,8 @@ class CustomDataset(CustomDatasetBase):
                  text_encoder=None, text_encoder_2=None,
                  cache_dir="latents_cache", no_caching_latents=False,
                  all_ar=False, num_workers=None, prefetch_factor=2,
-                 min_size=256, max_size=2048, bucket_step_size=64,
-                 max_bucket_area=512*768, token_dropout_rate=0.1,
+                 min_size=512, max_size=2048, bucket_step_size=64,
+                 max_bucket_area=1024*1024, token_dropout_rate=0.1,
                  caption_dropout_rate=0.1, min_tag_weight=0.1,
                  max_tag_weight=3.0, use_tag_weighting=True):
         super().__init__()

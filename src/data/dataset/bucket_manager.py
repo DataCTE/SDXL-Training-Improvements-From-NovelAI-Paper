@@ -18,18 +18,18 @@ class BucketManager:
     """
     
     def __init__(self, 
-                 min_size: int = 256,
+                 min_size: int = 512,
                  max_size: int = 2048,  # Updated to 2048 per SDXL requirements
                  step_size: int = 64,
-                 max_area: int = 512 * 768,
+                 max_area: int = 1024 * 1024,  # Updated to match SDXL's typical training resolution
                  add_square: bool = True):
         """Initialize the bucket manager.
         
         Args:
-            min_size: Minimum dimension size (default: 256)
+            min_size: Minimum dimension size (default: 512)
             max_size: Maximum dimension size (default: 2048)
             step_size: Size increment between buckets (default: 64)
-            max_area: Maximum area constraint (default: 512*768)
+            max_area: Maximum area constraint (default: 1024*1024)
             add_square: Whether to add square buckets (default: True)
         """
         self.min_size = min_size
