@@ -59,7 +59,9 @@ def main() -> None:
         )
         
         # Initialize training components with loaded state
-        training_state = initialize_training_components(config, device, dtype, models)
+        training_state = initialize_training_components(config, models)
+        training_state["device"] = device
+        training_state["dtype"] = dtype
         training_state["train_components"] = train_components
         training_state["training_history"] = training_history
         
