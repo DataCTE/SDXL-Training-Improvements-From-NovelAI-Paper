@@ -19,9 +19,9 @@ class BucketManager:
     
     def __init__(self, 
                  min_size: int = 512,
-                 max_size: int = 4096,  # Updated to 2048 per SDXL requirements
+                 max_size: int = 4096,  # Updated to 4096 for larger images
                  step_size: int = 64,
-                 max_area: int = 1024 * 1024,  # Updated to match SDXL's typical training resolution
+                 max_area: int = 1024 * 1024 * 4,  # Updated to handle larger areas
                  add_square: bool = True,
                  adaptive_buckets: bool = True):
         """Initialize the bucket manager.
@@ -30,7 +30,7 @@ class BucketManager:
             min_size: Minimum dimension size (default: 512)
             max_size: Maximum dimension size (default: 4096)
             step_size: Size increment between buckets (default: 64)
-            max_area: Maximum area constraint (default: 1024*1024)
+            max_area: Maximum area constraint (default: 4*1024*1024)
             add_square: Whether to add square buckets (default: True)
             adaptive_buckets: Whether to use adaptive bucket sizes (default: True)
         """
@@ -59,7 +59,7 @@ class BucketManager:
             buckets.update(self._generate_adaptive_buckets())
         
         # Add standard buckets from NovelAI algorithm
-        for width in range(self.min_size, self.max_size + 1, self.step_size):
+        for width in range(1024, self.max_size + 1, self.step_size):
             # Find largest height that satisfies area constraint
             height = min(
                 self.max_size,  # Don't exceed max_size
@@ -68,27 +68,37 @@ class BucketManager:
             # Round down to nearest step size
             height = (height // self.step_size) * self.step_size
             
-            # Enforce minimum size and only require one dimension to be below 1024
-            if height >= self.min_size and width >= self.min_size:
-                if height <= 1024 or width <= 1024:  
-                    buckets.add((height, width))
+            # Ensure minimum size
+            if height >= self.min_size:
+                buckets.add((height, width))
+            
+            # Add corresponding smaller height if width is large enough
+            if width >= 1024 and height >= 1024:
+                for h in range(self.min_size, 1024, self.step_size):
+                    if h * width <= self.max_area:
+                        buckets.add((h, width))
         
         # Add portrait buckets (swap height/width)
-        for height in range(self.min_size, self.max_size + 1, self.step_size):
+        for height in range(1024, self.max_size + 1, self.step_size):
             width = min(
                 self.max_size,
                 math.floor(self.max_area / height)
             )
             width = (width // self.step_size) * self.step_size
             
-            # Enforce minimum size and only require one dimension to be below 1024
-            if height >= self.min_size and width >= self.min_size:
-                if height <= 1024 or width <= 1024:  
-                    buckets.add((height, width))
+            # Ensure minimum size
+            if width >= self.min_size:
+                buckets.add((height, width))
+            
+            # Add corresponding smaller width if height is large enough
+            if height >= 1024 and width >= 1024:
+                for w in range(self.min_size, 1024, self.step_size):
+                    if height * w <= self.max_area:
+                        buckets.add((height, w))
         
-        # Add square buckets if requested (must have at least one dimension below 1024)
+        # Add square buckets if requested (must be 1024 or larger)
         if self.add_square:
-            for size in range(self.min_size, min(1024 + self.step_size, self.max_size + 1), self.step_size):
+            for size in range(1024, self.max_size + 1, self.step_size):
                 if size * size <= self.max_area:
                     buckets.add((size, size))
         
@@ -96,10 +106,11 @@ class BucketManager:
         buckets = sorted(buckets)
         
         # Log bucket statistics
-        total_pixels = sum(h * w for h, w in buckets)
-        avg_pixels = total_pixels / len(buckets)
-        logger.info(f"Average bucket resolution: {math.sqrt(avg_pixels):.1f} x {math.sqrt(avg_pixels):.1f}")
-        logger.info(f"Bucket resolutions: {buckets}")
+        if buckets:
+            total_pixels = sum(h * w for h, w in buckets)
+            avg_pixels = total_pixels / len(buckets)
+            logger.info(f"Average bucket resolution: {math.sqrt(avg_pixels):.1f} x {math.sqrt(avg_pixels):.1f}")
+            logger.info(f"Bucket resolutions: {buckets}")
         
         return buckets
 
