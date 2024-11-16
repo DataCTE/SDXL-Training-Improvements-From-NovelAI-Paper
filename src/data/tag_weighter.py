@@ -41,6 +41,28 @@ class TagStats:
         with self._lock:
             self.cooccurrence[tag1][tag2] += 1
             self.cooccurrence[tag2][tag1] += 1
+            
+    def get_emphasis(self, tag: str, default: float = 1.0) -> float:
+        """Get emphasis score for a tag based on frequency."""
+        with self._lock:
+            total_freq = sum(
+                self.frequencies[class_name][tag]
+                for class_name in self.frequencies
+            )
+            if total_freq == 0:
+                return default
+            return math.log1p(total_freq) / 10.0 + default
+            
+    def get_rarity(self, tag: str, default: float = 1.0) -> float:
+        """Get rarity score for a tag based on inverse frequency."""
+        with self._lock:
+            total_freq = sum(
+                self.frequencies[class_name][tag]
+                for class_name in self.frequencies
+            )
+            if total_freq == 0:
+                return default
+            return default / (math.log1p(total_freq) + 1.0)
 
 
 @dataclass
@@ -177,36 +199,44 @@ class TagBasedLossWeighter:
 
     def _init_tag_classes(self, tag_classes: Optional[Dict[str, Set[str]]]) -> None:
         """Initialize tag classification system."""
-        self.tag_classes = tag_classes or {
-            "character": set(),
-            "style": set(),
-            "setting": set(),
-            "action": set(),
-            "object": set(),
-            "quality": set(),
-            "emphasis": set(),
-            "meta": set(),
-        }
-
-        # Create tag to class mapping
-        self.tag_to_class = {
-            tag: class_name
-            for class_name, tags in self.tag_classes.items()
-            for tag in tags
-        }
+        try:
+            # Initialize base mapping
+            self.tag_to_class = {}
+            
+            # Update from provided classes
+            if tag_classes:
+                self.tag_to_class.update({
+                    tag: cls 
+                    for cls, tags in tag_classes.items() 
+                    for tag in tags
+                })
+                
+            # Validate categories
+            for category in self.TAG_CATEGORIES.values():
+                if not isinstance(category, dict):
+                    raise TypeError(f"Invalid category format: {category}")
+                if not all(k in category for k in ["description", "keywords", "patterns"]):
+                    raise ValueError(f"Missing required category fields in: {category}")
+                    
+            logger.info("Tag classification system initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize tag classes: {str(e)}")
+            raise
 
     def _init_statistics(self) -> None:
         """Initialize statistical tracking components."""
-        self.stats = TagStats()
-        self.cache = TagCache()
-
-        # Configure caching behavior
-        if not self.no_cache:
-            self.calculate_tag_weights = lru_cache(maxsize=self.cache_size)(
-                self._calculate_tag_weights
-            )
-        else:
-            self.calculate_tag_weights = self._calculate_tag_weights
+        try:
+            self.stats = TagStats()
+            self.cache = TagCache()
+            
+            # Initialize caches
+            if not hasattr(self, 'tag_weight_cache'):
+                self.tag_weight_cache = {}
+                
+            logger.info("Statistics and caches initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize statistics: {str(e)}")
+            raise
 
     def _init_executor(self) -> None:
         """Initialize thread pool executor."""
@@ -536,12 +566,18 @@ class TagBasedLossWeighter:
                 tag_class = self._classify_tag(tag)
                 class_weight = self.class_base_weights.get(tag_class, 1.0)
                 
-                # Calculate emphasis based on tag statistics
-                emphasis = self.stats.get_emphasis(tag) if hasattr(self, 'stats') else 1.0
-                rarity = self.stats.get_rarity(tag) if hasattr(self, 'stats') else 1.0
+                # Calculate emphasis and rarity factors
+                emphasis = self.stats.get_emphasis(tag)
+                rarity = self.stats.get_rarity(tag)
                 
-                # Combine factors
-                final_weight = class_weight * emphasis * rarity
+                # Apply emphasis and rarity modifiers
+                final_weight = (
+                    class_weight * 
+                    (1.0 + (emphasis - 1.0) * self.emphasis_factor) * 
+                    (1.0 + (rarity - 1.0) * self.rarity_factor)
+                )
+                
+                # Clamp to valid range
                 weights[tag] = max(self.min_weight, min(self.max_weight, final_weight))
 
             # Add special tag weights
@@ -554,98 +590,44 @@ class TagBasedLossWeighter:
             logger.warning(f"Error calculating weights: {str(e)}")
             return {tag: 1.0 for tag in tags}
 
-    def _calculate_tag_importance(self, tag: str, tags: List[str]) -> float:
+    def calculate_static_weights(
+        self,
+        tags: List[str], special_tags: Dict[str, any] = None
+    ) -> float:
         """
-        Calculate importance score for a tag based on context.
+        Static method to calculate basic weights without instance-specific data.
 
         Args:
-            tag (str): Target tag
-            tags (List[str]): All tags in the image
+            tags (List[str]): List of tags
+            special_tags (Dict): Special tag parameters
 
         Returns:
-            float: Importance score
+            float: Basic weight value
         """
-        class_name = self._classify_tag(tag)
-        if not class_name:
-            return 1.0
+        if special_tags is None:
+            special_tags = {}
 
-        # Get base class weight
-        importance = self.class_base_weights.get(class_name, 1.0)
+        base_weight = 1.0
 
-        # Apply character emphasis
-        if class_name == "character":
-            importance *= self.character_emphasis
-
-        # Apply emphasis for emphasized tags
-        if tag in self.tag_classes["emphasis"]:
-            importance *= self.emphasis_factor
-
-        # Apply rarity bonus
-        rarity_score = self.cache.get_rarity(tag, 1.0)
-        importance *= rarity_score
-
-        # Apply quality bonus for high-quality images
-        if class_name == "quality" and any(
-            q in tags for q in ["masterpiece", "best quality", "high quality"]
-        ):
-            importance *= 1.0 + self.quality_bonus
-
-        return importance
-
-    def _calculate_tag_weights(self, tags_tuple: Tuple[str, ...]) -> float:
-        """
-        Calculate tag weights with improved weighting scheme.
-        Raises exceptions on failure instead of returning default values.
-
-        Args:
-            tags_tuple (tuple): Tuple of tags for weight calculation
-
-        Returns:
-            float: Calculated weight value
-
-        Raises:
-            TypeError: For invalid data types
-            ValueError: For invalid values
-            RuntimeError: For PyTorch/CUDA errors
-            KeyError: For tag lookup failures
-            AttributeError: For missing attributes
-        """
-        tags = list(tags_tuple)
-        weights = []
-
-        # Calculate importance for each tag
-        for tag in tags:
-            importance = self._calculate_tag_importance(tag, tags)
-            weights.append(importance)
-
-        if not weights:
-            raise ValueError("No valid weights calculated for tags")
-
-        # Calculate final weight using weighted geometric mean
-        weights = torch.tensor(weights, dtype=torch.float32)
-        final_weight = torch.exp(torch.log(weights + 1e-6).mean())
+        # Apply basic modifiers
+        if "masterpiece" in tags:
+            base_weight *= 1.3
+        if special_tags.get("niji", False):
+            base_weight *= 1.2
+        if "stylize" in special_tags:
+            stylize_value = special_tags["stylize"]
+            stylize_weight = 1.0 + (math.log10(stylize_value) / 3.0)
+            base_weight *= stylize_weight
+        if "chaos" in special_tags:
+            chaos_value = special_tags["chaos"]
+            chaos_factor = 1.0 + (chaos_value / 200.0)
+            base_weight *= chaos_factor
 
         # Clamp between min and max
-        return torch.clamp(final_weight, self.min_weight, self.max_weight).item()
-
-    def _calculate_batch_weights(self, batch_tags: List[List[str]]) -> List[float]:
-        """
-        Calculate weights for a batch of tag lists in parallel.
-
-        Args:
-            batch_tags (List[List[str]]): List of tag lists to process
-
-        Returns:
-            List[float]: List of calculated weights
-        """
-        if len(batch_tags) > 50:  # Only parallelize for larger batches
-            futures = [
-                self.executor.submit(self._calculate_tag_weights, tuple(tags))
-                for tags in batch_tags
-            ]
-            return [future.result() for future in futures]
-        else:
-            return [self._calculate_tag_weights(tuple(tags)) for tags in batch_tags]
+        return max(
+            self.MIN_WEIGHT,
+            min(self.MAX_WEIGHT, base_weight),
+        )
 
     def calculate_weights(
         self, tags: List[str], special_tags: Dict[str, any] = None
@@ -747,6 +729,9 @@ class TagBasedLossWeighter:
     def _classify_tag(self, tag: str) -> str:
         """Classify a tag into its category."""
         try:
+            # Input validation
+            if not isinstance(tag, str):
+                raise TypeError(f"Tag must be a string, got {type(tag)}")
             if not tag:
                 return "default"
 
@@ -757,27 +742,119 @@ class TagBasedLossWeighter:
             # Then try pattern matching
             for class_name, category in self.TAG_CATEGORIES.items():
                 # Check keywords
-                if any(keyword in tag for keyword in category["keywords"]):
+                if any(keyword in tag.lower() for keyword in category["keywords"]):
                     return class_name
                 # Check patterns
-                if any(re.match(pattern, tag) for pattern in category["patterns"]):
+                if any(re.match(pattern, tag, re.IGNORECASE) for pattern in category["patterns"]):
                     return class_name
 
             # Default classification based on NLP analysis
-            doc = self.nlp(tag)
-            
-            # Basic NLP-based classification
-            if doc[0].pos_ in ["NOUN", "PROPN"]:
-                if any(ent.label_ == "PERSON" for ent in doc.ents):
-                    return "character"
-                return "object"
-            elif doc[0].pos_ == "ADJ":
-                return "quality"
-            elif doc[0].pos_ == "VERB":
-                return "action"
+            try:
+                doc = self.nlp(tag)
+                
+                # Basic NLP-based classification
+                if doc[0].pos_ in ["NOUN", "PROPN"]:
+                    if any(ent.label_ == "PERSON" for ent in doc.ents):
+                        return "character"
+                    return "object"
+            except Exception as nlp_error:
+                logger.warning(f"NLP analysis failed for tag '{tag}': {str(nlp_error)}")
                 
             return "default"
-
+            
         except Exception as e:
-            logger.warning(f"Error classifying tag {tag}: {str(e)}")
-            return "default"
+            logger.error(f"Tag classification failed for '{tag}': {str(e)}")
+            return "default"  # Fallback to default category
+
+    def _calculate_tag_importance(self, tag: str, tags: List[str]) -> float:
+        """
+        Calculate importance score for a tag based on context.
+
+        Args:
+            tag (str): Target tag
+            tags (List[str]): All tags in the image
+
+        Returns:
+            float: Importance score
+        """
+        class_name = self._classify_tag(tag)
+        if not class_name:
+            return 1.0
+
+        # Get base class weight
+        importance = self.class_base_weights.get(class_name, 1.0)
+
+        # Apply character emphasis
+        if class_name == "character":
+            importance *= self.character_emphasis
+
+        # Apply emphasis for emphasized tags
+        if tag in self.tag_classes["emphasis"]:
+            importance *= self.emphasis_factor
+
+        # Apply rarity bonus
+        rarity_score = self.cache.get_rarity(tag, 1.0)
+        importance *= rarity_score
+
+        # Apply quality bonus for high-quality images
+        if class_name == "quality" and any(
+            q in tags for q in ["masterpiece", "best quality", "high quality"]
+        ):
+            importance *= 1.0 + self.quality_bonus
+
+        return importance
+
+    def _calculate_tag_weights(self, tags_tuple: Tuple[str, ...]) -> float:
+        """
+        Calculate tag weights with improved weighting scheme.
+        Raises exceptions on failure instead of returning default values.
+
+        Args:
+            tags_tuple (tuple): Tuple of tags for weight calculation
+
+        Returns:
+            float: Calculated weight value
+
+        Raises:
+            TypeError: For invalid data types
+            ValueError: For invalid values
+            RuntimeError: For PyTorch/CUDA errors
+            KeyError: For tag lookup failures
+            AttributeError: For missing attributes
+        """
+        tags = list(tags_tuple)
+        weights = []
+
+        # Calculate importance for each tag
+        for tag in tags:
+            importance = self._calculate_tag_importance(tag, tags)
+            weights.append(importance)
+
+        if not weights:
+            raise ValueError("No valid weights calculated for tags")
+
+        # Calculate final weight using weighted geometric mean
+        weights = torch.tensor(weights, dtype=torch.float32)
+        final_weight = torch.exp(torch.log(weights + 1e-6).mean())
+
+        # Clamp between min and max
+        return torch.clamp(final_weight, self.min_weight, self.max_weight).item()
+
+    def _calculate_batch_weights(self, batch_tags: List[List[str]]) -> List[float]:
+        """
+        Calculate weights for a batch of tag lists in parallel.
+
+        Args:
+            batch_tags (List[List[str]]): List of tag lists to process
+
+        Returns:
+            List[float]: List of calculated weights
+        """
+        if len(batch_tags) > 50:  # Only parallelize for larger batches
+            futures = [
+                self.executor.submit(self._calculate_tag_weights, tuple(tags))
+                for tags in batch_tags
+            ]
+            return [future.result() for future in futures]
+        else:
+            return [self._calculate_tag_weights(tuple(tags)) for tags in batch_tags]
