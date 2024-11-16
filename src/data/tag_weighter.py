@@ -205,12 +205,8 @@ class TagBasedLossWeighter:
             self.calculate_tag_weights = lru_cache(maxsize=self.cache_size)(
                 self._calculate_tag_weights
             )
-            # Initialize cached version of _classify_tag
-            self._classify_tag = lru_cache(maxsize=1024)(self._classify_tag.__wrapped__)
         else:
             self.calculate_tag_weights = self._calculate_tag_weights
-            # Use uncached version
-            self._classify_tag = self._classify_tag.__wrapped__
 
     def _init_executor(self) -> None:
         """Initialize thread pool executor."""
@@ -460,41 +456,6 @@ class TagBasedLossWeighter:
         except TypeError as e:
             logger.error("Type error in caption formatting: %s", str(e))
             return caption  # Return original if formatting fails
-
-    @lru_cache(maxsize=1024)
-    def _classify_tag(self, tag: str) -> str:
-        """Classify a tag into its category."""
-        try:
-            if not tag:
-                return "default"
-
-            # First check explicit mappings
-            if tag in self.tag_to_class:
-                return self.tag_to_class[tag]
-
-            # Then try pattern matching
-            for class_name, patterns in self.tag_classes.items():
-                if any(pattern in tag for pattern in patterns):
-                    return class_name
-
-            # Default classification based on NLP analysis
-            doc = self.nlp(tag)
-            
-            # Basic NLP-based classification
-            if doc[0].pos_ in ["NOUN", "PROPN"]:
-                if any(ent.label_ == "PERSON" for ent in doc.ents):
-                    return "character"
-                return "object"
-            elif doc[0].pos_ == "ADJ":
-                return "quality"
-            elif doc[0].pos_ == "VERB":
-                return "action"
-                
-            return "default"
-
-        except Exception as e:
-            logger.warning(f"Error classifying tag: {str(e)}")
-            return "default"
 
     def process_caption(self, caption: str) -> Tuple[List[str], Dict[str, float]]:
         """Process a caption to extract tags and special tags with weights."""
@@ -781,3 +742,42 @@ class TagBasedLossWeighter:
         """Cleanup worker pool on deletion"""
         if hasattr(self, "executor"):
             self.executor.shutdown(wait=True)
+
+    @lru_cache(maxsize=1024)
+    def _classify_tag(self, tag: str) -> str:
+        """Classify a tag into its category."""
+        try:
+            if not tag:
+                return "default"
+
+            # First check explicit mappings
+            if tag in self.tag_to_class:
+                return self.tag_to_class[tag]
+
+            # Then try pattern matching
+            for class_name, category in self.TAG_CATEGORIES.items():
+                # Check keywords
+                if any(keyword in tag for keyword in category["keywords"]):
+                    return class_name
+                # Check patterns
+                if any(re.match(pattern, tag) for pattern in category["patterns"]):
+                    return class_name
+
+            # Default classification based on NLP analysis
+            doc = self.nlp(tag)
+            
+            # Basic NLP-based classification
+            if doc[0].pos_ in ["NOUN", "PROPN"]:
+                if any(ent.label_ == "PERSON" for ent in doc.ents):
+                    return "character"
+                return "object"
+            elif doc[0].pos_ == "ADJ":
+                return "quality"
+            elif doc[0].pos_ == "VERB":
+                return "action"
+                
+            return "default"
+
+        except Exception as e:
+            logger.warning(f"Error classifying tag {tag}: {str(e)}")
+            return "default"
