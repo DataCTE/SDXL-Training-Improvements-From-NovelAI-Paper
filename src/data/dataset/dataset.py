@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 import multiprocessing as mp
 from PIL import Image
 from tqdm import tqdm
+from .bucket_manager import BucketManager
 
 from ..tag_weighter import TagBasedLossWeighter
 from .base import CustomDatasetBase
@@ -21,7 +22,7 @@ class CustomDataset(CustomDatasetBase):
 
     This dataset handles image-caption pairs for SDXL training with support for:
     - Efficient latent caching and processing
-    - Dynamic resolution bucketing
+    - Dynamic resolution bucketing (following NovelAI paper)
     - Tag-based loss weighting
     - Parallel data processing
     - Multi-worker data loading
@@ -39,11 +40,10 @@ class CustomDataset(CustomDatasetBase):
         all_ar (bool, optional): Use aspect ratio for all images. Defaults to False.
         num_workers (int, optional): Number of worker processes. Defaults to min(8, cpu_count).
         prefetch_factor (int, optional): Number of batches to prefetch. Defaults to 2.
-        resolution_type (str, optional): Type of resolution handling. Defaults to "square".
-        enable_bucket_sampler (bool, optional): Enable bucketing by resolution. Defaults to True.
-        min_size (int, optional): Minimum image size. Defaults to 512.
-        max_size (int, optional): Maximum image size. Defaults to 2048.
-        bucket_reso_steps (int, optional): Resolution step size for buckets. Defaults to 64.
+        min_size (int, optional): Minimum image size. Defaults to 256.
+        max_size (int, optional): Maximum image size. Defaults to 1024.
+        bucket_step_size (int, optional): Resolution step size for buckets. Defaults to 64.
+        max_bucket_area (int, optional): Maximum area for buckets. Defaults to 512*768.
         token_dropout_rate (float, optional): Token dropout probability. Defaults to 0.1.
         caption_dropout_rate (float, optional): Caption dropout probability. Defaults to 0.1.
         min_tag_weight (float, optional): Minimum weight for tags. Defaults to 0.1.
@@ -54,11 +54,10 @@ class CustomDataset(CustomDatasetBase):
                  text_encoder=None, text_encoder_2=None,
                  cache_dir="latents_cache", no_caching_latents=False,
                  all_ar=False, num_workers=None, prefetch_factor=2,
-                 resolution_type="square", enable_bucket_sampler=True,
-                 min_size=512, max_size=2048, bucket_reso_steps=64,
-                 token_dropout_rate=0.1, caption_dropout_rate=0.1,
-                 min_tag_weight=0.1, max_tag_weight=3.0,
-                 use_tag_weighting=True):
+                 min_size=256, max_size=1024, bucket_step_size=64,
+                 max_bucket_area=512*768, token_dropout_rate=0.1,
+                 caption_dropout_rate=0.1, min_tag_weight=0.1,
+                 max_tag_weight=3.0, use_tag_weighting=True):
         super().__init__()
         # Store models
         self.tokenizer = tokenizer
@@ -78,12 +77,21 @@ class CustomDataset(CustomDatasetBase):
         self.collate_fn = self.custom_collate
         self.all_ar = all_ar
         self.no_caching_latents = no_caching_latents
-        self.enable_bucket_sampler = enable_bucket_sampler
-        self.resolution_type = resolution_type
         self.min_size = min_size
         self.max_size = max_size
-        self.bucket_reso_steps = bucket_reso_steps
+        self.bucket_step_size = bucket_step_size
+        self.max_bucket_area = max_bucket_area
         self.use_tag_weighting = use_tag_weighting
+        
+        # Initialize bucket manager
+        self.bucket_manager = BucketManager(
+            min_size=min_size,
+            max_size=max_size,
+            step_size=bucket_step_size,
+            max_area=max_bucket_area,
+            add_square=True
+        )
+        
         # Set up workers
         self.num_workers = num_workers or min(8, os.cpu_count() or 1)
         self.prefetch_factor = prefetch_factor
@@ -106,11 +114,10 @@ class CustomDataset(CustomDatasetBase):
             'all_ar': all_ar,
             'num_workers': self.num_workers,
             'prefetch_factor': prefetch_factor,
-            'resolution_type': resolution_type,
-            'enable_bucket_sampler': enable_bucket_sampler,
             'min_size': min_size,
             'max_size': max_size,
-            'bucket_reso_steps': bucket_reso_steps,
+            'bucket_step_size': bucket_step_size,
+            'max_bucket_area': max_bucket_area,
             'token_dropout_rate': token_dropout_rate,
             'caption_dropout_rate': caption_dropout_rate,
             'min_tag_weight': min_tag_weight,
@@ -219,31 +226,24 @@ class CustomDataset(CustomDatasetBase):
     def _precompute_bucket_data(self):
         """Pre-compute bucket data using thread pool"""
         def process_image_batch(paths):
-            results = defaultdict(list)
+            results = []
             for path in paths:
                 try:
                     with Image.open(path) as img:
                         width, height = img.size
-                        bucket = (height, width)
-                        results[bucket].append(path)
+                        results.append((path, height, width))
                 except Image.UnidentifiedImageError as e:
-                    # Handle invalid or corrupted images
                     logger.error("Invalid or corrupted image file %s: %s", path, str(e))
                 except Image.DecompressionBombError as e:
-                    # Handle images that are too large
                     logger.error("Image %s is too large to process: %s", path, str(e))
                 except ValueError as e:
-                    # Handle invalid image format
                     logger.error("Invalid image format in %s: %s", path, str(e))
                 except (IOError, OSError) as e:
-                    # Handle file I/O errors (catch these after more specific image errors)
                     logger.error("Failed to read image file %s: %s", path, str(e))
                 except MemoryError as e:
-                    # Handle out of memory errors
                     logger.error("Out of memory while processing %s: %s", path, str(e))
                     logger.error(traceback.format_exc())
                 except (AttributeError, TypeError) as e:
-                    # Handle errors from malformed image data
                     logger.error("Malformed image data in %s: %s", path, str(e))
                     logger.error(traceback.format_exc())
             return results
@@ -253,6 +253,8 @@ class CustomDataset(CustomDatasetBase):
         # Clear existing bucket data before recomputing
         self.bucket_data.clear()
         
+        # Collect image dimensions
+        image_dimensions = []
         with ThreadPoolExecutor(max_workers=self.init_params['num_workers']) as executor:
             futures = []
             for i in range(0, len(self.image_paths), chunk_size):
@@ -260,10 +262,23 @@ class CustomDataset(CustomDatasetBase):
                 futures.append(executor.submit(process_image_batch, chunk))
                 
             # Combine results
-            for future in tqdm(futures, desc="Processing image buckets"):
-                for bucket, paths in future.result().items():
-                    self.bucket_data[bucket].extend(paths)
-
+            for future in tqdm(futures, desc="Processing image dimensions"):
+                for path, height, width in future.result():
+                    image_dimensions.append((height, width))
+                    
+        # Assign images to buckets using bucket manager
+        bucket_assignments = self.bucket_manager.assign_to_buckets(image_dimensions)
+        
+        # Convert assignments to paths
+        for bucket, indices in bucket_assignments.items():
+            self.bucket_data[bucket] = [self.image_paths[i] for i in indices]
+            
+        # Log bucket statistics
+        total_images = sum(len(paths) for paths in self.bucket_data.values())
+        logger.info(f"Assigned {total_images} images to {len(self.bucket_data)} buckets")
+        for bucket, paths in self.bucket_data.items():
+            logger.info(f"Bucket {bucket}: {len(paths)} images")
+            
     def _precompute_tag_weights(self):
         """Pre-compute tag weights for all captions using thread pool"""
         if not self.use_tag_weighting or not hasattr(self, 'tag_weighter'):
