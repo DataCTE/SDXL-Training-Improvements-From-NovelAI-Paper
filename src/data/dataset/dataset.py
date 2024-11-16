@@ -619,73 +619,90 @@ class CustomDataset(CustomDatasetBase):
         try:
             total_images = len(self.image_paths)
             batch_size = 32  # Process larger batches for GPU efficiency
-            num_batches = (total_images + batch_size - 1) // batch_size
             
-            logger.info("Processing %d images in %d batches", total_images, num_batches)
+            # Group images by their bucket sizes
+            bucket_groups = defaultdict(list)
             
-            for batch_idx in tqdm(range(num_batches), desc="Processing latents"):
-                start_idx = batch_idx * batch_size
-                end_idx = min(start_idx + batch_size, total_images)
-                batch_paths = self.image_paths[start_idx:end_idx]
-                
-                # Process batch of images
+            logger.info("Grouping images by bucket sizes...")
+            for image_path in tqdm(self.image_paths, desc="Grouping images"):
                 try:
-                    # Load and preprocess all images in batch
-                    images = []
-                    valid_paths = []
-                    
-                    for image_path in batch_paths:
-                        try:
-                            with Image.open(image_path) as img:
-                                img = img.convert('RGB')
-                                # Get original dimensions
-                                orig_height, orig_width = img.size[1], img.size[0]
-                                
-                                # Find closest bucket resolution
-                                target_height, target_width = self.bucket_manager.find_closest_bucket(orig_height, orig_width)
-                                
-                                # Resize image to target bucket resolution
-                                if (orig_height, orig_width) != (target_height, target_width):
-                                    img = img.resize((target_width, target_height), Image.Resampling.LANCZOS)
-                                
-                                # Optimize image processing for GPU
-                                image = torch.from_numpy(
-                                    np.array(img, dtype=np.float32)
-                                ).permute(2, 0, 1) / 127.5 - 1
-                                images.append(image)
-                                valid_paths.append(image_path)
-                        except Exception as e:
-                            logger.debug(f"Failed to load/resize image {image_path}: {str(e)}")
-                            continue
-                    
-                    if not images:
-                        continue
+                    with Image.open(image_path) as img:
+                        img = img.convert('RGB')
+                        # Get original dimensions
+                        orig_height, orig_width = img.size[1], img.size[0]
                         
-                    # Stack images into a single batch tensor
-                    image_batch = torch.stack(images, dim=0)
-                    
-                    # Process batch through VAE with mixed precision
-                    with torch.amp.autocast('cuda'):
-                        with torch.no_grad():
-                            image_batch = image_batch.to(self.device, non_blocking=True)
-                            latents = self.vae.encode(image_batch).latent_dist.sample()
-                            latents = latents.cpu()  # Move to CPU immediately
-                            
-                    # Store latents in cache
-                    for path, latent in zip(valid_paths, latents):
-                        self.latents_cache[path] = latent
-                    
-                    # Clean up GPU memory
-                    del image_batch, latents, images
-                    torch.cuda.empty_cache()
-                    
+                        # Find closest bucket resolution
+                        target_height, target_width = self.bucket_manager.find_closest_bucket(orig_height, orig_width)
+                        bucket_groups[(target_height, target_width)].append(image_path)
                 except Exception as e:
-                    logger.error(f"Failed to process batch {batch_idx}: {str(e)}")
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                    logger.debug(f"Failed to process image {image_path} for grouping: {str(e)}")
                     continue
             
-            logger.info("Completed latent processing")
+            # Process each bucket group
+            total_batches = sum((len(group) + batch_size - 1) // batch_size 
+                              for group in bucket_groups.values())
+            logger.info(f"Processing {total_images} images in {total_batches} batches across {len(bucket_groups)} bucket sizes")
+            
+            processed_count = 0
+            with tqdm(total=total_images, desc="Processing latents") as pbar:
+                for (bucket_height, bucket_width), image_paths in bucket_groups.items():
+                    for i in range(0, len(image_paths), batch_size):
+                        batch_paths = image_paths[i:i + batch_size]
+                        
+                        try:
+                            # Load and preprocess all images in batch
+                            images = []
+                            valid_paths = []
+                            
+                            for image_path in batch_paths:
+                                try:
+                                    with Image.open(image_path) as img:
+                                        img = img.convert('RGB')
+                                        # Resize image to target bucket resolution
+                                        if (img.size[1], img.size[0]) != (bucket_height, bucket_width):
+                                            img = img.resize((bucket_width, bucket_height), Image.Resampling.LANCZOS)
+                                        
+                                        # Optimize image processing for GPU
+                                        image = torch.from_numpy(
+                                            np.array(img, dtype=np.float32)
+                                        ).permute(2, 0, 1) / 127.5 - 1
+                                        images.append(image)
+                                        valid_paths.append(image_path)
+                                except Exception as e:
+                                    logger.debug(f"Failed to load/resize image {image_path}: {str(e)}")
+                                    continue
+                            
+                            if not images:
+                                continue
+                                
+                            # Stack images into a single batch tensor
+                            image_batch = torch.stack(images, dim=0)
+                            
+                            # Process batch through VAE with mixed precision
+                            with torch.amp.autocast('cuda'):
+                                with torch.no_grad():
+                                    image_batch = image_batch.to(self.device, non_blocking=True)
+                                    latents = self.vae.encode(image_batch).latent_dist.sample()
+                                    latents = latents.cpu()  # Move to CPU immediately
+                                    
+                            # Store latents in cache
+                            for path, latent in zip(valid_paths, latents):
+                                self.latents_cache[path] = latent
+                            
+                            processed_count += len(valid_paths)
+                            pbar.update(len(valid_paths))
+                            
+                            # Clean up GPU memory
+                            del image_batch, latents, images
+                            torch.cuda.empty_cache()
+                            
+                        except Exception as e:
+                            logger.error(f"Failed to process batch for bucket {bucket_height}x{bucket_width}: {str(e)}")
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            continue
+            
+            logger.info(f"Completed latent processing for {processed_count} images")
             
         except Exception as e:
             logger.error("Failed to process latents: %s", str(e))
@@ -783,7 +800,7 @@ class CustomDataset(CustomDatasetBase):
                         # Move to GPU and use automatic mixed precision
                         with torch.cuda.amp.autocast():
                             with torch.no_grad():
-                                image = image.to(self.device, non_blocking=True)
+                                image = image.to(self.device)
                                 latent = self.vae.encode(image).latent_dist.sample()
                                 
                                 if not self.no_caching_latents:
