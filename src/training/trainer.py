@@ -28,8 +28,7 @@ from src.data.tag_weighter import TagBasedLossWeighter
 from src.training.vae_finetuner import VAEFineTuner
 from src.data.dataset.dataset import CustomDataset
 from src.utils.checkpoint import save_checkpoint
-from src.config.args import EMAArgs
-from torch.nn import Module
+
 
 logger = logging.getLogger(__name__)
 
@@ -432,17 +431,17 @@ def initialize_training_components(args, models):
                 lambda args, models, model_path: EMAModel(
                     model=models["unet"],
                     model_path=model_path,
-                    decay=args.decay,
-                    update_after_step=args.update_after_step,
-                    update_every=args.update_every,
-                    use_ema_warmup=args.use_ema_warmup,
-                    power=args.power,
-                    min_decay=args.min_decay,
-                    max_decay=args.max_decay,
-                    mixed_precision=args.mixed_precision,
-                    gradient_checkpointing=args.gradient_checkpointing
-                ) if args.use_ema else None,
-                args.use_ema,
+                    decay=args.ema.decay,
+                    update_after_step=args.ema.update_after_step,
+                    update_every=args.ema.update_every,
+                    use_ema_warmup=args.ema.use_ema_warmup,
+                    power=args.ema.power,
+                    min_decay=args.ema.min_decay,
+                    max_decay=args.ema.max_decay,
+                    mixed_precision=args.ema.mixed_precision,
+                    gradient_checkpointing=args.system.gradient_checkpointing
+                ) if args.ema.use_ema else None,
+                args.ema.use_ema,
                 (args, {"unet": models["unet"]}, args.model.model_path)
             ),
             "tag_weighter": (
