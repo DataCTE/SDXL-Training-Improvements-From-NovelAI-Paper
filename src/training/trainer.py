@@ -11,6 +11,9 @@ from collections import defaultdict
 from contextlib import nullcontext
 
 import torch
+import torch.nn as nn
+from torch.nn import Module
+from torch.optim import Optimizer
 import numpy as np
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -25,6 +28,8 @@ from src.data.tag_weighter import TagBasedLossWeighter
 from src.training.vae_finetuner import VAEFineTuner
 from src.data.dataset.dataset import CustomDataset
 from src.utils.checkpoint import save_checkpoint
+from src.config.args import EMAArgs
+from torch.nn import Module
 
 logger = logging.getLogger(__name__)
 
@@ -181,52 +186,136 @@ def _get_ema_config(
         "model_path": model_path,
     }
 
-
-def setup_ema(args: EMAModel, model, model_path: str, device=None):
-    """Setup EMA model with proper error handling.
+def _validate_ema_config(config: EMAArgs) -> None:
+    """Validate EMA configuration parameters.
     
     Args:
-        args: EMAArgs configuration object
-        model: The model to apply EMA to
-        device: Optional device to place the EMA model on
-
-    Returns:
-        Optional[EMAModel]: The configured EMA model or None if not enabled
-
+        config: EMA configuration to validate
+        
     Raises:
-        Exception: If the setup of the EMA model fails
+        ValueError: If any configuration parameters are invalid
     """
+    if config.ema_decay < 0 or config.ema_decay > 1:
+        raise ValueError(f"EMA decay must be between 0 and 1, got {config.ema_decay}")
+    
+    if config.ema_update_after_step < 0:
+        raise ValueError(f"EMA update_after_step must be non-negative, got {config.ema_update_after_step}")
+    
+    if config.ema_update_every < 1:
+        raise ValueError(f"EMA update_every must be at least 1, got {config.ema_update_every}")
+    
+    if config.ema_power < 0:
+        raise ValueError(f"EMA power must be non-negative, got {config.ema_power}")
+    
+    if config.ema_min_decay < 0 or config.ema_min_decay > config.ema_max_decay:
+        raise ValueError(f"EMA min_decay must be between 0 and max_decay, got {config.ema_min_decay}")
+    
+    if config.ema_max_decay < config.ema_min_decay or config.ema_max_decay > 1:
+        raise ValueError(f"EMA max_decay must be between min_decay and 1, got {config.ema_max_decay}")
+
+def _validate_model(model: Module) -> None:
+    """Validate model for EMA setup.
+    
+    Args:
+        model: PyTorch model to validate
+        
+    Raises:
+        TypeError: If model is not a PyTorch Module
+        ValueError: If model has no parameters
+    """
+    if not isinstance(model, Module):
+        raise TypeError(f"Model must be a PyTorch Module, got {type(model)}")
+    
+    if not any(p.requires_grad for p in model.parameters()):
+        raise ValueError("Model has no trainable parameters")
+
+def setup_ema(
+    config: 'EMAArgs',
+    models: Dict[str, Module],
+    model_path: Optional[str] = None,
+    device: Optional[Union[str, torch.device]] = None
+) -> Optional['EMAModel']:
+    """Set up Exponential Moving Average (EMA) model for training.
+    
+    Args:
+        config: EMA configuration arguments
+        models: Dictionary containing model components (unet, vae, etc.)
+        model_path: Optional path to pretrained model weights. If None, uses base model path.
+        device: Optional device to place EMA model on. Defaults to CUDA if available.
+    
+    Returns:
+        Optional[EMAModel]: Configured EMA model instance or None if EMA is disabled
+    
+    Raises:
+        ValueError: If invalid configuration parameters or missing models
+        RuntimeError: If EMA setup/initialization fails
+        TypeError: If invalid model types provided
+        MemoryError: If insufficient GPU memory
+    """
+    if not config.use_ema:
+        logger.info("EMA training disabled in configuration")
+        return None
+
     try:
-        # Use provided device or default to CUDA/CPU
+        # Get UNet model for EMA
+        if "unet" not in models:
+            raise ValueError("UNet model not found in models dictionary")
+        model = models["unet"]
+
+        # Validate configuration and model
+        _validate_ema_config(config)
+        _validate_model(model)
+
+        # Handle device setup
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        if not args.use_ema:
-            return None
+        # Determine mixed precision mode based on device capabilities
+        if torch.cuda.is_available():
+            if torch.cuda.is_bf16_supported():
+                mixed_precision = "bf16"
+                logger.info("Using bfloat16 for EMA model")
+            else:
+                mixed_precision = "fp16"
+                logger.info("Using float16 for EMA model")
+        else:
+            mixed_precision = "no"
+            logger.info("Mixed precision disabled for CPU training")
 
-        # Get appropriate mixed precision mode
-        mixed_precision = "bf16" if torch.cuda.is_available() else "no"
-
+        # Initialize EMA model
+        logger.info("Initializing EMA model...")
         ema = EMAModel(
             model=model,
-            model_path=args.model, 
-            decay=args.ema_decay,
-            update_after_step=args.ema_update_after_step,
+            model_path=model_path,  # Base model path for initialization
+            decay=config.ema_decay,
+            update_after_step=config.ema_update_after_step,
             device=device,
-            update_every=args.ema_update_every,
-            use_ema_warmup=args.use_ema_warmup,
-            power=args.ema_power,
-            min_decay=args.ema_min_decay,
-            max_decay=args.ema_max_decay,
+            update_every=config.ema_update_every,
+            use_ema_warmup=config.use_ema_warmup,
+            power=config.ema_power,
+            min_decay=config.ema_min_decay,
+            max_decay=config.ema_max_decay,
             mixed_precision=mixed_precision,
-            jit_compile=False,  # Default to False for better compatibility
+            jit_compile=False,  # Default to False for compatibility
             gradient_checkpointing=True  # Enable for memory efficiency
         )
+
+        # Log configuration details
+        logger.info("EMA model initialized successfully:")
+        logger.info(" - Device: %s", device)
+        logger.info(" - Mixed Precision: %s", mixed_precision)
+        logger.info(" - Update Every: %d steps", config.ema_update_every)
+        logger.info(" - Warmup: %s", "Enabled" if config.use_ema_warmup else "Disabled")
+        logger.info(" - Decay Rate: %.4f", config.ema_decay)
+
         return ema
 
-    except (ValueError, RuntimeError, AttributeError) as e:
-        raise type(e)(f"Failed to setup EMA model: {str(e)}") from e
-
+    except torch.cuda.OutOfMemoryError as e:
+        logger.error("CUDA out of memory during EMA setup")
+        raise MemoryError(f"Insufficient GPU memory for EMA model: {str(e)}") from e
+    except Exception as e:
+        logger.error("Failed to setup EMA model: %s", str(e))
+        raise RuntimeError(f"EMA setup failed: {str(e)}") from e
 
 def setup_validator(args, models, device, dtype) -> Optional[Any]:
     """Initialize validation components."""
@@ -503,7 +592,7 @@ def initialize_training_components(args, models):
             "ema": (
                 setup_ema, 
                 args.ema.use_ema, 
-                (args.ema, models["unet"]) 
+                (args.ema, models, args.model.model_path)
             ),
             "tag_weighter": (
                 setup_tag_weighter, 
