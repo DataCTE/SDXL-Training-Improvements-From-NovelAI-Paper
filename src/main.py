@@ -50,7 +50,6 @@ def main():
         trainer = train_sdxl(
             train_data_dir=config.data_dir,
             output_dir=config.output_dir,
-            val_data_dir=config.validation_dir,
             pretrained_model_path=config.model_path,
             batch_size=config.batch_size,
             num_epochs=config.num_epochs,
@@ -60,8 +59,6 @@ def main():
             gradient_checkpointing=config.gradient_checkpointing,
             gradient_accumulation_steps=config.gradient_accumulation_steps,
             max_grad_norm=config.max_grad_norm,
-            validation_prompts=config.validation_prompts,
-            validation_epochs=config.validation_epochs,
             save_epochs=config.save_epochs,
         )
         
