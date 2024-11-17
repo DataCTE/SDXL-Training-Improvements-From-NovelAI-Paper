@@ -1094,3 +1094,53 @@ class CustomDataset(CustomDatasetBase):
         # Cache result for future lookups
         self._bucket_cache[(height, width)] = best_bucket
         return best_bucket
+
+    def _load_caption(self, image_path: str) -> str:
+        """Load caption from corresponding text file.
+        
+        Args:
+            image_path: Path to the image file
+            
+        Returns:
+            Caption string from the text file
+        """
+        try:
+            caption_path = Path(image_path).with_suffix('.txt')
+            if caption_path.exists():
+                with open(caption_path, 'r', encoding='utf-8') as f:
+                    return f.read().strip()
+            else:
+                logger.warning(f"Caption file not found for {image_path}")
+                return ""
+        except Exception as e:
+            logger.error(f"Error loading caption for {image_path}: {str(e)}")
+            return ""
+
+    def _process_caption_tags(self, caption: str) -> Tuple[List[str], List[float]]:
+        """Process caption to extract tags and weights.
+        
+        Args:
+            caption: Raw caption string
+            
+        Returns:
+            Tuple of (tags list, weights list)
+        """
+        if not caption:
+            return [], []
+            
+        try:
+            # Split caption into tags
+            tags = [t.strip() for t in caption.split(',')]
+            tags = [t for t in tags if t]  # Remove empty tags
+            
+            if self.use_tag_weighting and self.tag_weighter is not None:
+                # Get weights for tags using batch processing
+                weights = self.tag_weighter.process_tag_batch(tags)
+                return tags, weights
+            else:
+                # Use uniform weights if tag weighting is disabled
+                return tags, [1.0] * len(tags)
+                
+        except Exception as e:
+            logger.error(f"Error processing caption tags: {str(e)}")
+            return [], []
