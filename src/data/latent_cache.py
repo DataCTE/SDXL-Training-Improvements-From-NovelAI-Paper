@@ -150,7 +150,7 @@ class LatentCacheManager:
         self,
         cache_dir: str = "latents_cache",
         vae: Optional[torch.nn.Module] = None,
-        workers_per_gpu: int = 20
+        workers_per_gpu: int = 2
     ) -> None:
         """Initialize the latent cache manager.
         
