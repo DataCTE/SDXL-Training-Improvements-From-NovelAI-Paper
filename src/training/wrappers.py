@@ -6,8 +6,10 @@ from dataclasses import asdict
 
 from src.training.trainer import SDXLTrainer, TrainingConfig
 from src.training.vae_finetuner import VAEFineTuner
-from src.data.setup_dataset import create_train_dataloader, create_validation_dataloader
+from src.data.multiaspect.dataset import create_train_dataloader, create_validation_dataloader
 from src.models.model_loader import create_sdxl_models, create_vae_model
+from src.data.cacheing.vae import VAECache
+from src.data.cacheing.text_embeds import TextEmbeddingCache
 
 logger = logging.getLogger(__name__)
 
@@ -40,17 +42,28 @@ def train_sdxl(
     # Setup configuration
     config = TrainingConfig(**kwargs)
     
+    # Create models and caches first
+    models_dict, _ = create_sdxl_models(pretrained_model_path)
+    vae_cache = VAECache(models_dict['vae'])
+    text_embedding_cache = TextEmbeddingCache(models_dict['text_encoder'], models_dict['text_encoder_2'])
+    
     # Create dataloaders
     train_dataloader = create_train_dataloader(
         train_data_dir,
-        batch_size=config.batch_size
+        vae_cache=vae_cache,
+        text_embedding_cache=text_embedding_cache,
+        batch_size=config.batch_size,
+        num_workers=config.num_workers if hasattr(config, 'num_workers') else 4
     )
     
     val_dataloader = None
     if val_data_dir:
         val_dataloader = create_validation_dataloader(
             val_data_dir,
-            batch_size=config.batch_size
+            vae_cache=vae_cache,
+            text_embedding_cache=text_embedding_cache,
+            batch_size=config.batch_size,
+            num_workers=config.num_workers if hasattr(config, 'num_workers') else 4
         )
     
     # Resume from checkpoint if specified
@@ -64,10 +77,9 @@ def train_sdxl(
         return trainer
     
     # Create new training instance
-    models = create_sdxl_models(pretrained_model_path)
     trainer = SDXLTrainer(
         config=config,
-        models=models,
+        models=models_dict,
         train_dataloader=train_dataloader,
         val_dataloader=val_dataloader
     )
@@ -114,9 +126,12 @@ def train_vae(
     vae = create_vae_model(pretrained_vae_path)
     
     # Create dataloader
-    create_train_dataloader(
+    train_dataloader = create_train_dataloader(
         train_data_dir,
-        batch_size=batch_size
+        vae_cache=None,
+        text_embedding_cache=None,
+        batch_size=batch_size,
+        num_workers=4
     )
     
     # Initialize trainer

@@ -7,10 +7,10 @@ with images of different aspect ratios using bucketing.
 
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List, Optional, Tuple, Any
-
+from typing import Dict, List, Optional, Tuple, Any, Union
+from pathlib import Path
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 
 from src.data.image_processing.loading import load_and_verify_image
 from src.data.image_processing.transforms import (
@@ -194,3 +194,116 @@ class MultiAspectDataset(Dataset):
             'text_embeds': text_embeds,
             'text_masks': text_masks
         }
+
+def create_train_dataloader(
+    train_data_dir: Union[str, Path],
+    vae_cache: VAECache,
+    text_embedding_cache: TextEmbeddingCache,
+    batch_size: int,
+    num_workers: int = 4,
+    enable_transforms: bool = True,
+    transform_params: Optional[Dict[str, Any]] = None,
+) -> DataLoader:
+    """Create training dataloader with multi-aspect dataset.
+    
+    Args:
+        train_data_dir: Directory containing training images and captions
+        vae_cache: Cache for VAE latents
+        text_embedding_cache: Cache for text embeddings
+        batch_size: Batch size for training
+        num_workers: Number of workers for data loading
+        enable_transforms: Whether to use data augmentation
+        transform_params: Parameters for data augmentation
+        
+    Returns:
+        DataLoader for training
+    """
+    # Get image paths and prompts from data directory
+    image_paths = []
+    prompts = []
+    data_dir = Path(train_data_dir)
+    for img_path in data_dir.glob("*.jpg"):
+        txt_path = img_path.with_suffix(".txt")
+        if txt_path.exists():
+            with open(txt_path, "r", encoding="utf-8") as f:
+                prompt = f.read().strip()
+            image_paths.append(str(img_path))
+            prompts.append(prompt)
+    
+    # Create bucket manager for aspect ratio handling
+    bucket_manager = BucketManager(image_paths)
+    
+    # Create dataset
+    dataset = MultiAspectDataset(
+        image_paths=image_paths,
+        prompts=prompts,
+        bucket_manager=bucket_manager,
+        vae_cache=vae_cache,
+        text_embedding_cache=text_embedding_cache,
+        num_workers=num_workers,
+        enable_transforms=enable_transforms,
+        transform_params=transform_params
+    )
+    
+    # Create and return dataloader
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True
+    )
+
+def create_validation_dataloader(
+    val_data_dir: Union[str, Path],
+    vae_cache: VAECache,
+    text_embedding_cache: TextEmbeddingCache,
+    batch_size: int,
+    num_workers: int = 4,
+) -> DataLoader:
+    """Create validation dataloader with multi-aspect dataset.
+    
+    Args:
+        val_data_dir: Directory containing validation images and captions
+        vae_cache: Cache for VAE latents
+        text_embedding_cache: Cache for text embeddings
+        batch_size: Batch size for validation
+        num_workers: Number of workers for data loading
+        
+    Returns:
+        DataLoader for validation
+    """
+    # Get image paths and prompts from validation directory
+    image_paths = []
+    prompts = []
+    data_dir = Path(val_data_dir)
+    for img_path in data_dir.glob("*.jpg"):
+        txt_path = img_path.with_suffix(".txt")
+        if txt_path.exists():
+            with open(txt_path, "r", encoding="utf-8") as f:
+                prompt = f.read().strip()
+            image_paths.append(str(img_path))
+            prompts.append(prompt)
+    
+    # Create bucket manager for aspect ratio handling
+    bucket_manager = BucketManager(image_paths)
+    
+    # Create dataset - no transforms for validation
+    dataset = MultiAspectDataset(
+        image_paths=image_paths,
+        prompts=prompts,
+        bucket_manager=bucket_manager,
+        vae_cache=vae_cache,
+        text_embedding_cache=text_embedding_cache,
+        num_workers=num_workers,
+        enable_transforms=False
+    )
+    
+    # Create and return dataloader
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True
+    )
