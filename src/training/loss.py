@@ -144,8 +144,25 @@ def compute_v_prediction_scaling(
     c_in = 1.0 / denominator
     return c_out, c_in
 
-def forward_pass(args, models, batch, device, dtype, components) -> torch.Tensor:
-    """Execute forward pass with proper error handling."""
+def forward_pass(args, model_dict, batch, device, dtype, components) -> torch.Tensor:
+    """Execute forward pass with proper error handling.
+    
+    Args:
+        args: Training configuration arguments
+        model_dict: Dictionary containing models (unet, vae, etc.)
+        batch: Training batch data
+        device: Device to run on
+        dtype: Data type for computations
+        components: Training components (tag_weighter, vae_finetuner, etc.)
+        
+    Returns:
+        torch.Tensor: Computed loss value
+        
+    Raises:
+        ValueError: If required batch data is missing
+        RuntimeError: If forward pass computation fails
+        KeyError: If required model or component is missing
+    """
     try:
         # Move batch to device
         batch = {k: v.to(device=device, dtype=dtype) if torch.is_tensor(v) else v for k, v in batch.items()}
@@ -156,7 +173,7 @@ def forward_pass(args, models, batch, device, dtype, components) -> torch.Tensor
         
         # Get noise prediction using v-prediction loss
         loss = training_loss_v_prediction(
-            model=models["unet"],
+            model=model_dict["unet"],
             x_0=latents,
             sigma=timesteps,
             text_embeddings=batch["prompt_embeds"],
