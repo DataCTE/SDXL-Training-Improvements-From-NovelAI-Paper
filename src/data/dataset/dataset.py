@@ -135,6 +135,12 @@ class CustomDataset(Dataset):
             tolerance=0.033
         )
         
+        # Initialize dataset components
+        self.dataset_initializer = DatasetInitializer()
+        self.image_grouper = ImageGrouper(
+            bucket_manager=self.bucket_manager
+        )
+        
         # Initialize latent cache if VAE provided
         self.latent_cache = (
             LatentCacheManager(vae=vae, cache_dir=cache_dir)
