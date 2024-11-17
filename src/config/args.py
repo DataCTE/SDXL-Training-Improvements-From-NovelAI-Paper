@@ -183,7 +183,6 @@ def parse_args() -> TrainingConfig:
     parser.add_argument("--num_workers", type=int, default=4)
     
     # Data arguments
-    parser.add_argument("--validation_dir", type=str, help="Validation data directory")
     parser.add_argument("--cache_dir", type=str, default="latents_cache")
     parser.add_argument("--no_caching", action="store_true")
     
