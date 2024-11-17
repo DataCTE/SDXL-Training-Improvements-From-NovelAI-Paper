@@ -177,41 +177,64 @@ class CustomDataset(CustomDatasetBase):
             # Process images by bucket to ensure consistent tensor sizes
             batch_size = 4  # Adjust based on GPU memory
             
-            # Iterate through each bucket group
-            for bucket_dims, image_paths in self.bucket_data.items():
-                for i in range(0, len(image_paths), batch_size):
-                    batch_paths = image_paths[i:i + batch_size]
-                    
-                    # Load and transform images using bucket dimensions
-                    batch_tensors = []
-                    valid_paths = []
-                    for path in batch_paths:
-                        image = self.image_processor.load_and_transform(
-                            path,
-                            target_height=bucket_dims[0],
-                            target_width=bucket_dims[1]
-                        )
-                        if image is not None:
-                            batch_tensors.append(image)
-                            valid_paths.append(path)
-                    
-                    if not batch_tensors:
+            # Initialize latent caching with all image paths
+            all_image_paths = []
+            for image_paths in self.bucket_data.values():
+                all_image_paths.extend(image_paths)
+                
+            # Check if we need to process any new images
+            if not self.latents_cache.initialize_latent_caching(all_image_paths):
+                return
+                
+            # Initialize GPU workers
+            self.latents_cache.initialize_workers()
+            
+            try:
+                # Iterate through each bucket group
+                for bucket_dims, image_paths in self.bucket_data.items():
+                    # Filter for uncached images
+                    uncached_paths = [path for path in image_paths if not self.latents_cache.is_cached(path)]
+                    if not uncached_paths:
                         continue
                         
-                    # Stack tensors and process batch
-                    try:
-                        batch_tensor = torch.stack(batch_tensors)
-                        latents = self.latents_cache.process_latents_batch(batch_tensor)
+                    for i in range(0, len(uncached_paths), batch_size):
+                        batch_paths = uncached_paths[i:i + batch_size]
                         
-                        # Cache individual latents
-                        if latents is not None:
-                            for idx, path in enumerate(valid_paths):
-                                self.latents_cache.latents_cache[path] = latents[idx]
-                                
-                    except Exception as e:
-                        logger.error(f"Failed to process latent batch: {str(e)}")
-                        continue
+                        # Load and transform images using bucket dimensions
+                        batch_tensors = []
+                        valid_paths = []
+                        for path in batch_paths:
+                            image = self.image_processor.load_and_transform(
+                                path,
+                                target_height=bucket_dims[0],
+                                target_width=bucket_dims[1]
+                            )
+                            if image is not None:
+                                batch_tensors.append(image)
+                                valid_paths.append(path)
                         
+                        if not batch_tensors:
+                            continue
+                            
+                        # Stack tensors and queue for processing
+                        try:
+                            batch_tensor = torch.stack(batch_tensors)
+                            self.latents_cache.process_latents_batch(batch_tensor, valid_paths)
+                        except Exception as e:
+                            logger.error(f"Failed to process latent batch: {str(e)}")
+                            continue
+                        
+                        # Process any completed results
+                        self.latents_cache.process_results()
+                
+                # Process any remaining results
+                while self.latents_cache.processed_images < self.latents_cache.total_images:
+                    self.latents_cache.process_results()
+                    
+            finally:
+                # Always ensure workers are closed
+                self.latents_cache.close_workers()
+                
             logger.info("Latent cache initialization completed")
             
         except Exception as e:
