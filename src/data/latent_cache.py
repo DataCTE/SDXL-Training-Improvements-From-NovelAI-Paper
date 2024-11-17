@@ -59,7 +59,7 @@ class GPUWorker:
 class LatentCacheManager:
     """Manages caching and retrieval of VAE latents."""
     
-    def __init__(self, cache_dir: str = "latents_cache", vae: Optional[torch.nn.Module] = None, workers_per_gpu: int = 4):
+    def __init__(self, cache_dir: str = "latents_cache", vae: Optional[torch.nn.Module] = None, workers_per_gpu: int = 10):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(exist_ok=True)
         self.vae = vae
