@@ -1,8 +1,7 @@
-"""
-Multi-aspect dataset implementation for SDXL training.
+"""Multi-aspect dataset implementation for SDXL training.
 
 This module provides a PyTorch Dataset implementation that supports training
-with images of different aspect ratios using bucketing.
+with images of different aspect ratios using bucketing and efficient caching.
 """
 
 import logging
@@ -11,27 +10,35 @@ from typing import Dict, List, Optional, Tuple, Any, Union
 from pathlib import Path
 import torch
 from torch.utils.data import Dataset, DataLoader
-from PIL import Image
+import random
 
 from src.data.image_processing.loading import load_and_verify_image
 from src.data.image_processing.transforms import (
-    resize_image, random_flip, random_jitter
+    resize_image, random_flip, random_jitter, random_rotate, gaussian_blur
+)
+from src.data.image_processing.manipluations import converter
+from src.data.image_processing.validation import (
+    validate_image_comprehensive, validate_tensor_comprehensive,
+    validate_dimensions, check_image_corruption
 )
 from src.data.cacheing.vae import VAECache
 from src.data.cacheing.text_embeds import TextEmbeddingCache
 from src.data.multiaspect.bucket_manager import BucketManager
+from src.data.multiaspect.image_grouper import ImageGrouper
 from src.data.prompt.caption_processor import CaptionProcessor
+
 logger = logging.getLogger(__name__)
 
 
 class MultiAspectDataset(Dataset):
     """Dataset that handles images with different aspect ratios.
     
-    This dataset implementation supports:
+    This dataset implementation integrates:
     - Dynamic bucketing based on aspect ratios
     - Efficient caching of VAE latents and text embeddings
     - Multi-threaded image loading and processing
-    - Data augmentation with configurable transforms
+    - Comprehensive image validation and error handling
+    - Configurable data augmentation pipeline
     """
     
     def __init__(
@@ -43,162 +50,205 @@ class MultiAspectDataset(Dataset):
         text_embedding_cache: TextEmbeddingCache,
         num_workers: int = 4,
         enable_transforms: bool = True,
-        transform_params: Optional[Dict[str, Any]] = None
+        transform_params: Optional[Dict[str, Any]] = None,
+        min_size: int = 512,
+        max_size: int = 2048
     ):
         """Initialize the dataset.
         
         Args:
             image_paths: List of paths to training images
-            prompts: List of corresponding prompts
-            bucket_manager: BucketManager instance for aspect ratio handling
-            vae_cache: VAECache instance for caching latents
-            text_embedding_cache: TextEmbeddingCache for prompt embeddings
-            num_workers: Number of worker threads for loading
-            enable_transforms: Whether to apply data augmentation
-            transform_params: Parameters for data augmentation
+            prompts: List of corresponding prompt texts
+            bucket_manager: Manager for aspect ratio buckets
+            vae_cache: Cache for VAE latents
+            text_embedding_cache: Cache for text embeddings
+            num_workers: Number of worker threads
+            enable_transforms: Whether to use data augmentation
+            transform_params: Parameters for transforms
+            min_size: Minimum image dimension
+            max_size: Maximum image dimension
         """
-        super().__init__()
-        
-        if len(image_paths) != len(prompts):
-            raise ValueError(
-                f"Number of images ({len(image_paths)}) must match "
-                f"number of prompts ({len(prompts)})"
-            )
-            
         self.image_paths = image_paths
         self.prompts = prompts
         self.bucket_manager = bucket_manager
         self.vae_cache = vae_cache
         self.text_embedding_cache = text_embedding_cache
-        
+        self.num_workers = num_workers
         self.enable_transforms = enable_transforms
         self.transform_params = transform_params or {}
+        self.min_size = min_size
+        self.max_size = max_size
+
+        # Initialize components
+        self.image_grouper = ImageGrouper(bucket_manager)
+        self.caption_processor = CaptionProcessor()
         
-        # Initialize workers
-        self.executor = ThreadPoolExecutor(max_workers=num_workers)
-        self.prompt_processor = CaptionProcessor()
-        
-        # Process and bucket all images
+        # Process and validate dataset
         self._process_dataset()
+
+    def _process_dataset(self):
+        """Process and validate the entire dataset.
         
-    def _process_dataset(self) -> None:
-        """Process all images and assign to buckets."""
-        logger.info("Processing dataset...")
-        
-        # Submit all image loading tasks
-        futures = []
-        for path in self.image_paths:
-            futures.append(
-                self.executor.submit(load_and_verify_image, path)
-            )
-            
-        # Process results
-        for idx, future in enumerate(futures):
-            try:
-                image = future.result()
-                if image is None:
-                    logger.warning("Failed to load image: %s", self.image_paths[idx])
-                    continue
-                    
-                # Get target size from bucket manager
-                try:
-                    target_width, target_height = self.bucket_manager.get_target_size(self.image_paths[idx])
-                    
-                    # Resize image to target size
-                    image = resize_image(image, (target_width, target_height))
-                    
-                    # Get VAE latents
-                    latents = self.vae_cache.get_latents(image)
-                    if latents is None:
-                        logger.warning("Failed to get VAE latents for: %s", self.image_paths[idx])
-                        continue
-                        
-                    # Get text embeddings
-                    text_embeddings = self.text_embedding_cache.get_embeddings(self.prompts[idx])
-                    if text_embeddings is None:
-                        logger.warning("Failed to get text embeddings for: %s", self.image_paths[idx])
-                        continue
-                        
-                except Exception as e:
-                    logger.error("Error processing image %s: %s", self.image_paths[idx], str(e))
-                    continue
-                    
-            except Exception as e:
-                logger.error("Failed to process image %s: %s", self.image_paths[idx], str(e))
-                continue
-        
-    def _apply_transforms(self, image: torch.Tensor) -> torch.Tensor:
-        """Apply data augmentation transforms.
-        
-        Args:
-            image: Input tensor image
-            
-        Returns:
-            Transformed image
+        This method:
+        1. Validates all images
+        2. Groups images into buckets
+        3. Preprocesses text prompts
+        4. Initializes caches
         """
-        if not self.enable_transforms:
-            return image
-            
-        # Apply random flipping
-        if self.transform_params.get('flip', True):
-            image = random_flip(image, p=0.5)
-            
-        # Apply color jittering
-        if self.transform_params.get('jitter', True):
-            image = random_jitter(
-                image,
-                brightness=self.transform_params.get('brightness', 0.2),
-                contrast=self.transform_params.get('contrast', 0.2),
-                saturation=self.transform_params.get('saturation', 0.2),
-                hue=self.transform_params.get('hue', 0.1),
-                p=0.5
-            )
-            
-        return image
+        logger.info("Processing dataset with %d images", len(self.image_paths))
         
-    def __len__(self) -> int:
-        """Get total number of samples."""
-        return len(self.image_paths)
+        # Validate images in parallel
+        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+            futures = []
+            for path in self.image_paths:
+                futures.append(executor.submit(self._validate_image, path))
+            
+            # Collect results and filter invalid images
+            valid_indices = []
+            for idx, future in enumerate(futures):
+                try:
+                    future.result()
+                    valid_indices.append(idx)
+                except Exception as e:
+                    logger.warning("Skipping invalid image %s: %s", self.image_paths[idx], str(e))
+            
+            # Filter dataset
+            self.image_paths = [self.image_paths[i] for i in valid_indices]
+            self.prompts = [self.prompts[i] for i in valid_indices]
+
+        # Group images into buckets
+        self.image_buckets = self.image_grouper.group_images(self.image_paths)
         
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """Get a training sample.
+        # Process prompts
+        self.processed_prompts = [
+            self.caption_processor.process_caption(prompt, training=True) for prompt in self.prompts
+        ]
+        
+        # Initialize caches
+        self._init_caches()
+        
+        logger.info("Dataset processing complete. %d valid images in %d buckets",
+                   len(self.image_paths), len(self.image_buckets))
+
+    def _validate_image(self, image_path: str) -> None:
+        """Validate a single image file.
         
         Args:
-            idx: Sample index
+            image_path: Path to image file
+            
+        Raises:
+            Various validation errors if image is invalid
+        """
+        # Check for corruption
+        if error := check_image_corruption(image_path):
+            raise ValueError(f"Corrupted image: {error}")
+            
+        # Load and validate image
+        image = load_and_verify_image(image_path)
+        validate_image_comprehensive(
+            image,
+            min_size=self.min_size,
+            max_size=self.max_size
+        )
+        
+        # Validate dimensions
+        width, height = image.size
+        validate_dimensions(
+            width, height,
+            min_size=self.min_size,
+            max_size=self.max_size
+        )
+
+    def _init_caches(self):
+        """Initialize VAE and text embedding caches."""
+        logger.info("Initializing caches...")
+        
+        # Process images in batches
+        batch_size = 32
+        for i in range(0, len(self.image_paths), batch_size):
+            batch_paths = self.image_paths[i:i + batch_size]
+            batch_prompts = self.processed_prompts[i:i + batch_size]
+            
+            # Update VAE cache
+            self.vae_cache.cache_batch(batch_paths)
+            
+            # Update text embedding cache
+            self.text_embedding_cache.cache_batch(batch_prompts)
+
+    def __len__(self) -> int:
+        """Get dataset size."""
+        return len(self.image_paths)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        """Get a single training example.
+        
+        Args:
+            idx: Index of example
             
         Returns:
             Dict containing:
-                - 'latents': VAE latents
-                - 'text_embeds': Text embeddings
-                - 'text_masks': Attention masks
+            - image_latents: VAE latents tensor
+            - prompt_embeds: Text embedding tensor
+            - bucket_size: (height, width) of bucket
         """
-        # Load and process image
         image_path = self.image_paths[idx]
-        image = load_and_verify_image(image_path)
-        if image is None:
-            raise RuntimeError(f"Failed to load image: {image_path}")
-            
-        # Get target size and resize
-        target_width, target_height = self.bucket_manager.get_target_size(image_path)
-        image = resize_image(image, (target_width, target_height))
+        prompt = self.processed_prompts[idx]
         
-        # Apply transforms
-        image = self._apply_transforms(image)
+        # Get bucket size
+        bucket_size = self.image_buckets[image_path]
         
-        # Get VAE latents
-        latents = self.vae_cache.get_latents(image)
+        # Get cached tensors
+        image_latents = self.vae_cache.get(image_path)
+        prompt_embeds = self.text_embedding_cache.get(prompt)
         
-        # Process prompt and get embeddings
-        prompt = self.prompts[idx]
-        text_embeds, text_masks = self.text_embedding_cache.get_text_embeddings(
-            self.prompt_processor.format_caption(prompt)
-        )
+        # Validate tensors
+        validate_tensor_comprehensive(image_latents)
+        validate_tensor_comprehensive(prompt_embeds)
+        
+        # Apply transforms if enabled
+        if self.enable_transforms:
+            image_latents = self._apply_transforms(image_latents)
         
         return {
-            'latents': latents,
-            'text_embeds': text_embeds,
-            'text_masks': text_masks
+            'image_latents': image_latents,
+            'prompt_embeds': prompt_embeds,
+            'bucket_size': bucket_size
         }
+
+    def _apply_transforms(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Apply data augmentation transforms.
+        
+        Args:
+            tensor: Input tensor
+            
+        Returns:
+            Transformed tensor
+        """
+        if random.random() < self.transform_params.get('flip_prob', 0.5):
+            tensor = random_flip(tensor)
+            
+        if random.random() < self.transform_params.get('rotate_prob', 0.3):
+            angle_range = self.transform_params.get('angle_range', (-10, 10))
+            tensor = random_rotate(tensor, angle_range)
+            
+        if random.random() < self.transform_params.get('jitter_prob', 0.5):
+            tensor = random_jitter(
+                tensor,
+                brightness=self.transform_params.get('brightness', 0.2),
+                contrast=self.transform_params.get('contrast', 0.2),
+                saturation=self.transform_params.get('saturation', 0.2),
+                hue=self.transform_params.get('hue', 0.1)
+            )
+            
+        if random.random() < self.transform_params.get('blur_prob', 0.1):
+            tensor = gaussian_blur(
+                tensor,
+                kernel_size=self.transform_params.get('blur_kernel', 3),
+                sigma=self.transform_params.get('blur_sigma', 1.0)
+            )
+            
+        return tensor
+
 
 def create_train_dataloader(
     train_data_dir: Union[str, Path],
@@ -209,49 +259,31 @@ def create_train_dataloader(
     enable_transforms: bool = True,
     transform_params: Optional[Dict[str, Any]] = None,
 ) -> DataLoader:
-    """Create training dataloader with multi-aspect dataset.
+    """Create training dataloader.
     
     Args:
-        train_data_dir: Directory containing training images and captions
-        vae_cache: Cache for VAE latents
-        text_embedding_cache: Cache for text embeddings
-        batch_size: Batch size for training
-        num_workers: Number of workers for data loading
-        enable_transforms: Whether to use data augmentation
-        transform_params: Parameters for data augmentation
+        train_data_dir: Directory with training data
+        vae_cache: VAE latents cache
+        text_embedding_cache: Text embeddings cache
+        batch_size: Batch size
+        num_workers: Number of workers
+        enable_transforms: Whether to use augmentation
+        transform_params: Transform parameters
         
     Returns:
         DataLoader for training
     """
-    # Get image paths and prompts from data directory
-    image_paths = []
-    prompts = []
-    data_dir = Path(train_data_dir)
-    for img_path in data_dir.glob("*.jpg"):
-        txt_path = img_path.with_suffix(".txt")
-        if txt_path.exists():
-            with open(txt_path, "r", encoding="utf-8") as f:
-                prompt = f.read().strip()
-            image_paths.append(str(img_path))
-            prompts.append(prompt)
+    # Create bucket manager
+    bucket_manager = BucketManager()
     
-    # Create bucket manager for aspect ratio handling
-    bucket_manager = BucketManager(
-        min_resolution=512,  # SDXL default minimum resolution
-        max_resolution=2048,  # SDXL default maximum resolution
-        resolution_step=64,   # Standard step size
-        tolerance=0.033      # 3.3% aspect ratio tolerance
-    )
-    
-    # Add images to bucket manager
-    for img_path in image_paths:
-        img = Image.open(img_path)
-        width, height = img.size
-        bucket_manager.add_image(img_path, width, height)
+    # Get image paths and prompts
+    train_data_dir = Path(train_data_dir)
+    image_paths = list(train_data_dir.glob('*.jpg')) + list(train_data_dir.glob('*.png'))
+    prompts = [path.with_suffix('.txt').read_text().strip() for path in image_paths]
     
     # Create dataset
     dataset = MultiAspectDataset(
-        image_paths=image_paths,
+        image_paths=[str(p) for p in image_paths],
         prompts=prompts,
         bucket_manager=bucket_manager,
         vae_cache=vae_cache,
@@ -261,7 +293,7 @@ def create_train_dataloader(
         transform_params=transform_params
     )
     
-    # Create and return dataloader
+    # Create dataloader
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -270,6 +302,7 @@ def create_train_dataloader(
         pin_memory=True
     )
 
+
 def create_validation_dataloader(
     val_data_dir: Union[str, Path],
     vae_cache: VAECache,
@@ -277,56 +310,38 @@ def create_validation_dataloader(
     batch_size: int,
     num_workers: int = 4,
 ) -> DataLoader:
-    """Create validation dataloader with multi-aspect dataset.
+    """Create validation dataloader.
     
     Args:
-        val_data_dir: Directory containing validation images and captions
-        vae_cache: Cache for VAE latents
-        text_embedding_cache: Cache for text embeddings
-        batch_size: Batch size for validation
-        num_workers: Number of workers for data loading
+        val_data_dir: Directory with validation data
+        vae_cache: VAE latents cache
+        text_embedding_cache: Text embeddings cache
+        batch_size: Batch size
+        num_workers: Number of workers
         
     Returns:
         DataLoader for validation
     """
-    # Get image paths and prompts from validation directory
-    image_paths = []
-    prompts = []
-    data_dir = Path(val_data_dir)
-    for img_path in data_dir.glob("*.jpg"):
-        txt_path = img_path.with_suffix(".txt")
-        if txt_path.exists():
-            with open(txt_path, "r", encoding="utf-8") as f:
-                prompt = f.read().strip()
-            image_paths.append(str(img_path))
-            prompts.append(prompt)
+    # Create bucket manager
+    bucket_manager = BucketManager()
     
-    # Create bucket manager for aspect ratio handling
-    bucket_manager = BucketManager(
-        min_resolution=512,  # SDXL default minimum resolution
-        max_resolution=2048,  # SDXL default maximum resolution
-        resolution_step=64,   # Standard step size
-        tolerance=0.033      # 3.3% aspect ratio tolerance
-    )
+    # Get image paths and prompts
+    val_data_dir = Path(val_data_dir)
+    image_paths = list(val_data_dir.glob('*.jpg')) + list(val_data_dir.glob('*.png'))
+    prompts = [path.with_suffix('.txt').read_text().strip() for path in image_paths]
     
-    # Add images to bucket manager
-    for img_path in image_paths:
-        img = Image.open(img_path)
-        width, height = img.size
-        bucket_manager.add_image(img_path, width, height)
-    
-    # Create dataset - no transforms for validation
+    # Create dataset
     dataset = MultiAspectDataset(
-        image_paths=image_paths,
+        image_paths=[str(p) for p in image_paths],
         prompts=prompts,
         bucket_manager=bucket_manager,
         vae_cache=vae_cache,
         text_embedding_cache=text_embedding_cache,
         num_workers=num_workers,
-        enable_transforms=False
+        enable_transforms=False  # No augmentation for validation
     )
     
-    # Create and return dataloader
+    # Create dataloader
     return DataLoader(
         dataset,
         batch_size=batch_size,

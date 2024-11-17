@@ -8,7 +8,7 @@ image processing operations.
 import logging
 import torch
 from PIL import Image
-from typing import Tuple
+from typing import Tuple, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +34,14 @@ class ConversionError(ProcessingError):
 
 class ValidationError(ProcessingError):
     """Exception raised when image validation fails."""
+
+
+class ImageValidationError(ValidationError):
+    """Exception raised for image validation failures."""
+
+
+class TensorValidationError(ValidationError):
+    """Exception raised for tensor validation failures."""
 
 
 def validate_tensor(tensor: torch.Tensor) -> None:
@@ -115,3 +123,129 @@ def validate_target_size(target_size: Tuple[int, int]) -> None:
     """
     if not all(s > 0 for s in target_size):
         raise ValidationError("Target size dimensions must be positive")
+
+
+def validate_image_comprehensive(
+    image: Image.Image,
+    min_size: int = 512,
+    max_size: int = 2048,
+    required_mode: str = 'RGB'
+) -> None:
+    """Validate a PIL Image.
+    
+    Args:
+        image: PIL Image to validate
+        min_size: Minimum allowed dimension
+        max_size: Maximum allowed dimension
+        required_mode: Required image mode (e.g., 'RGB')
+        
+    Raises:
+        ImageValidationError: If validation fails
+    """
+    if not isinstance(image, Image.Image):
+        raise ImageValidationError(f"Expected PIL Image, got {type(image)}")
+        
+    if image.mode != required_mode:
+        raise ImageValidationError(
+            f"Invalid image mode: {image.mode}, expected {required_mode}"
+        )
+        
+    width, height = image.size
+    if width < min_size or height < min_size:
+        raise ImageValidationError(
+            f"Image too small: {width}x{height}, minimum size is {min_size}"
+        )
+        
+    if width > max_size or height > max_size:
+        raise ImageValidationError(
+            f"Image too large: {width}x{height}, maximum size is {max_size}"
+        )
+        
+    try:
+        # Verify image data is valid
+        image.verify()
+    except Exception as e:
+        raise ImageValidationError(f"Invalid image data: {str(e)}")
+
+
+def validate_tensor_comprehensive(
+    tensor: torch.Tensor,
+    expected_dims: int = 4,
+    expected_channels: int = 3,
+    min_value: float = -1.0,
+    max_value: float = 1.0
+) -> None:
+    """Validate a PyTorch tensor.
+    
+    Args:
+        tensor: Input tensor to validate
+        expected_dims: Expected number of dimensions
+        expected_channels: Expected number of channels
+        min_value: Minimum allowed value
+        max_value: Maximum allowed value
+        
+    Raises:
+        TensorValidationError: If validation fails
+    """
+    if not isinstance(tensor, torch.Tensor):
+        raise TensorValidationError(f"Expected torch.Tensor, got {type(tensor)}")
+        
+    if tensor.dim() != expected_dims:
+        raise TensorValidationError(
+            f"Invalid tensor dimensions: {tensor.dim()}, expected {expected_dims}"
+        )
+        
+    if tensor.shape[1] != expected_channels:
+        raise TensorValidationError(
+            f"Invalid number of channels: {tensor.shape[1]}, expected {expected_channels}"
+        )
+        
+    if tensor.isnan().any():
+        raise TensorValidationError("Tensor contains NaN values")
+        
+    if tensor.isinf().any():
+        raise TensorValidationError("Tensor contains infinite values")
+        
+    if tensor.min() < min_value:
+        raise TensorValidationError(
+            f"Tensor contains values below minimum: {tensor.min()}, minimum is {min_value}"
+        )
+        
+    if tensor.max() > max_value:
+        raise TensorValidationError(
+            f"Tensor contains values above maximum: {tensor.max()}, maximum is {max_value}"
+        )
+
+
+def get_tensor_stats(tensor: torch.Tensor) -> Tuple[float, float, float, float]:
+    """Get basic statistics for a tensor.
+    
+    Args:
+        tensor: Input tensor
+        
+    Returns:
+        Tuple of (min, max, mean, std)
+    """
+    return (
+        float(tensor.min()),
+        float(tensor.max()),
+        float(tensor.mean()),
+        float(tensor.std())
+    )
+
+
+def check_image_corruption(image_path: str) -> Optional[str]:
+    """Check if an image file is corrupted.
+    
+    Args:
+        image_path: Path to image file
+        
+    Returns:
+        Error message if corrupted, None if valid
+    """
+    try:
+        with Image.open(image_path) as img:
+            img.verify()
+        return None
+    except Exception as e:
+        return str(e)
