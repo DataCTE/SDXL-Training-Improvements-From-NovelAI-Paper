@@ -201,13 +201,11 @@ def parse_args() -> TrainingConfig:
     parser.add_argument("--no_caching", action="store_true")
     
     # Validation arguments
-    parser.add_argument("--validation_prompts", nargs="+", type=str, default=None,
-                      help="List of prompts to use for validation")
     parser.add_argument("--validation_epochs", type=int, default=None, help="Run validation every N epochs")
     parser.add_argument("--validation_steps", type=int, default=None, help="Run validation every N steps")
     parser.add_argument("--save_epochs", type=int, default=None, help="Save checkpoint every N epochs")
-    parser.add_argument("--validation_num_inference_steps", type=int, default=20, help="Number of inference steps for validation")
-    parser.add_argument("--validation_guidance_scale", type=float, default=7.5, help="Guidance scale for validation")
+    parser.add_argument("--validation_num_inference_steps", type=int, default=28, help="Number of inference steps for validation")
+    parser.add_argument("--validation_guidance_scale", type=float, default=5.5, help="Guidance scale for validation")
     parser.add_argument("--validation_image_height", type=int, default=1024, help="Height of validation images")
     parser.add_argument("--validation_image_width", type=int, default=1024, help="Width of validation images")
     parser.add_argument("--validation_num_images_per_prompt", type=int, default=1, help="Number of images to generate per validation prompt")
