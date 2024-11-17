@@ -372,7 +372,7 @@ def create_validation_dataloader(
     vae_cache: VAECache,
     text_embedding_cache: TextEmbeddingCache,
     batch_size: int,
-    num_workers: int = 10,
+    num_workers: int = 24,
 ) -> DataLoader:
     """Create validation dataloader.
     

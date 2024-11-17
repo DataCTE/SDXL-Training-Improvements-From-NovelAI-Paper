@@ -149,7 +149,7 @@ class ImageGrouper:
                     orig_height, orig_width = img.size[1], img.size[0]
                     
                     # Find closest bucket resolution
-                    target_height, target_width = self.bucket_manager.find_bucket(
+                    target_height, target_width = self.bucket_manager._find_bucket(
                         orig_height, orig_width
                     )
                     local_bucket_groups[(target_height, target_width)].append(image_path)
