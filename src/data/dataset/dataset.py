@@ -142,7 +142,7 @@ class CustomDataset(Dataset):
         )
         
         # Initialize latent cache if VAE provided
-        self.latent_cache = (
+        self.latents_cache = (
             LatentCacheManager(vae=vae, cache_dir=cache_dir)
             if vae is not None else None
         )
@@ -271,8 +271,8 @@ class CustomDataset(Dataset):
                 target_size = self.bucket_manager.get_bucket_size(image_path)
             
             # Try to get cached latent first
-            if self.latent_cache is not None:
-                latent = self.latent_cache.get_latents(image_path)
+            if self.latents_cache is not None:
+                latent = self.latents_cache.get_latents(image_path)
                 if latent is not None:
                     return {
                         "latent": latent,
