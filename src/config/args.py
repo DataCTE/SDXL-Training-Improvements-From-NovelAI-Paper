@@ -138,6 +138,13 @@ class TrainingConfig:
     max_size: int = 4096
     bucket_step_size: int = 64
     max_bucket_area: int = 1024*1024
+    
+    # Sampling parameters
+    sigma_min: float = field(default=0.029)
+    scale_method: str = field(default="karras")
+
+    # Tag processing
+    use_tag_weighting: bool = field(default=False)
 
 def parse_args() -> TrainingConfig:
     """
@@ -215,6 +222,17 @@ def parse_args() -> TrainingConfig:
     # VAE arguments
     parser.add_argument("--vae_use_channel_scaling", action="store_true", help="Use channel scaling for VAE")
     
+    # Add sampling parameters
+    parser.add_argument("--sigma_min", type=float, default=0.029,
+                      help="Minimum sigma value for sampling")
+    parser.add_argument("--scale_method", type=str, default="karras",
+                      choices=["karras", "simple"],
+                      help="Method for scaling noise schedule")
+    
+    # Add tag processing arguments
+    parser.add_argument("--use_tag_weighting", action="store_true",
+                      help="Enable tag weighting based on frequency and emphasis")
+    
     args = parser.parse_args()
     
     # Convert to config
@@ -252,6 +270,9 @@ def parse_args() -> TrainingConfig:
         warmup_steps=args.warmup_steps,
         save_checkpoints=args.save_checkpoints,
         all_ar=args.all_ar,
+        sigma_min=args.sigma_min,
+        scale_method=args.scale_method,
+        use_tag_weighting=args.use_tag_weighting,
     )
     
     # Update optimizer config
