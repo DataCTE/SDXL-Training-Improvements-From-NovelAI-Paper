@@ -111,15 +111,14 @@ class TrainingConfig:
     
     # Validation settings
     validation_dir: Optional[str] = None
-    validation_prompts: List[str] = field(default_factory=list)
-    validation_epochs: int = 1
-    validation_steps: int = 1000
-    save_epochs: int = 1
-    validation_num_inference_steps: int = 28
-    validation_guidance_scale: float = 5.5
-    validation_image_height: int = 1024
-    validation_image_width: int = 1024
-    validation_num_images_per_prompt: int = 1
+    validation_prompts: Optional[List[str]] = field(default=None)
+    validation_epochs: Optional[int] = field(default=None)
+    validation_steps: Optional[int] = field(default=None)
+    validation_num_inference_steps: int = field(default=20)
+    validation_guidance_scale: float = field(default=7.5)
+    validation_image_height: int = field(default=1024)
+    validation_image_width: int = field(default=1024)
+    validation_num_images_per_prompt: int = field(default=1)
     
     # Optimizer configuration
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
@@ -198,12 +197,13 @@ def parse_args() -> TrainingConfig:
     parser.add_argument("--no_caching", action="store_true")
     
     # Validation arguments
-    parser.add_argument("--validation_prompts", type=str, nargs="+", help="List of prompts to use for validation")
-    parser.add_argument("--validation_epochs", type=int, default=1, help="Run validation every N epochs")
-    parser.add_argument("--validation_steps", type=int, default=1000, help="Run validation every N steps")
+    parser.add_argument("--validation_prompts", nargs="+", type=str, default=None,
+                      help="List of prompts to use for validation")
+    parser.add_argument("--validation_epochs", type=int, default=None, help="Run validation every N epochs")
+    parser.add_argument("--validation_steps", type=int, default=None, help="Run validation every N steps")
     parser.add_argument("--save_epochs", type=int, default=1, help="Save checkpoint every N epochs")
-    parser.add_argument("--validation_num_inference_steps", type=int, default=28, help="Number of inference steps for validation")
-    parser.add_argument("--validation_guidance_scale", type=float, default=5.5, help="Guidance scale for validation")
+    parser.add_argument("--validation_num_inference_steps", type=int, default=20, help="Number of inference steps for validation")
+    parser.add_argument("--validation_guidance_scale", type=float, default=7.5, help="Guidance scale for validation")
     parser.add_argument("--validation_image_height", type=int, default=1024, help="Height of validation images")
     parser.add_argument("--validation_image_width", type=int, default=1024, help="Width of validation images")
     parser.add_argument("--validation_num_images_per_prompt", type=int, default=1, help="Number of images to generate per validation prompt")
@@ -258,7 +258,7 @@ def parse_args() -> TrainingConfig:
         compile_mode=args.compile_mode,
         gradient_checkpointing=args.gradient_checkpointing,
         num_workers=args.num_workers,
-        validation_prompts=args.validation_prompts if args.validation_prompts else [],
+        validation_prompts=args.validation_prompts,
         validation_epochs=args.validation_epochs,
         validation_steps=args.validation_steps,
         save_epochs=args.save_epochs,
