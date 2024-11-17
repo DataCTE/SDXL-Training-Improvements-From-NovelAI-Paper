@@ -99,10 +99,10 @@ class BucketManager:
         self.image_stats[(height, width)] += 1
         
         # Find best bucket
-        bucket = self._find_bucket(height, width, no_upscale)
-        if bucket is not None:
-            self.image_buckets[image_path] = bucket
-            self.bucket_images[bucket].append(image_path)
+        target_bucket = self._find_bucket(height, width, no_upscale)
+        if target_bucket:
+            self.image_buckets[image_path] = target_bucket
+            self.bucket_images[target_bucket].append(image_path)
             
     def _find_bucket(
         self,
@@ -146,6 +146,24 @@ class BucketManager:
                 best_bucket = (bucket_height, bucket_width)
         
         return best_bucket
+        
+    def get_target_size(self, image_path: str) -> Tuple[int, int]:
+        """Get the target size for an image based on its bucket assignment.
+        
+        Args:
+            image_path: Path to the image
+            
+        Returns:
+            Tuple of (width, height) for the target size
+            
+        Raises:
+            KeyError: If image has not been added to a bucket
+        """
+        if image_path not in self.image_buckets:
+            raise KeyError(f"Image {image_path} has not been added to any bucket")
+            
+        bucket = self.image_buckets[image_path]
+        return bucket[1], bucket[0]  # Convert from (height, width) to (width, height)
         
     def get_bucket_size(self, image_path: str) -> Optional[Tuple[int, int]]:
         """Get the target size for an image.

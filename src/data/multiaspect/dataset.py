@@ -92,8 +92,7 @@ class MultiAspectDataset(Dataset):
                 self.executor.submit(load_and_verify_image, path)
             )
             
-        # Process results and assign to buckets
-        self.image_buckets: Dict[Tuple[int, int], List[int]] = {}
+        # Process results
         for idx, future in enumerate(futures):
             try:
                 image = future.result()
@@ -102,24 +101,31 @@ class MultiAspectDataset(Dataset):
                     continue
                     
                 # Get target size from bucket manager
-                target_size = self.bucket_manager.get_target_size(
-                    image.size[0], image.size[1]
-                )
-                
-                # Add to bucket
-                bucket = self.image_buckets.setdefault(target_size, [])
-                bucket.append(idx)
-                
-            except Exception as error:
-                logger.error(
-                    "Error processing image %s: %s",
-                    self.image_paths[idx], str(error)
-                )
-                
-        logger.info(
-            "Processed %d images into %d buckets",
-            len(self.image_paths), len(self.image_buckets)
-        )
+                try:
+                    target_width, target_height = self.bucket_manager.get_target_size(self.image_paths[idx])
+                    
+                    # Resize image to target size
+                    image = resize_image(image, (target_width, target_height))
+                    
+                    # Get VAE latents
+                    latents = self.vae_cache.get_latents(image)
+                    if latents is None:
+                        logger.warning("Failed to get VAE latents for: %s", self.image_paths[idx])
+                        continue
+                        
+                    # Get text embeddings
+                    text_embeddings = self.text_embedding_cache.get_embeddings(self.prompts[idx])
+                    if text_embeddings is None:
+                        logger.warning("Failed to get text embeddings for: %s", self.image_paths[idx])
+                        continue
+                        
+                except Exception as e:
+                    logger.error("Error processing image %s: %s", self.image_paths[idx], str(e))
+                    continue
+                    
+            except Exception as e:
+                logger.error("Failed to process image %s: %s", self.image_paths[idx], str(e))
+                continue
         
     def _apply_transforms(self, image: torch.Tensor) -> torch.Tensor:
         """Apply data augmentation transforms.
@@ -173,10 +179,8 @@ class MultiAspectDataset(Dataset):
             raise RuntimeError(f"Failed to load image: {image_path}")
             
         # Get target size and resize
-        target_size = self.bucket_manager.get_target_size(
-            image.size[0], image.size[1]
-        )
-        image = resize_image(image, target_size)
+        target_width, target_height = self.bucket_manager.get_target_size(image_path)
+        image = resize_image(image, (target_width, target_height))
         
         # Apply transforms
         image = self._apply_transforms(image)
