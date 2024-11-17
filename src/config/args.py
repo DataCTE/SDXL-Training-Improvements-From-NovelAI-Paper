@@ -178,7 +178,6 @@ def parse_args() -> TrainingConfig:
         rescale_multiplier=args.rescale_multiplier,
         resolution_scaling=args.resolution_scaling,
         min_snr_gamma=args.min_snr_gamma,
-        data_dir=args.data_dir,
         validation_dir=args.validation_dir,
         cache_dir=args.cache_dir,
         no_caching=args.no_caching,
