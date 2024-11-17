@@ -54,7 +54,7 @@ class GPUWorker:
 class LatentCacheManager:
     """Manages caching and retrieval of VAE latents."""
     
-    def __init__(self, cache_dir: str = "latents_cache", vae: Optional[torch.nn.Module] = None, workers_per_gpu: int = 2):
+    def __init__(self, cache_dir: str = "latents_cache", vae: Optional[torch.nn.Module] = None, workers_per_gpu: int = 4):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(exist_ok=True)
         self.vae = vae
@@ -63,8 +63,8 @@ class LatentCacheManager:
         self.num_gpus = torch.cuda.device_count()
         if self.num_gpus == 0:
             self.device = torch.device("cpu")
-            self.num_gpus = 1  # Fallback to CPU
-            workers_per_gpu = 4
+            self.num_gpus = 1  
+            workers_per_gpu = 1
             
         self.workers_per_gpu = workers_per_gpu
         self.total_workers = self.num_gpus * workers_per_gpu
