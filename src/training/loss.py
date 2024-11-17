@@ -144,6 +144,49 @@ def compute_v_prediction_scaling(
     c_in = 1.0 / denominator
     return c_out, c_in
 
+def forward_pass(args, models, batch, device, dtype, components) -> torch.Tensor:
+    """Execute forward pass with proper error handling."""
+    try:
+        # Move batch to device
+        batch = {k: v.to(device=device, dtype=dtype) if torch.is_tensor(v) else v for k, v in batch.items()}
+
+        # Get model predictions
+        latents = batch["latents"]
+        timesteps = batch["timesteps"]
+        
+        # Get noise prediction using v-prediction loss
+        loss = training_loss_v_prediction(
+            model=models["unet"],
+            x_0=latents,
+            sigma=timesteps,
+            text_embeddings=batch["prompt_embeds"],
+            added_cond_kwargs={
+                "text_embeds": batch["pooled_prompt_embeds"],
+                "time_ids": batch["add_text_embeds"],
+            },
+            sigma_data=args.training.sigma_data,
+            tag_weighter=components.get("tag_weighter"),
+            batch_tags=batch.get("tags"),
+            min_snr_gamma=args.training.min_snr_gamma,
+            rescale_cfg=args.training.rescale_cfg,
+            rescale_multiplier=args.training.rescale_multiplier,
+            scale_method=args.training.scale_method,
+            use_tag_weighting=args.data.use_tag_weighting,
+            device=device,
+            dtype=dtype
+        )
+
+        # Apply VAE finetuning loss if enabled
+        if components.get("vae_finetuner") is not None:
+            vae_loss = components["vae_finetuner"].compute_loss(batch)
+            loss = loss + vae_loss * args.vae_loss_weight
+
+        return loss
+
+    except (ValueError, RuntimeError, KeyError) as e:
+        logger.error("Forward pass failed: %s", str(e))
+        raise type(e)(f"Failed during forward pass: {str(e)}") from e
+
 @torch.jit.script
 def compute_loss_weights(
     snr: torch.Tensor,
