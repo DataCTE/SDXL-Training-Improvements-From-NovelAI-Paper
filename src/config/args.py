@@ -110,11 +110,16 @@ class TrainingConfig:
     
     # Validation settings
     validation_dir: Optional[str] = None
-    validation_prompts: List[str] = field(default_factory=list)
+    validation_prompts: List[str] = field(default_factory=lambda: [
+        "A majestic lion standing on a rocky outcrop",
+        "A futuristic cityscape with flying cars",
+        "A serene beach at sunset with palm trees",
+        "An intricate steampunk machine with gears and pipes"
+    ])
     validation_epochs: int = 1
     validation_steps: int = 1000
-    validation_num_inference_steps: int = 20
-    validation_guidance_scale: float = 7.5
+    validation_num_inference_steps: int = 28
+    validation_guidance_scale: float = 5.5
     validation_image_height: int = 1024
     validation_image_width: int = 1024
     validation_num_images_per_prompt: int = 1
