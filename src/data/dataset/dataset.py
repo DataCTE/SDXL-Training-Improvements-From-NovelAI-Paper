@@ -1,113 +1,75 @@
 import logging
-import os
-import traceback
-from collections import defaultdict
-from pathlib import Path
-from typing import Optional, Tuple, Union, Any, Dict, List
-import numpy as np
 import torch
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Any, Any
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-import multiprocessing as mp
 from PIL import Image
-from tqdm import tqdm
-from .bucket_manager import BucketManager
 
-from ..tag_weighter import TagBasedLossWeighter
 from .base import CustomDatasetBase
+from .bucket_manager import BucketManager
+from .dataset_initializer import DatasetInitializer
+from .image_grouper import ImageGrouper
+from ..caption_processor import CaptionProcessor
+from ..image_processor import ImageProcessor
+from ..latent_cache import LatentCacheManager
 
 logger = logging.getLogger(__name__)
 
 class CustomDataset(CustomDatasetBase):
     """Custom dataset implementation for SDXL training with advanced features.
-
-    This dataset handles image-caption pairs for SDXL training with support for:
-    - Efficient latent caching and processing
-    - Dynamic resolution bucketing (following NovelAI paper)
-    - Tag-based loss weighting
-    - Parallel data processing
-    - Multi-worker data loading
-    - Memory-efficient batch processing
-
+    
+    This class provides a comprehensive dataset implementation that:
+    1. Efficiently processes and caches image latents
+    2. Handles dynamic image resolutions through bucket batching
+    3. Processes captions with tag weighting
+    4. Manages memory usage through disk caching
+    
     Args:
         data_dir (str): Directory containing image-caption pairs
-        vae (nn.Module, optional): VAE model for latent computation. Defaults to None.
-        tokenizer (transformers.PreTrainedTokenizer, optional): Primary tokenizer. Defaults to None.
-        tokenizer_2 (transformers.PreTrainedTokenizer, optional): Secondary tokenizer. Defaults to None.
-        text_encoder (nn.Module, optional): Primary text encoder. Defaults to None.
-        text_encoder_2 (nn.Module, optional): Secondary text encoder. Defaults to None.
-        cache_dir (str, optional): Directory for caching latents. Defaults to "latents_cache".
-        no_caching_latents (bool, optional): Disable latent caching. Defaults to False.
-        all_ar (bool, optional): Use aspect ratio for all images. Defaults to False.
-        num_workers (int, optional): Number of worker processes. Defaults to min(8, cpu_count).
-        prefetch_factor (int, optional): Number of batches to prefetch. Defaults to 2.
-        min_size (int, optional): Minimum image size. Defaults to 512.
-        max_size (int, optional): Maximum image size. Defaults to 2048.
-        bucket_step_size (int, optional): Resolution step size for buckets. Defaults to 64.
-        max_bucket_area (int, optional): Maximum area for buckets. Defaults to 1024*1024.
-        token_dropout_rate (float, optional): Token dropout probability. Defaults to 0.1.
-        caption_dropout_rate (float, optional): Caption dropout probability. Defaults to 0.1.
-        min_tag_weight (float, optional): Minimum weight for tags. Defaults to 0.1.
-        max_tag_weight (float, optional): Maximum weight for tags. Defaults to 3.0.
-        use_tag_weighting (bool, optional): Enable tag-based loss weighting. Defaults to True.
+        vae (Optional[torch.nn.Module]): VAE model for latent computation
+        tokenizer (Optional[Any]): Tokenizer for text processing
+        tokenizer_2 (Optional[Any]): Secondary tokenizer for text processing
+        text_encoder (Optional[Any]): Text encoder for text processing
+        text_encoder_2 (Optional[Any]): Secondary text encoder for text processing
+        cache_dir (str): Directory for caching latents
+        no_caching_latents (bool): Disable latent caching
+        all_ar (bool): Use aspect ratio for bucketing
+        min_size (int): Minimum image size
+        max_size (int): Maximum image size
+        bucket_step_size (int): Resolution step size for buckets
+        max_bucket_area (int): Maximum area for buckets
+        token_dropout_rate (float): Token dropout probability
+        caption_dropout_rate (float): Caption dropout probability
+        min_tag_weight (float): Minimum weight for tags
+        max_tag_weight (float): Maximum weight for tags
+        use_tag_weighting (bool): Enable tag-based loss weighting
     """
-    def __init__(self, data_dir, vae=None, tokenizer=None, tokenizer_2=None,
-                 text_encoder=None, text_encoder_2=None,
-                 cache_dir="latents_cache", no_caching_latents=False,
-                 all_ar=False, num_workers=None, prefetch_factor=2,
-                 min_size=512, max_size=2048, bucket_step_size=64,
-                 max_bucket_area=1024*1024, token_dropout_rate=0.1,
-                 caption_dropout_rate=0.1, min_tag_weight=0.1,
-                 max_tag_weight=3.0, use_tag_weighting=True):
+    
+    def __init__(self, 
+                 data_dir: str, 
+                 vae: Optional[torch.nn.Module] = None,
+                 tokenizer: Optional[Any] = None,
+                 tokenizer_2: Optional[Any] = None,
+                 text_encoder: Optional[Any] = None,
+                 text_encoder_2: Optional[Any] = None,
+                 cache_dir: str = "latents_cache", 
+                 no_caching_latents: bool = False,
+                 all_ar: bool = False, 
+                 min_size: int = 512, 
+                 max_size: int = 4096,
+                 bucket_step_size: int = 64, 
+                 max_bucket_area: int = 1024*1024,
+                 token_dropout_rate: float = 0.1, 
+                 caption_dropout_rate: float = 0.1,
+                 min_tag_weight: float = 0.1, 
+                 max_tag_weight: float = 3.0,
+                 use_tag_weighting: bool = True):
         super().__init__()
-        # Store models
-        self.tokenizer = tokenizer
-        self.tokenizer_2 = tokenizer_2
-        self.text_encoder = text_encoder
-        self.text_encoder_2 = text_encoder_2
-        self.vae = vae
-        self.token_dropout_rate = token_dropout_rate
-        self.caption_dropout_rate = caption_dropout_rate
         
-        # Set device based on CUDA availability and VAE device
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        if self.vae is not None:
-            self.device = next(self.vae.parameters()).device
-        
-        # Initialize flags first before any processing
-        self.collate_fn = self.collate_fn
-        self.all_ar = all_ar
-        self.no_caching_latents = no_caching_latents
-        self.min_size = min_size
-        self.max_size = max_size
-        self.bucket_step_size = bucket_step_size
-        self.max_bucket_area = max_bucket_area
-        self.use_tag_weighting = use_tag_weighting
-        
-        # Initialize bucket manager
-        self.bucket_manager = BucketManager(
-            min_size=min_size,
-            max_size=max_size,
-            step_size=bucket_step_size,
-            max_area=max_bucket_area,
-            add_square=True
-        )
-        
-        # Initialize bucket lookup cache
-        self._bucket_cache = {}
-        self._build_bucket_lookup_cache()
-        
-        # Set up workers
-        self.num_workers = num_workers or min(8, os.cpu_count() or 1)
-        self.prefetch_factor = prefetch_factor
-        
-        # Initialize latents cache
-        self.latents_cache = {}
-        
-        # Initialize tag weight cache
-        self.tag_weight_cache = {}
-        
-        # Store initialization parameters for workers
-        self.init_params = {
+        # Store configuration
+        self.config = {
+            'data_dir': data_dir,
             'vae': vae,
             'tokenizer': tokenizer,
             'tokenizer_2': tokenizer_2,
@@ -116,8 +78,6 @@ class CustomDataset(CustomDatasetBase):
             'cache_dir': cache_dir,
             'no_caching_latents': no_caching_latents,
             'all_ar': all_ar,
-            'num_workers': self.num_workers,
-            'prefetch_factor': prefetch_factor,
             'min_size': min_size,
             'max_size': max_size,
             'bucket_step_size': bucket_step_size,
@@ -129,1018 +89,260 @@ class CustomDataset(CustomDatasetBase):
             'use_tag_weighting': use_tag_weighting
         }
         
-        # Basic initialization
-        self.data_dir = Path(data_dir)
-        self.cache_dir = Path(cache_dir)
-        self.cache_dir.mkdir(exist_ok=True)
+        # Set device based on VAE or CUDA availability
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if vae is not None:
+            self.device = next(vae.parameters()).device
+            
+        # Initialize components
+        self._initialize_components()
         
-        # Initialize multiprocessing components
-        if not no_caching_latents:
-            self.process_pool = None
-            self.task_queue = mp.Queue()
-            self.result_queue = mp.Queue()
-            self.workers = []
-            
-        # Initialize worker models
-        self.worker_models = None
-            
-        # Initialize tag weighter if needed
-        if use_tag_weighting:
-            self.tag_weighter = TagBasedLossWeighter(
-                config={
-                    'min_weight': min_tag_weight,
-                    'max_weight': max_tag_weight,
-                    'no_cache': no_caching_latents
-                }
+        # Initialize dataset
+        self._initialize_dataset()
+        
+        # Mark as initialized
+        self._initialized = True
+        
+    def _initialize_components(self) -> None:
+        """Initialize all dataset components with proper error handling."""
+        try:
+            # Initialize processors
+            self.image_processor = ImageProcessor()
+            self.caption_processor = CaptionProcessor(
+                token_dropout_rate=self.config['token_dropout_rate'],
+                caption_dropout_rate=self.config['caption_dropout_rate']
             )
-        else:
-            self.tag_weighter = None
             
-        # Convert image paths to strings once and validate caption files
-        image_extensions = ["*.png", "*.jpg", "*.jpeg", "*.webp", "*.bmp"]
-        all_image_paths = []
-        for ext in image_extensions:
-            all_image_paths.extend([str(p) for p in Path(data_dir).glob(ext)])
-            all_image_paths.extend([str(p) for p in Path(data_dir).glob(ext.upper())])
+            # Initialize cache managers
+            self.latents_cache = LatentCacheManager(
+                cache_dir=self.config['cache_dir'],
+                vae=self.config['vae']
+            )
+            
+            # Initialize bucket management
+            self.bucket_manager = BucketManager(
+                min_size=self.config['min_size'],
+                max_size=self.config['max_size'],
+                step_size=self.config['bucket_step_size'],
+                max_area=self.config['max_bucket_area']
+            )
+            
+            # Initialize image grouper
+            self.image_grouper = ImageGrouper(self.bucket_manager)
+            
+            # Initialize dataset initializer
+            self.dataset_initializer = DatasetInitializer()
+            
+            logger.info("All components initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize components: {str(e)}")
+            raise
 
-        if not all_image_paths:
-            raise RuntimeError(f"No images found in {data_dir}. Supported formats: {', '.join(image_extensions)}")
+    def _initialize_dataset(self) -> None:
+        """Initialize dataset structure and caches."""
+        try:
+            # Find valid image-caption pairs
+            self.image_paths = self.dataset_initializer.find_valid_pairs(self.config['data_dir'])
+            if not self.image_paths:
+                raise ValueError(f"No valid image-caption pairs found in {self.config['data_dir']}")
+            
+            # Group images into buckets
+            self.bucket_data = self.image_grouper.group_images(
+                image_paths=self.image_paths,
+                use_ar=self.config['all_ar']
+            )
+            
+            # Initialize latent caching if enabled
+            if not self.config['no_caching_latents']:
+                self._initialize_latent_cache()
+            
+            # Precompute tag weights if enabled
+            if self.config['use_tag_weighting']:
+                self._precompute_tag_weights()
+            
+            logger.info(f"Dataset initialized with {len(self.image_paths)} images in {len(self.bucket_data)} buckets")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize dataset: {str(e)}")
+            raise
 
-        # Validate image-caption pairs and only keep valid ones
-        self.image_paths = []
-        skipped_count = 0
-        
-        for img_path in all_image_paths:
-            caption_path = Path(img_path).with_suffix('.txt')
-            try:
-                # Verify the image can be opened
-                with Image.open(img_path) as img:
-                    img.verify()
-                # Verify the caption file exists and is not empty
-                if caption_path.exists():
-                    with open(caption_path, 'r', encoding='utf-8') as f:
-                        caption = f.read().strip()
-                    if caption:  # Only add if caption is not empty
-                        self.image_paths.append(img_path)
-                        continue
-            except Exception as e:
-                logger.debug(f"Skipping {img_path}: {str(e)}")
+    def _initialize_latent_cache(self) -> None:
+        """Initialize and process latent caching."""
+        if self.config['vae'] is None:
+            logger.warning("VAE not provided, skipping latent caching")
+            return
             
-            skipped_count += 1
-        
-        if skipped_count > 0:
-            logger.warning(f"Skipped {skipped_count} images due to missing or invalid caption files")
-        
-        if not self.image_paths:
-            raise RuntimeError(f"No valid image-caption pairs found in {data_dir}. Found {len(all_image_paths)} images but none had valid caption files.")
-        
-        logger.info(f"Found {len(self.image_paths)} valid image-caption pairs out of {len(all_image_paths)} total images")
-        
-        # Initialize dataset structure
-        self.bucket_data = self.group_images_by_bucket(self.image_paths)  # Initialize bucket_data in __init__
-
-    def _precompute_ar_buckets(self):
-        """Pre-compute aspect ratio based buckets using parallel processing.
-        This method groups images by their aspect ratio instead of absolute dimensions.
-        """
-        logger.info("Computing aspect ratio buckets...")
-        
-        def get_ar_bucket(height: int, width: int) -> Tuple[int, int]:
-            """Get bucket dimensions based on aspect ratio while maintaining area constraints"""
-            ar = width / height
-            
-            # Calculate dimensions that maintain AR and fit within max_area
-            if ar >= 1:  # Wider than tall
-                w = min(self.bucket_manager.max_size, 
-                       int((self.bucket_manager.max_area * ar)**0.5))
-                w = (w // self.bucket_manager.step_size) * self.bucket_manager.step_size
-                h = int(w / ar)
-                h = (h // self.bucket_manager.step_size) * self.bucket_manager.step_size
-            else:  # Taller than wide
-                h = min(self.bucket_manager.max_size, 
-                       int((self.bucket_manager.max_area / ar)**0.5))
-                h = (h // self.bucket_manager.step_size) * self.bucket_manager.step_size
-                w = int(h * ar)
-                w = (w // self.bucket_manager.step_size) * self.bucket_manager.step_size
-            
-            # Ensure minimum size
-            h = max(h, self.bucket_manager.min_size)
-            w = max(w, self.bucket_manager.min_size)
-            
-            # Ensure one dimension is below 1024
-            if h > 1024 and w > 1024:
-                if ar >= 1:
-                    h = 1024
-                else:
-                    w = 1024
-            
-            return (h, w)
-        
-        def process_ar_chunk(chunk: List[str]) -> Dict[Tuple[int, int], List[str]]:
-            """Process a chunk of images for AR-based bucket assignment"""
-            local_bucket_groups = defaultdict(list)
-            
-            for image_path in chunk:
-                try:
-                    with Image.open(image_path) as img:
+        try:
+            # Process images in batches
+            batch_size = 4  # Adjust based on GPU memory
+            for i in range(0, len(self.image_paths), batch_size):
+                batch_paths = self.image_paths[i:i + batch_size]
+                
+                # Load and transform images
+                batch_tensors = []
+                valid_paths = []
+                for path in batch_paths:
+                    # Get bucket dimensions for this image
+                    with Image.open(path) as img:
                         if img.mode != 'RGB':
                             img = img.convert('RGB')
                         orig_height, orig_width = img.size[1], img.size[0]
-                        
-                        # Get bucket based on aspect ratio
-                        target_height, target_width = get_ar_bucket(orig_height, orig_width)
-                        local_bucket_groups[(target_height, target_width)].append(image_path)
-                except Exception as e:
-                    logger.debug(f"Failed to process image {image_path} for AR grouping: {str(e)}")
+                        bucket_dims = self.image_grouper.get_ar_bucket(orig_height, orig_width)
+                    
+                    # Load and transform with target dimensions
+                    image = self.image_processor.load_and_transform(
+                        path,
+                        target_height=bucket_dims[0],
+                        target_width=bucket_dims[1]
+                    )
+                    if image is not None:
+                        batch_tensors.append(image)
+                        valid_paths.append(path)
+                
+                if not batch_tensors:
                     continue
-            
-            return dict(local_bucket_groups)
-        
-        # Split images into chunks for parallel processing
-        num_workers = 24  # Use same number of workers as regular bucket assignment
-        chunk_size = max(1, len(self.image_paths) // num_workers)
-        chunks = [self.image_paths[i:i + chunk_size] for i in range(0, len(self.image_paths), chunk_size)]
-        
-        # Process chunks in parallel
-        with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            futures = [executor.submit(process_ar_chunk, chunk) for chunk in chunks]
-            results = [future.result() for future in futures]
-        
-        # Merge results
-        self.bucket_data = self._merge_bucket_results(results)
-        
-        # Log statistics
-        total_images = sum(len(paths) for paths in self.bucket_data.values())
-        logger.info(f"Grouped {total_images} images into {len(self.bucket_data)} aspect ratio buckets")
-
-    def _process_image_chunk(self, chunk: List[str]) -> Dict[Tuple[int, int], List[str]]:
-        """Process a chunk of images for bucket assignment in parallel.
-        
-        Args:
-            chunk: List of image paths to process
-            
-        Returns:
-            Dictionary mapping bucket dimensions to lists of image paths
-        """
-        local_bucket_groups = defaultdict(list)
-        
-        for image_path in chunk:
-            try:
-                with Image.open(image_path) as img:
-                    if img.mode != 'RGB':
-                        img = img.convert('RGB')
-                    # Get original dimensions
-                    orig_height, orig_width = img.size[1], img.size[0]
                     
-                    # Find closest bucket resolution using cache
-                    target_height, target_width = self._find_bucket(orig_height, orig_width)
-                    local_bucket_groups[(target_height, target_width)].append(image_path)
-            except Exception as e:
-                logger.debug(f"Failed to process image {image_path} for grouping: {str(e)}")
-                continue
+                # Process batch through VAE
+                batch_tensor = torch.stack(batch_tensors)
+                latents = self.latents_cache.process_latents_batch(batch_tensor)
                 
-        return dict(local_bucket_groups)
-
-    def _merge_bucket_results(self, results: List[Dict[Tuple[int, int], List[str]]]) -> Dict[Tuple[int, int], List[str]]:
-        """Merge bucket assignment results from multiple workers.
-        
-        Args:
-            results: List of bucket group dictionaries from workers
-            
-        Returns:
-            Merged dictionary of bucket groups
-        """
-        merged = defaultdict(list)
-        for result in results:
-            for bucket, paths in result.items():
-                merged[bucket].extend(paths)
-        return dict(merged)
-
-    def group_images_by_bucket(self, image_paths: List[str]) -> Dict[Tuple[int, int], List[str]]:
-        """Group images by their closest bucket resolution using parallel processing.
-        
-        Args:
-            image_paths: List of paths to images
-            
-        Returns:
-            Dictionary mapping bucket dimensions to lists of image paths
-        """
-        # Use 24 workers for parallel processing
-        num_workers = 24
-        chunk_size = max(1, len(image_paths) // num_workers)
-        chunks = [image_paths[i:i + chunk_size] for i in range(0, len(image_paths), chunk_size)]
-        
-        # Process chunks in parallel using ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            futures = [executor.submit(self._process_image_chunk, chunk) for chunk in chunks]
-            results = [future.result() for future in futures]
-        
-        # Merge results from all workers
-        bucket_groups = self._merge_bucket_results(results)
-        
-        # Log statistics
-        total_images = sum(len(paths) for paths in bucket_groups.values())
-        logger.info(f"Grouped {total_images} images into {len(bucket_groups)} buckets using {num_workers} workers")
-        
-        return bucket_groups
-
-    def _initialize_dataset(self):
-        """Initialize dataset structure with proper error handling"""
-        try:
-            # Initialize bucket data based on all_ar setting
-            if self.init_params.get('all_ar', False):  # Use get() with default
-                logger.info("Using aspect ratio bucketing...")
-                self._precompute_ar_buckets()
-            else:
-                logger.info("Using standard bucket assignment...")
-                self.bucket_data = self.group_images_by_bucket(self.image_paths)
-            
-            # Pre-compute tag weights if enabled
-            if self.use_tag_weighting:
-                logger.info("Pre-computing tag weights...")
-                self._precompute_tag_weights()
+                # Store results
+                if latents is not None:
+                    for path, latent in zip(valid_paths, latents):
+                        self.latents_cache.latents_cache[path] = latent
                 
-            # Log bucket statistics
-            total_images = sum(len(paths) for paths in self.bucket_data.values())
-            num_buckets = len(self.bucket_data)
-            logger.info(f"Dataset initialized with {total_images} images in {num_buckets} buckets")
+                # Clean up GPU memory
+                del batch_tensor, batch_tensors, latents
+                torch.cuda.empty_cache()
             
-            # Validate that we have enough data
-            if total_images == 0:
-                raise RuntimeError("No valid images found after bucket assignment")
-            
-            # Initialize latent caching if enabled
-            if not self.init_params.get('no_caching_latents', False):
-                logger.info("Pre-computing latents...")
-                self._initialize_workers()
-                self._batch_process_latents_efficient()
-            else:
-                logger.info("Latent caching disabled, will process latents on-the-fly")
-                
-        except Exception as e:
-            logger.error(f"Failed to initialize dataset: {str(e)}")
-            traceback.print_exc()
-            raise RuntimeError("Dataset initialization failed") from e
-
-    def _precompute_bucket_data(self):
-        """Pre-compute bucket data using thread pool"""
-        def process_image_batch(paths):
-            results = []
-            for path in paths:
-                try:
-                    with Image.open(path) as img:
-                        width, height = img.size
-                        results.append((path, height, width))
-                except Image.UnidentifiedImageError as e:
-                    logger.error("Invalid or corrupted image file %s: %s", path, str(e))
-                except Image.DecompressionBombError as e:
-                    logger.error("Image %s is too large to process: %s", path, str(e))
-                except ValueError as e:
-                    logger.error("Invalid image format in %s: %s", path, str(e))
-                except (IOError, OSError) as e:
-                    logger.error("Failed to read image file %s: %s", path, str(e))
-                except MemoryError as e:
-                    logger.error("Out of memory while processing %s: %s", path, str(e))
-                    logger.error(traceback.format_exc())
-                except (AttributeError, TypeError) as e:
-                    logger.error("Malformed image data in %s: %s", path, str(e))
-                    logger.error(traceback.format_exc())
-            return results
-            
-        # Process in parallel using ThreadPoolExecutor
-        chunk_size = max(1, len(self.image_paths) // (self.init_params['num_workers'] * 4))
-        # Clear existing bucket data before recomputing
-        self.bucket_data.clear()
-        
-        # Collect image dimensions
-        image_dimensions = []
-        with ThreadPoolExecutor(max_workers=self.init_params['num_workers']) as executor:
-            futures = []
-            for i in range(0, len(self.image_paths), chunk_size):
-                chunk = self.image_paths[i:i + chunk_size]
-                futures.append(executor.submit(process_image_batch, chunk))
-                
-            # Combine results
-            for future in tqdm(futures, desc="Processing image dimensions"):
-                for path, height, width in future.result():
-                    image_dimensions.append((height, width))
-                    
-        # Assign images to buckets using bucket manager
-        bucket_assignments = self.bucket_manager.assign_to_buckets(image_dimensions)
-        
-        # Convert assignments to paths
-        for bucket, indices in bucket_assignments.items():
-            self.bucket_data[bucket] = [self.image_paths[i] for i in indices]
-            
-        # Log bucket statistics
-        total_images = sum(len(paths) for paths in self.bucket_data.values())
-        logger.info(f"Assigned {total_images} images to {len(self.bucket_data)} buckets")
-        for bucket, paths in self.bucket_data.items():
-            logger.info(f"Bucket {bucket}: {len(paths)} images")
-            
-    def _precompute_tag_weights(self):
-        """Pre-compute tag weights for all captions using thread pool"""
-        if not self.use_tag_weighting or not hasattr(self, 'tag_weighter'):
-            logger.warning("Tag weighting is disabled or tag weighter not initialized")
-            return
-            
-        # Ensure tag_weight_cache is initialized
-        if self.tag_weight_cache is None:
-            self.tag_weight_cache = {}
-            
-        def process_caption_batch(paths):
-            results = {}
-            for path in paths:
-                try:
-                    caption_path = Path(path).with_suffix('.txt')
-                    if not caption_path.exists():
-                        logger.debug(f"Caption file not found for {path}, using default weight")
-                        results[path] = 1.0
-                        continue
-
-                    with open(caption_path, 'r', encoding='utf-8') as f:
-                        caption = f.read().strip()
-                    
-                    if not caption:
-                        logger.debug(f"Empty caption file for {path}, using default weight")
-                        results[path] = 1.0
-                        continue
-
-                    # Split caption into tags and calculate weights for each
-                    tags = [tag.strip() for tag in caption.split(',') if tag.strip()]
-                    if not tags:
-                        logger.debug(f"No valid tags found in caption for {path}, using default weight")
-                        results[path] = 1.0
-                        continue
-
-                    tag_weights = [self.tag_weighter.calculate_tag_weight(tag) for tag in tags]
-                    # Use mean of tag weights as the overall weight
-                    weight = sum(tag_weights) / len(tag_weights) if tag_weights else 1.0
-                    results[path] = weight
-
-                except Exception as e:
-                    logger.debug(f"Failed to calculate tag weight for {path}: {str(e)}, using default weight")
-                    results[path] = 1.0  # Default weight on error
-            return results
-
-        # Process in parallel using ThreadPoolExecutor
-        chunk_size = max(1, len(self.image_paths) // (self.init_params['num_workers'] * 4))
-        processed_count = 0
-        error_count = 0
-        
-        with ThreadPoolExecutor(max_workers=self.init_params['num_workers']) as executor:
-            futures = []
-            for i in range(0, len(self.image_paths), chunk_size):
-                chunk = self.image_paths[i:i + chunk_size]
-                futures.append(executor.submit(process_caption_batch, chunk))
-                
-            # Combine results
-            for future in tqdm(futures, desc="Processing tag weights"):
-                try:
-                    results = future.result()
-                    self.tag_weight_cache.update(results)
-                    processed_count += len(results)
-                except Exception as e:
-                    logger.error(f"Failed to process tag weight batch: {str(e)}")
-                    error_count += 1
-                    continue
-
-        if error_count > 0:
-            logger.warning(f"{error_count} tag weight batches failed to process")
-        logger.info(f"Successfully processed tag weights for {processed_count} images")
-
-    def write_captions(self, formatted_paths):
-        """Write formatted captions using thread pool"""
-        def write_caption(path_caption):
-            path, caption = path_caption
-            try:
-                with open(path, 'w', encoding='utf-8') as f:
-                    f.write(caption)
-            except PermissionError as e:
-                logger.error("Permission denied writing to %s: %s", path, str(e))
-            except (IOError, OSError) as e:
-                logger.error("File I/O error writing to %s: %s", path, str(e))
-            except UnicodeEncodeError as e:
-                logger.error("Unicode encoding error writing to %s: %s", path, str(e))
-                
-        with ThreadPoolExecutor(max_workers=self.init_params['num_workers']) as executor:
-            list(executor.map(write_caption, formatted_paths))
-
-    def _preprocess_image_worker(self, image_path: str, target_height: int, target_width: int) -> Optional[torch.Tensor]:
-        """Worker function for parallel image preprocessing"""
-        try:
-            with Image.open(image_path) as img:
-                img = img.convert('RGB')
-                
-                # Resize if needed
-                if (img.size[1], img.size[0]) != (target_height, target_width):
-                    img = img.resize((target_width, target_height), Image.Resampling.LANCZOS)
-                
-                # Convert to tensor and normalize
-                image = torch.from_numpy(
-                    np.array(img, dtype=np.float32)
-                ).permute(2, 0, 1) / 127.5 - 1
-                
-                return image
-                
-        except Exception as e:
-            logger.debug(f"Failed to preprocess image {image_path}: {str(e)}")
-            return None
-
-    def _batch_process_latents_efficient(self):
-        """Process latents in batches efficiently using worker pool"""
-        try:
-            total_images = len(self.image_paths)
-            batch_size = 32  # Process larger batches for GPU efficiency
-            max_loaded_latents = 1000  # Maximum number of latents to keep in memory
-            
-            # Group images by their bucket sizes
-            bucket_groups = defaultdict(list)
-            
-            logger.info("Grouping images by bucket sizes...")
-            for image_path in tqdm(self.image_paths, desc="Grouping images"):
-                try:
-                    with Image.open(image_path) as img:
-                        img = img.convert('RGB')
-                        # Get original dimensions
-                        orig_height, orig_width = img.size[1], img.size[0]
-                        
-                        # Find closest bucket resolution
-                        target_height, target_width = self._find_bucket(orig_height, orig_width)
-                        bucket_groups[(target_height, target_width)].append(image_path)
-                except Exception as e:
-                    logger.debug(f"Failed to process image {image_path} for grouping: {str(e)}")
-                    continue
-            
-            # Process each bucket group
-            total_batches = sum((len(group) + batch_size - 1) // batch_size 
-                              for group in bucket_groups.values())
-            logger.info(f"Processing {total_images} images in {total_batches} batches across {len(bucket_groups)} bucket sizes")
-            
-            processed_count = 0
-            latents_in_memory = 0
-            
-            # Create process pool for parallel preprocessing
-            with ThreadPoolExecutor(max_workers=self.num_workers) as preprocessing_pool:
-                with tqdm(total=total_images, desc="Processing latents") as pbar:
-                    for (bucket_height, bucket_width), image_paths in bucket_groups.items():
-                        for i in range(0, len(image_paths), batch_size):
-                            batch_paths = image_paths[i:i + batch_size]
-                            
-                            # Check if we need to offload latents to disk
-                            if latents_in_memory >= max_loaded_latents:
-                                self._offload_latents_to_disk()
-                                latents_in_memory = 0
-                                torch.cuda.empty_cache()
-                            
-                            try:
-                                # Parallel preprocessing of images
-                                preprocess_futures = [
-                                    preprocessing_pool.submit(
-                                        self._preprocess_image_worker,
-                                        path, bucket_height, bucket_width
-                                    )
-                                    for path in batch_paths
-                                ]
-                                
-                                # Collect preprocessed images
-                                images = []
-                                valid_paths = []
-                                
-                                for path, future in zip(batch_paths, preprocess_futures):
-                                    try:
-                                        image = future.result()
-                                        if image is not None:
-                                            images.append(image)
-                                            valid_paths.append(path)
-                                    except Exception as e:
-                                        logger.debug(f"Failed to preprocess image {path}: {str(e)}")
-                                        continue
-                                
-                                if not images:
-                                    continue
-                                
-                                # Stack images into a single batch tensor
-                                image_batch = torch.stack(images, dim=0)
-                                
-                                # Process batch through VAE with mixed precision
-                                with torch.amp.autocast('cuda'):
-                                    with torch.no_grad():
-                                        image_batch = image_batch.to(self.device, non_blocking=True)
-                                        latents = self.vae.encode(image_batch).latent_dist.sample()
-                                        latents = latents.cpu()  # Move to CPU immediately
-                                
-                                # Store latents in cache
-                                for path, latent in zip(valid_paths, latents):
-                                    self.latents_cache[path] = latent
-                                    latents_in_memory += 1
-                                
-                                processed_count += len(valid_paths)
-                                pbar.update(len(valid_paths))
-                                
-                                # Clean up GPU memory
-                                del image_batch, latents, images
-                                torch.cuda.empty_cache()
-                                
-                            except Exception as e:
-                                logger.error(f"Failed to process batch for bucket {bucket_height}x{bucket_width}: {str(e)}")
-                                if torch.cuda.is_available():
-                                    torch.cuda.empty_cache()
-                                continue
-            
-            logger.info(f"Completed latent processing for {processed_count} images")
+            # Offload processed latents to disk
+            self.latents_cache.offload_to_disk()
             
         except Exception as e:
-            logger.error("Failed to process latents: %s", str(e))
-            logger.error(traceback.format_exc())
-            raise
-
-    def _initialize_worker(self):
-        """Initialize worker process state"""
-        if torch.cuda.is_available():
-            device = f'cuda:{torch.cuda.current_device()}'
-        else:
-            device = 'cpu'
-            
-        # Initialize models in worker process
-        self.worker_models = {
-            'vae': self.init_params['vae'].to(device),
-            'text_encoder': self.init_params['text_encoder'].to(device),
-            'text_encoder_2': self.init_params['text_encoder_2'].to(device),
-            'tokenizer': self.init_params['tokenizer'],
-            'tokenizer_2': self.init_params['tokenizer_2']
-        }
-
-    def _worker_process(self, task_queue, result_queue):
-        """Worker process function"""
-        try:
-            self._initialize_worker()
-            
-            while True:
-                task = task_queue.get()
-                if task is None:  # Poison pill
-                    break
-                    
-                try:
-                    result = self._process_task(task)
-                    result_queue.put(result)
-                except Exception as e:
-                    logger.error("Error processing task: %s", str(e))
-                    result_queue.put(None)
-                    
-        except Exception as e:
-            logger.error("Worker process error: %s", str(e))
-            logger.error(traceback.format_exc())
-        finally:
-            # Cleanup worker resources
-            if hasattr(self, 'worker_models'):
-                del self.worker_models
-
-    def _process_task(self, task):
-        """Process a task in the worker process
-        
-        Args:
-            task: Dictionary containing task information
-                - 'type': Type of task ('process_latent', etc.)
-                - 'data': Data needed for the task
-                
-        Returns:
-            Result of the task processing
-        """
-        if task['type'] == 'process_latent':
-            return self._process_single_latent(task['data'])
-        else:
-            logger.warning("Unknown task type: %s", task['type'])
-            return None
-
-    def _parse_tags(self, caption):
-        """Optimized tag parsing with caching"""
-        from functools import lru_cache
-        
-        @lru_cache(maxsize=10000)
-        def cached_parse_tags(caption_text):
-            """Cache tag parsing results for repeated captions"""
-            if not self.tag_weighter:
-                return [], {}
-            # Split caption into tags and process them
-            tags = [tag.strip() for tag in caption_text.split(',') if tag.strip()]
-            return tags, self.tag_weighter.process_tag_batch(tags)
-        
-        if not caption:
-            return [], {}
-            
-        return cached_parse_tags(caption)
-    
-    def parse_tags_batch(self, captions, num_workers=None):
-        """Parallel tag parsing for multiple captions"""
-        from concurrent.futures import ThreadPoolExecutor
-        import numpy as np
-        
-        if not captions:
-            return [], {}
-            
-        if num_workers is None:
-            num_workers = min(32, (os.cpu_count() or 1) + 4)
-            
-        def process_batch(caption_batch):
-            return [self._parse_tags(caption) for caption in caption_batch]
-            
-        # Process in parallel for large batches
-        if len(captions) > 100:
-            batch_size = max(50, len(captions) // (num_workers * 4))
-            batches = np.array_split(captions, max(1, len(captions) // batch_size))
-            
-            results = []
-            with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                futures = [executor.submit(process_batch, batch) for batch in batches]
-                results = [r for f in futures for r in f.result()]
-            return results
-            
-        # Process sequentially for small batches
-        return process_batch(captions)
-
-    def _format_caption(self, caption):
-        """Optimized caption formatting with caching"""
-        from functools import lru_cache
-        
-        @lru_cache(maxsize=10000)
-        def cached_format_caption(caption_text):
-            """Cache formatted captions"""
-            if not caption_text:
-                return ""
-            if not self.tag_weighter:
-                return caption_text
-                
-            try:
-                return self.tag_weighter.format_caption(caption_text)
-            except ValueError as e:
-                logger.error("Invalid caption format: %s", str(e))
-                return caption_text
-            except AttributeError as e:
-                logger.error("Tag weighter not properly initialized: %s", str(e))
-                return caption_text
-            except TypeError as e:
-                logger.error("Invalid caption type: %s", str(e))
-                return caption_text
-                
-        return cached_format_caption(caption)
-    
-    def format_captions_batch(self, captions, num_workers=None):
-        """Parallel caption formatting for multiple captions"""
-        from concurrent.futures import ThreadPoolExecutor
-        import numpy as np
-        
-        if not captions:
-            return []
-            
-        if num_workers is None:
-            num_workers = min(32, (os.cpu_count() or 1) + 4)
-            
-        def process_batch(caption_batch):
-            return [self._format_caption(caption) for caption in caption_batch]
-            
-        # Process in parallel for large batches
-        if len(captions) > 100:
-            batch_size = max(50, len(captions) // (num_workers * 4))
-            batches = np.array_split(captions, max(1, len(captions) // batch_size))
-            
-            results = []
-            with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                futures = [executor.submit(process_batch, batch) for batch in batches]
-                results = [r for f in futures for r in f.result()]
-            return results
-            
-        # Process sequentially for small batches
-        return process_batch(captions)
-
-    def _calculate_tag_weights(self, tags, special_tags):
-        """Optimized tag weight calculation with caching"""
-        from functools import lru_cache
-        
-        @lru_cache(maxsize=1024)
-        def cached_calculate_weights(tags_tuple, special_tags_tuple):
-            # Convert special tags back to regular tags with weights
-            weighted_tags = list(tags_tuple)
-            for tag, weight in special_tags_tuple:
-                if isinstance(weight, (int, float)):
-                    weighted_tags.append(f"{tag}::{weight}")
-            # Process tags in batch to get their weights
-            return self.tag_weighter.process_tag_batch(weighted_tags)
-        
-        # Convert inputs to hashable types for caching
-        tags_tuple = tuple(sorted(tags))
-        # Ensure special_tags is a dictionary before calling items()
-        if not isinstance(special_tags, dict):
-            special_tags = {tag: 1.0 for tag in special_tags}
-        special_tags_tuple = tuple(sorted(special_tags.items()))
-        
-        return cached_calculate_weights(tags_tuple, special_tags_tuple)
-    
-    def calculate_weights_batch(self, tag_pairs, num_workers=None):
-        """Parallel weight calculation for multiple tag pairs"""
-        from concurrent.futures import ThreadPoolExecutor
-        import numpy as np
-        
-        if not tag_pairs:
-            return []
-            
-        if num_workers is None:
-            num_workers = min(32, (os.cpu_count() or 1) + 4)
-            
-        def process_batch(pairs_batch):
-            return [self._calculate_tag_weights(tags, special_tags) 
-                   for tags, special_tags in pairs_batch]
-            
-        # Process in parallel for large batches
-        if len(tag_pairs) > 100:
-            batch_size = max(50, len(tag_pairs) // (num_workers * 4))
-            batches = np.array_split(tag_pairs, max(1, len(tag_pairs) // batch_size))
-            
-            results = []
-            with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                futures = [executor.submit(process_batch, batch) for batch in batches]
-                results = [r for f in futures for r in f.result()]
-            return results
-            
-        # Process sequentially for small batches
-        return process_batch(tag_pairs)
-
-    def _initialize_workers(self) -> None:
-        """Initialize worker processes for parallel latent computation"""
-        if not self.no_caching_latents:
-            # Use ProcessPoolExecutor instead of multiprocessing for better GPU handling
-            self.process_pool = ThreadPoolExecutor(max_workers=1)  # Single worker for GPU
-            logger.info("Initialized latent processing worker")
-
-    def _process_single_latent(self, image_path: str) -> Optional[Tuple[str, torch.Tensor]]:
-        """Process a single image into latent space"""
-        try:
-            # Load and preprocess image
-            image = Image.open(image_path).convert('RGB')
-            
-            # Convert to tensor and normalize
-            image_tensor = torch.from_numpy(
-                np.array(image, dtype=np.float32) / 255.0
-            ).permute(2, 0, 1).unsqueeze(0)
-            
-            # Move to GPU and process through VAE encoder
-            with torch.cuda.amp.autocast('cuda'):
-                with torch.no_grad():
-                    image_tensor = image_tensor.to(self.device)
-                    latent = self.vae.encode(image_tensor).latent_dist.sample()
-                    latent = latent.cpu()  # Move back to CPU for storage
-                    
-            # Clean up GPU memory
-            del image_tensor
-            torch.cuda.empty_cache()
-                
-            return image_path, latent
-            
-        except Exception as e:
-            logger.error("Failed to process latent for %s: %s", image_path, str(e))
+            logger.error(f"Failed to initialize latent cache: {str(e)}")
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            return None
 
-    def _offload_latents_to_disk(self):
-        """Offload latents from memory to disk"""
+    def _precompute_tag_weights(self) -> None:
+        """Pre-compute tag weights for all captions using thread pool."""
         try:
-            # Create a temporary directory for latent storage if it doesn't exist
-            latents_dir = self.cache_dir / "latents"
-            latents_dir.mkdir(exist_ok=True)
+            # Process captions in parallel
+            with ThreadPoolExecutor(max_workers=min(32, len(self.image_paths))) as executor:
+                futures = []
+                for path in self.image_paths:
+                    futures.append(executor.submit(self.caption_processor.load_caption, path))
+                
+                # Process results
+                for path, future in zip(self.image_paths, futures):
+                    try:
+                        caption = future.result()
+                        if caption:
+                            tags, weights = self.caption_processor.process_tags_with_weights(caption)
+                            self.caption_processor.weight_cache[path] = (tags, weights)
+                    except Exception as e:
+                        logger.debug(f"Failed to process caption for {path}: {str(e)}")
+                        continue
             
-            # Save latents to disk and clear from memory
-            for path, latent in self.latents_cache.items():
-                latent_path = latents_dir / f"{hash(path)}.pt"
-                torch.save(latent, latent_path)
-            
-            # Clear memory cache
-            self.latents_cache.clear()
-            torch.cuda.empty_cache()
+            logger.info(f"Precomputed weights for {len(self.caption_processor.weight_cache)} captions")
             
         except Exception as e:
-            logger.error(f"Failed to offload latents to disk: {str(e)}")
-            raise
+            logger.error(f"Failed to precompute tag weights: {str(e)}")
 
-    def collate_fn(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        """Custom collate function to handle batches of different sizes.
-        
-        Args:
-            batch: List of dictionaries containing batch items
-            
-        Returns:
-            Dictionary containing batched tensors
-        """
-        # Group items by bucket size
-        bucket_groups = defaultdict(list)
-        for item in batch:
-            bucket_size = item['bucket_size']
-            bucket_groups[bucket_size].append(item)
-        
-        # Process largest group if we have multiple sizes
-        if len(bucket_groups) > 1:
-            largest_group = max(bucket_groups.items(), key=lambda x: len(x[1]))
-            batch = largest_group[1]
-        
-        # Now all items in batch have same dimensions
-        return {
-            'image': torch.stack([item['image'] for item in batch]),
-            'latents': torch.stack([item['latents'] for item in batch]),
-            'caption': [item['caption'] for item in batch],
-            'tags': [item['tags'] for item in batch],
-            'tag_weights': [item['tag_weights'] for item in batch],
-            'bucket_size': batch[0]['bucket_size'],  # All same now
-            'image_path': [item['image_path'] for item in batch]
-        }
-
-    def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
+    def __getitem__(self, index: int) -> Dict[str, Any]:
         """Get a single item from the dataset.
         
         Args:
             index: Index of the item to get
             
         Returns:
-            Dictionary containing the item data
+            Dictionary containing:
+                - image: Preprocessed image tensor
+                - latents: VAE latent tensor (if caching enabled)
+                - caption: Original caption string
+                - tags: List of extracted tags
+                - weights: Tag weights for loss computation
+                - bucket_dims: (height, width) of the bucket
+                - image_path: Path to the original image
         """
         try:
-            # Get bucket and index within bucket
+            # Get image path and bucket dimensions
             bucket_idx = index % len(self.bucket_data)
-            bucket = list(self.bucket_data.keys())[bucket_idx]
-            image_idx = index // len(self.bucket_data)
+            bucket_dims = list(self.bucket_data.keys())[bucket_idx]
+            image_paths = self.bucket_data[bucket_dims]
+            image_idx = (index // len(self.bucket_data)) % len(image_paths)
+            image_path = image_paths[image_idx]
             
-            # Get image path from bucket
-            bucket_images = self.bucket_data[bucket]
-            if image_idx >= len(bucket_images):
-                # Wrap around if we've exhausted this bucket
-                image_idx = image_idx % len(bucket_images)
-            image_path = bucket_images[image_idx]
+            # Load and process image with target dimensions
+            image = self.image_processor.load_and_transform(
+                image_path,
+                target_height=bucket_dims[0],
+                target_width=bucket_dims[1]
+            )
+            if image is None:
+                raise ValueError(f"Failed to load image: {image_path}")
             
-            # Load and process image
-            target_height, target_width = bucket
+            # Get latents if caching is enabled
+            latents = None
+            if not self.config['no_caching_latents']:
+                latents = self.latents_cache.get_latents(image_path, image)
             
-            # Get caption
-            caption = self._load_caption(image_path)
-            if not caption:
-                caption = ""
-            
-            # Process tags if using tag weighting
-            tags, tag_weights = self._process_caption_tags(caption)
-            
-            # Load image and convert to RGB
-            with Image.open(image_path) as img:
-                if img.mode != 'RGB':
-                    img = img.convert('RGB')
+            # Load and process caption
+            caption = self.caption_processor.load_caption(image_path)
+            if caption is None:
+                raise ValueError(f"Failed to load caption for {image_path}")
                 
-                # Resize to target bucket size
-                if img.size != (target_width, target_height):
-                    img = img.resize((target_width, target_height), Image.Resampling.LANCZOS)
-                
-                # Convert to tensor
-                image = self.image_transforms(img)
+            # Get cached weights or compute them
+            if image_path in self.caption_processor.weight_cache:
+                tags, weights = self.caption_processor.weight_cache[image_path]
+            else:
+                tags, weights = self.caption_processor.process_tags_with_weights(caption)
             
-            # Get or compute latents
-            latents = self._get_latents(image_path, image)
-            
-            # Return processed data
-            return {
+            # Build return dictionary
+            item = {
                 'image': image,
-                'latents': latents,
                 'caption': caption,
                 'tags': tags,
-                'tag_weights': tag_weights,
-                'bucket_size': (target_height, target_width),
+                'weights': weights,
+                'bucket_dims': bucket_dims,
                 'image_path': image_path
             }
             
+            if latents is not None:
+                item['latents'] = latents
+                
+            return item
+            
         except Exception as e:
-            logger.error(f"Error processing item {index}: {str(e)}")
-            # Return next valid item
-            return self.__getitem__((index + 1) % len(self))
+            logger.error(f"Error getting item {index}: {str(e)}")
+            raise
 
-    def shuffle_dataset(self, seed: Optional[int] = None):
-        """Shuffle the dataset while maintaining image-caption pairs.
+    def __len__(self) -> int:
+        """Return the total number of items in the dataset."""
+        total_images = sum(len(paths) for paths in self.bucket_data.values())
+        return total_images
+
+    def shuffle_dataset(self, seed: Optional[int] = None) -> None:
+        """Shuffle the dataset while maintaining bucket grouping.
         
         Args:
             seed: Optional random seed for reproducibility
         """
         if seed is not None:
             torch.manual_seed(seed)
-            
-        # Create indices array
-        indices = torch.randperm(len(self.image_paths)).tolist()
         
-        # Shuffle image paths using the indices
-        self.image_paths = [self.image_paths[i] for i in indices]
+        # Shuffle within each bucket
+        for bucket_dims in self.bucket_data:
+            paths = self.bucket_data[bucket_dims]
+            indices = torch.randperm(len(paths)).tolist()
+            self.bucket_data[bucket_dims] = [paths[i] for i in indices]
         
-        # Shuffle cached data if present
-        if self.latents_cache:
-            new_latents_cache = {}
-            for i, idx in enumerate(indices):
-                path = self.image_paths[i]
-                if path in self.latents_cache:
-                    new_latents_cache[path] = self.latents_cache[path]
-            self.latents_cache = new_latents_cache
-            
-        if self.tag_weight_cache:
-            new_tag_cache = {}
-            for i, idx in enumerate(indices):
-                path = self.image_paths[i]
-                if path in self.tag_weight_cache:
-                    new_tag_cache[path] = self.tag_weight_cache[path]
-            self.tag_weight_cache = new_tag_cache
-            
-        logger.info(f"Shuffled dataset with {len(self.image_paths)} images")
+        logger.info("Dataset shuffled within buckets")
 
-    def __len__(self) -> int:
-        """Return the total number of items in the dataset"""
-        return len(self.image_paths)
-    
-    def _build_bucket_lookup_cache(self):
-        """Build an efficient lookup cache for bucket assignment"""
-        buckets = self.bucket_manager.buckets
-        for bucket in buckets:
-            h, w = bucket
-            # Cache exact matches
-            self._bucket_cache[(h, w)] = bucket
-            self._bucket_cache[(w, h)] = bucket  # Cache rotated version too
-
-    def _find_bucket(self, height: int, width: int) -> Tuple[int, int]:
-        """Find the best bucket for given dimensions using cache for speed.
+    def get_bucket_stats(self) -> Dict[Tuple[int, int], int]:
+        """Get statistics about bucket usage.
         
-        Args:
-            height: Image height
-            width: Image width
-            
         Returns:
-            Tuple of (bucket_height, bucket_width)
+            Dictionary mapping bucket dimensions to number of images
         """
-        # Check cache first
-        if (height, width) in self._bucket_cache:
-            return self._bucket_cache[(height, width)]
-            
-        # Find closest bucket
-        min_area_diff = float('inf')
-        best_bucket = None
-        target_area = height * width
-        
-        for bucket in self.bucket_manager.buckets:
-            bh, bw = bucket
-            if bh >= height and bw >= width:
-                area_diff = (bh * bw) - target_area
-                if area_diff < min_area_diff:
-                    min_area_diff = area_diff
-                    best_bucket = bucket
-                    
-        # Cache result for future lookups
-        self._bucket_cache[(height, width)] = best_bucket
-        return best_bucket
-
-    def _load_caption(self, image_path: str) -> str:
-        """Load caption from corresponding text file.
-        
-        Args:
-            image_path: Path to the image file
-            
-        Returns:
-            Caption string from the text file
-        """
-        try:
-            caption_path = Path(image_path).with_suffix('.txt')
-            if caption_path.exists():
-                with open(caption_path, 'r', encoding='utf-8') as f:
-                    return f.read().strip()
-            else:
-                logger.warning(f"Caption file not found for {image_path}")
-                return ""
-        except Exception as e:
-            logger.error(f"Error loading caption for {image_path}: {str(e)}")
-            return ""
-
-    def _process_caption_tags(self, caption: str) -> Tuple[List[str], List[float]]:
-        """Process caption to extract tags and weights.
-        
-        Args:
-            caption: Raw caption string
-            
-        Returns:
-            Tuple of (tags list, weights list)
-        """
-        if not caption:
-            return [], []
-            
-        try:
-            # Split caption into tags
-            tags = [t.strip() for t in caption.split(',')]
-            tags = [t for t in tags if t]  # Remove empty tags
-            
-            if self.use_tag_weighting and self.tag_weighter is not None:
-                # Get weights for tags using batch processing
-                weights = self.tag_weighter.process_tag_batch(tags)
-                return tags, weights
-            else:
-                # Use uniform weights if tag weighting is disabled
-                return tags, [1.0] * len(tags)
-                
-        except Exception as e:
-            logger.error(f"Error processing caption tags: {str(e)}")
-            return [], []
+        return {dims: len(paths) for dims, paths in self.bucket_data.items()}

@@ -69,40 +69,48 @@ class BucketSampler(CustomSamplerBase):
         self._epoch = value
         self._clear_caches()
 
-    def _initialize_buckets(self) -> None:
-        """Initialize buckets with memory optimization"""
-        self.buckets = []
-        self.bucket_weights = []
-        self.total_samples = 0
-
+    def _initialize_buckets(self):
+        """Initialize bucket data structures."""
         try:
-            # Get image sizes from dataset
-            image_sizes = [(i, self.dataset.get_image_size(i)) for i in range(len(self.dataset))]
-
+            if not hasattr(self.dataset, 'bucket_data'):
+                raise ValueError("Dataset must have bucket_data attribute")
+            
+            self.buckets = []
+            for bucket_dims, image_paths in self.dataset.bucket_data.items():
+                if self.resolution_binning:
+                    # Calculate area for resolution-based binning
+                    area = bucket_dims[0] * bucket_dims[1]
+                    bucket_indices = list(range(len(image_paths)))
+                    self.buckets.append(bucket_indices)
+                    self._bucket_cache[bucket_dims] = {
+                        'indices': bucket_indices,
+                        'area': area,
+                        'aspect_ratio': bucket_dims[0] / bucket_dims[1]
+                    }
+                else:
+                    # Simple bucket assignment without resolution binning
+                    bucket_indices = list(range(len(image_paths)))
+                    self.buckets.append(bucket_indices)
+                    self._bucket_cache[bucket_dims] = {
+                        'indices': bucket_indices,
+                        'dims': bucket_dims
+                    }
+            
+            # Sort buckets by area if using resolution binning
             if self.resolution_binning:
-                # Group by resolution
-                resolution_groups = {}
-                for idx, size in image_sizes:
-                    res_key = (size[0] // 64 * 64, size[1] // 64 * 64)  # Group by 64-pixel bins
-                    if res_key not in resolution_groups:
-                        resolution_groups[res_key] = []
-                    resolution_groups[res_key].append(idx)
-
-                # Create buckets from groups
-                for indices in resolution_groups.values():
-                    if len(indices) >= self.batch_size or not self.drop_last:
-                        self.buckets.append(indices)
-                        self.bucket_weights.append(len(indices))
-                        self.total_samples += len(indices)
-            else:
-                # Single bucket with all indices
-                all_indices = [idx for idx, _ in image_sizes]
-                self.buckets.append(all_indices)
-                self.bucket_weights.append(len(all_indices))
-                self.total_samples = len(all_indices)
-
+                self.buckets.sort(key=lambda x: self._bucket_cache[x]['area'])
+            
+            # Initialize bucket weights for sampling
+            total_samples = sum(len(bucket) for bucket in self.buckets)
+            self._cached_weights = [len(bucket) / total_samples for bucket in self.buckets]
+            
+            logger.info(
+                f"Initialized {len(self.buckets)} buckets with "
+                f"resolution binning={'enabled' if self.resolution_binning else 'disabled'}"
+            )
+            
         except Exception as e:
-            logger.error("Failed to initialize buckets: %s", str(e))
+            logger.error(f"Failed to initialize buckets: {str(e)}")
             raise
 
     def _calculate_bucket_weights(self) -> None:

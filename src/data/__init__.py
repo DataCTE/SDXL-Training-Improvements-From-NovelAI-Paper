@@ -19,10 +19,9 @@ from .dataset import (
     # Factory functions
     create_dataloader
 )
-from .tag_weighter import (
-    TagBasedLossWeighter,
-    TagStats,
-    TagCache
+from .caption_processor import (
+    CaptionProcessor,
+    TagStats
 )
 from .ultimate_upscaler import (
     UltimateUpscaler,
@@ -48,9 +47,8 @@ __all__ = [
     'create_dataloader',
     
     # Tag weighting system
-    'TagBasedLossWeighter',
+    'CaptionProcessor',
     'TagStats',
-    'TagCache',
     
     # Image upscaling
     'UltimateUpscaler',

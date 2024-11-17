@@ -288,6 +288,15 @@ def create_dataloader(
     tokenizer_2=None,
     text_encoder=None,
     text_encoder_2=None,
+    min_size=512,
+    max_size=4096,
+    bucket_step_size=64,
+    max_bucket_area=1024*1024,
+    token_dropout_rate=0.1,
+    caption_dropout_rate=0.1,
+    min_tag_weight=0.1,
+    max_tag_weight=3.0,
+    use_tag_weighting=True,
     **kwargs
 ):
     """Create a dataloader with proper model initialization."""
@@ -304,7 +313,15 @@ def create_dataloader(
         cache_dir=cache_dir,
         no_caching_latents=no_caching_latents,
         all_ar=all_ar,
-        num_workers=num_workers,
+        min_size=min_size,
+        max_size=max_size,
+        bucket_step_size=bucket_step_size,
+        max_bucket_area=max_bucket_area,
+        token_dropout_rate=token_dropout_rate,
+        caption_dropout_rate=caption_dropout_rate,
+        min_tag_weight=min_tag_weight,
+        max_tag_weight=max_tag_weight,
+        use_tag_weighting=use_tag_weighting,
         **kwargs
     )
     

@@ -24,7 +24,7 @@ from diffusers import AutoencoderKL
 from src.inference.text_to_image import SDXLInference
 from src.training.ema import EMAModel
 from src.training.loss import training_loss_v_prediction, get_cosine_schedule_with_warmup
-from src.data.tag_weighter import TagBasedLossWeighter
+from src.data.caption_processor import CaptionProcessor
 from src.training.vae_finetuner import VAEFineTuner
 from src.data.dataset.dataset import CustomDataset
 from src.utils.checkpoint import save_checkpoint
@@ -188,25 +188,49 @@ def _get_tag_weighter_config(
     }
 
 
-def setup_tag_weighter(args) -> Optional[Any]:
-    """Initialize tag weighting system."""
+def setup_tag_weighter(args) -> Optional[CaptionProcessor]:
+    """Initialize tag weighting system with CaptionProcessor.
+    
+    Args:
+        args: Configuration arguments containing tag weighting settings
+        
+    Returns:
+        Configured CaptionProcessor instance or None if tag weighting is disabled
+        
+    Raises:
+        ValueError: If required configuration is missing
+        RuntimeError: If initialization fails
+    """
     try:
         if not args.tag_weighting.use_tag_weighting:
             return None
 
-        weighter_config = _get_tag_weighter_config(
-            base_weight=getattr(args.tag_weighting, "tag_base_weight", 1.0),
-            min_weight=args.tag_weighting.min_tag_weight,
-            max_weight=args.tag_weighting.max_tag_weight,
-            window_size=getattr(args.tag_weighting, "tag_window_size", 100),
-            no_cache=args.data.no_caching,
+        # Initialize CaptionProcessor with configuration
+        processor = CaptionProcessor(
+            token_dropout_rate=args.data.token_dropout_rate,
+            caption_dropout_rate=args.data.caption_dropout_rate,
+            rarity_factor=args.tag_weighting.rarity_factor if hasattr(args.tag_weighting, "rarity_factor") else 0.9,
+            emphasis_factor=args.tag_weighting.emphasis_factor if hasattr(args.tag_weighting, "emphasis_factor") else 1.2
         )
-        weighter = TagBasedLossWeighter(config=weighter_config)
+        
+        # Set weight boundaries
+        processor.MIN_WEIGHT = args.tag_weighting.min_tag_weight
+        processor.MAX_WEIGHT = args.tag_weighting.max_tag_weight
+        
+        logger.info(
+            "Initialized CaptionProcessor with tag weighting: "
+            f"min_weight={processor.MIN_WEIGHT}, "
+            f"max_weight={processor.MAX_WEIGHT}, "
+            f"rarity_factor={processor.rarity_factor}, "
+            f"emphasis_factor={processor.emphasis_factor}"
+        )
+        
+            
+        return processor
 
-        return weighter
-
-    except (ValueError, RuntimeError, AttributeError) as e:
-        raise type(e)(f"Failed to setup tag weighter: {str(e)}") from e
+    except Exception as e:
+        logger.error(f"Failed to setup CaptionProcessor: {str(e)}")
+        raise RuntimeError(f"Failed to setup tag weighting system: {str(e)}") from e
 
 
 @dataclass
@@ -406,11 +430,18 @@ def initialize_training_components(args, models):
                 cache_dir=args.data.cache_dir,
                 no_caching_latents=args.data.no_caching,
                 use_tag_weighting=args.tag_weighting.use_tag_weighting,
-                num_workers=args.system.num_workers,
+                min_size=args.data.min_size,
+                max_size=args.data.max_size,
+                bucket_step_size=args.data.bucket_step_size,
+                max_bucket_area=args.data.max_bucket_area,
+                token_dropout_rate=args.data.token_dropout_rate,
+                caption_dropout_rate=args.data.caption_dropout_rate,
+                min_tag_weight=args.data.min_tag_weight,
+                max_tag_weight=args.data.max_tag_weight,
+                all_ar=args.data.all_ar
             ),
             batch_size=args.training.batch_size,
             shuffle=True,
-            num_workers=args.system.num_workers,
             pin_memory=True,
             drop_last=True,
         )
