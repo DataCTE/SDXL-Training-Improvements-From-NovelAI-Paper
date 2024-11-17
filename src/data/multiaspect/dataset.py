@@ -204,7 +204,7 @@ class MultiAspectDataset(Dataset):
                 batch_tensors = []
                 for path in batch_paths:
                     img = load_and_verify_image(path)
-                    tensor = converter.to_tensor(img)
+                    tensor = converter.pil_to_tensor(img, normalize=True)
                     batch_tensors.append(tensor)
                 batch_tensors = torch.stack(batch_tensors)
                 
