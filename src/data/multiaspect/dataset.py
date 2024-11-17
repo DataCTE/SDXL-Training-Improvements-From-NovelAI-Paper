@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Tuple, Any, Union
 from pathlib import Path
 import torch
 from torch.utils.data import Dataset, DataLoader
+from PIL import Image
 
 from src.data.image_processing.loading import load_and_verify_image
 from src.data.image_processing.transforms import (
@@ -231,7 +232,18 @@ def create_train_dataloader(
             prompts.append(prompt)
     
     # Create bucket manager for aspect ratio handling
-    bucket_manager = BucketManager(image_paths)
+    bucket_manager = BucketManager(
+        min_resolution=512,  # SDXL default minimum resolution
+        max_resolution=2048,  # SDXL default maximum resolution
+        resolution_step=64,   # Standard step size
+        tolerance=0.033      # 3.3% aspect ratio tolerance
+    )
+    
+    # Add images to bucket manager
+    for img_path in image_paths:
+        img = Image.open(img_path)
+        width, height = img.size
+        bucket_manager.add_image(img_path, width, height)
     
     # Create dataset
     dataset = MultiAspectDataset(
@@ -286,7 +298,18 @@ def create_validation_dataloader(
             prompts.append(prompt)
     
     # Create bucket manager for aspect ratio handling
-    bucket_manager = BucketManager(image_paths)
+    bucket_manager = BucketManager(
+        min_resolution=512,  # SDXL default minimum resolution
+        max_resolution=2048,  # SDXL default maximum resolution
+        resolution_step=64,   # Standard step size
+        tolerance=0.033      # 3.3% aspect ratio tolerance
+    )
+    
+    # Add images to bucket manager
+    for img_path in image_paths:
+        img = Image.open(img_path)
+        width, height = img.size
+        bucket_manager.add_image(img_path, width, height)
     
     # Create dataset - no transforms for validation
     dataset = MultiAspectDataset(
