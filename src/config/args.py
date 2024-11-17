@@ -178,6 +178,16 @@ def parse_args() -> TrainingConfig:
     parser.add_argument("--cache_dir", type=str, default="latents_cache")
     parser.add_argument("--no_caching", action="store_true")
     
+    # Validation arguments
+    parser.add_argument("--validation_prompts", type=str, nargs="+", help="List of prompts to use for validation")
+    parser.add_argument("--validation_epochs", type=int, default=1, help="Run validation every N epochs")
+    parser.add_argument("--save_epochs", type=int, default=1, help="Save checkpoint every N epochs")
+    parser.add_argument("--validation_num_inference_steps", type=int, default=28, help="Number of inference steps for validation")
+    parser.add_argument("--validation_guidance_scale", type=float, default=5.5, help="Guidance scale for validation")
+    parser.add_argument("--validation_image_height", type=int, default=1024, help="Height of validation images")
+    parser.add_argument("--validation_image_width", type=int, default=1024, help="Width of validation images")
+    parser.add_argument("--validation_num_images_per_prompt", type=int, default=1, help="Number of images to generate per validation prompt")
+    
     args = parser.parse_args()
     
     # Convert to config
@@ -203,6 +213,14 @@ def parse_args() -> TrainingConfig:
         compile_mode=args.compile_mode,
         gradient_checkpointing=args.gradient_checkpointing,
         num_workers=args.num_workers,
+        validation_prompts=args.validation_prompts if args.validation_prompts else [],
+        validation_epochs=args.validation_epochs,
+        save_epochs=args.save_epochs,
+        validation_num_inference_steps=args.validation_num_inference_steps,
+        validation_guidance_scale=args.validation_guidance_scale,
+        validation_image_height=args.validation_image_height,
+        validation_image_width=args.validation_image_width,
+        validation_num_images_per_prompt=args.validation_num_images_per_prompt,
     )
     
     # Update optimizer config
