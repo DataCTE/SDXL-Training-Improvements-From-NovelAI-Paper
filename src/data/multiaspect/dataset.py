@@ -20,7 +20,7 @@ from src.data.image_processing.transforms import (
 from src.data.image_processing.manipluations import converter
 from src.data.image_processing.validation import (
     validate_image_comprehensive, validate_tensor_comprehensive,
-    validate_dimensions, check_image_corruption
+    validate_dimensions, check_image_corruption, ImageValidationError
 )
 from src.data.cacheing.vae import VAECache
 from src.data.cacheing.text_embeds import TextEmbeddingCache
@@ -101,6 +101,7 @@ class MultiAspectDataset(Dataset):
         # Validate images in parallel
         with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
             futures = []
+            skipped_counts = {'size': 0, 'corruption': 0, 'missing': 0, 'other': 0}
             
             # Create progress bar for initial file scanning
             with tqdm(total=len(self.image_paths), desc="Validating images") as pbar:
@@ -113,14 +114,35 @@ class MultiAspectDataset(Dataset):
                     try:
                         future.result()
                         valid_indices.append(idx)
+                    except ImageValidationError as e:
+                        if "too small" in str(e) or "too large" in str(e):
+                            skipped_counts['size'] += 1
+                        else:
+                            skipped_counts['other'] += 1
+                    except FileNotFoundError:
+                        skipped_counts['missing'] += 1
                     except Exception as e:
-                        logger.warning(f"Skipping invalid image {self.image_paths[idx]}: {str(e)}")
+                        if "corrupted" in str(e).lower():
+                            skipped_counts['corruption'] += 1
+                        else:
+                            skipped_counts['other'] += 1
                     pbar.update(1)
             
             # Filter dataset
             self.image_paths = [self.image_paths[i] for i in valid_indices]
             self.prompts = [self.prompts[i] for i in valid_indices]
-
+            
+            # Log summary of skipped images
+            total_skipped = sum(skipped_counts.values())
+            if total_skipped > 0:
+                logger.warning(
+                    f"Skipped {total_skipped} images during validation:\n"
+                    f"  - Size requirements not met: {skipped_counts['size']}\n"
+                    f"  - Corrupted images: {skipped_counts['corruption']}\n"
+                    f"  - Missing files: {skipped_counts['missing']}\n"
+                    f"  - Other issues: {skipped_counts['other']}"
+                )
+            
         # Group images into buckets
         self.image_buckets = self.image_grouper.group_images(self.image_paths)
         
