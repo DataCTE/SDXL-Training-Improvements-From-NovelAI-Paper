@@ -23,11 +23,6 @@ from .caption_processor import (
     CaptionProcessor,
     TagStats
 )
-from .ultimate_upscaler import (
-    UltimateUpscaler,
-    USDUMode,
-    USDUSFMode
-)
 from .utils import (
     ImageConverter,
     tensor_to_pil,
@@ -49,11 +44,6 @@ __all__ = [
     # Tag weighting system
     'CaptionProcessor',
     'TagStats',
-    
-    # Image upscaling
-    'UltimateUpscaler',
-    'USDUMode',
-    'USDUSFMode',
     
     # Image utilities
     'ImageConverter',

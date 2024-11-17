@@ -1,7 +1,7 @@
 import logging
 import torch
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any, Any
+from typing import Dict, List, Optional, Tuple, Any
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from PIL import Image
@@ -174,55 +174,49 @@ class CustomDataset(CustomDatasetBase):
             return
             
         try:
-            # Process images in batches
+            # Process images by bucket to ensure consistent tensor sizes
             batch_size = 4  # Adjust based on GPU memory
-            for i in range(0, len(self.image_paths), batch_size):
-                batch_paths = self.image_paths[i:i + batch_size]
-                
-                # Load and transform images
-                batch_tensors = []
-                valid_paths = []
-                for path in batch_paths:
-                    # Get bucket dimensions for this image
-                    with Image.open(path) as img:
-                        if img.mode != 'RGB':
-                            img = img.convert('RGB')
-                        orig_height, orig_width = img.size[1], img.size[0]
-                        bucket_dims = self.image_grouper.get_ar_bucket(orig_height, orig_width)
-                    
-                    # Load and transform with target dimensions
-                    image = self.image_processor.load_and_transform(
-                        path,
-                        target_height=bucket_dims[0],
-                        target_width=bucket_dims[1]
-                    )
-                    if image is not None:
-                        batch_tensors.append(image)
-                        valid_paths.append(path)
-                
-                if not batch_tensors:
-                    continue
-                    
-                # Process batch through VAE
-                batch_tensor = torch.stack(batch_tensors)
-                latents = self.latents_cache.process_latents_batch(batch_tensor)
-                
-                # Store results
-                if latents is not None:
-                    for path, latent in zip(valid_paths, latents):
-                        self.latents_cache.latents_cache[path] = latent
-                
-                # Clean up GPU memory
-                del batch_tensor, batch_tensors, latents
-                torch.cuda.empty_cache()
             
-            # Offload processed latents to disk
-            self.latents_cache.offload_to_disk()
+            # Iterate through each bucket group
+            for bucket_dims, image_paths in self.bucket_data.items():
+                for i in range(0, len(image_paths), batch_size):
+                    batch_paths = image_paths[i:i + batch_size]
+                    
+                    # Load and transform images using bucket dimensions
+                    batch_tensors = []
+                    valid_paths = []
+                    for path in batch_paths:
+                        image = self.image_processor.load_and_transform(
+                            path,
+                            target_height=bucket_dims[0],
+                            target_width=bucket_dims[1]
+                        )
+                        if image is not None:
+                            batch_tensors.append(image)
+                            valid_paths.append(path)
+                    
+                    if not batch_tensors:
+                        continue
+                        
+                    # Stack tensors and process batch
+                    try:
+                        batch_tensor = torch.stack(batch_tensors)
+                        latents = self.latents_cache.process_latents_batch(batch_tensor)
+                        
+                        # Cache individual latents
+                        if latents is not None:
+                            for idx, path in enumerate(valid_paths):
+                                self.latents_cache.latents_cache[path] = latents[idx]
+                                
+                    except Exception as e:
+                        logger.error(f"Failed to process latent batch: {str(e)}")
+                        continue
+                        
+            logger.info("Latent cache initialization completed")
             
         except Exception as e:
             logger.error(f"Failed to initialize latent cache: {str(e)}")
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            raise
 
     def _precompute_tag_weights(self) -> None:
         """Pre-compute tag weights for all captions using thread pool."""
