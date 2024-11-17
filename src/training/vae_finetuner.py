@@ -242,7 +242,7 @@ class VAEFineTuner:
                     self.scale_factor = max(min(self.scale_factor, 1e6), 1e-6)
         self.current_step += 1
 
-    @torch.cuda.amp.autocast()
+    @torch.amp.autocast('cuda')
     def _forward_vae(self, latents: torch.Tensor) -> torch.Tensor:
         """Optimized VAE forward pass"""
         with torch.cuda.stream(self.compute_stream):

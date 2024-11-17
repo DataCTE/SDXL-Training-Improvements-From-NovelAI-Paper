@@ -97,11 +97,11 @@ def load_models(config) -> Dict[str, Any]:
         Dict containing all loaded models and components
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.float16 if config.training.mixed_precision == "fp16" else torch.float32
+    dtype = torch.float16 if config.mixed_precision == "fp16" else torch.float32
     
     # Load base models
     pipeline = StableDiffusionXLPipeline.from_pretrained(
-        config.model.model_path,
+        config.model_path,
         torch_dtype=dtype,
     )
     
@@ -117,9 +117,9 @@ def load_models(config) -> Dict[str, Any]:
     }
     
     # Load VAE if specified
-    if config.vae.path:
+    if config.vae_args.vae_path:
         models["vae"] = AutoencoderKL.from_pretrained(
-            config.vae.path,
+            config.vae_args.vae_path,
             torch_dtype=dtype
         )
     
@@ -129,7 +129,7 @@ def load_models(config) -> Dict[str, Any]:
             models[name] = model.to(device)
     
     # Enable gradient checkpointing if configured
-    if config.system.gradient_checkpointing:
+    if config.gradient_checkpointing:
         if hasattr(models["unet"], "enable_gradient_checkpointing"):
             models["unet"].enable_gradient_checkpointing()
         if hasattr(models["text_encoder"], "gradient_checkpointing_enable"):
@@ -138,8 +138,8 @@ def load_models(config) -> Dict[str, Any]:
             models["text_encoder_2"].gradient_checkpointing_enable()
     
     # Enable model compilation if configured
-    if config.system.enable_compile:
-        compile_mode = config.system.compile_mode
+    if config.enable_compile:
+        compile_mode = config.compile_mode
         if hasattr(models["unet"], "compile"):
             models["unet"] = torch.compile(models["unet"], mode=compile_mode)
         if hasattr(models["vae"], "compile"):
