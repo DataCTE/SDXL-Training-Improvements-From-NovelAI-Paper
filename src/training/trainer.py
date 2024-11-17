@@ -20,7 +20,7 @@ from diffusers import AutoencoderKL
 
 from src.inference.text_to_image import SDXLInference
 from src.training.ema import EMAModel
-from src.training.loss import get_cosine_schedule_with_warmup
+from src.training.loss import get_cosine_schedule_with_warmup, forward_pass
 from src.data.caption_processor import CaptionProcessor
 from src.training.vae_finetuner import VAEFineTuner
 from src.data.dataset.dataset import CustomDataset
