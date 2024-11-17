@@ -55,7 +55,10 @@ def train_sdxl(
             cache_dir=str(output_dir / "vae_cache"),
             vae=models_dict['vae']
         )
-        text_embedding_cache = TextEmbeddingCache(models_dict['text_encoder'], models_dict['text_encoder_2'])
+        text_embedding_cache = TextEmbeddingCache(
+            cache_dir=str(output_dir / "text_embeds_cache"),
+            text_encoder=models_dict['text_encoder']
+        )
         
         # Create dataloaders
         train_dataloader = create_train_dataloader(
