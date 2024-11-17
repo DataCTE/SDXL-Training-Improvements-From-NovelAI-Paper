@@ -109,20 +109,6 @@ class TrainingConfig:
     num_workers: int = 4
     
     # Validation settings
-    validation_dir: Optional[str] = None
-    validation_prompts: List[str] = field(default_factory=lambda: [
-        "A majestic lion standing on a rocky outcrop",
-        "A futuristic cityscape with flying cars",
-        "A serene beach at sunset with palm trees",
-        "An intricate steampunk machine with gears and pipes"
-    ])
-    validation_epochs: int = 1
-    validation_steps: int = 1000
-    validation_num_inference_steps: int = 28
-    validation_guidance_scale: float = 5.5
-    validation_image_height: int = 1024
-    validation_image_width: int = 1024
-    validation_num_images_per_prompt: int = 1
     
     # Checkpoint settings
     save_epochs: int = 1
@@ -200,15 +186,6 @@ def parse_args() -> TrainingConfig:
     parser.add_argument("--cache_dir", type=str, default="latents_cache")
     parser.add_argument("--no_caching", action="store_true")
     
-    # Validation arguments
-    parser.add_argument("--validation_epochs", type=int, default=None, help="Run validation every N epochs")
-    parser.add_argument("--validation_steps", type=int, default=None, help="Run validation every N steps")
-    parser.add_argument("--save_epochs", type=int, default=None, help="Save checkpoint every N epochs")
-    parser.add_argument("--validation_num_inference_steps", type=int, default=28, help="Number of inference steps for validation")
-    parser.add_argument("--validation_guidance_scale", type=float, default=5.5, help="Guidance scale for validation")
-    parser.add_argument("--validation_image_height", type=int, default=1024, help="Height of validation images")
-    parser.add_argument("--validation_image_width", type=int, default=1024, help="Width of validation images")
-    parser.add_argument("--validation_num_images_per_prompt", type=int, default=1, help="Number of images to generate per validation prompt")
     
     # Wandb arguments
     parser.add_argument("--use_wandb", action="store_true", help="Enable Weights & Biases logging")
@@ -253,22 +230,13 @@ def parse_args() -> TrainingConfig:
         rescale_multiplier=args.rescale_multiplier,
         resolution_scaling=args.resolution_scaling,
         min_snr_gamma=args.min_snr_gamma,
-        validation_dir=args.validation_dir,
         cache_dir=args.cache_dir,
         no_caching=args.no_caching,
         enable_compile=args.enable_compile,
         compile_mode=args.compile_mode,
         gradient_checkpointing=args.gradient_checkpointing,
         num_workers=args.num_workers,
-        validation_prompts=args.validation_prompts,
-        validation_epochs=args.validation_epochs,
-        validation_steps=args.validation_steps,
         save_epochs=args.save_epochs,
-        validation_num_inference_steps=args.validation_num_inference_steps,
-        validation_guidance_scale=args.validation_guidance_scale,
-        validation_image_height=args.validation_image_height,
-        validation_image_width=args.validation_image_width,
-        validation_num_images_per_prompt=args.validation_num_images_per_prompt,
         warmup_steps=args.warmup_steps,
         save_checkpoints=args.save_checkpoints,
         all_ar=args.all_ar,
