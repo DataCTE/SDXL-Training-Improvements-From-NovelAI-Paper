@@ -169,12 +169,26 @@ class DataArgs:
         cache_dir: Directory for caching intermediate data.
         no_caching: Whether to disable caching.
         num_inference_steps: Number of inference steps to use in processing.
+        min_size: Minimum image size for bucketing.
+        max_size: Maximum image size for bucketing.
+        bucket_step_size: Resolution step size for buckets.
+        max_bucket_area: Maximum area for buckets.
+        token_dropout_rate: Token dropout probability.
+        caption_dropout_rate: Caption dropout probability.
+        all_ar: Whether to use all aspect ratios.
     """
     
     data_dir: str
     cache_dir: str = "latents_cache"
     no_caching: bool = False
     num_inference_steps: int = 28
+    min_size: int = 512
+    max_size: int = 4096
+    bucket_step_size: int = 64
+    max_bucket_area: int = 1024*1024
+    token_dropout_rate: float = 0.1
+    caption_dropout_rate: float = 0.1
+    all_ar: bool = False
 
 @dataclass
 class TagWeightingArgs:
@@ -345,6 +359,13 @@ def parse_args() -> TrainingConfig:
     parser.add_argument("--cache_dir", type=str, default="latents_cache")
     parser.add_argument("--no_caching", action="store_true")
     parser.add_argument("--num_inference_steps", type=int, default=28)
+    parser.add_argument("--min_size", type=int, default=512)
+    parser.add_argument("--max_size", type=int, default=4096)
+    parser.add_argument("--bucket_step_size", type=int, default=64)
+    parser.add_argument("--max_bucket_area", type=int, default=1024*1024)
+    parser.add_argument("--token_dropout_rate", type=float, default=0.1)
+    parser.add_argument("--caption_dropout_rate", type=float, default=0.1)
+    parser.add_argument("--all_ar", action="store_true", default=False)
     
     # Tag weighting arguments
     parser.add_argument("--use_tag_weighting", action="store_true", default=True)
@@ -433,7 +454,14 @@ def parse_args() -> TrainingConfig:
             data_dir=args.data_dir,
             cache_dir=args.cache_dir,
             no_caching=args.no_caching,
-            num_inference_steps=args.num_inference_steps
+            num_inference_steps=args.num_inference_steps,
+            min_size=args.min_size,
+            max_size=args.max_size,
+            bucket_step_size=args.bucket_step_size,
+            max_bucket_area=args.max_bucket_area,
+            token_dropout_rate=args.token_dropout_rate,
+            caption_dropout_rate=args.caption_dropout_rate,
+            all_ar=args.all_ar
         ),
         tag_weighting=TagWeightingArgs(
             use_tag_weighting=args.use_tag_weighting,
