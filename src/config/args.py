@@ -120,6 +120,10 @@ class TrainingConfig:
     validation_image_width: int = field(default=1024)
     validation_num_images_per_prompt: int = field(default=1)
     
+    # Checkpoint settings
+    save_epochs: Optional[int] = field(default=None)
+    save_checkpoints: bool = field(default=False)
+    
     # Optimizer configuration
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
@@ -201,7 +205,7 @@ def parse_args() -> TrainingConfig:
                       help="List of prompts to use for validation")
     parser.add_argument("--validation_epochs", type=int, default=None, help="Run validation every N epochs")
     parser.add_argument("--validation_steps", type=int, default=None, help="Run validation every N steps")
-    parser.add_argument("--save_epochs", type=int, default=1, help="Save checkpoint every N epochs")
+    parser.add_argument("--save_epochs", type=int, default=None, help="Save checkpoint every N epochs")
     parser.add_argument("--validation_num_inference_steps", type=int, default=20, help="Number of inference steps for validation")
     parser.add_argument("--validation_guidance_scale", type=float, default=7.5, help="Guidance scale for validation")
     parser.add_argument("--validation_image_height", type=int, default=1024, help="Height of validation images")
