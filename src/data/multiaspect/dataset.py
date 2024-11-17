@@ -11,6 +11,7 @@ from pathlib import Path
 import torch
 from torch.utils.data import Dataset, DataLoader
 import random
+from tqdm.auto import tqdm
 
 from src.data.image_processing.loading import load_and_verify_image
 from src.data.image_processing.transforms import (
@@ -165,15 +166,19 @@ class MultiAspectDataset(Dataset):
         
         # Process images in batches
         batch_size = 32
-        for i in range(0, len(self.image_paths), batch_size):
-            batch_paths = self.image_paths[i:i + batch_size]
-            batch_prompts = self.processed_prompts[i:i + batch_size]
-            
-            # Update VAE cache
-            self.vae_cache.cache_batch(batch_paths)
-            
-            # Update text embedding cache
-            self.text_embedding_cache.cache_batch(batch_prompts)
+        total_batches = (len(self.image_paths) + batch_size - 1) // batch_size
+        
+        with tqdm(total=total_batches, desc="Caching VAE latents") as pbar_vae:
+            for i in range(0, len(self.image_paths), batch_size):
+                batch_paths = self.image_paths[i:i + batch_size]
+                self.vae_cache.cache_batch(batch_paths)
+                pbar_vae.update(1)
+        
+        with tqdm(total=total_batches, desc="Caching text embeddings") as pbar_text:
+            for i in range(0, len(self.processed_prompts), batch_size):
+                batch_prompts = self.processed_prompts[i:i + batch_size]
+                self.text_embedding_cache.cache_batch(batch_prompts)
+                pbar_text.update(1)
 
     def __len__(self) -> int:
         """Get dataset size."""
