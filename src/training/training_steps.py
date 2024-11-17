@@ -63,7 +63,11 @@ def train_step(
         metrics = {"loss": loss.item()}
         if metrics_manager is not None:
             for name, value in metrics.items():
-                metrics_manager.update_metric(name, value)
+                metrics_manager.update_metric(name, value, step=batch_idx)
+
+        # Log progress if needed
+        if batch_idx % getattr(args, "logging_steps", 50) == 0:
+            logger.info(f"Step {batch_idx}: Loss = {loss.item():.4f}")
 
         return metrics
 

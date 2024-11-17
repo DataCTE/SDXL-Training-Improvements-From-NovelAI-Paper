@@ -58,6 +58,13 @@ class TagWeightingConfig:
     similarity_threshold: float = 0.3
 
 @dataclass
+class WandBConfig:
+    use_wandb: bool = False
+    wandb_project: Optional[str] = None
+    wandb_run_name: Optional[str] = None
+    logging_steps: int = 50
+
+@dataclass
 class TrainingConfig:
     # Required parameters
     model_path: str
@@ -72,6 +79,8 @@ class TrainingConfig:
     gradient_accumulation_steps: int = 1
     learning_rate: float = 1e-5
     max_grad_norm: float = 1.0
+    warmup_steps: int = 500
+    save_checkpoints: bool = False
     
     # Model and training mode configuration
     training_mode: str = "v_prediction"
@@ -92,6 +101,7 @@ class TrainingConfig:
     sigma_max: float = 160.0
     scale_method: str = "karras"
     scale_factor: float = 0.7
+    all_ar: bool = False
     
     # Hardware and performance settings
     device: str = "cuda"
@@ -103,6 +113,7 @@ class TrainingConfig:
     validation_dir: Optional[str] = None
     validation_prompts: List[str] = field(default_factory=list)
     validation_epochs: int = 1
+    validation_steps: int = 1000
     save_epochs: int = 1
     validation_num_inference_steps: int = 28
     validation_guidance_scale: float = 5.5
@@ -116,6 +127,7 @@ class TrainingConfig:
     ema: EMAConfig = field(default_factory=EMAConfig)
     vae_args: VAEConfig = field(default_factory=VAEConfig)
     tag_weighting: TagWeightingConfig = field(default_factory=TagWeightingConfig)
+    wandb: WandBConfig = field(default_factory=WandBConfig)
     
     # Cache settings
     cache_dir: str = "latents_cache"
@@ -181,12 +193,27 @@ def parse_args() -> TrainingConfig:
     # Validation arguments
     parser.add_argument("--validation_prompts", type=str, nargs="+", help="List of prompts to use for validation")
     parser.add_argument("--validation_epochs", type=int, default=1, help="Run validation every N epochs")
+    parser.add_argument("--validation_steps", type=int, default=1000, help="Run validation every N steps")
     parser.add_argument("--save_epochs", type=int, default=1, help="Save checkpoint every N epochs")
     parser.add_argument("--validation_num_inference_steps", type=int, default=28, help="Number of inference steps for validation")
     parser.add_argument("--validation_guidance_scale", type=float, default=5.5, help="Guidance scale for validation")
     parser.add_argument("--validation_image_height", type=int, default=1024, help="Height of validation images")
     parser.add_argument("--validation_image_width", type=int, default=1024, help="Width of validation images")
     parser.add_argument("--validation_num_images_per_prompt", type=int, default=1, help="Number of images to generate per validation prompt")
+    
+    # Wandb arguments
+    parser.add_argument("--use_wandb", action="store_true", help="Enable Weights & Biases logging")
+    parser.add_argument("--wandb_project", type=str, help="W&B project name")
+    parser.add_argument("--wandb_run_name", type=str, help="W&B run name")
+    parser.add_argument("--logging_steps", type=int, default=50, help="Log metrics every N steps")
+    
+    # Training control arguments
+    parser.add_argument("--warmup_steps", type=int, default=500, help="Number of warmup steps")
+    parser.add_argument("--save_checkpoints", action="store_true", help="Save checkpoints during training")
+    parser.add_argument("--all_ar", action="store_true", help="Use all aspect ratios for training")
+    
+    # VAE arguments
+    parser.add_argument("--vae_use_channel_scaling", action="store_true", help="Use channel scaling for VAE")
     
     args = parser.parse_args()
     
@@ -215,12 +242,16 @@ def parse_args() -> TrainingConfig:
         num_workers=args.num_workers,
         validation_prompts=args.validation_prompts if args.validation_prompts else [],
         validation_epochs=args.validation_epochs,
+        validation_steps=args.validation_steps,
         save_epochs=args.save_epochs,
         validation_num_inference_steps=args.validation_num_inference_steps,
         validation_guidance_scale=args.validation_guidance_scale,
         validation_image_height=args.validation_image_height,
         validation_image_width=args.validation_image_width,
         validation_num_images_per_prompt=args.validation_num_images_per_prompt,
+        warmup_steps=args.warmup_steps,
+        save_checkpoints=args.save_checkpoints,
+        all_ar=args.all_ar,
     )
     
     # Update optimizer config
@@ -232,5 +263,11 @@ def parse_args() -> TrainingConfig:
     # Update EMA config
     config.ema.decay = args.ema_decay
     config.ema.warmup_steps = args.ema_warmup_steps
+    
+    # Update WandB config
+    config.wandb.use_wandb = args.use_wandb
+    config.wandb.wandb_project = args.wandb_project
+    config.wandb.wandb_run_name = args.wandb_run_name
+    config.wandb.logging_steps = args.logging_steps
     
     return config
