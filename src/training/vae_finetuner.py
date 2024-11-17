@@ -2,14 +2,13 @@ import torch
 import logging
 import os
 import torch.nn.functional as F
-from bitsandbytes.optim import AdamW8bit
+from src.training.optimizers.setup_optimizers import setup_optimizer
 from torch.cuda.amp import GradScaler
 from collections import deque
-from transformers import get_cosine_schedule_with_warmup
+from src.training.loss_functions import get_cosine_schedule_with_warmup
 from dataclasses import dataclass
 from threading import Lock
-
-
+from typing import Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -155,13 +154,15 @@ class VAEFineTuner:
 
     def _init_optimizer(self):
         """Initialize optimizer and related components."""
-        optim_cls = AdamW8bit if self.use_8bit_adam else torch.optim.AdamW
-        self.optimizer = optim_cls(
-            self.vae.parameters(),
-            lr=self.learning_rate,
-            betas=(self.adam_beta1, self.adam_beta2),
+        self.optimizer = setup_optimizer(
+            model=self.vae,
+            optimizer_type="adamw",
+            learning_rate=self.learning_rate,
             weight_decay=self.weight_decay,
-            eps=self.adam_epsilon
+            adam_beta1=self.adam_beta1,
+            adam_beta2=self.adam_beta2,
+            adam_epsilon=self.adam_epsilon,
+            use_8bit_optimizer=self.use_8bit_adam
         )
         
         self.lr_scheduler = get_cosine_schedule_with_warmup(
@@ -415,6 +416,50 @@ class VAEFineTuner:
             self.scale_factor = state['scale_factor']
             self.loss_meter.set_loss_history(state['loss_history'])
 
-def setup_vae_finetuner(args, vae, train_dataloader, val_dataloader=None):
-    """Set up VAE finetuner"""
-    return VAEFineTuner(args, vae, train_dataloader, val_dataloader)
+def setup_vae_finetuner(args, models: Dict[str, Any]) -> Optional[VAEFineTuner]:
+    """
+    Set up VAE finetuner with configuration.
+    
+    Args:
+        args: VAE finetuning configuration arguments
+        models: Dictionary containing models including the VAE
+        
+    Returns:
+        Configured VAEFineTuner instance or None if setup fails
+        
+    Raises:
+        ValueError: If VAE model is not found in models dictionary
+    """
+    try:
+        if "vae" not in models:
+            raise ValueError("VAE model not found in models dictionary")
+            
+        vae = models["vae"]
+        return VAEFineTuner(
+            vae=vae,
+            device=args.device if hasattr(args, "device") else "cuda",
+            mixed_precision=args.mixed_precision if hasattr(args, "mixed_precision") else "no",
+            use_amp=args.use_amp if hasattr(args, "use_amp") else False,
+            learning_rate=args.learning_rate if hasattr(args, "learning_rate") else 1e-6,
+            adam_beta1=args.adam_beta1 if hasattr(args, "adam_beta1") else 0.9,
+            adam_beta2=args.adam_beta2 if hasattr(args, "adam_beta2") else 0.999,
+            adam_epsilon=args.adam_epsilon if hasattr(args, "adam_epsilon") else 1e-8,
+            weight_decay=args.weight_decay if hasattr(args, "weight_decay") else 1e-2,
+            max_grad_norm=args.max_grad_norm if hasattr(args, "max_grad_norm") else 1.0,
+            gradient_checkpointing=args.gradient_checkpointing if hasattr(args, "gradient_checkpointing") else False,
+            use_8bit_adam=args.use_8bit_adam if hasattr(args, "use_8bit_adam") else False,
+            use_channel_scaling=args.use_channel_scaling if hasattr(args, "use_channel_scaling") else False,
+            adaptive_loss_scale=args.adaptive_loss_scale if hasattr(args, "adaptive_loss_scale") else False,
+            kl_weight=args.kl_weight if hasattr(args, "kl_weight") else 0.0,
+            perceptual_weight=args.perceptual_weight if hasattr(args, "perceptual_weight") else 0.0,
+            min_snr_gamma=args.min_snr_gamma if hasattr(args, "min_snr_gamma") else 5.0,
+            initial_scale_factor=args.initial_scale_factor if hasattr(args, "initial_scale_factor") else 1.0,
+            decay=args.decay if hasattr(args, "decay") else 0.9999,
+            update_after_step=args.update_after_step if hasattr(args, "update_after_step") else 100,
+            model_path=args.model_path if hasattr(args, "model_path") else None,
+            use_cache=args.use_cache if hasattr(args, "use_cache") else True,
+            cache_size=args.cache_size if hasattr(args, "cache_size") else 1000,
+        )
+    except Exception as e:
+        logger.error(f"Failed to setup VAE finetuner: {str(e)}")
+        return None

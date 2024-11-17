@@ -7,7 +7,7 @@ from dataclasses import asdict
 from src.training.trainer import SDXLTrainer, TrainingConfig
 from src.training.vae_finetuner import VAEFineTuner
 from src.data.setup_dataset import create_train_dataloader, create_validation_dataloader
-from src.models import create_sdxl_models, create_vae_model
+from src.models.model_loader import create_sdxl_models, create_vae_model
 
 logger = logging.getLogger(__name__)
 

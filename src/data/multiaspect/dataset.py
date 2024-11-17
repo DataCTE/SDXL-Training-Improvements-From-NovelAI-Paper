@@ -19,8 +19,7 @@ from src.data.image_processing.transforms import (
 from src.data.cacheing.vae import VAECache
 from src.data.cacheing.text_embeds import TextEmbeddingCache
 from src.data.multiaspect.bucket_manager import BucketManager
-from src.data.prompt.prompt_processor import PromptProcessor
-
+from src.data.prompt.caption_processor import CaptionProcessor
 logger = logging.getLogger(__name__)
 
 
@@ -76,7 +75,7 @@ class MultiAspectDataset(Dataset):
         
         # Initialize workers
         self.executor = ThreadPoolExecutor(max_workers=num_workers)
-        self.prompt_processor = PromptProcessor()
+        self.prompt_processor = CaptionProcessor()
         
         # Process and bucket all images
         self._process_dataset()
@@ -187,7 +186,7 @@ class MultiAspectDataset(Dataset):
         # Process prompt and get embeddings
         prompt = self.prompts[idx]
         text_embeds, text_masks = self.text_embedding_cache.get_text_embeddings(
-            self.prompt_processor.process(prompt)
+            self.prompt_processor.format_caption(prompt)
         )
         
         return {

@@ -5,294 +5,119 @@ for the SDXL training pipeline, organized by functional categories.
 """
 
 import argparse
-from dataclasses import dataclass
-from typing import Optional
+import logging
+from dataclasses import dataclass, field
+from typing import Optional, List
+from pathlib import Path
 
+logger = logging.getLogger(__name__)
 
 @dataclass
-class ModelArgs:
-    """Model loading and saving configuration.
+class OptimizerConfig:
+    optimizer_type: str = "adamw"
+    learning_rate: float = 1e-5
+    weight_decay: float = 1e-2
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.999
+    adam_epsilon: float = 1e-8
+    use_8bit_adam: bool = False
 
-    This class provides a structured way to define and parse the model-related
-    command line arguments for the SDXL training pipeline.
+@dataclass
+class SchedulerConfig:
+    use_scheduler: bool = True
+    num_warmup_steps: int = 1000
+    num_training_steps: int = 10000
+    num_cycles: int = 1
 
-    Attributes:
-        model_path: Path to the pre-trained model checkpoint to load.
-        output_dir: Directory to save the model checkpoint and other output files.
-    """
+@dataclass
+class EMAConfig:
+    decay: float = 0.9999
+    update_after_step: int = 100
+    use_warmup: bool = True
+    warmup_steps: int = 2000
+
+@dataclass
+class VAEConfig:
+    enable_vae_finetuning: bool = False
+    vae_path: Optional[str] = None
+    learning_rate: float = 1e-6
+    train_freq: int = 10
+    kl_weight: float = 0.0
+    perceptual_weight: float = 0.0
+    use_channel_scaling: bool = True
+    initial_scale_factor: float = 1.0
+
+@dataclass
+class TagWeightingConfig:
+    token_dropout_rate: float = 0.1
+    caption_dropout_rate: float = 0.1
+    rarity_factor: float = 0.9
+    emphasis_factor: float = 1.2
+    min_tag_freq: int = 10
+    min_cluster_size: int = 5
+    similarity_threshold: float = 0.3
+
+@dataclass
+class TrainingConfig:
+    # Model paths
     model_path: str
     output_dir: str = "./output"
-
-
-@dataclass
-class TrainingArgs:
-    """Training hyperparameters and configuration.
-
-    This class provides a structured way to define and parse the training-related
-    command line arguments for the SDXL training pipeline.
     
-    Attributes:
-        learning_rate: The learning rate for the optimizer.
-        num_epochs: The number of training epochs.
-        batch_size: The batch size for training.
-        gradient_accumulation_steps: The number of steps to accumulate gradients before applying them.
-        max_grad_norm: The maximum gradient norm for gradient clipping.
-        warmup_steps: The number of warmup steps.
-        training_mode: The training mode, either 'v_prediction' or 'kl'.
-        use_ztsnr: Whether to use ztsnr for training.
-        rescale_cfg: Whether to rescale the generator configuration.
-        rescale_multiplier: The rescaling multiplier.
-        resolution_scaling: Whether to perform resolution scaling.
-        min_snr_gamma: The minimum SNR gamma.
-        sigma_data: The standard deviation of the data.
-        sigma_min: The minimum standard deviation for the noise schedule.
-        sigma_max: The maximum standard deviation for the noise schedule.
-        scale_method: The scaling method, either 'karras' or 'linear'.
-        scale_factor: The scaling factor.
-        device: The device to use for training.
-        mixed_precision: The mixed precision mode to use.
-        use_amp: Whether to use automatic mixed precision.
-    """
-    learning_rate: float = 1e-6
-    num_epochs: int = 1
+    # Training parameters
     batch_size: int = 1
+    num_epochs: int = 1
     gradient_accumulation_steps: int = 1
+    mixed_precision: str = "fp16"
     max_grad_norm: float = 1.0
-    warmup_steps: int = 1000
+    
+    # Training mode
     training_mode: str = "v_prediction"
     use_ztsnr: bool = False
     rescale_cfg: bool = False
     rescale_multiplier: float = 0.7
     resolution_scaling: bool = True
     min_snr_gamma: float = 5.0
+    
+    # Noise scheduling
     sigma_data: float = 1.0
     sigma_min: float = 0.029
     sigma_max: float = 160.0
     scale_method: str = "karras"
     scale_factor: float = 0.7
+    
+    # Components
+    optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
+    scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
+    ema: EMAConfig = field(default_factory=EMAConfig)
+    vae_args: VAEConfig = field(default_factory=VAEConfig)
+    tag_weighting: TagWeightingConfig = field(default_factory=TagWeightingConfig)
+    
+    # System settings
     device: str = "cuda"
-    mixed_precision: str = "fp16"
-    use_amp: bool = False
-
-
-@dataclass
-class OptimizerArgs:
-    """
-    Configuration arguments for the optimizer.
-
-    Attributes:
-        optimizer_type: The type of optimizer to use, either 'adamw', 'adamw8bit', or 'soap'.
-        adam_beta1: The beta1 parameter for the Adam optimizer.
-        adam_beta2: The beta2 parameter for the Adam optimizer.
-        adam_epsilon: The epsilon value for numerical stability in Adam.
-        weight_decay: The weight decay (L2 penalty) applied during optimization.
-        use_8bit_adam: Whether to use the 8-bit Adam optimizer for reduced memory usage.
-        soap_adafactor_beta2: The beta2 parameter for the Adafactor optimizer in SOAP.
-        soap_adafactor_clip_threshold: The clip threshold for the Adafactor optimizer in SOAP.
-        soap_adafactor_eps: The epsilon value for numerical stability in Adafactor.
-        soap_adafactor_warmup_init: Whether to use warmup initialization for Adafactor in SOAP.
-        soap_adafactor_relative_step: Whether to use relative step size for Adafactor in SOAP.
-        soap_adafactor_scale_parameter: Whether to scale the parameter for Adafactor in SOAP.
-    """
-    optimizer_type: str = "adamw"
-    adam_beta1: float = 0.9
-    adam_beta2: float = 0.999
-    adam_epsilon: float = 1e-8
-    weight_decay: float = 1e-2
-    use_8bit_adam: bool = False
-    soap_adafactor_beta2: float = 0.99
-    soap_adafactor_clip_threshold: float = 1.0
-    soap_adafactor_eps: float = 1e-30
-    soap_adafactor_warmup_init: bool = True
-    soap_adafactor_relative_step: bool = True
-    soap_adafactor_scale_parameter: bool = True
-
-
-@dataclass
-class EMAArgs:
-    """Configuration arguments for Exponential Moving Average (EMA).
-
-    Attributes:
-        use_ema: Whether to use EMA.
-        ema_decay: The decay rate for EMA.
-        update_after_step: The number of steps after which EMA is updated.
-        use_ema_warmup: Whether to use a warmup schedule for EMA.
-        ema_warmup_steps: The number of warmup steps for EMA.
-    """
-    use_ema: bool = True
-    ema_decay: float = 0.9999
-    update_after_step: int = 100
-    use_ema_warmup: bool = True
-    ema_warmup_steps: int = 2000
-
-
-@dataclass
-class VAEArgs:
-    """
-    Configuration arguments for the VAE component.
-
-    Attributes:
-        use_vae: Whether to use the VAE component.
-        path: The path to the pre-trained VAE model.
-        decay: The decay rate for the VAE's EMA.
-        update_after_step: The number of steps after which the VAE's EMA is updated.
-        finetune_vae: Whether to finetune the VAE during training.
-        learning_rate: The learning rate for the VAE's optimizer.
-        train_freq: The frequency at which the VAE is trained.
-        adaptive_loss_scale: Whether to use an adaptive loss scale for the VAE.
-        kl_weight: The weighting of the KL loss for the VAE.
-        perceptual_weight: The weighting of the perceptual loss for the VAE.
-        use_channel_scaling: Whether to use channel scaling for the VAE.
-        initial_scale_factor: The initial scale factor for channel scaling.
-        weight_decay: The weight decay for the VAE's optimizer.
-        max_grad_norm: The maximum gradient norm for the VAE.
-        gradient_checkpointing: Whether to use gradient checkpointing for the VAE.
-        min_snr_gamma: The minimum SNR gamma for the VAE.
-    """
-    use_vae: bool = True
-    path: Optional[str] = None
-    decay: float = 0.9999
-    update_after_step: int = 100
-    finetune_vae: bool = False
-    learning_rate: float = 1e-6
-    train_freq: int = 10
-    adaptive_loss_scale: bool = True
-    kl_weight: float = 0.0
-    perceptual_weight: float = 0.0
-    use_channel_scaling: bool = True
-    initial_scale_factor: float = 1.0
-    weight_decay: float = 1e-2
-    max_grad_norm: float = 1.0
-    gradient_checkpointing: bool = False
-    min_snr_gamma: float = 5.0
-
-
-@dataclass
-class DataArgs:
-    """
-    Configuration arguments for data handling.
-
-    Attributes:
-        data_dir: Directory containing the dataset.
-        validation_dir: Directory containing the validation dataset.
-        cache_dir: Directory for caching intermediate data.
-        no_caching: Whether to disable caching.
-        num_inference_steps: Number of inference steps to use in processing.
-        min_size: Minimum image size for bucketing.
-        max_size: Maximum image size for bucketing.
-        bucket_step_size: Resolution step size for buckets.
-        max_bucket_area: Maximum area for buckets.
-        token_dropout_rate: Token dropout probability.
-        caption_dropout_rate: Caption dropout probability.
-        all_ar: Whether to use all aspect ratios.
-        min_tag_weight: Minimum weight for tags.
-        max_tag_weight: Maximum weight for tags.
-        use_tag_weighting: Whether to use tag weighting.
-    """
+    enable_compile: bool = False
+    compile_mode: str = "default"
+    gradient_checkpointing: bool = True
+    num_workers: int = 4
+    
+    # Data settings
     data_dir: str
     validation_dir: Optional[str] = None
     cache_dir: str = "latents_cache"
     no_caching: bool = False
-    num_inference_steps: int = 28
     min_size: int = 512
     max_size: int = 4096
     bucket_step_size: int = 64
     max_bucket_area: int = 1024*1024
-    token_dropout_rate: float = 0.1
-    caption_dropout_rate: float = 0.1
-    all_ar: bool = False
-    min_tag_weight: float = 0.1
-    max_tag_weight: float = 3.0
-    use_tag_weighting: bool = True
-
-
-@dataclass
-class TagWeightingArgs:
-    """Configuration arguments for tag weighting.
-
-    Attributes:
-        use_tag_weighting: Whether to use tag weighting.
-        min_tag_weight: The minimum tag weight.
-        max_tag_weight: The maximum tag weight.
-    """
-    use_tag_weighting: bool = True
-    min_tag_weight: float = 0.1
-    max_tag_weight: float = 3.0
-
-
-@dataclass
-class SystemArgs:
-    """
-    System configuration arguments.
-
-    Attributes:
-        enable_compile: Whether to enable model compilation.
-        compile_mode: The mode of compilation to use.
-        gradient_checkpointing: Whether to use gradient checkpointing for memory efficiency.
-        verbose: Whether to enable verbose logging.
-        num_workers: Number of worker threads to use.
-    """
-    enable_compile: bool = False
-    compile_mode: str = "default"
-    gradient_checkpointing: bool = True
-    verbose: bool = False
-    num_workers: int = 4
-
-
-@dataclass
-class LoggingArgs:
-    """
-    Configuration arguments for logging and checkpointing.
-
-    Attributes:
-        use_wandb: Whether to use W&B for logging.
-        wandb_project: The W&B project name to use.
-        wandb_run_name: The W&B run name to use, or None to autogenerate.
-        save_checkpoints: Whether to save model checkpoints.
-        save_epochs: The number of epochs between checkpoint saves.
-        resume_from_checkpoint: The path to a checkpoint to resume training from, or None to train from scratch.
-        push_to_hub: Whether to push the final model to the Hugging Face Hub.
-        logging_steps: The number of steps between logging updates.
-        validation_steps: The number of steps between validation checks.
-    """
-    use_wandb: bool = False
-    wandb_project: str = "sdxl-training"
-    wandb_run_name: Optional[str] = None
-    save_checkpoints: bool = False
+    
+    # Validation settings
+    validation_prompts: Optional[List[str]] = None
+    validation_epochs: int = 1
     save_epochs: int = 1
-    resume_from_checkpoint: Optional[str] = None
-    push_to_hub: bool = False
-    logging_steps: int = 100
-    validation_steps: int = 500
-
-
-@dataclass
-class TrainingConfig:
-    """
-    Configuration class for training.
-
-    Attributes:
-        model: Configuration arguments for the model.
-        training: Parameters related to the training process.
-        optimizer: Configuration for the optimizer used in training.
-        ema: Exponential Moving Average settings.
-        vae: Configuration for the VAE component.
-        data: Data handling parameters.
-        tag_weighting: Configuration for tag-based weighting.
-        system: System-level settings and resources.
-        logging: Logging and checkpointing configurations.
-    """
-
-    model: ModelArgs
-    training: TrainingArgs
-    optimizer: OptimizerArgs
-    ema: EMAArgs
-    vae: VAEArgs
-    data: DataArgs
-    tag_weighting: TagWeightingArgs
-    system: SystemArgs
-    logging: LoggingArgs
-
+    validation_num_inference_steps: int = 50
+    validation_guidance_scale: float = 7.5
+    validation_image_height: int = 1024
+    validation_image_width: int = 1024
+    validation_num_images_per_prompt: int = 1
 
 def parse_args() -> TrainingConfig:
     """
@@ -304,215 +129,83 @@ def parse_args() -> TrainingConfig:
     parser = argparse.ArgumentParser(description="Train a Stable Diffusion XL model")
     
     # Model arguments
-    parser.add_argument("--model_path", type=str, required=True)
-    parser.add_argument("--output_dir", type=str, default="./output")
+    parser.add_argument("--model_path", type=str, required=True, help="Path to pretrained model")
+    parser.add_argument("--output_dir", type=str, default="./output", help="Output directory")
     
     # Training parameters
-    parser.add_argument("--learning_rate", type=float, default=1e-6)
-    parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--num_epochs", type=int, default=1)
+    parser.add_argument("--learning_rate", type=float, default=1e-6)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    parser.add_argument("--mixed_precision", type=str, default="fp16", choices=["no", "fp16", "bf16"])
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
-    parser.add_argument("--warmup_steps", type=int, default=1000)
-    parser.add_argument("--training_mode", type=str, default="v_prediction",
-                       choices=["v_prediction", "epsilon"])
+    
+    # Training mode
+    parser.add_argument("--training_mode", type=str, default="v_prediction", choices=["v_prediction", "epsilon"])
     parser.add_argument("--use_ztsnr", action="store_true")
     parser.add_argument("--rescale_cfg", action="store_true")
     parser.add_argument("--rescale_multiplier", type=float, default=0.7)
     parser.add_argument("--resolution_scaling", action="store_true", default=True)
     parser.add_argument("--min_snr_gamma", type=float, default=5.0)
-    parser.add_argument("--sigma_data", type=float, default=1.0)
-    parser.add_argument("--sigma_min", type=float, default=0.029)
-    parser.add_argument("--sigma_max", type=float, default=160.0)
-    parser.add_argument("--scale_method", type=str, default="karras",
-                       choices=["karras", "simple"])
-    parser.add_argument("--scale_factor", type=float, default=0.7)
     
     # Optimizer arguments
-    parser.add_argument("--optimizer_type", type=str, default="adamw", choices=["adamw", "adamw8bit", "soap"])
-    parser.add_argument("--adam_beta1", type=float, default=0.9)
-    parser.add_argument("--adam_beta2", type=float, default=0.999)
-    parser.add_argument("--adam_epsilon", type=float, default=1e-8)
+    parser.add_argument("--optimizer_type", type=str, default="adamw", choices=["adamw", "adamw8bit"])
     parser.add_argument("--weight_decay", type=float, default=1e-2)
     parser.add_argument("--use_8bit_adam", action="store_true")
-    parser.add_argument("--soap_adafactor_beta2", type=float, default=0.99)
-    parser.add_argument("--soap_adafactor_clip_threshold", type=float, default=1.0)
-    parser.add_argument("--soap_adafactor_eps", type=float, default=1e-30)
-    parser.add_argument("--soap_adafactor_warmup_init", action="store_true")
-    parser.add_argument("--soap_adafactor_relative_step", action="store_true")
-    parser.add_argument("--soap_adafactor_scale_parameter", action="store_true")
     
     # EMA arguments
     parser.add_argument("--use_ema", action="store_true", default=True)
     parser.add_argument("--ema_decay", type=float, default=0.9999)
-    parser.add_argument("--update_after_step", type=int, default=100)
-    parser.add_argument("--use_ema_warmup", action="store_true", default=True)
     parser.add_argument("--ema_warmup_steps", type=int, default=2000)
     
     # System arguments
     parser.add_argument("--enable_compile", action="store_true")
     parser.add_argument("--compile_mode", type=str, choices=["default", "reduce-overhead", "max-autotune"], default="default")
     parser.add_argument("--gradient_checkpointing", action="store_true", default=True)
-    parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--num_workers", type=int, default=4)
     
-    # VAE arguments
-    parser.add_argument("--use_vae", action="store_true", default=True)
-    parser.add_argument("--vae_path", type=str)
-    parser.add_argument("--vae_decay", type=float, default=0.9999)
-    parser.add_argument("--vae_update_after_step", type=int, default=100)
-    parser.add_argument("--finetune_vae", action="store_true")
-    parser.add_argument("--vae_learning_rate", type=float, default=1e-6)
-    parser.add_argument("--vae_train_freq", type=int, default=10)
-    parser.add_argument("--adaptive_loss_scale", action="store_true")
-    parser.add_argument("--kl_weight", type=float, default=0.0)
-    parser.add_argument("--perceptual_weight", type=float, default=0.0)
-    parser.add_argument("--vae_use_channel_scaling", action="store_true", default=True)
-    parser.add_argument("--vae_initial_scale_factor", type=float, default=1.0)
-    
     # Data arguments
-    parser.add_argument("--data_dir", type=str, required=True)
-    parser.add_argument("--validation_dir", type=str)
+    parser.add_argument("--data_dir", type=str, required=True, help="Training data directory")
+    parser.add_argument("--validation_dir", type=str, help="Validation data directory")
     parser.add_argument("--cache_dir", type=str, default="latents_cache")
     parser.add_argument("--no_caching", action="store_true")
-    parser.add_argument("--num_inference_steps", type=int, default=28)
-    parser.add_argument("--min_size", type=int, default=512)
-    parser.add_argument("--max_size", type=int, default=4096)
-    parser.add_argument("--bucket_step_size", type=int, default=64)
-    parser.add_argument("--max_bucket_area", type=int, default=1024*1024)
-    parser.add_argument("--token_dropout_rate", type=float, default=0.1)
-    parser.add_argument("--caption_dropout_rate", type=float, default=0.1)
-    parser.add_argument("--all_ar", action="store_true", default=False)
-    parser.add_argument("--min_tag_weight", type=float, default=0.1)
-    parser.add_argument("--max_tag_weight", type=float, default=3.0)
-    parser.add_argument("--use_tag_weighting", action="store_true", default=True)
     
-    # Tag weighting arguments
-    # These parameters are moved to DataArgs since they are needed for dataset initialization
-    # parser.add_argument("--use_tag_weighting", action="store_true", default=True)
-    # parser.add_argument("--min_tag_weight", type=float, default=0.1)
-    # parser.add_argument("--max_tag_weight", type=float, default=3.0)
-    
-    # Logging arguments
-    parser.add_argument("--use_wandb", action="store_true")
-    parser.add_argument("--wandb_project", type=str, default="sdxl-training")
-    parser.add_argument("--wandb_run_name", type=str)
-    parser.add_argument("--save_checkpoints", action="store_true")
-    parser.add_argument("--save_epochs", type=int, default=1)
-    parser.add_argument("--resume_from_checkpoint", type=str)
-    parser.add_argument("--push_to_hub", action="store_true")
-    parser.add_argument("--logging_steps", type=int, default=100)
-    parser.add_argument("--validation_steps", type=int, default=500)
-    
+    # Parse arguments
     args = parser.parse_args()
     
-    # Convert namespace to structured config
+    # Convert to config
     config = TrainingConfig(
-        model=ModelArgs(
-            model_path=args.model_path,
-            output_dir=args.output_dir
-        ),
-        training=TrainingArgs(
-            learning_rate=args.learning_rate,
-            num_epochs=args.num_epochs,
-            batch_size=args.batch_size,
-            gradient_accumulation_steps=args.gradient_accumulation_steps,
-            max_grad_norm=args.max_grad_norm,
-            warmup_steps=args.warmup_steps,
-            training_mode=args.training_mode,
-            use_ztsnr=args.use_ztsnr,
-            rescale_cfg=args.rescale_cfg,
-            rescale_multiplier=args.rescale_multiplier,
-            resolution_scaling=args.resolution_scaling,
-            min_snr_gamma=args.min_snr_gamma,
-            sigma_data=args.sigma_data,
-            sigma_min=args.sigma_min,
-            sigma_max=args.sigma_max,
-            scale_method=args.scale_method,
-            scale_factor=args.scale_factor,
-            device="cuda",
-            mixed_precision="fp16",
-            use_amp=False,
-        ),
-        optimizer=OptimizerArgs(
-            optimizer_type=args.optimizer_type,
-            adam_beta1=args.adam_beta1,
-            adam_beta2=args.adam_beta2,
-            adam_epsilon=args.adam_epsilon,
-            weight_decay=args.weight_decay,
-            use_8bit_adam=args.use_8bit_adam,
-            soap_adafactor_beta2=args.soap_adafactor_beta2,
-            soap_adafactor_clip_threshold=args.soap_adafactor_clip_threshold,
-            soap_adafactor_eps=args.soap_adafactor_eps,
-            soap_adafactor_warmup_init=args.soap_adafactor_warmup_init,
-            soap_adafactor_relative_step=args.soap_adafactor_relative_step,
-            soap_adafactor_scale_parameter=args.soap_adafactor_scale_parameter,
-        ),
-        ema=EMAArgs(
-            use_ema=args.use_ema,
-            ema_decay=args.ema_decay,
-            update_after_step=args.update_after_step,
-            use_ema_warmup=args.use_ema_warmup,
-            ema_warmup_steps=args.ema_warmup_steps,
-        ),
-        vae=VAEArgs(
-            use_vae=args.use_vae,
-            path=args.vae_path,
-            decay=args.vae_decay,
-            update_after_step=args.vae_update_after_step,
-            finetune_vae=args.finetune_vae,
-            learning_rate=args.vae_learning_rate,
-            train_freq=args.vae_train_freq,
-            adaptive_loss_scale=args.adaptive_loss_scale,
-            kl_weight=args.kl_weight,
-            perceptual_weight=args.perceptual_weight,
-            use_channel_scaling=args.vae_use_channel_scaling,
-            initial_scale_factor=args.vae_initial_scale_factor,
-            weight_decay=args.weight_decay,
-            max_grad_norm=args.max_grad_norm,
-            gradient_checkpointing=False,
-            min_snr_gamma=args.min_snr_gamma
-        ),
-        data=DataArgs(
-            data_dir=args.data_dir,
-            validation_dir=args.validation_dir,
-            cache_dir=args.cache_dir,
-            no_caching=args.no_caching,
-            num_inference_steps=args.num_inference_steps,
-            min_size=args.min_size,
-            max_size=args.max_size,
-            bucket_step_size=args.bucket_step_size,
-            max_bucket_area=args.max_bucket_area,
-            token_dropout_rate=args.token_dropout_rate,
-            caption_dropout_rate=args.caption_dropout_rate,
-            all_ar=args.all_ar,
-            min_tag_weight=args.min_tag_weight,
-            max_tag_weight=args.max_tag_weight,
-            use_tag_weighting=args.use_tag_weighting
-        ),
-        tag_weighting=TagWeightingArgs(
-            use_tag_weighting=args.use_tag_weighting,
-            min_tag_weight=args.min_tag_weight,
-            max_tag_weight=args.max_tag_weight,
-        ),
-        system=SystemArgs(
-            enable_compile=args.enable_compile,
-            compile_mode=args.compile_mode,
-            gradient_checkpointing=args.gradient_checkpointing,
-            verbose=args.verbose,
-            num_workers=args.num_workers
-        ),
-        logging=LoggingArgs(
-            use_wandb=args.use_wandb,
-            wandb_project=args.wandb_project,
-            wandb_run_name=args.wandb_run_name,
-            save_checkpoints=args.save_checkpoints,
-            save_epochs=args.save_epochs,
-            resume_from_checkpoint=args.resume_from_checkpoint,
-            push_to_hub=args.push_to_hub,
-            logging_steps=args.logging_steps,
-            validation_steps=args.validation_steps
-        )
+        model_path=args.model_path,
+        output_dir=args.output_dir,
+        batch_size=args.batch_size,
+        num_epochs=args.num_epochs,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        mixed_precision=args.mixed_precision,
+        max_grad_norm=args.max_grad_norm,
+        training_mode=args.training_mode,
+        use_ztsnr=args.use_ztsnr,
+        rescale_cfg=args.rescale_cfg,
+        rescale_multiplier=args.rescale_multiplier,
+        resolution_scaling=args.resolution_scaling,
+        min_snr_gamma=args.min_snr_gamma,
+        data_dir=args.data_dir,
+        validation_dir=args.validation_dir,
+        cache_dir=args.cache_dir,
+        no_caching=args.no_caching,
+        enable_compile=args.enable_compile,
+        compile_mode=args.compile_mode,
+        gradient_checkpointing=args.gradient_checkpointing,
+        num_workers=args.num_workers,
     )
+    
+    # Update optimizer config
+    config.optimizer.optimizer_type = args.optimizer_type
+    config.optimizer.learning_rate = args.learning_rate
+    config.optimizer.weight_decay = args.weight_decay
+    config.optimizer.use_8bit_adam = args.use_8bit_adam
+    
+    # Update EMA config
+    config.ema.decay = args.ema_decay
+    config.ema.warmup_steps = args.ema_warmup_steps
     
     return config

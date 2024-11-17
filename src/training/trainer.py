@@ -4,7 +4,7 @@ from typing import Dict, Any, Optional
 from dataclasses import dataclass
 from src.training.training_steps import train_step
 from src.training.training_utils import initialize_training_components
-from src.training.validation import validate_model
+from src.training.validation import generate_validation_images
 from src.training.metrics import MetricsManager
 
 logger = logging.getLogger(__name__)
@@ -100,14 +100,14 @@ class SDXLTrainer:
         
     def validate(self, epoch: int):
         """Run validation loop."""
-        metrics = validate_model(
+        generate_validation_images(
             self.config,
             self.models,
             self.val_dataloader,
             self.device,
             self.dtype
         )
-        logger.info(f"Validation metrics for epoch {epoch}: {metrics}")
+        logger.info(f"Validation images saved for epoch {epoch}")
         
     def save_checkpoint(self, save_dir: str, epoch: int):
         """Save training checkpoint."""

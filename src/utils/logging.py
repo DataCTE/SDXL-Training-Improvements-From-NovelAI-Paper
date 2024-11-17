@@ -1,29 +1,56 @@
+"""Logging utilities for SDXL training.
+
+This module provides utilities for setting up logging and tracking training progress.
+"""
+
 import logging
 import sys
-import os
 from pathlib import Path
-import torch
-import wandb
+from typing import Dict, Any, Optional, Union
+import json
 import time
-import traceback
-import numpy as np
-from typing import Dict, Any, Union
-from functools import lru_cache
+from datetime import datetime
 
-logger = logging.getLogger(__name__)
+class ColoredFormatter(logging.Formatter):
+    """Custom formatter adding colors to log levels."""
+    
+    grey = "\x1b[38;20m"
+    yellow = "\x1b[33;20m"
+    red = "\x1b[31;20m"
+    bold_red = "\x1b[31;1m"
+    reset = "\x1b[0m"
+    
+    FORMATS = {
+        logging.DEBUG: grey + "%(asctime)s - %(levelname)s - %(name)s - %(message)s" + reset,
+        logging.INFO: grey + "%(asctime)s - %(levelname)s - %(message)s" + reset,
+        logging.WARNING: yellow + "%(asctime)s - %(levelname)s - %(message)s" + reset,
+        logging.ERROR: red + "%(asctime)s - %(levelname)s - %(message)s" + reset,
+        logging.CRITICAL: bold_red + "%(asctime)s - %(levelname)s - %(message)s" + reset
+    }
+    
+    def format(self, record):
+        log_fmt = self.FORMATS.get(record.levelno)
+        formatter = logging.Formatter(log_fmt, datefmt="%Y-%m-%d %H:%M:%S")
+        return formatter.format(record)
 
-def setup_logging(log_dir=None, log_level=logging.INFO):
-    """
-    Configure logging settings for the application
+def setup_logging(
+    log_dir: Optional[Union[str, Path]] = None,
+    log_level: int = logging.INFO,
+    enable_console: bool = True,
+    log_format: str = "%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+) -> None:
+    """Configure logging settings for the application.
     
     Args:
-        log_dir (str, optional): Directory to save log files
+        log_dir: Directory to save log files
         log_level: Logging level (default: INFO)
+        enable_console: Whether to enable console output
+        log_format: Format string for log messages
     """
     # Create formatter
-    formatter = logging.Formatter(
-        fmt='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
+    file_formatter = logging.Formatter(
+        fmt=log_format,
+        datefmt="%Y-%m-%d %H:%M:%S"
     )
     
     # Configure root logger
@@ -34,51 +61,54 @@ def setup_logging(log_dir=None, log_level=logging.INFO):
     for handler in root_logger.handlers[:]:
         root_logger.removeHandler(handler)
     
-    # Add console handler
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(formatter)
-    root_logger.addHandler(console_handler)
+    # Add console handler with colored output
+    if enable_console:
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(ColoredFormatter())
+        root_logger.addHandler(console_handler)
     
     # Add file handler if log_dir is specified
     if log_dir:
         log_dir = Path(log_dir)
         log_dir.mkdir(parents=True, exist_ok=True)
         
-        file_handler = logging.FileHandler(
-            log_dir / "training.log",
-            mode='a'
-        )
-        file_handler.setFormatter(formatter)
+        # Create timestamped log file
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_file = log_dir / f"training_{timestamp}.log"
+        
+        file_handler = logging.FileHandler(log_file, mode="a")
+        file_handler.setFormatter(file_formatter)
         root_logger.addHandler(file_handler)
+        
+        # Create a symlink to latest log
+        latest_log = log_dir / "latest.log"
+        if latest_log.exists():
+            latest_log.unlink()
+        latest_log.symlink_to(log_file.name)
 
-def log_system_info():
-    """Log system and environment information"""
-    # PyTorch version and CUDA info
-    logger.info("PyTorch version: %s", torch.__version__)
-    logger.info("CUDA available: %s", torch.cuda.is_available())
-    if torch.cuda.is_available():
-        logger.info("CUDA version: %s", torch.version.cuda)
-        logger.info("GPU device: %s", torch.cuda.get_device_name(0))
-        logger.info("GPU memory: %.2fGB", torch.cuda.get_device_properties(0).total_memory / 1e9)
-
-def log_training_setup(args, models, train_components):
-    """
-    Log training configuration and setup details
+def log_training_setup(
+    args: Any,
+    models: Dict[str, Any],
+    train_components: Dict[str, Any],
+) -> None:
+    """Log training configuration and setup details.
     
     Args:
         args: Training arguments
         models: Dictionary of model components
         train_components: Dictionary of training components
     """
+    logger = logging.getLogger(__name__)
+    
     # Log arguments
-    logger.info("\n=== Training Configuration ===")
-    for key, value in vars(args).items():
-        logger.info("%s: %s", key, value)
+    logger.info("=== Training Configuration ===")
+    config_dict = {k: str(v) for k, v in vars(args).items()}
+    logger.info("Arguments:\n%s", json.dumps(config_dict, indent=2))
     
     # Log model information
     logger.info("\n=== Model Information ===")
     for name, model in models.items():
-        if hasattr(model, 'parameters'):
+        if hasattr(model, "parameters"):
             num_params = sum(p.numel() for p in model.parameters())
             trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
             logger.info("%s:", name)
@@ -86,196 +116,83 @@ def log_training_setup(args, models, train_components):
             logger.info("  Trainable parameters: %d", trainable_params)
     
     # Log dataset information
-    if 'dataset' in train_components:
+    if "dataset" in train_components:
         logger.info("\n=== Dataset Information ===")
-        logger.info("Number of training samples: %d", len(train_components['dataset']))
+        logger.info("Number of training samples: %d", len(train_components["dataset"]))
         logger.info("Batch size: %d", args.batch_size)
-        logger.info("Steps per epoch: %d", len(train_components['train_dataloader']))
+        logger.info("Steps per epoch: %d", len(train_components["train_dataloader"]))
+        
+    # Log optimizer information
+    if "optimizer" in train_components:
+        logger.info("\n=== Optimizer Information ===")
+        optimizer = train_components["optimizer"]
+        logger.info("Optimizer: %s", optimizer.__class__.__name__)
+        logger.info("Learning rate: %f", args.optimizer.learning_rate)
+        
+    # Log system information
+    logger.info("\n=== System Information ===")
+    logger.info("Mixed precision: %s", args.mixed_precision)
+    logger.info("Gradient checkpointing: %s", args.gradient_checkpointing)
+    logger.info("Number of workers: %d", args.num_workers)
 
-def log_gpu_memory():
-    """Log current GPU memory usage"""
-    if torch.cuda.is_available():
-        allocated = torch.cuda.memory_allocated() / 1e9
-        reserved = torch.cuda.memory_reserved() / 1e9
-        return "GPU Memory: %.2fGB allocated, %.2fGB reserved" % (allocated, reserved)
-    return "GPU not available"
-
-def setup_wandb(args):
-    """
-    Initialize Weights & Biases logging with optimized configuration
+class TrainingLogger:
+    """Logger for tracking training progress and metrics."""
     
-    Args:
-        args: Training arguments containing W&B configuration
+    def __init__(self, log_dir: Union[str, Path]):
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.metrics_file = self.log_dir / "metrics.jsonl"
+        self.start_time = time.time()
+        self.logger = logging.getLogger(__name__)
         
-    Returns:
-        wandb.Run or None: Initialized W&B run
-    """
-    if not args.logging.use_wandb:
-        return None
+    def log_metrics(self, metrics: Dict[str, float], step: int) -> None:
+        """Log training metrics.
         
-    try:
-        # Use more robust wandb initialization with additional configuration
-        run = wandb.init(
-            project=args.logging.wandb_project,
-            name=args.logging.wandb_run_name or "sdxl_training_%d" % int(time.time()),
-            config=vars(args),
-            resume='allow',  # Allow resuming previous runs
-            save_code=True,  # Save code snapshot for reproducibility
-            tags=['sdxl', 'training'],
-            # Reduce network overhead
-            settings=wandb.Settings(
-                _disable_stats=True,  # Disable resource-intensive stats collection
-                _save_requirements=False  # Disable saving requirements
-            )
-        )
-        
-        # Define metrics (no changes needed for these strings as they are static)
-        wandb.define_metric("loss/*", summary="min", step_metric="global_step")
-        wandb.define_metric("train/loss", summary="min", step_metric="global_step")
-        wandb.define_metric("val/loss", summary="min", step_metric="global_step")
-        wandb.define_metric("lr/*", summary="last", step_metric="global_step")
-        wandb.define_metric("train/lr", summary="last", step_metric="global_step")
-        wandb.define_metric("epoch", summary="max")
-        wandb.define_metric("epoch/*", step_metric="epoch")
-        wandb.define_metric("validation/*", summary="last", step_metric="epoch")
-        wandb.define_metric("performance/*", summary="mean", step_metric="global_step")
-        wandb.define_metric("memory/*", summary="max", step_metric="global_step")
-        wandb.define_metric("gradients/*", summary="mean", step_metric="global_step")
-        
-        logger.info("Initialized W&B run: %s", run.name)
-        return run
-        
-    except (wandb.Error, RuntimeError, ValueError, AttributeError) as e:
-        logger.error("Failed to initialize W&B: %s", str(e))
-        return None
-
-def log_metrics_batch(metrics_dict, step=None):
-    """
-    Efficiently log metrics in batches to reduce API calls
-    
-    Args:
-        metrics_dict (dict): Dictionary of metrics to log
-        step (int, optional): Global training step
-    """
-    if not wandb.run:
-        return
-        
-    try:
-        wandb.log(metrics_dict, step=step)
-    except (wandb.Error, RuntimeError, ValueError) as e:
-        logger.warning(f"Failed to log metrics batch: {str(e)}")
-
-def log_model_gradients(model, step):
-    """
-    Log model gradient statistics
-    
-    Args:
-        model: PyTorch model
-        step (int): Global training step
-    """
-    if not wandb.run:
-        return
-        
-    try:
-        grad_dict = {}
-        for name, param in model.named_parameters():
-            if param.grad is not None:
-                grad_dict[f"gradients/{name}/mean"] = param.grad.mean().item()
-                grad_dict[f"gradients/{name}/std"] = param.grad.std().item()
-                grad_dict[f"gradients/{name}/norm"] = param.grad.norm().item()
-        
-        if grad_dict:
-            wandb.log(grad_dict, step=step)
-    except (wandb.Error, RuntimeError, ValueError, torch.cuda.CudaError) as e:
-        logger.warning(f"Failed to log model gradients: {str(e)}")
-
-def log_memory_stats(step: int) -> None:
-    """Log CUDA memory statistics to W&B."""
-    if not wandb.run or not torch.cuda.is_available():
-        return
-
-    try:
-        memory_stats = {
-            "memory/allocated": torch.cuda.memory_allocated() / 1024**2,  # MB
-            "memory/reserved": torch.cuda.memory_reserved() / 1024**2,    # MB
-            "memory/max_allocated": torch.cuda.max_memory_allocated() / 1024**2,  # MB
-            "memory/max_reserved": torch.cuda.max_memory_reserved() / 1024**2,    # MB
+        Args:
+            metrics: Dictionary of metric names and values
+            step: Current training step
+        """
+        # Add timestamp and step
+        log_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "step": step,
+            "elapsed_time": time.time() - self.start_time,
+            **metrics
         }
-        wandb.log(memory_stats, step=step)
-    except (wandb.Error, RuntimeError, torch.cuda.CudaError) as e:
-        logger.warning("Failed to log memory stats: %s", str(e))
-
-def cleanup_wandb(run):
-    """
-    Cleanup W&B run with enhanced error handling
-    
-    Args:
-        run: W&B run to cleanup
-    """
-    if run is not None:
-        try:
-            # Log system info before closing
-            run.log({
-                "system/final_gpu_memory": torch.cuda.memory_allocated() / 1e9 if torch.cuda.is_available() else 0,
-                "system/peak_gpu_memory": torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0
-            })
-            run.finish(quiet=True)  # Suppress verbose output
-        except (wandb.Error, RuntimeError, ValueError, torch.cuda.CudaError) as e:
-            logger.error("Error closing W&B run: %s", str(e))
-
-def log_epoch_metrics(wandb_run, metrics: Dict[str, float], epoch: int, global_step: int) -> None:
-    """Log epoch metrics to W&B with proper error handling."""
-    try:
-        # Prepare metrics for logging
-        log_dict = {"train/%s" % k: v for k, v in metrics.items()}
-        log_dict.update({"train/epoch": epoch, "train/global_step": global_step})
         
-        # Log to W&B
-        wandb_run.log(log_dict, step=global_step)
+        # Write to metrics file
+        with open(self.metrics_file, "a") as f:
+            f.write(json.dumps(log_entry) + "\n")
         
         # Log to console
-        metrics_str = ", ".join("%s: %.6f" % (k, v) for k, v in metrics.items())
-        logger.info("Epoch %d metrics: %s", epoch, metrics_str)
-    except (ValueError, RuntimeError, AttributeError) as e:
-        logger.error("Failed to log epoch metrics: %s", str(e))
-        logger.error(traceback.format_exc())
-
-def log_optimizer_config(args) -> None:
-    """Log optimizer configuration details."""
-    logger.info("Optimizer config:")
-    logger.info("  Type: %s", args.optimizer_type)
-    logger.info("  Learning rate: %f", args.learning_rate)
-    logger.info("  Weight decay: %f", args.weight_decay)
-    logger.info("  Adam beta1: %f", args.adam_beta1)
-    logger.info("  Adam beta2: %f", args.adam_beta2)
-    logger.info("  Adam epsilon: %f", args.adam_epsilon)
-
-def log_vae_config(args) -> None:
-    """Log VAE configuration details."""
-    logger.info("VAE config:")
-    logger.info("  Learning rate: %f", args.vae_learning_rate)
-    logger.info("  Weight decay: %f", args.vae_weight_decay)
-    logger.info("  Adam beta1: %f", args.vae_adam_beta1)
-    logger.info("  Adam beta2: %f", args.vae_adam_beta2)
-    logger.info("  Adam epsilon: %f", args.vae_adam_epsilon)
-    logger.info("  Max grad norm: %f", args.vae_max_grad_norm)
-    logger.info("  Gradient checkpointing: %s", args.vae_gradient_checkpointing)
-
-def log_ema_config(args) -> None:
-    """Log EMA configuration details."""
-    logger.info("EMA config:")
-    logger.info("  Decay: %f", args.ema_decay)
-    logger.info("  Update every: %d", args.ema_update_every)
-
-@lru_cache(maxsize=1)
-def _get_memory_stats_format() -> Dict[str, str]:
-    """Cache memory statistics format strings."""
-    return {
-        "allocated": "Allocated: %.1fMB",
-        "cached": "Cached: %.1fMB",
-        "max_allocated": "Max Allocated: %.1fMB",
-        "max_cached": "Max Cached: %.1fMB",
-        "active": "Active: %.1fMB",
-        "inactive": "Inactive: %.1fMB",
-        "fragmentation": "Fragmentation: %.1f",
-    }
+        metrics_str = ", ".join(f"{k}: {v:.4f}" for k, v in metrics.items())
+        self.logger.info("Step %d: %s", step, metrics_str)
+    
+    def log_validation_results(
+        self,
+        metrics: Dict[str, float],
+        epoch: int,
+        save_path: Optional[str] = None,
+    ) -> None:
+        """Log validation results.
+        
+        Args:
+            metrics: Dictionary of validation metrics
+            epoch: Current epoch number
+            save_path: Optional path where validation artifacts were saved
+        """
+        self.logger.info("=== Validation Results (Epoch %d) ===", epoch)
+        for name, value in metrics.items():
+            self.logger.info("%s: %.4f", name, value)
+        
+        if save_path:
+            self.logger.info("Validation artifacts saved to: %s", save_path)
+            
+    def log_checkpoint(self, checkpoint_path: str, epoch: int) -> None:
+        """Log checkpoint saving.
+        
+        Args:
+            checkpoint_path: Path where checkpoint was saved
+            epoch: Current epoch number
+        """
+        self.logger.info("Saved checkpoint for epoch %d to: %s", epoch, checkpoint_path)

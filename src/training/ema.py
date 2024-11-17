@@ -205,3 +205,61 @@ class EMAModel:
         if dtype is not None:
             self.ema_model.to(dtype=dtype)
         return self
+
+def setup_ema_model(
+    model: torch.nn.Module,
+    model_path: str,
+    decay: float = 0.9999,
+    update_after_step: int = 100,
+    device: Optional[Union[str, torch.device]] = None,
+    update_every: int = 1,
+    use_ema_warmup: bool = True,
+    power: float = 2/3,
+    min_decay: float = 0.0,
+    max_decay: float = 0.9999,
+    mixed_precision: str = "bf16",
+    jit_compile: bool = False,
+    gradient_checkpointing: bool = True,
+) -> Optional[EMAModel]:
+    """
+    Set up an EMA model for training.
+    
+    Args:
+        model: The base model to create EMA from
+        model_path: Path to the model checkpoint
+        decay: EMA decay rate
+        update_after_step: Number of steps before starting EMA updates
+        device: Device to place the model on
+        update_every: Update frequency for EMA weights
+        use_ema_warmup: Whether to use EMA warmup
+        power: Power factor for EMA decay
+        min_decay: Minimum decay rate
+        max_decay: Maximum decay rate
+        mixed_precision: Mixed precision mode ("no", "fp16", "bf16")
+        jit_compile: Whether to JIT compile the model
+        gradient_checkpointing: Whether to use gradient checkpointing
+        
+    Returns:
+        Configured EMAModel instance or None if setup fails
+    """
+    try:
+        ema = EMAModel(
+            model=model,
+            model_path=model_path,
+            decay=decay,
+            update_after_step=update_after_step,
+            device=device,
+            update_every=update_every,
+            use_ema_warmup=use_ema_warmup,
+            power=power,
+            min_decay=min_decay,
+            max_decay=max_decay,
+            mixed_precision=mixed_precision,
+            jit_compile=jit_compile,
+            gradient_checkpointing=gradient_checkpointing,
+        )
+        logger.info("Successfully initialized EMA model")
+        return ema
+    except Exception as e:
+        logger.error(f"Failed to initialize EMA model: {str(e)}")
+        return None

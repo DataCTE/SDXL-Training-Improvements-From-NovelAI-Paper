@@ -3,9 +3,9 @@ import logging
 from typing import Dict, Any, Optional, List
 from functools import lru_cache
 from src.data.prompt.caption_processor import CaptionProcessor
-from src.training.optimizers import setup_optimizer
+from src.training.optimizers.setup_optimizers import setup_optimizer
 from src.training.ema import setup_ema_model
-from src.training.vae_trainer import setup_vae_finetuner
+from src.training.vae_finetuner import setup_vae_finetuner
 from src.training.loss_functions import get_cosine_schedule_with_warmup
 
 logger = logging.getLogger(__name__)
@@ -114,16 +114,25 @@ def initialize_training_components(
     components = {}
     try:
         # Set up optimizer
-        optimizer = setup_optimizer(args, models)
+        optimizer = setup_optimizer(
+            model=models.get("unet", None),  # Primary model for training
+            optimizer_type=args.optimizer.optimizer_type if hasattr(args.optimizer, "optimizer_type") else "adamw",
+            learning_rate=args.optimizer.learning_rate if hasattr(args.optimizer, "learning_rate") else 1e-5,
+            weight_decay=args.optimizer.weight_decay if hasattr(args.optimizer, "weight_decay") else 1e-2,
+            adam_beta1=args.optimizer.adam_beta1 if hasattr(args.optimizer, "adam_beta1") else 0.9,
+            adam_beta2=args.optimizer.adam_beta2 if hasattr(args.optimizer, "adam_beta2") else 0.999,
+            adam_epsilon=args.optimizer.adam_epsilon if hasattr(args.optimizer, "adam_epsilon") else 1e-8,
+            use_8bit_optimizer=args.optimizer.use_8bit_adam if hasattr(args.optimizer, "use_8bit_adam") else False
+        )
         components["optimizer"] = optimizer
 
         # Set up learning rate scheduler
         if args.scheduler.use_scheduler:
             scheduler = get_cosine_schedule_with_warmup(
                 optimizer,
-                args.scheduler.num_warmup_steps,
-                args.scheduler.num_training_steps,
-                args.scheduler.num_cycles,
+                num_warmup_steps=args.scheduler.num_warmup_steps,
+                num_training_steps=args.scheduler.num_training_steps,
+                num_cycles=args.scheduler.num_cycles if hasattr(args.scheduler, "num_cycles") else 1
             )
             components["scheduler"] = scheduler
 
@@ -133,13 +142,20 @@ def initialize_training_components(
 
         # Set up EMA
         if args.use_ema:
-            components["ema_model"] = setup_ema_model(args, models)
+            components["ema_model"] = setup_ema_model(
+                model=models.get("unet", None),
+                model_path=args.model_path if hasattr(args, "model_path") else None,
+                device=args.device if hasattr(args, "device") else "cuda",
+                decay=args.ema.decay if hasattr(args.ema, "decay") else 0.9999,
+                update_after_step=args.ema.update_after_step if hasattr(args.ema, "update_after_step") else 100,
+                mixed_precision=args.mixed_precision if hasattr(args, "mixed_precision") else "no"
+            )
 
         # Set up tag weighter
         components["tag_weighter"] = setup_tag_weighter(args)
 
         # Set up VAE finetuner
-        if args.vae_args.enable_vae_finetuning:
+        if hasattr(args, "vae_args") and hasattr(args.vae_args, "enable_vae_finetuning") and args.vae_args.enable_vae_finetuning:
             components["vae_finetuner"] = setup_vae_finetuner(args.vae_args, models)
 
         # Validate components

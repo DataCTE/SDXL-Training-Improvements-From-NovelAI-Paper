@@ -2,7 +2,7 @@
 
 import os
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 
 import torch
 from diffusers import (
@@ -17,6 +17,74 @@ from transformers import (
 )
 
 from src.models.SDXL.pipeline import StableDiffusionXLPipeline
+
+
+def create_sdxl_models(
+    pretrained_model_path: str,
+    vae_path: Optional[str] = None,
+    dtype: torch.dtype = torch.float32,
+    device: Optional[torch.device] = None,
+) -> Tuple[Dict[str, Any], StableDiffusionXLPipeline]:
+    """Create SDXL models from pretrained weights.
+    
+    Args:
+        pretrained_model_path: Path to pretrained SDXL model
+        vae_path: Optional path to custom VAE model
+        dtype: Model dtype to use
+        device: Device to load models on
+        
+    Returns:
+        Tuple of (models dict, pipeline)
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+    # Load base pipeline
+    pipeline = StableDiffusionXLPipeline.from_pretrained(
+        pretrained_model_path,
+        torch_dtype=dtype,
+    )
+    
+    # Extract components
+    models = {
+        "unet": pipeline.unet,
+        "vae": pipeline.vae,
+        "text_encoder": pipeline.text_encoder,
+        "text_encoder_2": pipeline.text_encoder_2,
+        "tokenizer": pipeline.tokenizer,
+        "tokenizer_2": pipeline.tokenizer_2,
+        "scheduler": pipeline.scheduler,
+    }
+    
+    # Load custom VAE if specified
+    if vae_path:
+        models["vae"] = create_vae_model(vae_path, dtype)
+    
+    # Move models to device
+    for name, model in models.items():
+        if hasattr(model, "to"):
+            models[name] = model.to(device)
+            
+    return models, pipeline
+
+
+def create_vae_model(
+    vae_path: str,
+    dtype: torch.dtype = torch.float32,
+) -> AutoencoderKL:
+    """Create VAE model from pretrained weights.
+    
+    Args:
+        vae_path: Path to pretrained VAE model
+        dtype: Model dtype to use
+        
+    Returns:
+        Loaded VAE model
+    """
+    return AutoencoderKL.from_pretrained(
+        vae_path,
+        torch_dtype=dtype
+    )
 
 
 def load_models(config) -> Dict[str, Any]:
