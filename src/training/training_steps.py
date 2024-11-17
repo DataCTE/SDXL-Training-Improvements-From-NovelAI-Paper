@@ -3,7 +3,7 @@ import logging
 from typing import Dict, Any, Optional
 from contextlib import nullcontext
 from src.training.metrics import MetricsManager
-from src.training.loss import forward_pass
+from src.training.loss_functions import forward_pass
 
 logger = logging.getLogger(__name__)
 
