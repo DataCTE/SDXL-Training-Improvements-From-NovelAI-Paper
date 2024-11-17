@@ -4,10 +4,10 @@ from typing import Dict, Any, Optional, Union, List
 from pathlib import Path
 from dataclasses import asdict
 
-from ..training.trainer import SDXLTrainer, TrainingConfig
-from ..training.vae_finetuner import VAEFineTuner
-from ..data.setup_dataset import create_train_dataloader, create_validation_dataloader
-from ..models.model_loader import create_sdxl_models, create_vae_model
+from src.training.trainer import SDXLTrainer, TrainingConfig
+from src.training.vae_finetuner import VAEFineTuner
+from src.data.setup_dataset import create_train_dataloader, create_validation_dataloader
+from src.models.model_loader import create_sdxl_models, create_vae_model
 
 logger = logging.getLogger(__name__)
 
