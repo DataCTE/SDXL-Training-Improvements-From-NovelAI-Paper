@@ -7,107 +7,101 @@ This project implements a Stable Diffusion XL training pipeline with Zero Termin
 
 ```
 src/
+├── config/
+│   ├── __init__.py
+│   └── args.py            # Centralized configuration management
+│
 ├── data/
 │   ├── __init__.py
-│   ├── dataset.py           # Advanced dataset with caching and dynamic resolution
-│   ├── tag_weighter.py      # CLIP-based dynamic tag weighting
-│   ├── ultimate_upscaler.py # High-resolution upscaling with coherence
-│   ├── usdu_patch.py        # Ultimate SD Upscaler integration
-│   └── utils.py            # Data processing and augmentation utilities
-│
-├── inference/
-│   ├── __init__.py
-│   ├── text_to_image.py    # Optimized inference pipeline
-│   ├── img2img.py          # Image-to-image pipeline
-│   └── Comfyui-zsnmode/    # ComfyUI integration nodes
+│   ├── caption_processor.py # Tag processing and weighting
+│   ├── image_processor.py  # Image loading and transformation
+│   ├── latent_cache.py    # VAE latent caching system
+│   ├── dataset/
+│   │   ├── __init__.py
+│   │   ├── base.py        # Base dataset class
+│   │   ├── bucket_manager.py # Resolution bucket management
+│   │   ├── dataset.py     # Main dataset implementation
+│   │   ├── dataset_initializer.py # Dataset setup
+│   │   ├── image_grouper.py # Image resolution grouping
+│   │   └── dataloader.py  # Custom data loading
+│   └── utils.py          # Data processing utilities
 │
 ├── models/
 │   ├── __init__.py
-│   ├── architecture.py     # Model architecture definitions
-│   ├── attention.py        # Memory-efficient attention implementations
-│   └── vae.py             # Enhanced VAE components
+│   ├── architecture.py   # Model architecture definitions
+│   ├── attention.py      # Memory-efficient attention
+│   └── vae.py           # Enhanced VAE components
 │
 ├── training/
 │   ├── __init__.py
-│   ├── ema.py             # Enhanced EMA with momentum scheduling
-│   ├── loss.py            # ZTSNR and perceptual loss implementations
-│   ├── trainer.py         # Memory-efficient training loop
-│   └── vae_finetuner.py   # Advanced VAE fine-tuning
+│   ├── ema.py           # Enhanced EMA with scheduling
+│   ├── loss.py          # ZTSNR loss implementations
+│   ├── trainer.py       # Memory-efficient training loop
+│   └── vae_finetuner.py # VAE fine-tuning
 │
 ├── utils/
 │   ├── __init__.py
-│   ├── checkpoint.py      # Robust model state management
-│   ├── device.py         # Memory and device optimization
-│   ├── hub.py            # HuggingFace integration
-│   ├── logging.py        # Comprehensive training monitoring
-│   ├── model_card.py     # Automated documentation
-│   ├── setup.py          # Advanced configuration
-│   └── validation.py     # Extensive model validation
+│   ├── checkpoint.py    # Model state management
+│   ├── device.py       # Memory and device optimization
+│   ├── hub.py          # HuggingFace integration
+│   ├── logging.py      # Training monitoring
+│   └── validation.py   # Model validation
 │
-└── main.py               # Entry point with CLI
+└── main.py             # Entry point with CLI
 ```
 
 ## Component Details
 
+### Config Module
+- `args.py`: Centralized configuration
+  - Training parameters
+  - Dataset configuration
+  - Model architecture settings
+  - Tag weighting parameters
+  - Optimization settings
+  - Validation configuration
+
 ### Data Module
-- `dataset.py`: Advanced dataset implementation
-  - Multi-resolution image handling
-  - Efficient latent caching system
-  - Dynamic batch composition
-  - Automatic augmentation pipeline
-  - Memory-mapped storage
-  - Streaming capabilities
-  - Multi-worker data loading
-
-- `tag_weighter.py`: Dynamic tag weighting
-  - CLIP embedding analysis
-  - Frequency-based normalization
-  - Category-specific weighting
-  - Tag correlation analysis
-  - Dropout regularization
+- `caption_processor.py`: Tag processing system
+  - Tag extraction and normalization
+  - Weight computation
+  - Tag statistics tracking
+  - Dynamic weight adjustment
   - Cache management
-  - Real-time weight updates
 
-### Models Module
-- `architecture.py`: Enhanced SDXL architecture
-  - Memory-efficient attention
-  - Gradient checkpointing
-  - Custom scaling rules
-  - Dynamic resolution handling
-  - Feature pyramid networks
-  - Skip connections
+- `dataset/`: Advanced dataset implementation
+  - `bucket_manager.py`: Resolution bucket system
+    - Dynamic bucket generation
+    - Aspect ratio preservation
+    - Area constraints
+    - Adaptive bucketing
+  - `dataset.py`: Main dataset
+    - Multi-resolution handling
+    - Latent caching
+    - Tag weighting
+    - Memory optimization
+  - `image_grouper.py`: Resolution grouping
+    - Efficient bucket assignment
+    - Parallel processing
+    - Memory management
 
-- `attention.py`: Optimized attention mechanisms
-  - Sparse attention patterns
-  - Memory-efficient implementation
-  - Dynamic head pruning
-  - Cross-frame attention
-  - Flash attention support
-  - Xformers integration
 
 ### Training Module
-- `loss.py`: Comprehensive loss system
-  - ZTSNR implementation
-  - Perceptual loss components
+- `loss.py`: ZTSNR loss system
+  - V-prediction loss
   - Dynamic weighting
+  - Tag-weighted loss
   - Gradient scaling
-  - Feature matching
-  - Style transfer loss
 
 - `trainer.py`: Advanced training loop
-  - Gradient accumulation
   - Mixed precision training
   - Dynamic batch sizing
   - Memory optimization
-  - Distributed training
-  - Checkpoint management
   - Progress tracking
 
 ### Utils Module
-- `checkpoint.py`: Robust state management
+- `checkpoint.py`: State management
   - Safe state saving/loading
-  - Incremental updates
-  - Emergency recovery
   - Version control
   - Metadata tracking
 
@@ -115,42 +109,34 @@ src/
   - Memory tracking
   - CUDA optimization
   - Cache management
-  - Automatic mixed precision
-  - Memory defragmentation
-  - Device assignment
 
 ## Implementation Notes
 
 ### Memory Management
-- Automatic garbage collection
-- Gradient checkpointing
-- Efficient attention
-- Dynamic batching
-- Cache optimization
+- Bucket-based batching
+- Efficient latent caching
+- Dynamic resolution handling
 - Memory-mapped data
 - Streaming processing
 
 ### Training Features
 - Multi-resolution support
 - Dynamic tag weighting
-- Adaptive learning rates
+- Adaptive bucket selection
 - Progressive training
-- Validation pipeline
 - Automated logging
-- Emergency recovery
 
 ### Performance Optimizations
 - Mixed precision training
 - Memory-efficient attention
-- Gradient accumulation
+- Bucket-based batching
 - Efficient data loading
 - Caching strategies
-- Device optimization
 
 ## Usage Guidelines
 
 Refer to main README.md for:
-- Detailed installation steps
+- Installation steps
 - Training configurations
 - Performance optimization
 - Troubleshooting guide

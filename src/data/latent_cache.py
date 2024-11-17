@@ -28,7 +28,7 @@ class LatentCacheManager:
     def process_single_latent(self, image_tensor: torch.Tensor) -> Optional[torch.Tensor]:
         """Process a single image into latent space."""
         try:
-            with torch.cuda.amp.autocast('cuda'):
+            with torch.cuda.amp.autocast(enabled=True):
                 with torch.no_grad():
                     image_tensor = image_tensor.to(self.device)
                     latent = self.vae.encode(image_tensor).latent_dist.sample()
@@ -49,7 +49,7 @@ class LatentCacheManager:
     def process_latents_batch(self, image_tensors: torch.Tensor) -> Optional[torch.Tensor]:
         """Process a batch of images into latent space efficiently."""
         try:
-            with torch.cuda.amp.autocast('cuda'):
+            with torch.cuda.amp.autocast(enabled=True):
                 with torch.no_grad():
                     image_tensors = image_tensors.to(self.device)
                     latents = self.vae.encode(image_tensors).latent_dist.sample()

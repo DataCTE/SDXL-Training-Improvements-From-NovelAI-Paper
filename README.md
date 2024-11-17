@@ -2,7 +2,6 @@
 
 Most SDXL implementations use a maximum noise deviation (σ_max) of 14.6 [meaning that only 14.6% of the noise is removed at maximum] inherited from SD1.5/1.4, without accounting for SDXL's larger scale. Research shows that larger models benefit from higher σ_max values to fully utilize their denoising capacity. This repository implements an increased σ_max ≈ 20000.0 (as recommended by NovelAI research arXiv:2409.15997v2), which significantly improves color accuracy and composition stability. Combined with Zero Terminal SNR (ZTSNR) and VAE finetuning.
 
-
 ### Current Status
 
 - [x] Core ZTSNR implementation
@@ -11,12 +10,12 @@ Most SDXL implementations use a maximum noise deviation (σ_max) of 14.6 [meanin
 - [x] Sigma max 20000.0
 - [x] High-resolution coherence enhancements
 - [x] VAE improvements
-- [x] Tag-based CLIP weighting
-- [x] Functional detailed wandb logging
-- [x] Ultimate SD Upscaler integration
+- [x] Tag-based weighting system
+- [x] Bucket-based batching
 - [x] Dynamic resolution handling
 - [x] Memory-efficient training
 - [x] Automatic mixed precision (AMP)
+- [x] Functional detailed wandb logging
 
 - [x] 10k dataset proof of concept (completed) [link](https://huggingface.co/dataautogpt3/ProteusSigma)
 - [ ] 200k+ dataset finetune (in progress)
@@ -82,7 +81,7 @@ python src/main.py \
   --learning_rate 1e-6 \
   --batch_size 1 \
   --enable_compile \
-  --finetune_vae
+  --use_tag_weighting
 ```
 
 ### Advanced Configuration
@@ -113,36 +112,43 @@ python src/main.py \
   --perceptual_weight 0.1
 ```
 
-## Tag-Based CLIP Weighting
+## Tag Weighting System
 
 ### Configuration
 ```bash
 python src/main.py \
+  # Tag weighting parameters
+  --use_tag_weighting \
   --min_tag_weight 0.1 \
   --max_tag_weight 3.0 \
-  --character_weight 1.5 \
-  --style_weight 1.2 \
-  --quality_weight 0.8 \
-  --setting_weight 1.0 \
-  --action_weight 1.1 \
-  --object_weight 0.9 \
-  --tag_frequency_path "tag_frequencies.json" \
-  --tag_embedding_cache "tag_embeddings.pt" \
-  --dynamic_tag_weights \
-  --tag_dropout 0.1
+  
+  # Caption processing
+  --token_dropout_rate 0.1 \
+  --caption_dropout_rate 0.1 \
+  
+  # Resolution handling
+  --min_size 512 \
+  --max_size 4096 \
+  --bucket_step_size 64 \
+  --max_bucket_area 4194304 \
+  --all_ar
 ```
 
-### Weight Ranges
-- `min_tag_weight`: 0.1 to 1.0 (default: 0.1)
-- `max_tag_weight`: 1.0 to 5.0 (default: 3.0)
+### Weight Configuration
+- `use_tag_weighting`: Enable tag-based loss weighting
+- `min_tag_weight`: Minimum weight for any tag (default: 0.1)
+- `max_tag_weight`: Maximum weight for any tag (default: 3.0)
 
-### Class Weights
-- `character_weight`: 1.5 (character emphasis)
-- `style_weight`: 1.2 (style consistency)
-- `quality_weight`: 0.8 (quality control)
-- `setting_weight`: 1.0 (background balance)
-- `action_weight`: 1.1 (pose emphasis)
-- `object_weight`: 0.9 (object balance)
+### Caption Processing
+- `token_dropout_rate`: Rate at which individual tokens are dropped (default: 0.1)
+- `caption_dropout_rate`: Rate at which entire captions are dropped (default: 0.1)
+
+### Resolution Handling
+- `min_size`: Minimum dimension size (default: 512)
+- `max_size`: Maximum dimension size (default: 4096)
+- `bucket_step_size`: Resolution increment between buckets (default: 64)
+- `max_bucket_area`: Maximum area constraint (default: 4194304)
+- `all_ar`: Use aspect ratio for bucket assignment
 
 ## Dataset Format
 
@@ -156,15 +162,35 @@ data_dir/
 ...
 ```
 
-### Tag Format
+### Caption Format
+Text files should contain comma-separated tags:
 ```plain
-character_tags, style_tags, setting_tags, quality_tags
+tag1, tag2, tag3, tag4
 ```
-Example: `1girl, anime style, outdoor, high quality`
+Example: `1girl, white hair, outdoor, high quality`
 
 ## Project Structure
 See [Project Structure Documentation](src/filestruc.md) for detailed component descriptions.
 
+## Memory Management
+
+### Bucket-Based Batching
+- Dynamic resolution grouping
+- Aspect ratio preservation
+- Memory-efficient processing
+- Consistent tensor sizes
+
+### Latent Caching
+- VAE latent precomputation
+- Disk-based caching
+- Memory-mapped storage
+- Efficient batch processing
+
+### Resolution Handling
+- Dynamic bucket generation
+- Area-constrained scaling
+- Adaptive aspect ratios
+- Progressive resizing
 
 ## ComfyUI Integration
 
@@ -211,7 +237,6 @@ Recommended workflow:
 2. Configure CFG rescaling if using high CFG values
 3. Optionally use the Laplace scheduler for improved noise distribution
 
-
 ## Contributing
 
 Contributions are welcome! Please feel free to submit issues or pull requests for improvements.
@@ -227,5 +252,3 @@ Apache 2.0
   journal={arXiv preprint arXiv:2409.15997v2},
   year={2024}
 }
-
-```
