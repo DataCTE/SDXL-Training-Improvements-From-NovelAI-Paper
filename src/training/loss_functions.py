@@ -76,9 +76,10 @@ def get_sigmas(
     base_res: int = 1024 * 1024,
     rho: float = 7.0,
     sigma_max_base: float = 20000.0,
+    use_ztsnr: bool = True,
     cache_key: Optional[str] = None
 ) -> torch.Tensor:
-    """Enhanced sigma schedule generation with caching and optimizations"""
+    """Enhanced sigma schedule generation with ZTSNR support"""
     try:
         # Check cache first
         if cache_key is not None:
@@ -89,60 +90,61 @@ def get_sigmas(
         # Calculate sigma_max based on resolution if needed
         sigma_max = sigma_max_base
         if resolution_scaling:
-            scale_factor = calculate_scale_factor(height, width, base_res, scale_method)
+            # Scale sigma_max based on resolution as per NovelAI paper
+            current_res = height * width
+            scale_factor = (current_res / base_res) ** 0.25  # Rule of thumb: double sigma_max when quadrupling resolution
             sigma_max = sigma_max_base * scale_factor
 
-        # Log configuration if verbose
-        if verbose:
-            log_config = {
-                "Sigma Max": sigma_max,
-                "Sigma Min": sigma_min,
-                "Resolution": f"{height}x{width}",
-                "Base Resolution": f"{int(np.sqrt(base_res))}x{int(np.sqrt(base_res))}",
-                "Steps": num_inference_steps,
-                "Rho": rho
-            }
-            logger.info("Generating sigma schedule:")
-            for key, value in log_config.items():
-                logger.info("- %s: %s", key, value)
-
-        # Compute schedule
+        # Generate sigma schedule
         sigmas = compute_sigma_schedule(num_inference_steps, sigma_min, sigma_max, rho)
         
+        # Add infinite noise step for ZTSNR if enabled
+        if use_ztsnr:
+            ztsnr_sigma = torch.tensor([float('inf')], device=sigmas.device, dtype=sigmas.dtype)
+            sigmas = torch.cat([ztsnr_sigma, sigmas])
+
         # Move to device/dtype if specified
         if device is not None:
             sigmas = sigmas.to(device)
         if dtype is not None:
             sigmas = sigmas.to(dtype)
 
-        # Log schedule details if verbose
-        if verbose:
-            logger.info("- First 3 sigmas: %s", sigmas[:3].tolist())
-            logger.info("- Last 3 sigmas: %s", sigmas[-3:].tolist())
-
-        # Cache result if requested
+        # Cache if key provided
         if cache_key is not None:
             _sigma_cache.set(cache_key, sigmas)
 
         return sigmas
-        
+
     except Exception as e:
-        logger.error("Failed to generate sigmas: %s", str(e))
-        logger.error(traceback.format_exc())
+        logger.error("Sigma schedule generation failed: %s", str(e))
         raise
 
 @torch.jit.script
-def compute_v_prediction_scaling(
-    sigma: torch.Tensor,
-    sigma_data: float = 1.0
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Optimized Karras scaling computation for v-prediction"""
-    sigma_sq = sigma * sigma
-    sigma_data_sq = sigma_data * sigma_data
-    denominator = torch.sqrt(sigma_sq + sigma_data_sq)
-    c_out = -sigma * sigma_data / denominator
-    c_in = 1.0 / denominator
-    return c_out, c_in
+def compute_loss_weights(
+    snr: torch.Tensor,
+    min_snr_gamma: float = 5.0,
+    scale_method: str = "karras",
+    rescale_multiplier: float = 1.0,
+    rescale_cfg: bool = True,
+    use_min_snr: bool = True
+) -> torch.Tensor:
+    """Compute loss weights with MinSNR support"""
+    try:
+        if use_min_snr:
+            # Implement MinSNR loss weighting
+            snr_clipped = torch.minimum(snr, torch.full_like(snr, min_snr_gamma))
+            weights = snr_clipped / snr
+        else:
+            weights = torch.ones_like(snr)
+
+        if rescale_cfg:
+            weights = weights * rescale_multiplier
+
+        return weights
+
+    except Exception as e:
+        logger.error("Loss weight computation failed: %s", str(e))
+        raise
 
 def forward_pass(args, model_dict, batch, device, dtype, components) -> torch.Tensor:
     """Execute forward pass with proper error handling.
@@ -204,118 +206,77 @@ def forward_pass(args, model_dict, batch, device, dtype, components) -> torch.Te
         logger.error("Forward pass failed: %s", str(e))
         raise type(e)(f"Failed during forward pass: {str(e)}") from e
 
-@torch.jit.script
-def compute_loss_weights(
-    snr: torch.Tensor,
-    min_snr_gamma: float,
-    scale_method: str,
-    rescale_multiplier: float,
-    rescale_cfg: bool
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Optimized loss weight computation"""
-    snr_weight = torch.clamp(snr / min_snr_gamma, max=1.0)
-    
-    if rescale_cfg:
-        snr_plus_one = 1.0 + snr
-        cfg_scale = rescale_multiplier * (
-            torch.sqrt(snr_plus_one) if scale_method == "karras"
-            else snr_plus_one
-        )
-    else:
-        cfg_scale = torch.ones_like(snr)
-    
-    return snr_weight, cfg_scale
-
-@torch.compile()
 def training_loss_v_prediction(
     model: torch.nn.Module,
     x_0: torch.Tensor,
     sigma: torch.Tensor,
     text_embeddings: torch.Tensor,
     added_cond_kwargs: Dict[str, torch.Tensor],
-    sigma_data: float,
-    tag_weighter: Optional[Any],
-    batch_tags: Optional[Any],
-    min_snr_gamma: float,
-    rescale_cfg: bool,
-    rescale_multiplier: float,
-    scale_method: str,
-    use_tag_weighting: bool,
-    device: torch.device,
-    dtype: torch.dtype,
+    sigma_data: float = 1.0,
+    tag_weighter: Optional[Any] = None,
+    batch_tags: Optional[Any] = None,
+    min_snr_gamma: float = 5.0,
+    rescale_cfg: bool = True,
+    rescale_multiplier: float = 1.0,
+    scale_method: str = "karras",
+    use_tag_weighting: bool = True,
+    use_min_snr: bool = True,
+    device: torch.device = None,
+    dtype: torch.dtype = None,
 ) -> torch.Tensor:
-    """
-    Compute training loss using v-prediction.
-    
-    Args:
-        model: UNet model
-        x_0: Input latents
-        sigma: Noise timesteps
-        text_embeddings: Text embeddings
-        added_cond_kwargs: Additional conditioning kwargs
-        sigma_data: Data sigma parameter
-        tag_weighter: Optional tag weighter for weighting loss by tags
-        batch_tags: Optional batch tags for tag weighting
-        min_snr_gamma: Minimum SNR gamma parameter
-        rescale_cfg: Whether to rescale classifier-free guidance
-        rescale_multiplier: Rescale multiplier value
-        scale_method: Method for scaling loss
-        use_tag_weighting: Whether to use tag weighting
-        device: Torch device
-        dtype: Torch dtype
-        
-    Returns:
-        Training loss tensor
-    """
-    # Add noise to input
-    noise = torch.randn_like(x_0)
-    noised = x_0 + noise * sigma.view(-1, 1, 1, 1)
+    """Training loss using v-prediction with MinSNR and ZTSNR support"""
+    try:
+        # Handle infinite sigma for ZTSNR
+        if torch.isinf(sigma).any():
+            sigma = torch.where(torch.isinf(sigma), torch.tensor(20000.0, device=sigma.device, dtype=sigma.dtype), sigma)
 
-    # Get model prediction
-    v_pred = model(
-        noised,
-        sigma,
-        encoder_hidden_states=text_embeddings,
-        added_cond_kwargs=added_cond_kwargs,
-    ).sample
+        # Add noise to input
+        noise = torch.randn_like(x_0)
+        noised = x_0 + noise * sigma.view(-1, 1, 1, 1)
 
-    # Compute v-target
-    v_target = noise * sigma.view(-1, 1, 1, 1)
+        # Compute v target (velocity)
+        v_target = noise * sigma_data / (sigma**2 + sigma_data**2).sqrt()
 
-    # Compute loss
-    loss = (v_pred - v_target) ** 2
+        # Get model prediction
+        v_pred = model(noised, sigma, text_embeddings, added_cond_kwargs=added_cond_kwargs)
 
-    # Apply loss scaling
-    if scale_method == "min_snr":
-        # Scale loss by min_snr_gamma
-        loss_weights = (sigma ** 2) / (sigma ** 2 + sigma_data ** 2)
-        loss_weights = loss_weights.view(-1, 1, 1, 1)
-        if min_snr_gamma is not None:
-            loss_weights = loss_weights.clamp(max=min_snr_gamma)
-        loss = loss * loss_weights
-    elif scale_method == "karras":
-        # Scale loss using Karras method
-        loss = loss / (sigma ** 2)
-    elif scale_method == "none":
-        # No scaling
-        pass
-    else:
-        raise ValueError(f"Unknown scale method: {scale_method}")
+        # Compute SNR for loss weighting
+        snr = (sigma_data / sigma) ** 2
+        weights = compute_loss_weights(
+            snr,
+            min_snr_gamma=min_snr_gamma,
+            scale_method=scale_method,
+            rescale_multiplier=rescale_multiplier,
+            rescale_cfg=rescale_cfg,
+            use_min_snr=use_min_snr
+        )
 
-    # Apply tag weighting if enabled
-    if use_tag_weighting and tag_weighter is not None and batch_tags is not None:
-        tag_weights = tag_weighter.compute_weights(batch_tags)
-        tag_weights = tag_weights.to(device=device, dtype=dtype)
-        loss = loss * tag_weights.view(-1, 1, 1, 1)
+        # Compute weighted MSE loss
+        loss = torch.mean((v_pred - v_target) ** 2 * weights)
 
-    # Apply CFG rescaling if enabled
-    if rescale_cfg:
-        loss = loss * rescale_multiplier
+        # Apply tag weighting if enabled
+        if use_tag_weighting and tag_weighter is not None and batch_tags is not None:
+            tag_weights = tag_weighter(batch_tags)
+            loss = loss * tag_weights.mean()
 
-    # Average loss
-    loss = loss.mean()
+        return loss
 
-    return loss
+    except Exception as e:
+        logger.error("Training loss computation failed: %s", str(e))
+        raise
+
+@torch.jit.script
+def compute_v_prediction_scaling(
+    sigma: torch.Tensor,
+    sigma_data: float = 1.0
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Optimized Karras scaling computation for v-prediction"""
+    sigma_sq = sigma * sigma
+    sigma_data_sq = sigma_data * sigma_data
+    denominator = torch.sqrt(sigma_sq + sigma_data_sq)
+    c_out = -sigma * sigma_data / denominator
+    c_in = 1.0 / denominator
+    return c_out, c_in
 
 def get_loss_info(loss_tensor: torch.Tensor) -> dict:
     """Get detailed information about loss values"""

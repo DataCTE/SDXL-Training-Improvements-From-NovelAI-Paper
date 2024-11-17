@@ -101,11 +101,11 @@ class TrainingConfig:
     
     # Validation settings
     validation_dir: Optional[str] = None
-    validation_prompts: Optional[List[str]] = None
+    validation_prompts: List[str] = field(default_factory=list)
     validation_epochs: int = 1
     save_epochs: int = 1
-    validation_num_inference_steps: int = 50
-    validation_guidance_scale: float = 7.5
+    validation_num_inference_steps: int = 28
+    validation_guidance_scale: float = 5.5
     validation_image_height: int = 1024
     validation_image_width: int = 1024
     validation_num_images_per_prompt: int = 1
