@@ -14,9 +14,9 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class OptimizerConfig:
-    optimizer_type: str = "adamw"
     learning_rate: float = 1e-5
     weight_decay: float = 1e-2
+    optimizer_type: str = "adamw"
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
     adam_epsilon: float = 1e-8
@@ -59,48 +59,33 @@ class TagWeightingConfig:
 
 @dataclass
 class TrainingConfig:
-    # Model paths
+    # Required arguments (no defaults)
     model_path: str
-    output_dir: str = "./output"
+    data_dir: str
     
-    # Training parameters
+    # Optional arguments (with defaults)
+    output_dir: str = "./output"
     batch_size: int = 1
     num_epochs: int = 1
     gradient_accumulation_steps: int = 1
     mixed_precision: str = "fp16"
     max_grad_norm: float = 1.0
-    
-    # Training mode
     training_mode: str = "v_prediction"
     use_ztsnr: bool = False
     rescale_cfg: bool = False
     rescale_multiplier: float = 0.7
     resolution_scaling: bool = True
     min_snr_gamma: float = 5.0
-    
-    # Noise scheduling
     sigma_data: float = 1.0
     sigma_min: float = 0.029
     sigma_max: float = 160.0
     scale_method: str = "karras"
     scale_factor: float = 0.7
-    
-    # Components
-    optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
-    scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
-    ema: EMAConfig = field(default_factory=EMAConfig)
-    vae_args: VAEConfig = field(default_factory=VAEConfig)
-    tag_weighting: TagWeightingConfig = field(default_factory=TagWeightingConfig)
-    
-    # System settings
     device: str = "cuda"
     enable_compile: bool = False
     compile_mode: str = "default"
     gradient_checkpointing: bool = True
     num_workers: int = 4
-    
-    # Data settings
-    data_dir: str
     validation_dir: Optional[str] = None
     cache_dir: str = "latents_cache"
     no_caching: bool = False
@@ -108,8 +93,6 @@ class TrainingConfig:
     max_size: int = 4096
     bucket_step_size: int = 64
     max_bucket_area: int = 1024*1024
-    
-    # Validation settings
     validation_prompts: Optional[List[str]] = None
     validation_epochs: int = 1
     save_epochs: int = 1
@@ -118,6 +101,13 @@ class TrainingConfig:
     validation_image_height: int = 1024
     validation_image_width: int = 1024
     validation_num_images_per_prompt: int = 1
+    
+    # Component configs
+    optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
+    scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
+    ema: EMAConfig = field(default_factory=EMAConfig)
+    vae_args: VAEConfig = field(default_factory=VAEConfig)
+    tag_weighting: TagWeightingConfig = field(default_factory=TagWeightingConfig)
 
 def parse_args() -> TrainingConfig:
     """
@@ -128,11 +118,12 @@ def parse_args() -> TrainingConfig:
     """
     parser = argparse.ArgumentParser(description="Train a Stable Diffusion XL model")
     
-    # Model arguments
+    # Required arguments
     parser.add_argument("--model_path", type=str, required=True, help="Path to pretrained model")
-    parser.add_argument("--output_dir", type=str, default="./output", help="Output directory")
+    parser.add_argument("--data_dir", type=str, required=True, help="Training data directory")
     
-    # Training parameters
+    # Optional arguments
+    parser.add_argument("--output_dir", type=str, default="./output", help="Output directory")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=1e-6)
@@ -165,17 +156,16 @@ def parse_args() -> TrainingConfig:
     parser.add_argument("--num_workers", type=int, default=4)
     
     # Data arguments
-    parser.add_argument("--data_dir", type=str, required=True, help="Training data directory")
     parser.add_argument("--validation_dir", type=str, help="Validation data directory")
     parser.add_argument("--cache_dir", type=str, default="latents_cache")
     parser.add_argument("--no_caching", action="store_true")
     
-    # Parse arguments
     args = parser.parse_args()
     
     # Convert to config
     config = TrainingConfig(
         model_path=args.model_path,
+        data_dir=args.data_dir,
         output_dir=args.output_dir,
         batch_size=args.batch_size,
         num_epochs=args.num_epochs,
