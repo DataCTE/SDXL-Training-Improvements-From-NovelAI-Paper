@@ -14,24 +14,18 @@ import torch
 import wandb
 
 from src.config.args import parse_args
-from src.training.trainer import (
-    train_epoch,
-    initialize_training_components,
-    run_validation,
-    setup_optimizer,
-    setup_vae_finetuner
-)
-from src.utils.checkpoint import load_checkpoint, save_checkpoint, save_final_outputs
+from src.training.trainer import SDXLTrainer
+from src.data.setup_dataset import create_train_dataloader, create_validation_dataloader
 from src.utils.hub import create_model_card, save_model_card, push_to_hub
 from src.utils.logging import (
     setup_logging,
     log_system_info,
-    log_training_setup,
     setup_wandb,
     cleanup_wandb,
     log_memory_stats,
     log_model_gradients
 )
+from src.models.model_loader import load_models
 
 logger = logging.getLogger(__name__)
 
@@ -46,162 +40,122 @@ def main() -> None:
         # Log system information and setup
         log_system_info()
         
-        # Get device and dtype
+        # Get device
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
         
-        # Load model and initialize components
-        models, train_components, training_history = load_checkpoint(
-            config.model.model_path,
-            config.model.vae_path if hasattr(config.model, 'vae_path') else None,
-            dtype=dtype
+        # Load models first
+        models = load_models(config)
+        
+        # Setup data loaders
+        train_dataloader = create_train_dataloader(
+            data_dir=config.data.data_dir,
+            vae=models["vae"],
+            tokenizer=models["tokenizer"],
+            tokenizer_2=models["tokenizer_2"],
+            text_encoder=models["text_encoder"],
+            text_encoder_2=models["text_encoder_2"],
+            batch_size=config.training.batch_size,
+            cache_dir=config.data.cache_dir,
+            all_ar=config.data.all_ar,
+            use_tag_weighting=config.data.use_tag_weighting
         )
         
-        # Initialize training components with loaded state
-        training_state = initialize_training_components(config, models)
-        training_state["device"] = device
-        training_state["dtype"] = dtype
-        training_state["train_components"] = train_components
-        training_state["training_history"] = training_history
+        val_dataloader = None
+        if config.data.validation_dir:
+            val_dataloader = create_validation_dataloader(
+                data_dir=config.data.validation_dir,
+                vae=models["vae"],
+                tokenizer=models["tokenizer"],
+                tokenizer_2=models["tokenizer_2"],
+                batch_size=config.training.batch_size
+            )
         
-        # Log training setup with all required components
-        log_training_setup(config, models, training_state)
+        # Initialize trainer with all required components
+        trainer = SDXLTrainer(
+            config=config,
+            models=models,
+            train_dataloader=train_dataloader,
+            val_dataloader=val_dataloader,
+            device=device
+        )
         
-        # Setup output directory
-        output_dir = Path(config.model.output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Initialize wandb if enabled
+        # Setup wandb if enabled
         wandb_run = None
         if config.logging.use_wandb:
             wandb_run = setup_wandb(config)
         
-        # Setup training components
-        setup_optimizer(config, models)
-        if config.vae.finetune_vae:
-            setup_vae_finetuner(config.vae, models)
-        # EMA setup is handled by initialize_training_components
-        
-        # Resume from checkpoint if specified
-        if config.logging.resume_from_checkpoint:
-            loaded_models, loaded_components, loaded_history = load_checkpoint(
-                config.logging.resume_from_checkpoint,
-                config.model.vae_path if hasattr(config.model, 'vae_path') else None,
-                dtype=dtype
-            )
-            # Update models and training state with loaded components
-            models.update(loaded_models)
-            training_state["train_components"] = loaded_components
-            training_state["training_history"] = loaded_history
+        # Create output directory
+        output_dir = Path(config.model.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
         
         # Training loop
         for epoch in range(config.training.num_epochs):
-            logger.info("Starting epoch %d/%d", epoch + 1, config.training.num_epochs)
+            logger.info(f"Starting epoch {epoch + 1}/{config.training.num_epochs}")
             
             # Train for one epoch
-            train_metrics = train_epoch(
-                epoch=epoch,
-                args=config,
-                models=models,
-                components=training_state,
-                device=device,
-                dtype=dtype,
-                global_step=training_state.get("total_steps", 0)
-            )
+            trainer.train_epoch(epoch)
+            metrics = trainer.metrics_manager.get_metrics()
             
-            # Log metrics if using wandb
+            # Log metrics
             if config.logging.use_wandb:
-                wandb.log({f"train/{k}": v for k, v in train_metrics.items()})
+                wandb.log({f"train/{k}": v for k, v in metrics.items()})
             
             # Run validation if available
-            if "val_dataloader" in training_state:
-                val_metrics = run_validation(
-                    args=config,
-                    models=models,
-                    components=training_state,
-                    device=device,
-                    dtype=dtype,
-                    global_step=training_state.get("total_steps", 0)
-                )
-                
-                # Log validation metrics
+            if val_dataloader:
+                trainer.validate(epoch)
+                val_metrics = trainer.metrics_manager.get_validation_metrics()
                 if config.logging.use_wandb:
                     wandb.log({f"val/{k}": v for k, v in val_metrics.items()})
             
-            # Save checkpoint if enabled
-            if config.logging.save_checkpoints:
-                checkpoint_path = output_dir / f"checkpoint-{epoch}.pt"
-                save_checkpoint(
-                    save_path=checkpoint_path,
-                    models=models,
-                    train_components=training_state,
-                    training_history={"epoch": epoch, "total_steps": training_state.get("total_steps", 0)},
-                    is_final=False
+            # Save checkpoint
+            if config.logging.save_checkpoints and (epoch + 1) % config.logging.save_epochs == 0:
+                trainer.save_checkpoint(
+                    str(output_dir),
+                    epoch
                 )
             
             # Log memory stats and model gradients
-            current_step = training_state.get("total_steps", 0)
-            log_memory_stats(step=current_step)
-            log_model_gradients(
-                model=models["unet"],
-                step=current_step
-            )
+            log_memory_stats(step=epoch)
+            log_model_gradients(trainer.models["unet"], step=epoch)
         
-        # Save final outputs
+        # Save final model
         final_model_path = output_dir / "final_model"
-        save_final_outputs(
-            final_model_path,
-            training_state["model"],
-            training_state["ema_model"] if config.ema.use_ema else None,
-            training_state["vae"] if config.vae.use_vae else None
-        )
+        trainer.save_checkpoint(str(final_model_path), config.training.num_epochs - 1)
         
         # Create and save model card
-        model_card = create_model_card(
-            config=config,
-            training_history=training_state.get("training_history", {
-                "loss_history": [],
-                "validation_scores": [],
-                "best_score": float('inf'),
-                "total_steps": training_state.get("total_steps", 0)
-            })
-        )
+        model_card = create_model_card(config, trainer.metrics_manager.get_training_history())
         save_model_card(output_dir / "README.md", model_card)
         
         # Push to hub if configured
-        if hasattr(config.logging, 'push_to_hub') and config.logging.push_to_hub:
+        if config.logging.push_to_hub:
             push_to_hub(
                 output_dir,
-                training_state["model"],
-                training_state["ema_model"] if config.ema.use_ema else None,
-                training_state["vae"] if config.vae.use_vae else None,
+                trainer.models["unet"],
+                trainer.components.get("ema_model"),
+                trainer.models["vae"],
                 config
             )
         
         logger.info("Training completed successfully!")
         
     except (torch.cuda.CudaError, torch.cuda.OutOfMemoryError) as e:
-        logger.error("CUDA error occurred: %s", str(e), exc_info=True)
+        logger.error(f"CUDA error occurred: {str(e)}", exc_info=True)
         sys.exit(3)
     except (TypeError, AttributeError) as e:
-        logger.error("Type or attribute error in training pipeline: %s", str(e), exc_info=True)
+        logger.error(f"Type or attribute error in training pipeline: {str(e)}", exc_info=True)
         sys.exit(5)
     except (ImportError, ModuleNotFoundError) as e:
-        logger.error("Failed to import required module: %s", str(e), exc_info=True)
+        logger.error(f"Failed to import required module: {str(e)}", exc_info=True)
         sys.exit(4)
     except (RuntimeError, ValueError, OSError) as e:
-        # RuntimeError: CUDA/model errors
-        # ValueError: Invalid parameter values or model states
-        # OSError: File operations, checkpoint loading/saving
-        logger.error("Training failed: %s", str(e), exc_info=True)
+        logger.error(f"Training failed: {str(e)}", exc_info=True)
         sys.exit(1)
     except KeyboardInterrupt:
         logger.info("Training interrupted by user")
         sys.exit(0)
-        
     finally:
         # Cleanup
-        if config.logging.use_wandb and wandb_run is not None:
+        if wandb_run is not None:
             cleanup_wandb(wandb_run)
 
 

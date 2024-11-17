@@ -1,897 +1,150 @@
-import logging
-import gc
-import os
-import math
-import time
-from typing import Dict, Any, Union, Optional, List
-from functools import lru_cache
-from multiprocessing import Manager
-from dataclasses import dataclass
-from collections import defaultdict
-from contextlib import nullcontext
-
 import torch
-import numpy as np
-from torch.utils.data import DataLoader
-from tqdm import tqdm
-from transformers.optimization import Adafactor
-from bitsandbytes.optim import AdamW8bit
-from diffusers import AutoencoderKL
-
-from src.inference.text_to_image import SDXLInference
-from src.training.ema import EMAModel
-from src.training.loss import get_cosine_schedule_with_warmup, forward_pass
-from src.data.caption_processor import CaptionProcessor
-from src.training.vae_finetuner import VAEFineTuner
-from src.data.dataset.dataset import CustomDataset
-from src.utils.checkpoint import save_checkpoint
-
+import logging
+from typing import Dict, Any, Optional
+from dataclasses import dataclass
+from src.training.training_steps import train_step
+from src.training.training_utils import initialize_training_components
+from src.training.validation import validate_model
+from src.training.metrics import MetricsManager
 
 logger = logging.getLogger(__name__)
 
-@lru_cache(maxsize=128)
-def _get_optimizer_config(
-    optimizer_type: str,
-    learning_rate: float,
-    weight_decay: float,
-    adam_beta1: float,
-    adam_beta2: float,
-    adam_epsilon: float,
-) -> Dict[str, Any]:
-    """Cache optimizer configurations."""
-    base_config = {
-        "lr": learning_rate,
-        "weight_decay": weight_decay,
-    }
-
-    if optimizer_type.lower() == "adamw":
-        return {**base_config, "betas": (adam_beta1, adam_beta2), "eps": adam_epsilon}
-    elif optimizer_type.lower() == "adafactor":
-        return {
-            **base_config,
-            "scale_parameter": True,
-            "relative_step": False,
-            "warmup_init": False,
-        }
-    else:
-        raise ValueError(f"Unsupported optimizer type: {optimizer_type}")
-
-
-def setup_optimizer(args, models) -> torch.optim.Optimizer:
-    """Set up optimizer with proper configuration and memory optimizations."""
-    try:
-        # Validate UNet model
-        if not hasattr(models["unet"], "parameters"):
-            raise ValueError("UNet model is not properly initialized")
-
-        # Get trainable parameters with optimized list comprehension
-        params_to_optimize = [p for p in models["unet"].parameters() if p.requires_grad]
-
-        # Add text encoder parameters if needed
-        if getattr(args, "train_text_encoder", False):
-            if all(k in models for k in ["text_encoder", "text_encoder_2"]):
-                text_params = [
-                    p
-                    for model_key in ["text_encoder", "text_encoder_2"]
-                    for p in models[model_key].parameters()
-                    if p.requires_grad
-                ]
-                params_to_optimize.extend(text_params)
-
-        # Validate parameters
-        if not params_to_optimize:
-            raise ValueError("No trainable parameters found")
-
-        # Log total number of trainable parameters
-        total_params = sum(p.numel() for p in params_to_optimize)
-        logger.info("Total trainable parameters: %s", format(total_params, ","))
-
-        # Get cached optimizer config
-        opt_config = _get_optimizer_config(
-            getattr(args.optimizer, "optimizer_type", "adamw"),
-            args.training.learning_rate,
-            args.optimizer.weight_decay,
-            args.optimizer.adam_beta1,
-            args.optimizer.adam_beta2,
-            args.optimizer.adam_epsilon,
-        )
-
-        # Initialize optimizer based on type
-        if args.optimizer.use_8bit_adam:
-            try:
-                optimizer = AdamW8bit(params_to_optimize, **opt_config)
-            except ImportError as e:
-                logger.warning("Failed to import 8-bit AdamW: %s. Falling back to regular AdamW.", str(e))
-                args.optimizer.use_8bit_adam = False
-                optimizer = torch.optim.AdamW(params_to_optimize, **opt_config)
-        elif args.optimizer.use_adafactor:
-            optimizer = Adafactor(
-                params_to_optimize,
-                lr=opt_config["lr"],
-                weight_decay=opt_config["weight_decay"],
-                scale_parameter=True,
-                relative_step=False,
-                warmup_init=False,
-            )
-        else:
-            optimizer = torch.optim.AdamW(params_to_optimize, **opt_config)
-
-        return optimizer
-
-    except (ValueError, RuntimeError, AttributeError) as e:
-        raise type(e)(f"Failed to setup optimizer: {str(e)}") from e
-
-def setup_vae_finetuner(vae_args, models) -> Optional[VAEFineTuner]:
-    """
-    Set up the VAE FineTuner if fine-tuning is enabled in the arguments.
-
-    Args:
-        vae_args: VAEArgs configuration object
-        models: Dictionary containing models and training configs
-
-    Returns:
-        Optional[VAEFineTuner]: Configured VAE finetuner if enabled, None otherwise.
-    """
-    if not vae_args.finetune_vae:
-        return None
-
-    try:
-        # Determine device
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        vae_finetuner = VAEFineTuner(
-            vae=models["vae"],
-            device=device,
-            mixed_precision="fp16" if torch.cuda.is_available() else "no",
-            use_amp=torch.cuda.is_available(),
-            learning_rate=vae_args.learning_rate,
-            # Use the VAE's own config values
-            adam_beta1=0.9,  # Default Adam beta1
-            adam_beta2=0.999,  # Default Adam beta2
-            adam_epsilon=1e-8,  # Default Adam epsilon
-            weight_decay=vae_args.weight_decay,
-            max_grad_norm=vae_args.max_grad_norm,
-            gradient_checkpointing=vae_args.gradient_checkpointing,
-            use_8bit_adam=False,  # Default to standard Adam for VAE
-            use_channel_scaling=vae_args.use_channel_scaling,
-            adaptive_loss_scale=vae_args.adaptive_loss_scale,
-            kl_weight=vae_args.kl_weight,
-            perceptual_weight=vae_args.perceptual_weight,
-            min_snr_gamma=vae_args.min_snr_gamma,
-            initial_scale_factor=vae_args.initial_scale_factor,
-            decay=vae_args.decay,
-            update_after_step=vae_args.update_after_step,
-        )
-        return vae_finetuner
-    except Exception as e:
-        logger.error("Failed to setup VAE finetuner: %s", str(e))
-        raise
-
-@lru_cache(maxsize=32)
-def _get_tag_weighter_config(
-    base_weight: float,
-    min_weight: float,
-    max_weight: float,
-    window_size: int,
-    no_cache: bool = False,
-) -> Dict[str, Any]:
-    """Cache tag weighter configuration."""
-    return {
-        "base_weight": base_weight,
-        "min_weight": min_weight,
-        "max_weight": max_weight,
-        "window_size": window_size,
-        "no_cache": no_cache,
-    }
-
-
-def setup_tag_weighter(args) -> Optional[CaptionProcessor]:
-    """Initialize tag weighting system with CaptionProcessor.
-    
-    Args:
-        args: Configuration arguments containing tag weighting settings
-        
-    Returns:
-        Configured CaptionProcessor instance or None if tag weighting is disabled
-        
-    Raises:
-        ValueError: If required configuration is missing
-        RuntimeError: If initialization fails
-    """
-    try:
-        if not args.data.use_tag_weighting:
-            return None
-
-        # Initialize CaptionProcessor with configuration
-        processor = CaptionProcessor(
-            token_dropout_rate=args.data.token_dropout_rate,
-            caption_dropout_rate=args.data.caption_dropout_rate,
-            rarity_factor=0.9,  # Default value
-            emphasis_factor=1.2  # Default value
-        )
-        
-        # Set weight boundaries
-        processor.MIN_WEIGHT = args.data.min_tag_weight
-        processor.MAX_WEIGHT = args.data.max_tag_weight
-        
-        logger.info(
-            "Initialized CaptionProcessor with tag weighting: "
-            f"min_weight={processor.MIN_WEIGHT}, "
-            f"max_weight={processor.MAX_WEIGHT}, "
-            f"rarity_factor={processor.rarity_factor}, "
-            f"emphasis_factor={processor.emphasis_factor}"
-        )
-        
-            
-        return processor
-
-    except Exception as e:
-        logger.error(f"Failed to setup CaptionProcessor: {str(e)}")
-        raise RuntimeError(f"Failed to setup tag weighting system: {str(e)}") from e
-
-
 @dataclass
-class AverageMeter:
-    """Fully pickleable average meter."""
+class TrainingConfig:
+    """Configuration for training pipeline."""
+    batch_size: int = 1
+    num_epochs: int = 100
+    learning_rate: float = 1e-5
+    mixed_precision: str = "fp16"
+    gradient_checkpointing: bool = False
+    gradient_accumulation_steps: int = 1
+    max_grad_norm: Optional[float] = 1.0
+    use_8bit_adam: bool = False
+    use_ema: bool = True
+    ema_decay: float = 0.9999
+    train_text_encoder: bool = False
+    validation_epochs: int = 5
+    save_epochs: int = 10
 
-    name: str
-    fmt: str = ":f"
-    window_size: Optional[int] = None
-
-    def __post_init__(self):
-        self._val: float = 0
-        self._sum: float = 0
-        self._count: int = 0
-        self._avg: float = 0
-        self._history: List[float] = []
-
-    def __getstate__(self):
-        """Get state for pickling."""
-        return {
-            "name": self.name,
-            "fmt": self.fmt,
-            "window_size": self.window_size,
-            "_val": self._val,
-            "_sum": self._sum,
-            "_count": self._count,
-            "_avg": self._avg,
-            "_history": self._history,
-        }
-
-    def __setstate__(self, state):
-        """Set state for unpickling."""
-        self.__dict__.update(state)
-
-    def reset(self) -> None:
-        """Reset all metrics."""
-        self._val = 0
-        self._sum = 0
-        self._count = 0
-        self._avg = 0
-        self._history.clear()
-
-    def update(self, val: Union[float, np.ndarray, torch.Tensor], n: int = 1) -> None:
-        """Update with support for tensors and arrays."""
-        if isinstance(val, (torch.Tensor, np.ndarray)):
-            val = float(
-                val.detach().cpu().item() if torch.is_tensor(val) else val.item()
-            )
-
-        self._val = val
-        self._sum += val * n
-        self._count += n
-        self._avg = self._sum / self._count
-
-        if self.window_size:
-            self._history.append(val)
-            if len(self._history) > self.window_size:
-                self._history.pop(0)
-            self._avg = np.mean(self._history)
-
-    @property
-    def val(self) -> float:
-        """Get the most recent value added to the meter.
-
-        Returns:
-            float: The last value that was added
-        """
-        return self._val
-
-    @property
-    def avg(self) -> float:
-        """Get the average of all values in the meter.
-
-        Returns:
-            float: The running average value
-        """
-        return self._avg
-
-    @property
-    def sum(self) -> float:
-        """Get the sum of all values added to the meter.
-
-        Returns:
-            float: The total sum of values
-        """
-        return self._sum
-
-    @property
-    def count(self) -> int:
-        """Get the count of values that have been added.
-
-        Returns:
-            int: The total number of updates
-        """
-        return self._count
-
-
-class MetricsManager:
-    """Fully process-safe metrics manager."""
-
-    def __init__(self):
-        self._manager = Manager()
-        self._metrics = self._manager.dict()
-
-    def get_metric(self, name: str) -> AverageMeter:
-        """Retrieve or create a metric by name.
-
-        Args:
-            name (str): The name of the metric to retrieve
-
-        Returns:
-            AverageMeter: The metric object associated with the given name
-        """
-        if name not in self._metrics:
-            self._metrics[name] = AverageMeter(name=name)
-        return self._metrics[name]
-
-    def update_metric(self, name: str, value: float, n: int = 1) -> None:
-        """Update a metric with a new value.
-
-        Args:
-            name (str): The name of the metric to update
-            value (float): The value to update the metric with
-            n (int, optional): The weight of the update. Defaults to 1.
-        """
-        metric = self.get_metric(name)
-        metric.update(value, n)
-        self._metrics[name] = metric  # Update in shared dict
-
-    def get_all_metrics(self) -> Dict[str, float]:
-        """Get all metrics as a dictionary of averages.
-
-        Returns:
-            Dict[str, float]: A dictionary mapping metric names to their current average values
-        """
-        return {name: meter.avg for name, meter in dict(self._metrics).items()}
-
-
-def initialize_training_components(args, models):
-    """Initialize all training components with proper error handling"""
-    components = {}
-
-    try:
-        # Setup optimizer with validation
-        if not models.get("unet"):
-            raise ValueError("UNet model not found in models dictionary")
-        components["optimizer"] = setup_optimizer(args, models)
-
-        # Setup data loader with validation
-        required_models = [
-            "vae",
-            "tokenizer",
-            "tokenizer_2",
-            "text_encoder",
-            "text_encoder_2",
-        ]
-        if not all(k in models for k in required_models):
-            raise ValueError(
-                f"Missing required models: {[k for k in required_models if k not in models]}"
-            )
-
-        # Create process-safe copies of models for the dataloader
-        dataloader_models = {}
-        for key in required_models:
-            model = models[key]
-            if key == "vae":
-                # Special handling for VAE
-                dataloader_models[key] = AutoencoderKL.from_config(model.config)
-                dataloader_models[key].load_state_dict(model.state_dict())
-            elif hasattr(model, "state_dict"):
-                if hasattr(model, "config"):
-                    # Handle transformers models
-                    if "CLIPTextModel" in model.__class__.__name__:
-                        dataloader_models[key] = type(model)(config=model.config)
-                        dataloader_models[key].load_state_dict(model.state_dict())
-                    else:
-                        # Handle other models with configs
-                        dataloader_models[key] = type(model)(**model.config)
-                        dataloader_models[key].load_state_dict(model.state_dict())
-                else:
-                    # Handle models without config
-                    dataloader_models[key] = type(model)()
-                    dataloader_models[key].load_state_dict(model.state_dict())
-            else:
-                # For tokenizers and other objects that don't need special handling
-                dataloader_models[key] = model
-
-        # Initialize data loader
-        components["train_dataloader"] = DataLoader(
-            dataset=CustomDataset(
-                data_dir=args.data.data_dir,
-                tokenizer=dataloader_models["tokenizer"],
-                tokenizer_2=dataloader_models["tokenizer_2"],
-                text_encoder=dataloader_models["text_encoder"],
-                text_encoder_2=dataloader_models["text_encoder_2"],
-                vae=dataloader_models["vae"],
-                cache_dir=args.data.cache_dir,
-                no_caching_latents=args.data.no_caching,
-                use_tag_weighting=args.data.use_tag_weighting,
-                min_size=args.data.min_size,
-                max_size=args.data.max_size,
-                bucket_step_size=args.data.bucket_step_size,
-                max_bucket_area=args.data.max_bucket_area,
-                token_dropout_rate=args.data.token_dropout_rate,
-                caption_dropout_rate=args.data.caption_dropout_rate,
-                min_tag_weight=args.data.min_tag_weight,
-                max_tag_weight=args.data.max_tag_weight,
-                all_ar=args.data.all_ar
-            ),
-            batch_size=args.training.batch_size,
-            shuffle=True,
-            pin_memory=True,
-            drop_last=True,
-        )
-
-        # Setup scheduler
-        num_update_steps_per_epoch = (
-            len(components["train_dataloader"])
-            // args.training.gradient_accumulation_steps
-        )
-        components["scheduler"] = get_cosine_schedule_with_warmup(
-            optimizer=components["optimizer"],
-            num_warmup_steps=args.training.warmup_steps,
-            num_training_steps=num_update_steps_per_epoch * args.training.num_epochs,
-        )
-
-        optional_components = {
-            "ema": (
-                lambda args, models, model_path: EMAModel(
-                    model=models["unet"],
-                    model_path=model_path,
-                    decay=args.ema.decay,
-                    update_after_step=args.ema.update_after_step,
-                    update_every=args.ema.update_every,
-                    use_ema_warmup=args.ema.use_ema_warmup,
-                    power=args.ema.power,
-                    min_decay=args.ema.min_decay,
-                    max_decay=args.ema.max_decay,
-                    mixed_precision=args.ema.mixed_precision,
-                    gradient_checkpointing=args.system.gradient_checkpointing
-                ) if args.ema.use_ema else None,
-                args.ema.use_ema,
-                (args, {"unet": models["unet"]}, args.model.model_path)
-            ),
-            "tag_weighter": (
-                setup_tag_weighter, 
-                args.data.use_tag_weighting, 
-                (args,)
-            ),
-            "vae_finetuner": (
-                setup_vae_finetuner, 
-                args.vae.finetune_vae, 
-                (args.vae, models)
-            ),
-        }
-
-
-
-        # Initialize optional components
-        for name, (setup_func, use_flag, setup_args) in optional_components.items():
-            try:
-                if use_flag:
-                    components[name] = setup_func(*setup_args)
-                else:
-                    components[name] = None
-            except Exception as e:
-                logger.error(f"Failed to initialize {name}: {str(e)}")
-                raise RuntimeError(f"Failed to initialize {name}: {str(e)}") from e
-
-        # Setup metrics tracking
-        components["metrics"] = MetricsManager()
-
-        # Validate components
-        _validate_components(components)
-
-        return components
-
-    except (ValueError, RuntimeError, AttributeError) as e:
-        _cleanup_failed_initialization(components)
-        raise type(e)(f"Failed to initialize training components: {str(e)}") from e
-
-
-def _validate_components(components: Dict[str, Any]) -> None:
-    """Validate initialized components."""
-    required = ["optimizer", "train_dataloader", "scheduler", "metrics"]
-    if not all(k in components for k in required):
-        raise ValueError(
-            f"Missing required components: {[k for k in required if k not in components]}"
-        )
-
-
-def _cleanup_failed_initialization(components: Dict[str, Any]) -> None:
-    """Clean up resources in case of failed initialization."""
-    try:
-        # Close data loader if it was created
-        if "train_dataloader" in components:
-            try:
-                components["train_dataloader"].dataset.cleanup()
-            except (AttributeError, RuntimeError, IOError, OSError) as e:
-                raise type(e)(f"Failed to cleanup train dataloader: {str(e)}") from e
-            except (KeyError, TypeError) as e:
-                raise type(e)(f"Invalid train dataloader configuration: {str(e)}") from e
-
-        # Clear CUDA cache
-        if torch.cuda.is_available():
-            try:
-                torch.cuda.empty_cache()
-                gc.collect()
-            except (RuntimeError, torch.cuda.CudaError) as e:
-                raise type(e)(f"Failed to clear CUDA cache: {str(e)}") from e
-
-    except (KeyError, TypeError, AttributeError) as e:
-        raise type(e)(f"Failed to cleanup training resources: {str(e)}") from e
-
-
-def train_epoch(
-    epoch: int,
-    args,
-    models: Dict[str, Any],
-    components: Dict[str, Any],
-    device: torch.device,
-    dtype: torch.dtype,
-    global_step: int = 0,
-) -> Dict[str, float]:
-    """Train for one epoch and return metrics.
+class SDXLTrainer:
+    """Main trainer class for SDXL model improvements."""
     
-    Args:
-        epoch: Current epoch number
-        args: Training configuration
-        models: Dictionary of models (unet, vae, etc.)
-        components: Dictionary of training components (optimizer, scheduler, etc.)
-        device: Device to train on
-        dtype: Data type for training
-        global_step: Global training step counter
-    """
-    models["unet"].train()
-    
-    # Initialize progress bar
-    progress = tqdm(
-        total=len(components["train_dataloader"]),
-        desc=f"Training epoch {epoch}",
-        leave=False,
-    )
-
-    # Initialize metrics for this epoch
-    epoch_metrics = defaultdict(float)
-    samples_seen = 0
-    current_step = global_step
-
-    for batch_idx, batch in enumerate(components["train_dataloader"]):
-        with components.get("metrics", nullcontext()) as metrics:
-            # Forward pass
-            with torch.cuda.amp.autocast(enabled=args.system.mixed_precision):
-                loss = forward_pass(args, models, batch, device, dtype, components)
-                loss = loss / args.training.gradient_accumulation_steps
-
-            # Update metrics
-            if metrics:
-                metrics.update("loss", loss.item() * args.training.gradient_accumulation_steps)
-                epoch_metrics["loss"] += loss.item() * args.training.gradient_accumulation_steps
-                samples_seen += 1
-
-            # Backward pass and optimization
-            if args.system.mixed_precision:
-                components["scaler"].scale(loss).backward()
-                if (batch_idx + 1) % args.training.gradient_accumulation_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        models["unet"].parameters(), args.training.max_grad_norm
-                    )
-                    components["scaler"].step(components["optimizer"])
-                    components["scaler"].update()
-                    components["scheduler"].step()
-                    components["optimizer"].zero_grad()
-                    current_step += 1
-            else:
-                loss.backward()
-                if (batch_idx + 1) % args.training.gradient_accumulation_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        models["unet"].parameters(), args.training.max_grad_norm
-                    )
-                    components["optimizer"].step()
-                    components["scheduler"].step()
-                    components["optimizer"].zero_grad()
-                    current_step += 1
-
-            # Update EMA model if enabled
-            if (
-                components.get("ema") is not None
-                and (batch_idx + 1) % args.training.gradient_accumulation_steps == 0
-            ):
-                components["ema"].step(models["unet"])
-
+    def __init__(
+        self,
+        config: TrainingConfig,
+        models: Dict[str, Any],
+        train_dataloader: torch.utils.data.DataLoader,
+        val_dataloader: Optional[torch.utils.data.DataLoader] = None,
+        device: str = "cuda",
+    ):
+        self.config = config
+        self.models = models
+        self.train_dataloader = train_dataloader
+        self.val_dataloader = val_dataloader
+        self.device = torch.device(device)
+        self.dtype = torch.float16 if config.mixed_precision == "fp16" else torch.float32
+        
+        # Initialize components (optimizer, scheduler, etc.)
+        self.components = initialize_training_components(config, models)
+        self.metrics_manager = MetricsManager()
+        
+        # Move models to device
+        for model in self.models.values():
+            model.to(self.device)
+            
+    def train(self, save_dir: str):
+        """Execute training loop with validation."""
+        for epoch in range(self.config.num_epochs):
+            # Training epoch
+            self.train_epoch(epoch)
+            
+            # Validation
+            if self.val_dataloader and epoch % self.config.validation_epochs == 0:
+                self.validate(epoch)
+                
+            # Save checkpoint
+            if epoch % self.config.save_epochs == 0:
+                self.save_checkpoint(save_dir, epoch)
+                
+    def train_epoch(self, epoch: int):
+        """Execute single training epoch."""
+        total_loss = 0
+        num_batches = len(self.train_dataloader)
+        
+        for batch_idx, batch in enumerate(self.train_dataloader):
+            # Move batch to device
+            batch = {k: v.to(self.device) if torch.is_tensor(v) else v 
+                    for k, v in batch.items()}
+            
+            # Training step
+            loss_dict = train_step(
+                self.config,
+                self.models,
+                self.components,
+                batch,
+                batch_idx,
+                self.device,
+                self.dtype,
+                self.metrics_manager
+            )
+            
+            total_loss += loss_dict["total_loss"]
+            
             # Log progress
-            if metrics and batch_idx % args.logging.logging_steps == 0:
-                metrics.log_metrics(
-                    step=current_step,
-                    epoch=epoch,
-                    learning_rate=components["scheduler"].get_last_lr()[0],
-                )
-
-            # Run validation if needed
-            if (
-                args.validation.validation_steps > 0
-                and current_step > 0
-                and current_step % args.validation.validation_steps == 0
-            ):
-                run_validation(args, models, components, device, dtype, global_step=current_step)
-
-        # Update progress bar
-        progress.update(1)
-        if batch_idx % args.logging.logging_steps == 0:
-            progress.set_postfix(
-                {
-                    "loss": epoch_metrics["loss"] / samples_seen if samples_seen > 0 else 0,
-                    "lr": components["scheduler"].get_last_lr()[0],
-                    "step": current_step,
-                }
-            )
-
-    progress.close()
-
-    # Log epoch metrics
-    epoch_metrics = {k: v / samples_seen for k, v in epoch_metrics.items()} if samples_seen > 0 else {}
-    if components.get("metrics"):
-        components["metrics"].log_epoch_metrics(
-            epoch=epoch,
-            metrics=epoch_metrics,
-            step=current_step,
+            if batch_idx % 10 == 0:
+                logger.info(f"Epoch {epoch} [{batch_idx}/{num_batches}]: "
+                          f"Loss: {loss_dict['total_loss']:.4f}")
+                
+        avg_loss = total_loss / num_batches
+        logger.info(f"Epoch {epoch} completed. Average loss: {avg_loss:.4f}")
+        
+    def validate(self, epoch: int):
+        """Run validation loop."""
+        metrics = validate_model(
+            self.config,
+            self.models,
+            self.val_dataloader,
+            self.device,
+            self.dtype
         )
-
-    # Save checkpoint if needed
-    if epoch % args.logging.save_epochs == 0:
-        training_history = {
-            'loss_history': epoch_metrics,
-            'total_steps': current_step
+        logger.info(f"Validation metrics for epoch {epoch}: {metrics}")
+        
+    def save_checkpoint(self, save_dir: str, epoch: int):
+        """Save training checkpoint."""
+        checkpoint = {
+            'epoch': epoch,
+            'model_state': {name: model.state_dict() 
+                          for name, model in self.models.items()},
+            'optimizer_state': self.components['optimizer'].state_dict(),
+            'config': self.config,
         }
-        save_checkpoint(
-            args.logging.checkpoint_dir,
-            models,
-            components,
-            training_history
+        
+        if 'ema_model' in self.components:
+            checkpoint['ema_state'] = self.components['ema_model'].state_dict()
+            
+        save_path = f"{save_dir}/checkpoint_epoch_{epoch}.pt"
+        torch.save(checkpoint, save_path)
+        logger.info(f"Saved checkpoint to {save_path}")
+        
+    @classmethod
+    def load_checkpoint(cls, checkpoint_path: str, train_dataloader, val_dataloader=None):
+        """Load training checkpoint and reconstruct trainer."""
+        checkpoint = torch.load(checkpoint_path)
+        
+        # Reconstruct trainer
+        trainer = cls(
+            config=checkpoint['config'],
+            models={name: type(model)() for name, model in checkpoint['model_state'].items()},
+            train_dataloader=train_dataloader,
+            val_dataloader=val_dataloader
         )
         
-    return epoch_metrics
-
-
-def train(args, models, components, device, dtype) -> Dict[str, float]:
-    """Execute training steps with proper error handling."""
-    metrics_manager = components["metrics_manager"]
-
-    # Set model to training mode
-    models["unet"].train()
-    if getattr(args, "train_text_encoder", False):
-        models["text_encoder"].train()
-        models["text_encoder_2"].train()
-
-    start_time = time.time()
-
-    progress_bar = tqdm(
-        components["train_dataloader"],
-        desc="Training",
-        dynamic_ncols=True,
-        leave=False,
-    )
-
-    try:
-        for batch_idx, batch in enumerate(progress_bar):
-            try:
-                metrics_manager.update_metric("data_time", time.time() - start_time)
-
-                # Execute training step
-                batch_metrics = train_step(
-                    args=args,
-                    models=models,
-                    components=components,
-                    batch=batch,
-                    batch_idx=batch_idx,
-                    device=device,
-                    dtype=dtype,
-                )
-
-                # Update metrics
-                for k, v in batch_metrics.items():
-                    metrics_manager.update_metric(k, v)
-
-                # Update progress bar
-                progress_bar.set_postfix(
-                    {
-                        k: f"{v:.6f}"
-                        for k, v in metrics_manager.get_all_metrics().items()
-                    }
-                )
-
-                metrics_manager.update_metric("batch_time", time.time() - start_time)
-                start_time = time.time()
-
-            except (ValueError, RuntimeError, AttributeError) as e:
-                raise type(e)(f"Failed during training step: {str(e)}") from e
-
-        return metrics_manager.get_all_metrics()
-
-    finally:
-        progress_bar.close()
-
-        # Set models back to eval mode if needed
-        models["unet"].eval()
-        if getattr(args, "train_text_encoder", False):
-            models["text_encoder"].eval()
-            models["text_encoder_2"].eval()
-
-
-def train_step(
-    args, models, components, batch, batch_idx: int, device, dtype
-) -> Dict[str, float]:
-    """Execute single training step with proper error handling."""
-    try:
-        # Move batch to device
-        batch = {
-            k: v.to(device=device, dtype=dtype) if isinstance(v, torch.Tensor) else v
-            for k, v in batch.items()
-        }
-
-        # Zero gradients
-        components["optimizer"].zero_grad(set_to_none=True)
-
-        # Forward pass with autocast
-        with torch.cuda.amp.autocast(enabled=args.system.mixed_precision):
-            # Get loss from model
-            loss = models["unet"](
-                x_0=batch["latents"],
-                sigma=batch["sigmas"],
-                text_embeddings=batch["text_embeddings"],
-                added_cond_kwargs=batch.get("added_cond_kwargs"),
-                sigma_data=args.sigma_data,
-                tag_weighter=components.get("tag_weighter"),
-                batch_tags=batch.get("tags"),
-                min_snr_gamma=args.min_snr_gamma,
-                rescale_cfg=args.rescale_cfg,
-                rescale_multiplier=args.rescale_multiplier,
-                scale_method=args.scale_method,
-                use_tag_weighting=args.use_tag_weighting,
-                device=device,
-                dtype=dtype,
-            )
-
-            # Scale loss for gradient accumulation
-            if args.training.gradient_accumulation_steps > 1:
-                loss = loss / args.training.gradient_accumulation_steps
-
-        # Backward pass with gradient scaling
-        if args.system.mixed_precision:
-            components["scaler"].scale(loss).backward()
-            if (batch_idx + 1) % args.training.gradient_accumulation_steps == 0:
-                components["scaler"].unscale_(components["optimizer"])
-                torch.nn.utils.clip_grad_norm_(
-                    models["unet"].parameters(), args.training.max_grad_norm
-                )
-                components["scaler"].step(components["optimizer"])
-                components["scaler"].update()
-                components["scheduler"].step()
-        else:
-            loss.backward()
-            if (batch_idx + 1) % args.training.gradient_accumulation_steps == 0:
-                torch.nn.utils.clip_grad_norm_(
-                    models["unet"].parameters(), args.training.max_grad_norm
-                )
-                components["optimizer"].step()
-                components["scheduler"].step()
-
-        # Update EMA model if enabled
-        if (
-            components.get("ema") is not None
-            and (batch_idx + 1) % args.training.gradient_accumulation_steps == 0
-        ):
-            components["ema"].step(models["unet"])
-
-        # Update VAE if enabled
-        if components.get("vae_finetuner") is not None:
-            vae_metrics = components["vae_finetuner"].train_step(batch)
-        else:
-            vae_metrics = {}
-
-        # Compute metrics
-        metrics = {
-            "loss": loss.item(),
-            "lr": components["optimizer"].param_groups[0]["lr"],
-            "grad_norm": get_grad_norm(models["unet"]),
-            **vae_metrics,
-        }
-
-        if components.get("ema"):
-            metrics["ema_decay"] = components["ema"].cur_decay_value
-
-        return metrics
-
-    except (ValueError, RuntimeError, AttributeError) as e:
-        raise type(e)(f"Failed to execute training step: {str(e)}") from e
-
-
-def get_grad_norm(model: torch.nn.Module) -> float:
-    """Calculate gradient norm with proper error handling."""
-    try:
-        total_norm = 0.0
-        for p in model.parameters():
-            if p.grad is not None:
-                param_norm = p.grad.detach().data.norm(2)
-                total_norm += param_norm.item() ** 2
-        return math.sqrt(total_norm)
-    except (ValueError, RuntimeError, AttributeError) as e:
-        raise type(e)(f"Failed to calculate gradient norm: {str(e)}") from e
-
-
-def run_validation(
-    args, models, components, device, dtype, global_step: int
-) -> Dict[str, float]:
-    """Run validation with proper error handling and metrics tracking."""
-    try:
-        # Initialize inference pipeline if not already in components
-        if "inference" not in components:
-            components["inference"] = SDXLInference(
-                device=device,
-                dtype=dtype,
-                use_v_prediction=args.training_mode == "v_prediction",
-            )
-
-        # Set models to eval mode
-        for model in models.values():
-            if isinstance(model, torch.nn.Module):
-                model.eval()
-
-        # Run validation
-        with torch.no_grad():
-            # Run validation using configured prompts
-            validation_metrics = components["inference"].run_validation(
-                prompts=args.validation_prompts,
-                output_dir=os.path.join(
-                    args.output_dir, f"validation_{global_step}"
-                ),
-                log_to_wandb=args.use_wandb,
-                guidance_scale=args.validation_guidance_scale,
-                num_inference_steps=args.validation_num_steps,
-                height=args.validation_height,
-                width=args.validation_width,
-                num_images_per_prompt=args.validation_images_per_prompt,
-                seed=args.validation_seed,
-                rescale_cfg=args.rescale_cfg,
-                scale_method=args.scale_method,
-                rescale_multiplier=args.rescale_multiplier,
-            )
-
-            # Add EMA metrics if enabled
-            if components.get("ema"):
-                validation_metrics["validation/ema_decay"] = components[
-                    "ema"
-                ].cur_decay_value
-
-            return validation_metrics
-
-    finally:
-        # Set models back to train mode
-        for model in models.values():
-            if isinstance(model, torch.nn.Module):
-                model.train()
-
-        # Clear CUDA cache
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # Load states
+        for name, state in checkpoint['model_state'].items():
+            trainer.models[name].load_state_dict(state)
+        trainer.components['optimizer'].load_state_dict(checkpoint['optimizer_state'])
+        
+        if 'ema_state' in checkpoint and 'ema_model' in trainer.components:
+            trainer.components['ema_model'].load_state_dict(checkpoint['ema_state'])
+            
+        return trainer

@@ -414,3 +414,7 @@ class VAEFineTuner:
             self.optimizer.load_state_dict(state['optimizer'])
             self.scale_factor = state['scale_factor']
             self.loss_meter.set_loss_history(state['loss_history'])
+
+def setup_vae_finetuner(args, vae, train_dataloader, val_dataloader=None):
+    """Set up VAE finetuner"""
+    return VAEFineTuner(args, vae, train_dataloader, val_dataloader)

@@ -23,6 +23,7 @@ class ModelArgs:
     model_path: str
     output_dir: str = "./output"
 
+
 @dataclass
 class TrainingArgs:
     """Training hyperparameters and configuration.
@@ -73,25 +74,38 @@ class TrainingArgs:
     mixed_precision: str = "fp16"
     use_amp: bool = False
 
+
 @dataclass
 class OptimizerArgs:
     """
     Configuration arguments for the optimizer.
 
     Attributes:
+        optimizer_type: The type of optimizer to use, either 'adamw', 'adamw8bit', or 'soap'.
         adam_beta1: The beta1 parameter for the Adam optimizer.
         adam_beta2: The beta2 parameter for the Adam optimizer.
         adam_epsilon: The epsilon value for numerical stability in Adam.
         weight_decay: The weight decay (L2 penalty) applied during optimization.
-        use_adafactor: Whether to use the Adafactor optimizer.
-        use_8bit_adam: Whether to use 8-bit Adam optimizer for reduced memory usage.
+        use_8bit_adam: Whether to use the 8-bit Adam optimizer for reduced memory usage.
+        soap_adafactor_beta2: The beta2 parameter for the Adafactor optimizer in SOAP.
+        soap_adafactor_clip_threshold: The clip threshold for the Adafactor optimizer in SOAP.
+        soap_adafactor_eps: The epsilon value for numerical stability in Adafactor.
+        soap_adafactor_warmup_init: Whether to use warmup initialization for Adafactor in SOAP.
+        soap_adafactor_relative_step: Whether to use relative step size for Adafactor in SOAP.
+        soap_adafactor_scale_parameter: Whether to scale the parameter for Adafactor in SOAP.
     """
+    optimizer_type: str = "adamw"
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
     adam_epsilon: float = 1e-8
     weight_decay: float = 1e-2
-    use_adafactor: bool = False
     use_8bit_adam: bool = False
+    soap_adafactor_beta2: float = 0.99
+    soap_adafactor_clip_threshold: float = 1.0
+    soap_adafactor_eps: float = 1e-30
+    soap_adafactor_warmup_init: bool = True
+    soap_adafactor_relative_step: bool = True
+    soap_adafactor_scale_parameter: bool = True
 
 
 @dataclass
@@ -100,24 +114,17 @@ class EMAArgs:
 
     Attributes:
         use_ema: Whether to use EMA.
-        decay: The decay rate for EMA.
+        ema_decay: The decay rate for EMA.
         update_after_step: The number of steps after which EMA is updated.
-        power: The power to which the decay is raised.
-        min_decay: The minimum decay rate.
-        max_decay: The maximum decay rate.
-        update_every: The number of steps between EMA updates.
         use_ema_warmup: Whether to use a warmup schedule for EMA.
-        mixed_precision: Mixed precision mode for EMA model ('no', 'fp16', or 'bf16').
+        ema_warmup_steps: The number of warmup steps for EMA.
     """
     use_ema: bool = True
-    decay: float = 0.9999
+    ema_decay: float = 0.9999
     update_after_step: int = 100
-    power: float = 0.6667
-    min_decay: float = 0.0
-    max_decay: float = 0.9999
-    update_every: int = 1
     use_ema_warmup: bool = True
-    mixed_precision: str = "bf16"
+    ema_warmup_steps: int = 2000
+
 
 @dataclass
 class VAEArgs:
@@ -159,6 +166,7 @@ class VAEArgs:
     gradient_checkpointing: bool = False
     min_snr_gamma: float = 5.0
 
+
 @dataclass
 class DataArgs:
     """
@@ -166,6 +174,7 @@ class DataArgs:
 
     Attributes:
         data_dir: Directory containing the dataset.
+        validation_dir: Directory containing the validation dataset.
         cache_dir: Directory for caching intermediate data.
         no_caching: Whether to disable caching.
         num_inference_steps: Number of inference steps to use in processing.
@@ -181,6 +190,7 @@ class DataArgs:
         use_tag_weighting: Whether to use tag weighting.
     """
     data_dir: str
+    validation_dir: Optional[str] = None
     cache_dir: str = "latents_cache"
     no_caching: bool = False
     num_inference_steps: int = 28
@@ -195,6 +205,7 @@ class DataArgs:
     max_tag_weight: float = 3.0
     use_tag_weighting: bool = True
 
+
 @dataclass
 class TagWeightingArgs:
     """Configuration arguments for tag weighting.
@@ -204,8 +215,10 @@ class TagWeightingArgs:
         min_tag_weight: The minimum tag weight.
         max_tag_weight: The maximum tag weight.
     """
-    # These parameters are moved to DataArgs since they are needed for dataset initialization
-    pass
+    use_tag_weighting: bool = True
+    min_tag_weight: float = 0.1
+    max_tag_weight: float = 3.0
+
 
 @dataclass
 class SystemArgs:
@@ -252,6 +265,7 @@ class LoggingArgs:
     logging_steps: int = 100
     validation_steps: int = 500
 
+
 @dataclass
 class TrainingConfig:
     """
@@ -278,6 +292,7 @@ class TrainingConfig:
     tag_weighting: TagWeightingArgs
     system: SystemArgs
     logging: LoggingArgs
+
 
 def parse_args() -> TrainingConfig:
     """
@@ -314,23 +329,25 @@ def parse_args() -> TrainingConfig:
     parser.add_argument("--scale_factor", type=float, default=0.7)
     
     # Optimizer arguments
+    parser.add_argument("--optimizer_type", type=str, default="adamw", choices=["adamw", "adamw8bit", "soap"])
     parser.add_argument("--adam_beta1", type=float, default=0.9)
     parser.add_argument("--adam_beta2", type=float, default=0.999)
     parser.add_argument("--adam_epsilon", type=float, default=1e-8)
     parser.add_argument("--weight_decay", type=float, default=1e-2)
-    parser.add_argument("--use_adafactor", action="store_true")
     parser.add_argument("--use_8bit_adam", action="store_true")
+    parser.add_argument("--soap_adafactor_beta2", type=float, default=0.99)
+    parser.add_argument("--soap_adafactor_clip_threshold", type=float, default=1.0)
+    parser.add_argument("--soap_adafactor_eps", type=float, default=1e-30)
+    parser.add_argument("--soap_adafactor_warmup_init", action="store_true")
+    parser.add_argument("--soap_adafactor_relative_step", action="store_true")
+    parser.add_argument("--soap_adafactor_scale_parameter", action="store_true")
     
     # EMA arguments
     parser.add_argument("--use_ema", action="store_true", default=True)
-    parser.add_argument("--decay", type=float, default=0.9999)
+    parser.add_argument("--ema_decay", type=float, default=0.9999)
     parser.add_argument("--update_after_step", type=int, default=100)
-    parser.add_argument("--power", type=float, default=0.6667)
-    parser.add_argument("--min_decay", type=float, default=0.0)
-    parser.add_argument("--max_decay", type=float, default=0.9999)
-    parser.add_argument("--update_every", type=int, default=1)
     parser.add_argument("--use_ema_warmup", action="store_true", default=True)
-    parser.add_argument("--mixed_precision", type=str, default="bf16", choices=["no", "fp16", "bf16"])
+    parser.add_argument("--ema_warmup_steps", type=int, default=2000)
     
     # System arguments
     parser.add_argument("--enable_compile", action="store_true")
@@ -355,6 +372,7 @@ def parse_args() -> TrainingConfig:
     
     # Data arguments
     parser.add_argument("--data_dir", type=str, required=True)
+    parser.add_argument("--validation_dir", type=str)
     parser.add_argument("--cache_dir", type=str, default="latents_cache")
     parser.add_argument("--no_caching", action="store_true")
     parser.add_argument("--num_inference_steps", type=int, default=28)
@@ -417,23 +435,25 @@ def parse_args() -> TrainingConfig:
             use_amp=False,
         ),
         optimizer=OptimizerArgs(
+            optimizer_type=args.optimizer_type,
             adam_beta1=args.adam_beta1,
             adam_beta2=args.adam_beta2,
             adam_epsilon=args.adam_epsilon,
             weight_decay=args.weight_decay,
-            use_adafactor=args.use_adafactor,
-            use_8bit_adam=args.use_8bit_adam
+            use_8bit_adam=args.use_8bit_adam,
+            soap_adafactor_beta2=args.soap_adafactor_beta2,
+            soap_adafactor_clip_threshold=args.soap_adafactor_clip_threshold,
+            soap_adafactor_eps=args.soap_adafactor_eps,
+            soap_adafactor_warmup_init=args.soap_adafactor_warmup_init,
+            soap_adafactor_relative_step=args.soap_adafactor_relative_step,
+            soap_adafactor_scale_parameter=args.soap_adafactor_scale_parameter,
         ),
         ema=EMAArgs(
             use_ema=args.use_ema,
-            decay=args.decay,
+            ema_decay=args.ema_decay,
             update_after_step=args.update_after_step,
-            power=args.power,
-            min_decay=args.min_decay,
-            max_decay=args.max_decay,
-            update_every=args.update_every,
             use_ema_warmup=args.use_ema_warmup,
-            mixed_precision=args.mixed_precision,
+            ema_warmup_steps=args.ema_warmup_steps,
         ),
         vae=VAEArgs(
             use_vae=args.use_vae,
@@ -455,6 +475,7 @@ def parse_args() -> TrainingConfig:
         ),
         data=DataArgs(
             data_dir=args.data_dir,
+            validation_dir=args.validation_dir,
             cache_dir=args.cache_dir,
             no_caching=args.no_caching,
             num_inference_steps=args.num_inference_steps,
@@ -469,7 +490,11 @@ def parse_args() -> TrainingConfig:
             max_tag_weight=args.max_tag_weight,
             use_tag_weighting=args.use_tag_weighting
         ),
-        tag_weighting=TagWeightingArgs(),
+        tag_weighting=TagWeightingArgs(
+            use_tag_weighting=args.use_tag_weighting,
+            min_tag_weight=args.min_tag_weight,
+            max_tag_weight=args.max_tag_weight,
+        ),
         system=SystemArgs(
             enable_compile=args.enable_compile,
             compile_mode=args.compile_mode,
