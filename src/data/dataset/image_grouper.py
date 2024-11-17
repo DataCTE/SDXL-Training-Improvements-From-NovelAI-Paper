@@ -67,24 +67,24 @@ class ImageGrouper:
         # Calculate dimensions that maintain AR and fit within max_area
         if ar >= 1:  # Wider than tall
             w = min(
-                self.bucket_manager.max_size,
-                int((self.bucket_manager.max_area * ar)**0.5)
+                self.bucket_manager.max_resolution,
+                int((self.bucket_manager.max_resolution * self.bucket_manager.max_resolution * ar)**0.5)
             )
-            w = (w // self.bucket_manager.step_size) * self.bucket_manager.step_size
+            w = (w // self.bucket_manager.resolution_step) * self.bucket_manager.resolution_step
             h = int(w / ar)
-            h = (h // self.bucket_manager.step_size) * self.bucket_manager.step_size
+            h = (h // self.bucket_manager.resolution_step) * self.bucket_manager.resolution_step
         else:  # Taller than wide
             h = min(
-                self.bucket_manager.max_size,
-                int((self.bucket_manager.max_area / ar)**0.5)
+                self.bucket_manager.max_resolution,
+                int((self.bucket_manager.max_resolution * self.bucket_manager.max_resolution / ar)**0.5)
             )
-            h = (h // self.bucket_manager.step_size) * self.bucket_manager.step_size
+            h = (h // self.bucket_manager.resolution_step) * self.bucket_manager.resolution_step
             w = int(h * ar)
-            w = (w // self.bucket_manager.step_size) * self.bucket_manager.step_size
+            w = (w // self.bucket_manager.resolution_step) * self.bucket_manager.resolution_step
         
         # Ensure minimum size
-        h = max(h, self.bucket_manager.min_size)
-        w = max(w, self.bucket_manager.min_size)
+        h = max(h, self.bucket_manager.min_resolution)
+        w = max(w, self.bucket_manager.min_resolution)
         
         # Ensure one dimension is below 1024
         if h > 1024 and w > 1024:
