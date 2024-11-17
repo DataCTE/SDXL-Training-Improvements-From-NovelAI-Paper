@@ -278,8 +278,41 @@ def create_train_dataloader(
     
     # Get image paths and prompts
     train_data_dir = Path(train_data_dir)
-    image_paths = list(train_data_dir.glob('*.jpg')) + list(train_data_dir.glob('*.png'))
-    prompts = [path.with_suffix('.txt').read_text().strip() for path in image_paths]
+    image_paths = []
+    prompts = []
+    
+    # Collect only valid image-caption pairs
+    for img_path in train_data_dir.glob('*.jpg'):
+        txt_path = img_path.with_suffix('.txt')
+        try:
+            if txt_path.exists():
+                prompt = txt_path.read_text().strip()
+                image_paths.append(img_path)
+                prompts.append(prompt)
+            else:
+                logger.warning(f"Skipping {img_path}: No matching caption file found")
+        except Exception as e:
+            logger.warning(f"Error reading caption for {img_path}: {str(e)}")
+            continue
+            
+    # Also check png files
+    for img_path in train_data_dir.glob('*.png'):
+        txt_path = img_path.with_suffix('.txt')
+        try:
+            if txt_path.exists():
+                prompt = txt_path.read_text().strip()
+                image_paths.append(img_path)
+                prompts.append(prompt)
+            else:
+                logger.warning(f"Skipping {img_path}: No matching caption file found")
+        except Exception as e:
+            logger.warning(f"Error reading caption for {img_path}: {str(e)}")
+            continue
+    
+    if not image_paths:
+        raise ValueError(f"No valid image-caption pairs found in {train_data_dir}")
+        
+    logger.info(f"Found {len(image_paths)} valid image-caption pairs")
     
     # Create dataset
     dataset = MultiAspectDataset(
@@ -327,8 +360,41 @@ def create_validation_dataloader(
     
     # Get image paths and prompts
     val_data_dir = Path(val_data_dir)
-    image_paths = list(val_data_dir.glob('*.jpg')) + list(val_data_dir.glob('*.png'))
-    prompts = [path.with_suffix('.txt').read_text().strip() for path in image_paths]
+    image_paths = []
+    prompts = []
+    
+    # Collect only valid image-caption pairs
+    for img_path in val_data_dir.glob('*.jpg'):
+        txt_path = img_path.with_suffix('.txt')
+        try:
+            if txt_path.exists():
+                prompt = txt_path.read_text().strip()
+                image_paths.append(img_path)
+                prompts.append(prompt)
+            else:
+                logger.warning(f"Skipping {img_path}: No matching caption file found")
+        except Exception as e:
+            logger.warning(f"Error reading caption for {img_path}: {str(e)}")
+            continue
+            
+    # Also check png files
+    for img_path in val_data_dir.glob('*.png'):
+        txt_path = img_path.with_suffix('.txt')
+        try:
+            if txt_path.exists():
+                prompt = txt_path.read_text().strip()
+                image_paths.append(img_path)
+                prompts.append(prompt)
+            else:
+                logger.warning(f"Skipping {img_path}: No matching caption file found")
+        except Exception as e:
+            logger.warning(f"Error reading caption for {img_path}: {str(e)}")
+            continue
+    
+    if not image_paths:
+        raise ValueError(f"No valid image-caption pairs found in {val_data_dir}")
+        
+    logger.info(f"Found {len(image_paths)} valid image-caption pairs")
     
     # Create dataset
     dataset = MultiAspectDataset(
