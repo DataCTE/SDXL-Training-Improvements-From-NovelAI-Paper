@@ -194,11 +194,26 @@ class MultiAspectDataset(Dataset):
         batch_size = 32
         total_batches = (len(self.image_paths) + batch_size - 1) // batch_size
         
-        with tqdm(total=total_batches, desc="Caching VAE latents") as pbar_vae:
+        # Initialize VAE workers
+        self.vae_cache.initialize_workers()
+        
+        with tqdm(total=len(self.image_paths), desc="Caching VAE latents") as pbar_vae:
             for i in range(0, len(self.image_paths), batch_size):
                 batch_paths = self.image_paths[i:i + batch_size]
-                self.vae_cache.cache_batch(batch_paths)
-                pbar_vae.update(1)
+                # Load images for the batch
+                batch_tensors = []
+                for path in batch_paths:
+                    img = load_and_verify_image(path)
+                    tensor = converter.to_tensor(img)
+                    batch_tensors.append(tensor)
+                batch_tensors = torch.stack(batch_tensors)
+                
+                # Process the batch
+                self.vae_cache.process_batch(batch_tensors, batch_paths)
+                self.vae_cache.process_results(pbar_vae)
+        
+        # Close VAE workers
+        self.vae_cache.close_workers()
         
         with tqdm(total=total_batches, desc="Caching text embeddings") as pbar_text:
             for i in range(0, len(self.processed_prompts), batch_size):
