@@ -19,6 +19,7 @@ def train_sdxl(
     val_data_dir: Optional[Union[str, Path]] = None,
     pretrained_model_path: Optional[str] = None,
     resume_from_checkpoint: Optional[str] = None,
+    models: Optional[Dict[str, Any]] = None,
     **kwargs
 ) -> SDXLTrainer:
     """
@@ -30,61 +31,76 @@ def train_sdxl(
         val_data_dir: Optional directory containing validation data
         pretrained_model_path: Optional path to pretrained model weights
         resume_from_checkpoint: Optional path to resume training from checkpoint
+        models: Optional pre-loaded model dictionary
         **kwargs: Additional training configuration parameters
         
     Returns:
         Trained SDXLTrainer instance
     """
-    # Create output directory
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Setup configuration
-    config = TrainingConfig(**kwargs)
-    
-    # Create models and caches first
-    models_dict, _ = create_sdxl_models(pretrained_model_path)
-    vae_cache = VAECache(models_dict['vae'])
-    text_embedding_cache = TextEmbeddingCache(models_dict['text_encoder'], models_dict['text_encoder_2'])
-    
-    # Create dataloaders
-    train_dataloader = create_train_dataloader(
-        train_data_dir,
-        vae_cache=vae_cache,
-        text_embedding_cache=text_embedding_cache,
-        batch_size=config.batch_size,
-        num_workers=config.num_workers if hasattr(config, 'num_workers') else 4
-    )
-    
-    val_dataloader = None
-    if val_data_dir:
-        val_dataloader = create_validation_dataloader(
-            val_data_dir,
+    try:
+        # Create output directory
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Setup configuration
+        config = TrainingConfig(**kwargs)
+        
+        # Use provided models or create new ones
+        if models is None:
+            models_dict, _ = create_sdxl_models(pretrained_model_path)
+        else:
+            models_dict = models
+            
+        vae_cache = VAECache(
+            cache_dir=str(output_dir / "vae_cache"),
+            vae=models_dict['vae']
+        )
+        text_embedding_cache = TextEmbeddingCache(models_dict['text_encoder'], models_dict['text_encoder_2'])
+        
+        # Create dataloaders
+        train_dataloader = create_train_dataloader(
+            train_data_dir,
             vae_cache=vae_cache,
             text_embedding_cache=text_embedding_cache,
             batch_size=config.batch_size,
             num_workers=config.num_workers if hasattr(config, 'num_workers') else 4
         )
-    
-    # Resume from checkpoint if specified
-    if resume_from_checkpoint:
-        trainer = SDXLTrainer.load_checkpoint(
-            resume_from_checkpoint,
-            train_dataloader,
-            val_dataloader
+        
+        val_dataloader = None
+        if val_data_dir:
+            val_dataloader = create_validation_dataloader(
+                val_data_dir,
+                vae_cache=vae_cache,
+                text_embedding_cache=text_embedding_cache,
+                batch_size=config.batch_size,
+                num_workers=config.num_workers if hasattr(config, 'num_workers') else 4
+            )
+        
+        # Resume from checkpoint if specified
+        if resume_from_checkpoint:
+            trainer = SDXLTrainer.load_checkpoint(
+                resume_from_checkpoint,
+                train_dataloader,
+                val_dataloader
+            )
+            logger.info(f"Resumed training from {resume_from_checkpoint}")
+            return trainer
+        
+        # Create new training instance
+        trainer = SDXLTrainer(
+            config=config,
+            models=models_dict,
+            train_dataloader=train_dataloader,
+            val_dataloader=val_dataloader
         )
-        logger.info(f"Resumed training from {resume_from_checkpoint}")
+        
         return trainer
-    
-    # Create new training instance
-    trainer = SDXLTrainer(
-        config=config,
-        models=models_dict,
-        train_dataloader=train_dataloader,
-        val_dataloader=val_dataloader
-    )
-    
-    return trainer
+        
+    except Exception as e:
+        import traceback
+        logger.error("SDXL training setup failed with error: %s", str(e))
+        logger.error("Full traceback:\n%s", traceback.format_exc())
+        raise
 
 def train_vae(
     train_data_dir: Union[str, Path],
@@ -92,7 +108,7 @@ def train_vae(
     pretrained_vae_path: Optional[str] = None,
     learning_rate: float = 1e-6,
     batch_size: int = 1,
-    num_epochs: int = 100,
+    num_epochs: int = 1,
     mixed_precision: str = "fp16",
     use_8bit_adam: bool = False,
     gradient_checkpointing: bool = False,
@@ -126,7 +142,7 @@ def train_vae(
     vae = create_vae_model(pretrained_vae_path)
     
     # Create dataloader
-    train_dataloader = create_train_dataloader(
+    load_dataloader = create_train_dataloader(
         train_data_dir,
         vae_cache=None,
         text_embedding_cache=None,

@@ -15,9 +15,11 @@ from transformers import (
     CLIPTextModelWithProjection,
     CLIPTokenizer,
 )
-
+import logging
 from src.models.SDXL.pipeline import StableDiffusionXLPipeline
 
+
+logger = logging.getLogger(__name__)
 
 def create_sdxl_models(
     pretrained_model_path: str,
@@ -36,36 +38,43 @@ def create_sdxl_models(
     Returns:
         Tuple of (models dict, pipeline)
     """
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-    # Load base pipeline
-    pipeline = StableDiffusionXLPipeline.from_pretrained(
-        pretrained_model_path,
-        torch_dtype=dtype,
-    )
-    
-    # Extract components
-    models = {
-        "unet": pipeline.unet,
-        "vae": pipeline.vae,
-        "text_encoder": pipeline.text_encoder,
-        "text_encoder_2": pipeline.text_encoder_2,
-        "tokenizer": pipeline.tokenizer,
-        "tokenizer_2": pipeline.tokenizer_2,
-        "scheduler": pipeline.scheduler,
-    }
-    
-    # Load custom VAE if specified
-    if vae_path:
-        models["vae"] = create_vae_model(vae_path, dtype)
-    
-    # Move models to device
-    for name, model in models.items():
-        if hasattr(model, "to"):
-            models[name] = model.to(device)
+    try:
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             
-    return models, pipeline
+        # Load base pipeline
+        pipeline = StableDiffusionXLPipeline.from_pretrained(
+            pretrained_model_path,
+            torch_dtype=dtype,
+        )
+        
+        # Extract components
+        models = {
+            "unet": pipeline.unet,
+            "vae": pipeline.vae,
+            "text_encoder": pipeline.text_encoder,
+            "text_encoder_2": pipeline.text_encoder_2,
+            "tokenizer": pipeline.tokenizer,
+            "tokenizer_2": pipeline.tokenizer_2,
+            "scheduler": pipeline.scheduler,
+        }
+        
+        # Load custom VAE if specified
+        if vae_path:
+            models["vae"] = create_vae_model(vae_path, dtype)
+        
+        # Move models to device
+        for name, model in models.items():
+            if hasattr(model, "to"):
+                models[name] = model.to(device)
+                
+        return models, pipeline
+        
+    except Exception as e:
+        import traceback
+        logger.error("SDXL model creation failed with error: %s", str(e))
+        logger.error("Full traceback:\n%s", traceback.format_exc())
+        raise
 
 
 def create_vae_model(
@@ -81,10 +90,17 @@ def create_vae_model(
     Returns:
         Loaded VAE model
     """
-    return AutoencoderKL.from_pretrained(
-        vae_path,
-        torch_dtype=dtype
-    )
+    try:
+        return AutoencoderKL.from_pretrained(
+            vae_path,
+            torch_dtype=dtype
+        )
+        
+    except Exception as e:
+        import traceback
+        logger.error("VAE model creation failed with error: %s", str(e))
+        logger.error("Full traceback:\n%s", traceback.format_exc())
+        raise
 
 
 def load_models(config) -> Dict[str, Any]:
@@ -96,56 +112,63 @@ def load_models(config) -> Dict[str, Any]:
     Returns:
         Dict containing all loaded models and components
     """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.float16 if config.mixed_precision == "fp16" else torch.float32
-    
-    # Load base models
-    pipeline = StableDiffusionXLPipeline.from_pretrained(
-        config.model_path,
-        torch_dtype=dtype,
-    )
-    
-    # Extract components
-    models = {
-        "unet": pipeline.unet,
-        "vae": pipeline.vae,
-        "text_encoder": pipeline.text_encoder,
-        "text_encoder_2": pipeline.text_encoder_2,
-        "tokenizer": pipeline.tokenizer,
-        "tokenizer_2": pipeline.tokenizer_2,
-        "scheduler": pipeline.scheduler,
-    }
-    
-    # Load VAE if specified
-    if config.vae_args.vae_path:
-        models["vae"] = AutoencoderKL.from_pretrained(
-            config.vae_args.vae_path,
-            torch_dtype=dtype
+    try:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        dtype = torch.float16 if config.mixed_precision == "fp16" else torch.float32
+        
+        # Load base models
+        pipeline = StableDiffusionXLPipeline.from_pretrained(
+            config.model_path,
+            torch_dtype=dtype,
         )
-    
-    # Move models to device
-    for name, model in models.items():
-        if hasattr(model, "to"):
-            models[name] = model.to(device)
-    
-    # Enable gradient checkpointing if configured
-    if config.gradient_checkpointing:
-        if hasattr(models["unet"], "enable_gradient_checkpointing"):
-            models["unet"].enable_gradient_checkpointing()
-        if hasattr(models["text_encoder"], "gradient_checkpointing_enable"):
-            models["text_encoder"].gradient_checkpointing_enable()
-        if hasattr(models["text_encoder_2"], "gradient_checkpointing_enable"):
-            models["text_encoder_2"].gradient_checkpointing_enable()
-    
-    # Enable model compilation if configured
-    if config.enable_compile:
-        compile_mode = config.compile_mode
-        if hasattr(models["unet"], "compile"):
-            models["unet"] = torch.compile(models["unet"], mode=compile_mode)
-        if hasattr(models["vae"], "compile"):
-            models["vae"] = torch.compile(models["vae"], mode=compile_mode)
-    
-    return models
+        
+        # Extract components
+        models = {
+            "unet": pipeline.unet,
+            "vae": pipeline.vae,
+            "text_encoder": pipeline.text_encoder,
+            "text_encoder_2": pipeline.text_encoder_2,
+            "tokenizer": pipeline.tokenizer,
+            "tokenizer_2": pipeline.tokenizer_2,
+            "scheduler": pipeline.scheduler,
+        }
+        
+        # Load VAE if specified
+        if config.vae_args.vae_path:
+            models["vae"] = AutoencoderKL.from_pretrained(
+                config.vae_args.vae_path,
+                torch_dtype=dtype
+            )
+        
+        # Move models to device
+        for name, model in models.items():
+            if hasattr(model, "to"):
+                models[name] = model.to(device)
+        
+        # Enable gradient checkpointing if configured
+        if config.gradient_checkpointing:
+            if hasattr(models["unet"], "enable_gradient_checkpointing"):
+                models["unet"].enable_gradient_checkpointing()
+            if hasattr(models["text_encoder"], "gradient_checkpointing_enable"):
+                models["text_encoder"].gradient_checkpointing_enable()
+            if hasattr(models["text_encoder_2"], "gradient_checkpointing_enable"):
+                models["text_encoder_2"].gradient_checkpointing_enable()
+        
+        # Enable model compilation if configured
+        if config.enable_compile:
+            compile_mode = config.compile_mode
+            if hasattr(models["unet"], "compile"):
+                models["unet"] = torch.compile(models["unet"], mode=compile_mode)
+            if hasattr(models["vae"], "compile"):
+                models["vae"] = torch.compile(models["vae"], mode=compile_mode)
+        
+        return models
+        
+    except Exception as e:
+        import traceback
+        logger.error("Model loading failed with error: %s", str(e))
+        logger.error("Full traceback:\n%s", traceback.format_exc())
+        raise
 
 
 def save_models(models: Dict[str, Any], output_dir: str, save_vae: bool = True) -> None:
@@ -156,25 +179,32 @@ def save_models(models: Dict[str, Any], output_dir: str, save_vae: bool = True) 
         output_dir: Directory to save models to
         save_vae: Whether to save VAE model
     """
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Save UNET
-    models["unet"].save_pretrained(os.path.join(output_dir, "unet"))
-    
-    # Save text encoders
-    models["text_encoder"].save_pretrained(os.path.join(output_dir, "text_encoder"))
-    models["text_encoder_2"].save_pretrained(os.path.join(output_dir, "text_encoder_2"))
-    
-    # Save tokenizers
-    models["tokenizer"].save_pretrained(os.path.join(output_dir, "tokenizer"))
-    models["tokenizer_2"].save_pretrained(os.path.join(output_dir, "tokenizer_2"))
-    
-    # Save VAE if requested
-    if save_vae:
-        models["vae"].save_pretrained(os.path.join(output_dir, "vae"))
-    
-    # Save scheduler
-    models["scheduler"].save_pretrained(os.path.join(output_dir, "scheduler"))
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Save UNET
+        models["unet"].save_pretrained(os.path.join(output_dir, "unet"))
+        
+        # Save text encoders
+        models["text_encoder"].save_pretrained(os.path.join(output_dir, "text_encoder"))
+        models["text_encoder_2"].save_pretrained(os.path.join(output_dir, "text_encoder_2"))
+        
+        # Save tokenizers
+        models["tokenizer"].save_pretrained(os.path.join(output_dir, "tokenizer"))
+        models["tokenizer_2"].save_pretrained(os.path.join(output_dir, "tokenizer_2"))
+        
+        # Save VAE if requested
+        if save_vae:
+            models["vae"].save_pretrained(os.path.join(output_dir, "vae"))
+        
+        # Save scheduler
+        models["scheduler"].save_pretrained(os.path.join(output_dir, "scheduler"))
+        
+    except Exception as e:
+        import traceback
+        logger.error("Model saving failed with error: %s", str(e))
+        logger.error("Full traceback:\n%s", traceback.format_exc())
+        raise
 
 
 def load_checkpoint(checkpoint_path: str, models: Dict[str, Any]) -> Dict[str, Any]:
@@ -187,17 +217,24 @@ def load_checkpoint(checkpoint_path: str, models: Dict[str, Any]) -> Dict[str, A
     Returns:
         Updated models dictionary with loaded weights
     """
-    if not os.path.exists(checkpoint_path):
-        raise ValueError(f"Checkpoint not found at {checkpoint_path}")
-    
-    checkpoint = torch.load(checkpoint_path)
-    
-    # Load model weights
-    models["unet"].load_state_dict(checkpoint["unet_state_dict"])
-    models["text_encoder"].load_state_dict(checkpoint["text_encoder_state_dict"])
-    models["text_encoder_2"].load_state_dict(checkpoint["text_encoder_2_state_dict"])
-    
-    if "vae_state_dict" in checkpoint and models.get("vae") is not None:
-        models["vae"].load_state_dict(checkpoint["vae_state_dict"])
-    
-    return models
+    try:
+        if not os.path.exists(checkpoint_path):
+            raise ValueError(f"Checkpoint not found at {checkpoint_path}")
+        
+        checkpoint = torch.load(checkpoint_path)
+        
+        # Load model weights
+        models["unet"].load_state_dict(checkpoint["unet_state_dict"])
+        models["text_encoder"].load_state_dict(checkpoint["text_encoder_state_dict"])
+        models["text_encoder_2"].load_state_dict(checkpoint["text_encoder_2_state_dict"])
+        
+        if "vae_state_dict" in checkpoint and models.get("vae") is not None:
+            models["vae"].load_state_dict(checkpoint["vae_state_dict"])
+        
+        return models
+        
+    except Exception as e:
+        import traceback
+        logger.error("Checkpoint loading failed with error: %s", str(e))
+        logger.error("Full traceback:\n%s", traceback.format_exc())
+        raise

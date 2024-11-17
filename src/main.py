@@ -60,6 +60,7 @@ def main():
             gradient_accumulation_steps=config.gradient_accumulation_steps,
             max_grad_norm=config.max_grad_norm,
             save_epochs=config.save_epochs,
+            models=models
         )
         
         # Save final model
@@ -67,8 +68,9 @@ def main():
         logger.info("Training completed successfully!")
         
     except Exception as e:
-        logger.error("Training failed: %s", str(e))
-        logger.debug("Traceback:", exc_info=True)
+        import traceback
+        logger.error("Training failed with error: %s", str(e))
+        logger.error("Full traceback:\n%s", traceback.format_exc())
         sys.exit(1)
 
 if __name__ == "__main__":
