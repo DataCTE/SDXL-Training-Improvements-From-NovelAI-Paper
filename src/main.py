@@ -4,13 +4,12 @@ import logging
 import sys
 from pathlib import Path
 
-from src.config.args import parse_args
-from src.training.wrappers import train_sdxl, train_vae
-from src.utils.logging import setup_logging
-from src.models.model_loader import load_models
+from config.args import parse_args
+from training.wrappers import train_sdxl, train_vae
+from utils.logging import setup_logging
+from models.model_loader import load_models
 
 logger = logging.getLogger(__name__)
-
 
 
 def main():
