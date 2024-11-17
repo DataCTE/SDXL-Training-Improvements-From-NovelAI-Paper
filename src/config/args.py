@@ -176,8 +176,10 @@ class DataArgs:
         token_dropout_rate: Token dropout probability.
         caption_dropout_rate: Caption dropout probability.
         all_ar: Whether to use all aspect ratios.
+        min_tag_weight: Minimum weight for tags.
+        max_tag_weight: Maximum weight for tags.
+        use_tag_weighting: Whether to use tag weighting.
     """
-    
     data_dir: str
     cache_dir: str = "latents_cache"
     no_caching: bool = False
@@ -189,21 +191,21 @@ class DataArgs:
     token_dropout_rate: float = 0.1
     caption_dropout_rate: float = 0.1
     all_ar: bool = False
+    min_tag_weight: float = 0.1
+    max_tag_weight: float = 3.0
+    use_tag_weighting: bool = True
 
 @dataclass
 class TagWeightingArgs:
-    """
-    Configuration arguments for tag weighting.
+    """Configuration arguments for tag weighting.
 
     Attributes:
         use_tag_weighting: Whether to use tag weighting.
         min_tag_weight: The minimum tag weight.
         max_tag_weight: The maximum tag weight.
     """
-    use_tag_weighting: bool = True
-    min_tag_weight: float = 0.1
-    max_tag_weight: float = 3.0
-
+    # These parameters are moved to DataArgs since they are needed for dataset initialization
+    pass
 
 @dataclass
 class SystemArgs:
@@ -363,11 +365,15 @@ def parse_args() -> TrainingConfig:
     parser.add_argument("--token_dropout_rate", type=float, default=0.1)
     parser.add_argument("--caption_dropout_rate", type=float, default=0.1)
     parser.add_argument("--all_ar", action="store_true", default=False)
-    
-    # Tag weighting arguments
-    parser.add_argument("--use_tag_weighting", action="store_true", default=True)
     parser.add_argument("--min_tag_weight", type=float, default=0.1)
     parser.add_argument("--max_tag_weight", type=float, default=3.0)
+    parser.add_argument("--use_tag_weighting", action="store_true", default=True)
+    
+    # Tag weighting arguments
+    # These parameters are moved to DataArgs since they are needed for dataset initialization
+    # parser.add_argument("--use_tag_weighting", action="store_true", default=True)
+    # parser.add_argument("--min_tag_weight", type=float, default=0.1)
+    # parser.add_argument("--max_tag_weight", type=float, default=3.0)
     
     # Logging arguments
     parser.add_argument("--use_wandb", action="store_true")
@@ -458,13 +464,12 @@ def parse_args() -> TrainingConfig:
             max_bucket_area=args.max_bucket_area,
             token_dropout_rate=args.token_dropout_rate,
             caption_dropout_rate=args.caption_dropout_rate,
-            all_ar=args.all_ar
-        ),
-        tag_weighting=TagWeightingArgs(
-            use_tag_weighting=args.use_tag_weighting,
+            all_ar=args.all_ar,
             min_tag_weight=args.min_tag_weight,
-            max_tag_weight=args.max_tag_weight
+            max_tag_weight=args.max_tag_weight,
+            use_tag_weighting=args.use_tag_weighting
         ),
+        tag_weighting=TagWeightingArgs(),
         system=SystemArgs(
             enable_compile=args.enable_compile,
             compile_mode=args.compile_mode,
