@@ -13,6 +13,7 @@ from threading import Lock
 from typing import Dict, Optional, Tuple
 
 import torch
+import numpy as np
 from PIL import Image
 
 from src.data.image_processing.validation import validate_tensor, validate_image
@@ -156,7 +157,7 @@ class ImageConverter:
         
         # Convert to tensor
         tensor = torch.from_numpy(
-            image.convert('RGB').__array__()
+            np.array(image.convert('RGB'))
         ).permute(2, 0, 1)
         
         if normalize:
