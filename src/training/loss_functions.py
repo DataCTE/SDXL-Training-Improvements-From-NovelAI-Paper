@@ -69,82 +69,138 @@ def get_sigmas(
     height: int = 1024,
     width: int = 1024,
     resolution_scaling: bool = True,
-    scale_method: str = "karras",
     verbose: bool = True,
-    device: Optional[torch.device] = None,
-    dtype: Optional[torch.dtype] = None,
     base_res: int = 1024 * 1024,
     rho: float = 7.0,
-    sigma_max_base: float = 20000.0,
-    use_ztsnr: bool = True,
+    sigma_max_base: float = 20000.0,  # Increased from 14.6 for ZTSNR
+    use_ztsnr: bool = True,  # Enable ZTSNR by default
     cache_key: Optional[str] = None
 ) -> torch.Tensor:
     """Enhanced sigma schedule generation with ZTSNR support"""
-    try:
-        # Check cache first
-        if cache_key is not None:
-            cached_sigmas = _sigma_cache.get(cache_key)
-            if cached_sigmas is not None:
-                return cached_sigmas
+    # Check cache first
+    if cache_key is not None:
+        cached_sigmas = _sigma_cache.get(cache_key)
+        if cached_sigmas is not None:
+            return cached_sigmas
 
-        # Calculate sigma_max based on resolution if needed
-        sigma_max = sigma_max_base
-        if resolution_scaling:
-            # Scale sigma_max based on resolution as per NovelAI paper
-            current_res = height * width
-            scale_factor = (current_res / base_res) ** 0.25  # Rule of thumb: double sigma_max when quadrupling resolution
-            sigma_max = sigma_max_base * scale_factor
+    # Calculate sigma_max based on resolution if needed
+    sigma_max = sigma_max_base
+    if resolution_scaling:
+        # Scale sigma_max based on resolution as per NovelAI paper
+        current_res = height * width
+        scale_factor = (current_res / base_res) ** 0.25  # Rule of thumb: double sigma_max when quadrupling resolution
+        sigma_max = sigma_max_base * scale_factor
 
-        # Generate sigma schedule
-        sigmas = compute_sigma_schedule(num_inference_steps, sigma_min, sigma_max, rho)
-        
-        # Add infinite noise step for ZTSNR if enabled
-        if use_ztsnr:
-            ztsnr_sigma = torch.tensor([float('inf')], device=sigmas.device, dtype=sigmas.dtype)
-            sigmas = torch.cat([ztsnr_sigma, sigmas])
+    # Generate sigma schedule
+    sigmas = compute_sigma_schedule(num_inference_steps, sigma_min, sigma_max, rho)
+    
+    # Add infinite noise step for ZTSNR if enabled
+    if use_ztsnr:
+        ztsnr_sigma = torch.tensor([20000.0], device=sigmas.device, dtype=sigmas.dtype)  # Practical approximation of infinity
+        sigmas = torch.cat([ztsnr_sigma, sigmas])
 
-        # Move to device/dtype if specified
-        if device is not None:
-            sigmas = sigmas.to(device)
-        if dtype is not None:
-            sigmas = sigmas.to(dtype)
+    # Cache if key provided
+    if cache_key is not None:
+        _sigma_cache.set(cache_key, sigmas)
 
-        # Cache if key provided
-        if cache_key is not None:
-            _sigma_cache.set(cache_key, sigmas)
+    return sigmas
 
-        return sigmas
-
-    except Exception as e:
-        logger.error("Sigma schedule generation failed: %s", str(e))
-        raise
+@torch.jit.script
+def compute_v_prediction_scaling(
+    sigma: torch.Tensor,
+    sigma_data: float = 1.0
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Optimized Karras scaling computation for v-prediction"""
+    sigma_sq = sigma * sigma
+    sigma_data_sq = sigma_data * sigma_data
+    denominator = torch.sqrt(sigma_sq + sigma_data_sq)
+    c_out = -sigma * sigma_data / denominator
+    c_in = 1.0 / denominator
+    return c_out, c_in
 
 @torch.jit.script
 def compute_loss_weights(
     snr: torch.Tensor,
-    min_snr_gamma: float = 5.0,
-    scale_method: str = "karras",
-    rescale_multiplier: float = 1.0,
-    rescale_cfg: bool = True,
-    use_min_snr: bool = True
+    min_snr_gamma: float,
+    rescale_multiplier: float,
+    rescale_cfg: bool,
 ) -> torch.Tensor:
     """Compute loss weights with MinSNR support"""
-    try:
-        if use_min_snr:
-            # Implement MinSNR loss weighting
-            snr_clipped = torch.minimum(snr, torch.full_like(snr, min_snr_gamma))
-            weights = snr_clipped / snr
-        else:
-            weights = torch.ones_like(snr)
+    # Implement MinSNR loss weighting
+    snr_clipped = torch.minimum(snr, torch.full_like(snr, min_snr_gamma))
+    weights = snr_clipped / snr
+    
+    if rescale_cfg:
+        weights = weights * rescale_multiplier
+        
+    return weights
 
-        if rescale_cfg:
-            weights = weights * rescale_multiplier
+@torch.jit.script
+def compute_v_target(noise: torch.Tensor, sigma: torch.Tensor, sigma_data: float) -> torch.Tensor:
+    """Compute v-prediction target"""
+    return noise * sigma_data / torch.sqrt(sigma * sigma + sigma_data * sigma_data)
 
-        return weights
+def training_loss_v_prediction(
+    model: torch.nn.Module,
+    x_0: torch.Tensor,
+    sigma: torch.Tensor,
+    text_embeddings: torch.Tensor,
+    added_cond_kwargs: Dict[str, torch.Tensor],
+    sigma_data: float = 1.0,
+    tag_weighter: Optional[Any] = None,
+    batch_tags: Optional[Any] = None,
+    min_snr_gamma: float = 5.0,
+    rescale_cfg: bool = True,
+    rescale_multiplier: float = 1.0,
+    use_tag_weighting: bool = True
+) -> torch.Tensor:
+    """Training loss using v-prediction with MinSNR and ZTSNR support.
+    
+    Args:
+        model: UNet model for prediction
+        x_0: Input latent tensor
+        sigma: Noise level tensor
+        text_embeddings: Text condition embeddings
+        added_cond_kwargs: Additional conditioning arguments
+        sigma_data: Data sigma parameter (default: 1.0)
+        tag_weighter: Optional tag weighting function
+        batch_tags: Optional batch tags for weighting
+        min_snr_gamma: Minimum SNR gamma for loss weighting (default: 5.0)
+        rescale_cfg: Whether to rescale classifier-free guidance (default: True)
+        rescale_multiplier: Multiplier for CFG rescaling (default: 1.0)
+        use_tag_weighting: Whether to use tag-based loss weighting (default: True)
+    
+    Returns:
+        torch.Tensor: Computed training loss
+    """
+    # Add noise to input
+    noise = torch.randn_like(x_0)
+    noised = x_0 + noise * sigma.view(-1, 1, 1, 1)
 
-    except Exception as e:
-        logger.error("Loss weight computation failed: %s", str(e))
-        raise
+    # Compute v target (velocity)
+    v_target = compute_v_target(noise, sigma, sigma_data)
+
+    # Get model prediction
+    v_pred = model(noised, sigma, text_embeddings, added_cond_kwargs=added_cond_kwargs)
+
+    # Compute SNR for loss weighting
+    snr = (sigma_data / sigma) ** 2
+    weights = compute_loss_weights(
+        snr,
+        min_snr_gamma=min_snr_gamma,
+        rescale_multiplier=rescale_multiplier,
+        rescale_cfg=rescale_cfg,
+    )
+
+    # Compute weighted MSE loss
+    loss = torch.mean((v_pred - v_target) ** 2 * weights)
+
+    # Apply tag weighting if enabled
+    if use_tag_weighting and tag_weighter is not None and batch_tags is not None:
+        tag_weights = tag_weighter(batch_tags)
+        loss = loss * tag_weights.mean()
+
+    return loss
 
 def forward_pass(args, model_dict, batch, device, dtype, components) -> torch.Tensor:
     """Execute forward pass with proper error handling.
@@ -189,10 +245,7 @@ def forward_pass(args, model_dict, batch, device, dtype, components) -> torch.Te
             min_snr_gamma=args.training.min_snr_gamma,
             rescale_cfg=args.training.rescale_cfg,
             rescale_multiplier=args.training.rescale_multiplier,
-            scale_method=args.training.scale_method,
             use_tag_weighting=args.data.use_tag_weighting,
-            device=device,
-            dtype=dtype
         )
 
         # Apply VAE finetuning loss if enabled
@@ -205,78 +258,6 @@ def forward_pass(args, model_dict, batch, device, dtype, components) -> torch.Te
     except (ValueError, RuntimeError, KeyError) as e:
         logger.error("Forward pass failed: %s", str(e))
         raise type(e)(f"Failed during forward pass: {str(e)}") from e
-
-def training_loss_v_prediction(
-    model: torch.nn.Module,
-    x_0: torch.Tensor,
-    sigma: torch.Tensor,
-    text_embeddings: torch.Tensor,
-    added_cond_kwargs: Dict[str, torch.Tensor],
-    sigma_data: float = 1.0,
-    tag_weighter: Optional[Any] = None,
-    batch_tags: Optional[Any] = None,
-    min_snr_gamma: float = 5.0,
-    rescale_cfg: bool = True,
-    rescale_multiplier: float = 1.0,
-    scale_method: str = "karras",
-    use_tag_weighting: bool = True,
-    use_min_snr: bool = True,
-    device: torch.device = None,
-    dtype: torch.dtype = None,
-) -> torch.Tensor:
-    """Training loss using v-prediction with MinSNR and ZTSNR support"""
-    try:
-        # Handle infinite sigma for ZTSNR
-        if torch.isinf(sigma).any():
-            sigma = torch.where(torch.isinf(sigma), torch.tensor(20000.0, device=sigma.device, dtype=sigma.dtype), sigma)
-
-        # Add noise to input
-        noise = torch.randn_like(x_0)
-        noised = x_0 + noise * sigma.view(-1, 1, 1, 1)
-
-        # Compute v target (velocity)
-        v_target = noise * sigma_data / (sigma**2 + sigma_data**2).sqrt()
-
-        # Get model prediction
-        v_pred = model(noised, sigma, text_embeddings, added_cond_kwargs=added_cond_kwargs)
-
-        # Compute SNR for loss weighting
-        snr = (sigma_data / sigma) ** 2
-        weights = compute_loss_weights(
-            snr,
-            min_snr_gamma=min_snr_gamma,
-            scale_method=scale_method,
-            rescale_multiplier=rescale_multiplier,
-            rescale_cfg=rescale_cfg,
-            use_min_snr=use_min_snr
-        )
-
-        # Compute weighted MSE loss
-        loss = torch.mean((v_pred - v_target) ** 2 * weights)
-
-        # Apply tag weighting if enabled
-        if use_tag_weighting and tag_weighter is not None and batch_tags is not None:
-            tag_weights = tag_weighter(batch_tags)
-            loss = loss * tag_weights.mean()
-
-        return loss
-
-    except Exception as e:
-        logger.error("Training loss computation failed: %s", str(e))
-        raise
-
-@torch.jit.script
-def compute_v_prediction_scaling(
-    sigma: torch.Tensor,
-    sigma_data: float = 1.0
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Optimized Karras scaling computation for v-prediction"""
-    sigma_sq = sigma * sigma
-    sigma_data_sq = sigma_data * sigma_data
-    denominator = torch.sqrt(sigma_sq + sigma_data_sq)
-    c_out = -sigma * sigma_data / denominator
-    c_in = 1.0 / denominator
-    return c_out, c_in
 
 def get_loss_info(loss_tensor: torch.Tensor) -> dict:
     """Get detailed information about loss values"""
