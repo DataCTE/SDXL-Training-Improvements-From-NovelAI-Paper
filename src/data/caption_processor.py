@@ -17,8 +17,15 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class TagStats:
-    """Thread-safe container for tag statistics tracking."""
+    """Thread-safe container for tag statistics tracking.
     
+    Attributes:
+        frequencies (Dict[str, Dict[str, int]]): Nested dictionary tracking tag frequencies by class.
+        class_counts (Dict[str, int]): Dictionary tracking counts per class.
+        cooccurrence (Dict[str, Dict[str, int]]): Nested dictionary tracking tag co-occurrences.
+        total_occurrences (Dict[str, int]): Dictionary tracking total occurrences of each tag.
+        _lock (Lock): Thread lock for synchronization.
+    """
     frequencies: Dict[str, Dict[str, int]] = field(
         default_factory=lambda: defaultdict(lambda: defaultdict(int))
     )
@@ -71,7 +78,22 @@ class TagStats:
             )[:n]
 
 class CaptionProcessor:
-    """Handles caption loading, parsing, tag processing, and weight computation."""
+    """Handles caption loading, parsing, tag processing, and weight computation.
+    
+    This class implements advanced caption processing techniques based on the NovelAI paper,
+    including tag categorization, weight computation, and dynamic tag dropout.
+    
+    Attributes:
+        token_dropout_rate (float): Rate at which individual tokens are dropped during training.
+        caption_dropout_rate (float): Rate at which entire captions are dropped.
+        rarity_factor (float): Factor controlling the impact of tag rarity on weights.
+        emphasis_factor (float): Factor controlling the impact of tag emphasis markers.
+        num_workers (int): Number of worker threads for parallel processing.
+        tag_stats (TagStats): Thread-safe container for tag statistics.
+        weight_cache (Dict): Cache for computed tag weights.
+        _category_cache (Dict): Internal cache for tag categories.
+        tag_categories (Dict): Mapping of tag categories and their properties.
+    """
     
     # Weight boundaries from NovelAI paper
     MIN_WEIGHT: float = 0.1
@@ -81,24 +103,50 @@ class CaptionProcessor:
                  token_dropout_rate: float = 0.1,
                  caption_dropout_rate: float = 0.1,
                  rarity_factor: float = 0.9,
-                 emphasis_factor: float = 1.2):
-        self.token_dropout_rate = token_dropout_rate
-        self.caption_dropout_rate = caption_dropout_rate
-        self.rarity_factor = rarity_factor
-        self.emphasis_factor = emphasis_factor
+                 emphasis_factor: float = 1.2,
+                 min_tag_freq: int = 10,
+                 min_cluster_size: int = 5,
+                 similarity_threshold: float = 0.3):
+        """Initialize the CaptionProcessor.
+        
+        Args:
+            token_dropout_rate: Rate at which individual tokens are dropped.
+            caption_dropout_rate: Rate at which entire captions are dropped.
+            rarity_factor: Controls impact of tag rarity on weights (0.0-1.0).
+            emphasis_factor: Controls impact of emphasis markers (>1.0).
+            min_tag_freq: Minimum frequency for a tag to be considered in clustering.
+            min_cluster_size: Minimum size for a tag cluster.
+            similarity_threshold: DBSCAN eps parameter for clustering.
+        """
+        self.token_dropout_rate = max(0.0, min(1.0, token_dropout_rate))
+        self.caption_dropout_rate = max(0.0, min(1.0, caption_dropout_rate))
+        self.rarity_factor = max(0.0, min(1.0, rarity_factor))
+        self.emphasis_factor = max(1.0, emphasis_factor)
         self.num_workers = min(32, (os.cpu_count() or 1) + 4)
         
-        # Initialize stats tracking
+        # Initialize stats tracking with thread safety
         self.tag_stats = TagStats()
-        self.weight_cache = {}
-        self._category_cache = {}
-        self.tag_categories = {"general": {"keywords": [], "base_weight": 1.0, "representative_tags": []}}
+        self.weight_cache: Dict[str, float] = {}
+        self._category_cache: Dict[str, Any] = {}
+        self.tag_categories: Dict[str, Dict[str, Any]] = {
+            "general": {
+                "keywords": [],
+                "base_weight": 1.0,
+                "representative_tags": []
+            }
+        }
         
-        # Tag clustering parameters
-        self.min_tag_freq = 10  # Minimum frequency for a tag to be considered
-        self.min_cluster_size = 5  # Minimum size for a cluster
-        self.similarity_threshold = 0.3  # DBSCAN eps parameter
+        # Clustering parameters with validation
+        self.min_tag_freq = max(1, min_tag_freq)
+        self.min_cluster_size = max(2, min_cluster_size)
+        self.similarity_threshold = max(0.1, min(0.9, similarity_threshold))
         
+        # Initialize logging
+        logger.info(
+            f"Initialized CaptionProcessor with token_dropout={token_dropout_rate}, "
+            f"caption_dropout={caption_dropout_rate}, rarity_factor={rarity_factor}"
+        )
+    
     def analyze_dataset(self, captions: List[str]) -> None:
         """Analyze dataset to build tag statistics and categories."""
         logger.info("Analyzing dataset to build tag categories...")
@@ -130,7 +178,17 @@ class CaptionProcessor:
         self._create_tag_categories(common_tags)
         
     def _create_tag_categories(self, common_tags: List[str]) -> None:
-        """Create tag categories using clustering on co-occurrence patterns and TF-IDF features."""
+        """Create tag categories using clustering on co-occurrence patterns and TF-IDF features.
+        
+        This method implements an advanced clustering approach that combines:
+        1. Tag co-occurrence patterns
+        2. TF-IDF feature analysis
+        3. DBSCAN clustering
+        4. Category naming based on representative tags
+        
+        Args:
+            common_tags: List of tags that meet the minimum frequency threshold.
+        """
         # Create co-occurrence matrix
         matrix_size = len(common_tags)
         cooccurrence_matrix = np.zeros((matrix_size, matrix_size))
@@ -252,29 +310,123 @@ class CaptionProcessor:
         self._category_cache[tag] = "general"
         return "general"
     
-    def compute_tag_weight(self, tag: str) -> float:
-        """Compute weight for a single tag."""
+    def process_caption(self, caption: str, training: bool = True) -> Tuple[List[str], List[float]]:
+        """Process a caption into tags and weights.
+        
+        Implements the tag processing pipeline from the NovelAI paper:
+        1. Tag parsing and normalization
+        2. Weight computation based on rarity and emphasis
+        3. Optional token dropout during training
+        
+        Args:
+            caption: Raw caption string to process.
+            training: Whether to apply dropout during processing.
+            
+        Returns:
+            Tuple containing:
+            - List of processed tags
+            - List of corresponding weights
+        """
+        # Parse and normalize tags
+        tags = self.parse_tags(caption)
+        if not tags:
+            return [], []
+            
+        # Apply caption dropout during training
+        if training and random.random() < self.caption_dropout_rate:
+            return [], []
+            
+        # Process tags and compute weights
+        processed_tags = []
+        weights = []
+        
+        for tag in tags:
+            # Apply token dropout during training
+            if training and random.random() < self.token_dropout_rate:
+                continue
+                
+            # Get or compute tag weight
+            weight = self.get_tag_weight(tag)
+            
+            # Add to results if valid
+            if weight > 0:
+                processed_tags.append(tag)
+                weights.append(weight)
+                
+        return processed_tags, weights
+        
+    def get_tag_weight(self, tag: str) -> float:
+        """Compute the weight for a tag based on rarity and category.
+        
+        Implements the weight computation formula from the NovelAI paper:
+        weight = base_weight * rarity_factor * emphasis_multiplier
+        
+        Args:
+            tag: Tag to compute weight for.
+            
+        Returns:
+            Computed weight, clamped to [MIN_WEIGHT, MAX_WEIGHT].
+        """
+        # Check cache first
         if tag in self.weight_cache:
             return self.weight_cache[tag]
             
-        # Get base weight from category
-        category = self.get_tag_category(tag)
-        base_weight = self.tag_categories[category]["base_weight"]
-        
-        # Apply rarity factor
+        # Get base components
         rarity = self.tag_stats.get_rarity(tag)
-        weight = base_weight * (1.0 + self.rarity_factor * rarity)
+        category_weight = self._get_category_weight(tag)
         
-        # Apply emphasis factor for quality tags
-        if category == "quality":
-            weight *= self.emphasis_factor
+        # Compute final weight
+        weight = category_weight * (1.0 + (rarity * self.rarity_factor))
         
-        # Clamp weight to bounds
+        # Apply emphasis if present
+        emphasis_level = self._get_emphasis_level(tag)
+        if emphasis_level > 0:
+            weight *= (self.emphasis_factor ** emphasis_level)
+            
+        # Clamp to valid range
         weight = max(self.MIN_WEIGHT, min(self.MAX_WEIGHT, weight))
         
         # Cache and return
         self.weight_cache[tag] = weight
         return weight
+        
+    def _get_emphasis_level(self, tag: str) -> int:
+        """Get the emphasis level of a tag based on curly brace markers.
+        
+        Args:
+            tag: Tag to check for emphasis markers.
+            
+        Returns:
+            Number of emphasis levels (number of curly brace pairs).
+        """
+        emphasis = 0
+        while tag.startswith('{') and tag.endswith('}'):
+            emphasis += 1
+            tag = tag[1:-1].strip()
+        return emphasis
+        
+    def _get_category_weight(self, tag: str) -> float:
+        """Get the base weight for a tag's category.
+        
+        Args:
+            tag: Tag to get category weight for.
+            
+        Returns:
+            Base weight for the tag's category (defaults to 1.0).
+        """
+        # Check category cache
+        if tag in self._category_cache:
+            return self._category_cache[tag]
+            
+        # Find matching category
+        for category, info in self.tag_categories.items():
+            if tag in info["keywords"]:
+                self._category_cache[tag] = info['base_weight']
+                return info['base_weight']
+                
+        # Default to general category
+        self._category_cache[tag] = 1.0
+        return 1.0
     
     def load_caption(self, image_path: str) -> str:
         """Load caption from corresponding text file."""
@@ -356,13 +508,13 @@ class CaptionProcessor:
                 self.tag_stats.update_cooccurrence(tag1, tag2)
         
         # Compute weights
-        weights = [self.compute_tag_weight(tag) for tag in tags]
+        weights = [self.get_tag_weight(tag) for tag in tags]
         
         return tags, weights
     
     def process_tag_batch(self, tags: List[str]) -> List[float]:
         """Process a batch of tags in parallel to compute weights."""
-        return [self.compute_tag_weight(tag) for tag in tags]
+        return [self.get_tag_weight(tag) for tag in tags]
     
     def process_caption_file(self, caption_path: Path) -> Tuple[float, Optional[str]]:
         """Process a caption file and return its weight and any error message.
@@ -389,7 +541,7 @@ class CaptionProcessor:
             if not tags:
                 return 1.0, "No valid tags found in caption"
 
-            tag_weights = [self.compute_tag_weight(tag) for tag in tags]
+            tag_weights = [self.get_tag_weight(tag) for tag in tags]
             # Use mean of tag weights as the overall weight
             weight = sum(tag_weights) / len(tag_weights) if tag_weights else 1.0
             return weight, None

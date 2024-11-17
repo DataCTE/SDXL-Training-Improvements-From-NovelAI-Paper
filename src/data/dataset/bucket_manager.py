@@ -1,6 +1,17 @@
+"""
+Bucket management module for SDXL training pipeline.
+
+This module implements the NovelAI bucketing algorithm with improvements for
+efficient batch processing of images with varying aspect ratios. It handles
+dynamic bucket generation and image assignment based on resolution statistics.
+
+Classes:
+    BucketManager: Manages image resolution buckets and assignments
+"""
+
 import logging
 import math
-from typing import List, Tuple, Dict, Set
+from typing import List, Tuple, Dict, Set, Optional
 from collections import defaultdict
 
 logger = logging.getLogger(__name__)
@@ -8,199 +19,179 @@ logger = logging.getLogger(__name__)
 class BucketManager:
     """Manages image resolution buckets according to NovelAI paper recommendations.
     
-    Algorithm steps from the paper:
-    1. Start width at 256
-    2. Find largest height that satisfies width * height ≤ 512 * 768
-    3. Increment width by 64 until reaching 1024
-    4. Repeat process with width/height swapped
-    5. Add 512×512 bucket
-    6. Remove duplicate buckets
+    This class implements an improved version of the NovelAI bucketing algorithm
+    with support for adaptive buckets and dataset statistics. It ensures efficient
+    batch processing while preserving aspect ratios.
+    
+    Attributes:
+        min_resolution: Minimum allowed dimension size
+        max_resolution: Maximum allowed dimension size
+        resolution_step: Size increment between buckets
+        tolerance: Aspect ratio tolerance (default: 0.033 or 3.3%)
+        buckets: List of available bucket resolutions
+        image_buckets: Mapping of images to their assigned buckets
     """
     
-    def __init__(self, 
-                 min_size: int = 512,
-                 max_size: int = 4096,  # Updated to 4096 for larger images
-                 step_size: int = 64,
-                 max_area: int = 1024 * 1024 * 4,  # Updated to handle larger areas
-                 add_square: bool = True,
-                 adaptive_buckets: bool = True):
+    def __init__(
+        self,
+        min_resolution: int = 512,
+        max_resolution: int = 4096,
+        resolution_step: int = 64,
+        tolerance: float = 0.033
+    ) -> None:
         """Initialize the bucket manager.
         
         Args:
-            min_size: Minimum dimension size (default: 512)
-            max_size: Maximum dimension size (default: 4096)
-            step_size: Size increment between buckets (default: 64)
-            max_area: Maximum area constraint (default: 4*1024*1024)
-            add_square: Whether to add square buckets (default: True)
-            adaptive_buckets: Whether to use adaptive bucket sizes (default: True)
+            min_resolution: Minimum allowed dimension
+            max_resolution: Maximum allowed dimension
+            resolution_step: Resolution increment between buckets
+            tolerance: Aspect ratio tolerance (default: 0.033)
         """
-        self.min_size = min_size
-        self.max_size = max_size
-        self.step_size = step_size
-        self.max_area = max_area
-        self.add_square = add_square
-        self.adaptive_buckets = adaptive_buckets
-        self.image_stats = defaultdict(int)  # Track image resolution statistics
+        self.min_resolution = min_resolution
+        self.max_resolution = max_resolution
+        self.resolution_step = resolution_step
+        self.tolerance = tolerance
         
-        # Generate buckets
-        self.buckets = self._generate_buckets()
-        logger.info(f"Generated {len(self.buckets)} buckets")
+        # Initialize storage
+        self.buckets: List[Tuple[int, int]] = []
+        self.image_buckets: Dict[str, Tuple[int, int]] = {}
+        self.bucket_images: Dict[Tuple[int, int], List[str]] = defaultdict(list)
+        self.image_stats: Dict[Tuple[int, int], int] = defaultdict(int)
         
-    def _generate_buckets(self) -> List[Tuple[int, int]]:
-        """Generate resolution buckets following the NovelAI algorithm with improvements.
+        # Generate initial buckets
+        self._generate_buckets()
+        logger.info("Generated %d initial buckets", len(self.buckets))
         
-        Returns:
-            List of (height, width) tuples representing bucket resolutions
-        """
+    def _generate_buckets(self) -> None:
+        """Generate initial set of resolution buckets."""
         buckets = set()
+        max_area = self.max_resolution * self.max_resolution
         
-        if self.adaptive_buckets and self.image_stats:
-            # Generate adaptive buckets based on dataset statistics
-            buckets.update(self._generate_adaptive_buckets())
-        
-        # Add landscape buckets (width >= 1024)
-        for width in range(1024, self.max_size + 1, self.step_size):
-            # Find heights that satisfy area constraint
-            max_height = min(
-                self.max_size,
-                math.floor(self.max_area / width)
-            )
-            max_height = (max_height // self.step_size) * self.step_size
-            
-            # Add valid height combinations
-            for height in range(self.min_size, max_height + 1, self.step_size):
-                if height * width <= self.max_area:
+        # Generate landscape buckets
+        for width in range(self.min_resolution, self.max_resolution + 1, self.resolution_step):
+            for height in range(self.min_resolution, self.max_resolution + 1, self.resolution_step):
+                if width * height <= max_area:
                     buckets.add((height, width))
         
-        # Add portrait buckets (height >= 1024)
-        for height in range(1024, self.max_size + 1, self.step_size):
-            # Find widths that satisfy area constraint
-            max_width = min(
-                self.max_size,
-                math.floor(self.max_area / height)
-            )
-            max_width = (max_width // self.step_size) * self.step_size
-            
-            # Add valid width combinations
-            for width in range(self.min_size, max_width + 1, self.step_size):
-                if height * width <= self.max_area:
-                    buckets.add((height, width))
+        # Add square buckets
+        for size in range(self.min_resolution, self.max_resolution + 1, self.resolution_step):
+            if size * size <= max_area:
+                buckets.add((size, size))
         
-        # Add square buckets if requested (must be 1024 or larger)
-        if self.add_square:
-            for size in range(1024, self.max_size + 1, self.step_size):
-                if size * size <= self.max_area:
-                    buckets.add((size, size))
+        self.buckets = sorted(list(buckets))
         
-        # Convert to sorted list for consistent ordering
-        buckets = sorted(buckets)
+    def add_image(
+        self,
+        image_path: str,
+        width: int,
+        height: int,
+        no_upscale: bool = True
+    ) -> None:
+        """Add an image to the appropriate bucket.
         
-        # Log bucket statistics
-        if buckets:
-            total_pixels = sum(h * w for h, w in buckets)
-            avg_pixels = total_pixels / len(buckets)
-            logger.info(f"Average bucket resolution: {math.sqrt(avg_pixels):.1f} x {math.sqrt(avg_pixels):.1f}")
-            logger.info(f"Bucket resolutions: {buckets}")
-        
-        return buckets
-
-    def _generate_adaptive_buckets(self) -> Set[Tuple[int, int]]:
-        """Generate adaptive buckets based on dataset statistics"""
-        adaptive_buckets = set()
-        
-        # Find most common aspect ratios
-        aspect_ratios = defaultdict(int)
-        for (h, w), count in self.image_stats.items():
-            ar = w / h
-            # Round to nearest 0.1 to group similar ratios
-            ar_rounded = round(ar * 10) / 10
-            aspect_ratios[ar_rounded] += count
-        
-        # Sort by frequency
-        common_ars = sorted(aspect_ratios.items(), key=lambda x: x[1], reverse=True)
-        
-        # Generate buckets for most common aspect ratios
-        for ar, _ in common_ars[:5]:  # Top 5 most common ratios
-            # Generate multiple sizes maintaining this aspect ratio
-            for base_size in range(self.min_size, self.max_size + 1, self.step_size):
-                height = base_size
-                width = round(height * ar / self.step_size) * self.step_size
-                
-                # Enforce at least one dimension >= 1024
-                if height >= 1024 or width >= 1024:
-                    if (width >= self.min_size and width <= self.max_size and 
-                        height >= self.min_size and height <= self.max_size and 
-                        height * width <= self.max_area):
-                        adaptive_buckets.add((height, width))
-        
-        return adaptive_buckets
-
-    def update_stats(self, height: int, width: int):
-        """Update dataset statistics with a new image"""
+        Args:
+            image_path: Path to the image
+            width: Image width
+            height: Image height
+            no_upscale: Whether to prevent upscaling
+        """
+        # Update statistics
         self.image_stats[(height, width)] += 1
         
-    def find_closest_bucket(self, height: int, width: int) -> Tuple[int, int]:
-        """Find the closest bucket for a given image size.
-        
-        The closest bucket is determined by:
-        1. Maintaining aspect ratio as closely as possible (error < 0.033)
-        2. Minimizing total pixel count while satisfying aspect ratio
-        3. Considering dataset statistics for adaptive bucketing
+        # Find best bucket
+        bucket = self._find_bucket(height, width, no_upscale)
+        if bucket is not None:
+            self.image_buckets[image_path] = bucket
+            self.bucket_images[bucket].append(image_path)
+            
+    def _find_bucket(
+        self,
+        height: int,
+        width: int,
+        no_upscale: bool = True
+    ) -> Optional[Tuple[int, int]]:
+        """Find the most appropriate bucket for given dimensions.
         
         Args:
             height: Image height
             width: Image width
+            no_upscale: Whether to prevent upscaling
             
         Returns:
-            Tuple of (target_height, target_width)
+            Tuple of (bucket_height, bucket_width) or None if no suitable bucket
         """
-        # Update statistics
-        self.update_stats(height, width)
-        
         original_ar = width / height
-        min_ar_error = float('inf')
         best_bucket = None
         min_area = float('inf')
+        min_ar_error = float('inf')
         
         for bucket_height, bucket_width in self.buckets:
+            # Skip if would require upscaling
+            if no_upscale and (bucket_height > height or bucket_width > width):
+                continue
+                
             bucket_ar = bucket_width / bucket_height
             ar_error = abs(bucket_ar - original_ar)
             
             # Check if aspect ratio is within tolerance
-            if ar_error < 0.033:  # 3.3% aspect ratio tolerance
+            if ar_error <= self.tolerance:
                 area = bucket_height * bucket_width
                 if area < min_area:
                     min_area = area
                     best_bucket = (bucket_height, bucket_width)
                     min_ar_error = ar_error
-            # If no good match found yet, consider this bucket
+            # Consider this bucket if no good match found yet
             elif best_bucket is None or ar_error < min_ar_error:
                 min_ar_error = ar_error
                 best_bucket = (bucket_height, bucket_width)
         
         return best_bucket
-    
-    def get_buckets(self) -> List[Tuple[int, int]]:
-        """Get the list of all buckets.
         
-        Returns:
-            List of (height, width) tuples for all buckets
-        """
-        return self.buckets.copy()
-    
-    def assign_to_buckets(self, images: List[Tuple[int, int]]) -> Dict[Tuple[int, int], List[int]]:
-        """Assign a list of images to buckets.
+    def get_bucket_size(self, image_path: str) -> Optional[Tuple[int, int]]:
+        """Get the target size for an image.
         
         Args:
-            images: List of (height, width) tuples representing image dimensions
+            image_path: Path to the image
             
         Returns:
-            Dictionary mapping bucket dimensions to list of image indices
+            Tuple of (target_height, target_width) or None if not found
         """
-        bucket_assignments = defaultdict(list)
+        return self.image_buckets.get(image_path)
         
-        for idx, (height, width) in enumerate(images):
-            bucket = self.find_closest_bucket(height, width)
-            bucket_assignments[bucket].append(idx)
+    def get_bucket_images(self, bucket: Tuple[int, int]) -> List[str]:
+        """Get all images assigned to a bucket.
+        
+        Args:
+            bucket: Tuple of (height, width)
             
-        return dict(bucket_assignments)
+        Returns:
+            List of image paths in the bucket
+        """
+        return self.bucket_images[bucket]
+        
+    def finalize_buckets(self) -> None:
+        """Finalize bucket assignments and optimize bucket distribution."""
+        # Remove empty buckets
+        empty_buckets = [
+            bucket for bucket in self.buckets
+            if not self.bucket_images[bucket]
+        ]
+        for bucket in empty_buckets:
+            self.buckets.remove(bucket)
+            del self.bucket_images[bucket]
+            
+        # Log statistics
+        total_images = sum(len(images) for images in self.bucket_images.values())
+        logger.info(
+            "Finalized %d buckets containing %d images",
+            len(self.buckets), total_images
+        )
+        
+        # Log bucket distribution
+        for bucket in sorted(self.buckets):
+            image_count = len(self.bucket_images[bucket])
+            if image_count > 0:
+                logger.debug(
+                    "Bucket %dx%d: %d images",
+                    bucket[1], bucket[0], image_count
+                )
