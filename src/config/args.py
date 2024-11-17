@@ -71,6 +71,7 @@ class TrainingConfig:
     mixed_precision: str = "fp16"
     max_grad_norm: float = 1.0
     training_mode: str = "v_prediction"
+    training: bool = True
     use_ztsnr: bool = False
     rescale_cfg: bool = False
     rescale_multiplier: float = 0.7
