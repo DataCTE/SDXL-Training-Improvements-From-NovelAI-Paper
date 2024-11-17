@@ -156,6 +156,7 @@ def parse_args() -> TrainingConfig:
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--mixed_precision", type=str, default="fp16", choices=["no", "fp16", "bf16"])
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument("--save_epochs", type=int, default=1)
     
     # Training mode
     parser.add_argument("--training_mode", type=str, default="v_prediction", choices=["v_prediction", "epsilon"])
