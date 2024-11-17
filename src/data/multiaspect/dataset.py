@@ -52,7 +52,7 @@ class MultiAspectDataset(Dataset):
         enable_transforms: bool = True,
         transform_params: Optional[Dict[str, Any]] = None,
         min_size: int = 512,
-        max_size: int = 2048
+        max_size: int = 4096
     ):
         """Initialize the dataset.
         

@@ -89,7 +89,7 @@ def validate_dimensions(
     width: int,
     height: int,
     min_size: int = 1024,
-    max_size: int = 2048
+    max_size: int = 4096
 ) -> None:
     """Validate image dimensions.
     
@@ -128,7 +128,7 @@ def validate_target_size(target_size: Tuple[int, int]) -> None:
 def validate_image_comprehensive(
     image: Image.Image,
     min_size: int = 512,
-    max_size: int = 2048,
+    max_size: int = 4096,
     required_mode: str = 'RGB'
 ) -> None:
     """Validate a PIL Image.
