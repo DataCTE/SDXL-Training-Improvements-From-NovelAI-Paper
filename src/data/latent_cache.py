@@ -94,8 +94,8 @@ class GPUWorker:
                 # Process in mixed precision for speed
                 with torch.amp.autocast('cuda', enabled=True):
                     with torch.no_grad():
-                        # Process in chunks to avoid OOM
-                        chunk_size = 32  # Optimal batch size
+                        # Increased chunk size for better GPU utilization
+                        chunk_size = 64  # Increased from 32
                         all_latents = []
                         
                         for i in range(0, len(batch_tensor), chunk_size):
@@ -150,7 +150,7 @@ class LatentCacheManager:
         self,
         cache_dir: str = "latents_cache",
         vae: Optional[torch.nn.Module] = None,
-        workers_per_gpu: int = 4
+        workers_per_gpu: int = 20  # Restored to 20 workers per GPU
     ) -> None:
         """Initialize the latent cache manager.
         
@@ -174,13 +174,13 @@ class LatentCacheManager:
         self.total_workers = self.num_gpus * workers_per_gpu
         
         # Configure queue sizes for optimal throughput
-        self.queue_size = 100
+        self.queue_size = max(200, self.total_workers * 4)  # Increased queue size
         logger.info(
             "Initializing %d workers across %d GPUs (%d per GPU)",
             self.total_workers, self.num_gpus, workers_per_gpu
         )
         
-        # Initialize thread-safe caching
+        # Initialize thread-safe caching with larger memory buffer
         self.latents_cache: Dict[str, torch.Tensor] = {}
         self.cache_lock = Lock()
         
@@ -188,19 +188,14 @@ class LatentCacheManager:
         self.cached_files: Set[str] = set()
         self._load_cached_files()
         
-        # Initialize processing queues
+        # Initialize processing queues with larger sizes
         self.queue_in = mp.Queue(maxsize=self.queue_size)
         self.queue_out = mp.Queue(maxsize=self.queue_size)
         self.workers: List[mp.Process] = []
         
-        # Initialize prefetching
-        self.prefetch_size = 3
+        # Increase prefetching for better throughput
+        self.prefetch_size = 8  # Increased from 3
         self.prefetch_queue = mp.Queue(maxsize=self.prefetch_size)
-
-        # Initialize progress tracking
-        self.total_images = 0
-        self.processed_images = 0
-        self.pbar = None
 
     def _load_cached_files(self) -> None:
         """Load list of already cached files."""
@@ -219,8 +214,8 @@ class LatentCacheManager:
         self, image_tensors: torch.Tensor, batch_paths: List[str]
     ) -> None:
         """Queue a batch of images for processing with prefetching."""
-        # Split into smaller batches for better memory management
-        batch_size = 32  # Optimal batch size
+        # Increased batch size for better throughput
+        batch_size = 64  # Increased from 32
         for i in range(0, len(image_tensors), batch_size):
             batch_tensor = image_tensors[i:i + batch_size]
             batch_path = batch_paths[i:i + batch_size]
