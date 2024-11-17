@@ -101,17 +101,21 @@ class MultiAspectDataset(Dataset):
         # Validate images in parallel
         with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
             futures = []
-            for path in self.image_paths:
-                futures.append(executor.submit(self._validate_image, path))
             
-            # Collect results and filter invalid images
-            valid_indices = []
-            for idx, future in enumerate(futures):
-                try:
-                    future.result()
-                    valid_indices.append(idx)
-                except Exception as e:
-                    logger.warning("Skipping invalid image %s: %s", self.image_paths[idx], str(e))
+            # Create progress bar for initial file scanning
+            with tqdm(total=len(self.image_paths), desc="Validating images") as pbar:
+                for path in self.image_paths:
+                    futures.append(executor.submit(self._validate_image, path))
+                
+                # Collect results and filter invalid images
+                valid_indices = []
+                for idx, future in enumerate(futures):
+                    try:
+                        future.result()
+                        valid_indices.append(idx)
+                    except Exception as e:
+                        logger.warning(f"Skipping invalid image {self.image_paths[idx]}: {str(e)}")
+                    pbar.update(1)
             
             # Filter dataset
             self.image_paths = [self.image_paths[i] for i in valid_indices]
@@ -260,7 +264,7 @@ def create_train_dataloader(
     vae_cache: VAECache,
     text_embedding_cache: TextEmbeddingCache,
     batch_size: int,
-    num_workers: int = 4,
+    num_workers: int = 10,
     enable_transforms: bool = True,
     transform_params: Optional[Dict[str, Any]] = None,
 ) -> DataLoader:
@@ -346,7 +350,7 @@ def create_validation_dataloader(
     vae_cache: VAECache,
     text_embedding_cache: TextEmbeddingCache,
     batch_size: int,
-    num_workers: int = 4,
+    num_workers: int = 10,
 ) -> DataLoader:
     """Create validation dataloader.
     
