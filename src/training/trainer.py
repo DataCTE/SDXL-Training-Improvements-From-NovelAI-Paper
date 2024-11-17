@@ -11,9 +11,6 @@ from collections import defaultdict
 from contextlib import nullcontext
 
 import torch
-import torch.nn as nn
-from torch.nn import Module
-from torch.optim import Optimizer
 import numpy as np
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -202,20 +199,20 @@ def setup_tag_weighter(args) -> Optional[CaptionProcessor]:
         RuntimeError: If initialization fails
     """
     try:
-        if not args.tag_weighting.use_tag_weighting:
+        if not args.data.use_tag_weighting:
             return None
 
         # Initialize CaptionProcessor with configuration
         processor = CaptionProcessor(
             token_dropout_rate=args.data.token_dropout_rate,
             caption_dropout_rate=args.data.caption_dropout_rate,
-            rarity_factor=args.tag_weighting.rarity_factor if hasattr(args.tag_weighting, "rarity_factor") else 0.9,
-            emphasis_factor=args.tag_weighting.emphasis_factor if hasattr(args.tag_weighting, "emphasis_factor") else 1.2
+            rarity_factor=0.9,  # Default value
+            emphasis_factor=1.2  # Default value
         )
         
         # Set weight boundaries
-        processor.MIN_WEIGHT = args.tag_weighting.min_tag_weight
-        processor.MAX_WEIGHT = args.tag_weighting.max_tag_weight
+        processor.MIN_WEIGHT = args.data.min_tag_weight
+        processor.MAX_WEIGHT = args.data.max_tag_weight
         
         logger.info(
             "Initialized CaptionProcessor with tag weighting: "
@@ -429,7 +426,7 @@ def initialize_training_components(args, models):
                 vae=dataloader_models["vae"],
                 cache_dir=args.data.cache_dir,
                 no_caching_latents=args.data.no_caching,
-                use_tag_weighting=args.tag_weighting.use_tag_weighting,
+                use_tag_weighting=args.data.use_tag_weighting,
                 min_size=args.data.min_size,
                 max_size=args.data.max_size,
                 bucket_step_size=args.data.bucket_step_size,
@@ -477,7 +474,7 @@ def initialize_training_components(args, models):
             ),
             "tag_weighter": (
                 setup_tag_weighter, 
-                args.tag_weighting.use_tag_weighting, 
+                args.data.use_tag_weighting, 
                 (args,)
             ),
             "vae_finetuner": (
@@ -927,7 +924,7 @@ def forward_pass(args, models, batch, device, dtype, components) -> torch.Tensor
             rescale_cfg=args.training.rescale_cfg,
             rescale_multiplier=args.training.rescale_multiplier,
             scale_method=args.training.scale_method,
-            use_tag_weighting=args.tag_weighting.use_tag_weighting,
+            use_tag_weighting=args.data.use_tag_weighting,
             device=device,
             dtype=dtype
         )
@@ -942,3 +939,4 @@ def forward_pass(args, models, batch, device, dtype, components) -> torch.Tensor
     except (ValueError, RuntimeError, KeyError) as e:
         logger.error("Forward pass failed: %s", str(e))
         raise type(e)(f"Failed during forward pass: {str(e)}") from e
+

@@ -172,96 +172,90 @@ def training_loss_v_prediction(
     x_0: torch.Tensor,
     sigma: torch.Tensor,
     text_embeddings: torch.Tensor,
-    added_cond_kwargs: Optional[Dict[str, Any]] = None,
-    sigma_data: float = 1.0,
-    tag_weighter: Optional[Any] = None,
-    batch_tags: Optional[Any] = None,
-    min_snr_gamma: float = 5.0,
-    rescale_cfg: bool = True,
-    rescale_multiplier: float = 0.7,
-    scale_method: str = "karras",
-    use_tag_weighting: bool = True,
-    device: Optional[torch.device] = None,
-    dtype: Optional[torch.dtype] = None
+    added_cond_kwargs: Dict[str, torch.Tensor],
+    sigma_data: float,
+    tag_weighter: Optional[Any],
+    batch_tags: Optional[Any],
+    min_snr_gamma: float,
+    rescale_cfg: bool,
+    rescale_multiplier: float,
+    scale_method: str,
+    use_tag_weighting: bool,
+    device: torch.device,
+    dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Ultra-optimized v-prediction loss with minimal memory operations"""
-    try:
-        # Input validation
-        if not isinstance(model, torch.nn.Module):
-            raise ValueError("Model must be a torch.nn.Module")
-        if not torch.is_tensor(x_0) or not torch.is_tensor(sigma) or not torch.is_tensor(text_embeddings):
-            raise ValueError("Inputs must be torch tensors")
-        if scale_method not in ["karras", "simple"]:
-            raise ValueError(f"Invalid scale method: {scale_method}")
-            
-        # Ensure contiguous tensors for better memory access
-        x_0 = x_0.contiguous()
-        sigma = sigma.contiguous()
-        text_embeddings = text_embeddings.contiguous()
+    """
+    Compute training loss using v-prediction.
+    
+    Args:
+        model: UNet model
+        x_0: Input latents
+        sigma: Noise timesteps
+        text_embeddings: Text embeddings
+        added_cond_kwargs: Additional conditioning kwargs
+        sigma_data: Data sigma parameter
+        tag_weighter: Optional tag weighter for weighting loss by tags
+        batch_tags: Optional batch tags for tag weighting
+        min_snr_gamma: Minimum SNR gamma parameter
+        rescale_cfg: Whether to rescale classifier-free guidance
+        rescale_multiplier: Rescale multiplier value
+        scale_method: Method for scaling loss
+        use_tag_weighting: Whether to use tag weighting
+        device: Torch device
+        dtype: Torch dtype
         
-        # Single contiguous memory allocation for noise
-        noise = torch.randn_like(x_0, memory_format=torch.contiguous_format)
-        
-        # Move tensors to device/dtype if specified
-        if device is not None or dtype is not None:
-            tensors_to_move = [noise, sigma, x_0, text_embeddings]
-            for tensor in tensors_to_move:
-                tensor = tensor.to(device=device, dtype=dtype, non_blocking=True)
-        
-        # Pre-compute common terms (fused operations)
-        sigma_expanded = sigma.view(-1, 1, 1, 1)
-        sigma_sq = sigma * sigma
-        sigma_data_sq = sigma_data * sigma_data
-        
-        # Compute scaling factors with fused operations
-        inv_denominator = torch.rsqrt(sigma_sq + sigma_data_sq)
-        c_out = -sigma * sigma_data * inv_denominator
-        c_in = inv_denominator
-        
-        # Compute noised input with fused operations
-        noised = torch.addcmul(x_0, sigma_expanded, noise)
-        model_input = noised * c_in.view(-1, 1, 1, 1)
-        
-        # Forward pass with error handling
-        try:
-            model_output = model(
-                model_input,
-                sigma_expanded,
-                encoder_hidden_states=text_embeddings,
-                added_cond_kwargs=added_cond_kwargs
-            ).sample
-        except Exception as e:
-            logger.error("Model forward pass failed: %s", str(e))
-            raise
-        
-        # Compute loss components with fused operations
-        target = noise * c_out.view(-1, 1, 1, 1)
-        mse = torch.square(model_output - target).mean(dim=(1, 2, 3))
-        
-        # Compute SNR and weights with optimized operations
-        snr = torch.square(sigma_data * inv_denominator * sigma)
-        snr_weight, cfg_scale = compute_loss_weights(
-            snr, min_snr_gamma, scale_method, rescale_multiplier, rescale_cfg
-        )
-        
-        # Compute final loss with fused operations
-        loss = torch.mean(mse * snr_weight) * cfg_scale.mean()
-        
-        # Apply tag weighting if enabled
-        if use_tag_weighting and tag_weighter is not None and batch_tags is not None:
-            try:
-                tag_weight = tag_weighter(batch_tags).mean()
-                loss = loss * tag_weight
-            except (TypeError, ValueError, RuntimeError, KeyError, AttributeError) as e:
-                logger.warning("Tag weighting failed: %s (type: %s)", str(e), type(e).__name__)
-                # Continue with unweighted loss
-        
-        return loss
-        
-    except Exception as e:
-        logger.error("Loss computation failed: %s", str(e))
-        logger.error(traceback.format_exc())
-        raise
+    Returns:
+        Training loss tensor
+    """
+    # Add noise to input
+    noise = torch.randn_like(x_0)
+    noised = x_0 + noise * sigma.view(-1, 1, 1, 1)
+
+    # Get model prediction
+    v_pred = model(
+        noised,
+        sigma,
+        encoder_hidden_states=text_embeddings,
+        added_cond_kwargs=added_cond_kwargs,
+    ).sample
+
+    # Compute v-target
+    v_target = noise * sigma.view(-1, 1, 1, 1)
+
+    # Compute loss
+    loss = (v_pred - v_target) ** 2
+
+    # Apply loss scaling
+    if scale_method == "min_snr":
+        # Scale loss by min_snr_gamma
+        loss_weights = (sigma ** 2) / (sigma ** 2 + sigma_data ** 2)
+        loss_weights = loss_weights.view(-1, 1, 1, 1)
+        if min_snr_gamma is not None:
+            loss_weights = loss_weights.clamp(max=min_snr_gamma)
+        loss = loss * loss_weights
+    elif scale_method == "karras":
+        # Scale loss using Karras method
+        loss = loss / (sigma ** 2)
+    elif scale_method == "none":
+        # No scaling
+        pass
+    else:
+        raise ValueError(f"Unknown scale method: {scale_method}")
+
+    # Apply tag weighting if enabled
+    if use_tag_weighting and tag_weighter is not None and batch_tags is not None:
+        tag_weights = tag_weighter.compute_weights(batch_tags)
+        tag_weights = tag_weights.to(device=device, dtype=dtype)
+        loss = loss * tag_weights.view(-1, 1, 1, 1)
+
+    # Apply CFG rescaling if enabled
+    if rescale_cfg:
+        loss = loss * rescale_multiplier
+
+    # Average loss
+    loss = loss.mean()
+
+    return loss
 
 def get_loss_info(loss_tensor: torch.Tensor) -> dict:
     """Get detailed information about loss values"""
