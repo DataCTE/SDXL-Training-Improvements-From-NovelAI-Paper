@@ -71,7 +71,7 @@ class TrainingConfig:
     data_dir: str
     
     # Output configuration
-    output_dir: str = "./output"
+    output_dir: str = "output"
     
     # Training hyperparameters
     batch_size: int = 1
@@ -80,7 +80,6 @@ class TrainingConfig:
     learning_rate: float = 1e-5
     max_grad_norm: float = 1.0
     warmup_steps: int = 500
-    save_checkpoints: bool = False
     
     # Model and training mode configuration
     training_mode: str = "v_prediction"
@@ -111,18 +110,18 @@ class TrainingConfig:
     
     # Validation settings
     validation_dir: Optional[str] = None
-    validation_prompts: Optional[List[str]] = field(default=None)
-    validation_epochs: Optional[int] = field(default=None)
-    validation_steps: Optional[int] = field(default=None)
-    validation_num_inference_steps: int = field(default=20)
-    validation_guidance_scale: float = field(default=7.5)
-    validation_image_height: int = field(default=1024)
-    validation_image_width: int = field(default=1024)
-    validation_num_images_per_prompt: int = field(default=1)
+    validation_prompts: List[str] = field(default_factory=list)
+    validation_epochs: int = 1
+    validation_steps: int = 1000
+    validation_num_inference_steps: int = 20
+    validation_guidance_scale: float = 7.5
+    validation_image_height: int = 1024
+    validation_image_width: int = 1024
+    validation_num_images_per_prompt: int = 1
     
     # Checkpoint settings
-    save_epochs: Optional[int] = field(default=None)
-    save_checkpoints: bool = field(default=False)
+    save_epochs: int = 1
+    save_checkpoints: bool = False
     
     # Optimizer configuration
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
@@ -142,12 +141,8 @@ class TrainingConfig:
     bucket_step_size: int = 64
     max_bucket_area: int = 1024*1024
     
-    # Sampling parameters
-    sigma_min: float = field(default=0.029)
-    scale_method: str = field(default="karras")
-
     # Tag processing
-    use_tag_weighting: bool = field(default=False)
+    use_tag_weighting: bool = False
 
 def parse_args() -> TrainingConfig:
     """
@@ -163,7 +158,7 @@ def parse_args() -> TrainingConfig:
     parser.add_argument("--data_dir", type=str, required=True, help="Training data directory")
     
     # Optional arguments
-    parser.add_argument("--output_dir", type=str, default="./output", help="Output directory")
+    parser.add_argument("--output_dir", type=str, default="output", help="Output directory")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=1e-5)
