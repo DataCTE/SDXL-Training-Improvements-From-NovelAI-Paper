@@ -9,6 +9,10 @@ import torch.multiprocessing as mp
 from queue import Empty
 from threading import Lock
 
+# Set the start method to 'spawn' for CUDA multiprocessing
+if mp.get_start_method(allow_none=True) != 'spawn':
+    mp.set_start_method('spawn', force=True)
+
 logger = logging.getLogger(__name__)
 
 class GPUWorker:
@@ -31,7 +35,8 @@ class GPUWorker:
                     
                 batch_tensor, batch_paths = batch_data
                 
-                with torch.cuda.amp.autocast(enabled=True):
+                # Update to use newer torch.amp.autocast API
+                with torch.amp.autocast('cuda', enabled=True):
                     with torch.no_grad():
                         batch_tensor = batch_tensor.to(self.device)
                         latents = self.vae.encode(batch_tensor).latent_dist.sample()
@@ -123,7 +128,8 @@ class LatentCacheManager:
         if self.vae is not None and image_tensor is not None:
             # Process single image on first available GPU
             device = torch.device(f'cuda:{0}')
-            with torch.cuda.amp.autocast(enabled=True):
+            # Update to use newer torch.amp.autocast API
+            with torch.amp.autocast('cuda', enabled=True):
                 with torch.no_grad():
                     image_tensor = image_tensor.to(device)
                     latents = self.vae.encode(image_tensor).latent_dist.sample()
