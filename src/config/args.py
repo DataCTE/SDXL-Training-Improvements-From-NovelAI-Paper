@@ -59,19 +59,29 @@ class TagWeightingConfig:
 
 @dataclass
 class TrainingConfig:
-    # Required arguments (no defaults)
+    # Required parameters
     model_path: str
     data_dir: str
     
-    # Optional arguments (with defaults)
+    # Output configuration
     output_dir: str = "./output"
+    
+    # Training hyperparameters
     batch_size: int = 1
     num_epochs: int = 1
     gradient_accumulation_steps: int = 1
-    mixed_precision: str = "fp16"
+    learning_rate: float = 1e-5
     max_grad_norm: float = 1.0
+    
+    # Model and training mode configuration
     training_mode: str = "v_prediction"
-    training: bool = True
+    mixed_precision: str = "fp16"
+    gradient_checkpointing: bool = False
+    use_8bit_adam: bool = False
+    use_ema: bool = True
+    ema_decay: float = 0.9999
+    
+    # SDXL specific parameters
     use_ztsnr: bool = False
     rescale_cfg: bool = False
     rescale_multiplier: float = 0.7
@@ -82,18 +92,15 @@ class TrainingConfig:
     sigma_max: float = 160.0
     scale_method: str = "karras"
     scale_factor: float = 0.7
+    
+    # Hardware and performance settings
     device: str = "cuda"
     enable_compile: bool = False
     compile_mode: str = "default"
-    gradient_checkpointing: bool = True
     num_workers: int = 4
+    
+    # Validation settings
     validation_dir: Optional[str] = None
-    cache_dir: str = "latents_cache"
-    no_caching: bool = False
-    min_size: int = 512
-    max_size: int = 4096
-    bucket_step_size: int = 64
-    max_bucket_area: int = 1024*1024
     validation_prompts: Optional[List[str]] = None
     validation_epochs: int = 1
     save_epochs: int = 1
@@ -103,12 +110,22 @@ class TrainingConfig:
     validation_image_width: int = 1024
     validation_num_images_per_prompt: int = 1
     
-    # Component configs
+    # Optimizer configuration
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
     ema: EMAConfig = field(default_factory=EMAConfig)
     vae_args: VAEConfig = field(default_factory=VAEConfig)
     tag_weighting: TagWeightingConfig = field(default_factory=TagWeightingConfig)
+    
+    # Cache settings
+    cache_dir: str = "latents_cache"
+    no_caching: bool = False
+    
+    # Dataset settings
+    min_size: int = 512
+    max_size: int = 4096
+    bucket_step_size: int = 64
+    max_bucket_area: int = 1024*1024
 
 def parse_args() -> TrainingConfig:
     """
@@ -127,7 +144,7 @@ def parse_args() -> TrainingConfig:
     parser.add_argument("--output_dir", type=str, default="./output", help="Output directory")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_epochs", type=int, default=1)
-    parser.add_argument("--learning_rate", type=float, default=1e-6)
+    parser.add_argument("--learning_rate", type=float, default=1e-5)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--mixed_precision", type=str, default="fp16", choices=["no", "fp16", "bf16"])
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
