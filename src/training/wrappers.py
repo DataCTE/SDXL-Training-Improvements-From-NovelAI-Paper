@@ -31,52 +31,43 @@ def train_sdxl(
     pretrained_model_path: Optional[str] = None,
     resume_from_checkpoint: Optional[str] = None,
     models: Optional[Dict[str, Any]] = None,
+    config: Optional[TrainingConfig] = None,
     **kwargs
 ) -> SDXLTrainer:
-    """
-    High-level wrapper for training SDXL models with improvements.
-    
-    Args:
-        train_data_dir: Directory containing training data
-        output_dir: Directory to save checkpoints and outputs
-        val_data_dir: Optional directory containing validation data
-        pretrained_model_path: Optional path to pretrained model weights
-        resume_from_checkpoint: Optional path to resume training from checkpoint
-        models: Optional pre-loaded model dictionary
-        **kwargs: Additional training configuration parameters
-        
-    Returns:
-        Trained SDXLTrainer instance
-    """
+    """High-level wrapper for training SDXL models."""
     try:
-        # Remove validation_config from kwargs if present
-        kwargs.pop('validation_config', None)
-        
-        # Setup configuration using the proper TrainingConfig
-        config = TrainingConfig(
-            pretrained_model_path=str(pretrained_model_path) if pretrained_model_path else "",
-            train_data_dir=str(train_data_dir),
-            output_dir=str(output_dir),
-            **{k: v for k, v in kwargs.items() if k in {f.name for f in fields(TrainingConfig)}}
-        )
+        # Setup configuration
+        if config is None:
+            config = TrainingConfig(
+                pretrained_model_path=str(pretrained_model_path) if pretrained_model_path else "",
+                train_data_dir=str(train_data_dir),
+                output_dir=str(output_dir),
+                **kwargs
+            )
         
         # Create output directory
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Use provided models or create new ones
+        # Setup logging directory
+        log_dir = output_dir / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Load or create models
         if models is None:
+            logger.info("Creating new SDXL models...")
             models_dict, _ = create_sdxl_models(pretrained_model_path)
         else:
+            logger.info("Using provided models...")
             models_dict = models
             
-        # Setup caches
+        # Setup caches with proper config
         vae_cache = VAECache(
             vae=models_dict['vae'],
             cache_dir=str(output_dir / "vae_cache"),
-            max_cache_size=config.cache_size,
-            num_workers=config.num_workers,
-            batch_size=config.batch_size
+            max_cache_size=config.caching.vae_cache_size,
+            num_workers=config.caching.vae_cache_num_workers,
+            batch_size=config.caching.vae_cache_batch_size
         )
         
         text_embedding_cache = TextEmbeddingCache(
@@ -85,39 +76,31 @@ def train_sdxl(
             tokenizer1=models_dict['tokenizer'],
             tokenizer2=models_dict['tokenizer_2'],
             cache_dir=str(output_dir / "text_embeds_cache"),
-            max_cache_size=config.cache_size,
-            num_workers=config.num_workers,
-            batch_size=config.batch_size
+            max_cache_size=config.caching.text_cache_size,
+            num_workers=config.caching.text_cache_num_workers,
+            batch_size=config.caching.text_cache_batch_size
         )
         
         # Get image paths and captions
-        train_image_paths = [str(p) for p in Path(train_data_dir).glob("*.[jJ][pP][gG]")]
+        logger.info("Loading and validating training data...")
+        train_image_paths = []
+        for path in Path(train_data_dir).glob("*.[jJ][pP][gG]"):
+            if validate_image(str(path)):
+                train_image_paths.append(str(path))
+            else:
+                logger.warning(f"Skipping invalid image: {path}")
+        
+        if not train_image_paths:
+            raise ValueError(f"No valid training images found in {train_data_dir}")
+            
         train_captions = load_captions(train_image_paths)
         
-        # Create bucket manager
-        bucket_manager = BucketManager(
-            max_resolution=config.max_resolution,
-            min_batch_size=1,
-            max_batch_size=config.batch_size,
-            num_workers=config.num_workers
-        )
-        
-        # Add images to bucket manager
-        for image_path in train_image_paths:
-            try:
-                with Image.open(image_path) as img:
-                    width, height = img.size
-                bucket_manager.add_image(image_path, width, height)
-            except Exception as e:
-                logger.warning(f"Failed to process {image_path}: {e}")
-        
         # Create train dataloader
+        logger.info("Creating training dataloader...")
         train_dataloader = create_train_dataloader(
             image_paths=train_image_paths,
             captions=train_captions,
-            bucket_manager=bucket_manager,
-            batch_size=config.batch_size,
-            num_workers=config.num_workers,
+            config=config,
             vae_cache=vae_cache,
             text_cache=text_embedding_cache
         )
@@ -125,22 +108,29 @@ def train_sdxl(
         # Create validation dataloader if validation data provided
         val_dataloader = None
         if val_data_dir:
-            val_image_paths = [str(p) for p in Path(val_data_dir).glob("*.[jJ][pP][gG]")]
-            val_captions = load_captions(val_image_paths)
-            
-            val_dataloader = create_validation_dataloader(
-                image_paths=val_image_paths,
-                captions=val_captions,
-                bucket_manager=bucket_manager,
-                batch_size=config.batch_size,
-                num_workers=config.num_workers,
-                vae_cache=vae_cache,
-                text_cache=text_embedding_cache
-            )
+            logger.info("Setting up validation...")
+            val_image_paths = []
+            for path in Path(val_data_dir).glob("*.[jJ][pP][gG]"):
+                if validate_image(str(path)):
+                    val_image_paths.append(str(path))
+                else:
+                    logger.warning(f"Skipping invalid validation image: {path}")
+                    
+            if val_image_paths:
+                val_captions = load_captions(val_image_paths)
+                val_dataloader = create_validation_dataloader(
+                    image_paths=val_image_paths,
+                    captions=val_captions,
+                    config=config,
+                    vae_cache=vae_cache,
+                    text_cache=text_embedding_cache
+                )
+            else:
+                logger.warning(f"No valid validation images found in {val_data_dir}")
         
         # Resume from checkpoint if specified
         if resume_from_checkpoint:
-            # Create pipeline from checkpoint
+            logger.info(f"Resuming from checkpoint: {resume_from_checkpoint}")
             pipeline = StableDiffusionXLPipeline(
                 vae=models_dict["vae"],
                 text_encoder=models_dict["text_encoder"],
@@ -151,11 +141,8 @@ def train_sdxl(
                 scheduler=models_dict["scheduler"]
             )
             
-            # Load checkpoint
             load_checkpoint(resume_from_checkpoint, pipeline)
-            logger.info(f"Resumed training from {resume_from_checkpoint}")
             
-            # Update models dict with loaded weights
             models_dict.update({
                 "vae": pipeline.vae,
                 "text_encoder": pipeline.text_encoder,
@@ -164,6 +151,7 @@ def train_sdxl(
             })
         
         # Create trainer
+        logger.info("Initializing SDXL trainer...")
         trainer = SDXLTrainer(
             config=config,
             models=models_dict,
@@ -181,32 +169,37 @@ def train_sdxl(
 def train_vae(
     train_data_dir: Union[str, Path],
     output_dir: Union[str, Path],
-    config: Optional[VAEConfig] = None,
+    config: VAEConfig,
     **kwargs
 ) -> VAEFinetuner:
-    """High-level wrapper for VAE finetuning with improvements."""
+    """High-level wrapper for VAE finetuning."""
     try:
-        # Create output directory
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Use provided config or create default
-        if config is None:
-            config = VAEConfig(**kwargs)
+        # Setup logging directory
+        log_dir = output_dir / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        
+        logger.info("Initializing VAE finetuning...")
         
         # Create VAE model
-        vae = create_vae_model(config.vae_path)
+        vae = create_vae_model(
+            vae_path=config.vae_path,
+            device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        )
         
-        # Setup VAE cache
+        # Setup VAE cache with proper config
         vae_cache = VAECache(
             vae=vae,
             cache_dir=str(output_dir / "vae_cache"),
             max_cache_size=config.cache_size,
-            num_workers=config.num_workers,  # Use config value
+            num_workers=config.num_workers if hasattr(config, 'num_workers') else 4,
             batch_size=config.batch_size
         )
         
         # Get and validate image paths
+        logger.info("Loading and validating training data...")
         train_image_paths = []
         for path in Path(train_data_dir).glob("*.[jJ][pP][gG]"):
             if validate_image(str(path)):
@@ -214,37 +207,34 @@ def train_vae(
             else:
                 logger.warning(f"Skipping invalid image: {path}")
         
-        # Create bucket manager
-        bucket_manager = BucketManager(train_image_paths)
+        if not train_image_paths:
+            raise ValueError(f"No valid training images found in {train_data_dir}")
         
         # Create empty captions dict (VAE training doesn't need captions)
         train_captions = {path: "" for path in train_image_paths}
         
-        # Create and initialize trainer
+        # Create dataloader
+        logger.info("Creating training dataloader...")
+        train_dataloader = create_train_dataloader(
+            image_paths=train_image_paths,
+            captions=train_captions,
+            config=config,
+            vae_cache=vae_cache,
+            text_cache=None
+        )
+        
+        # Create trainer
+        logger.info("Initializing VAE trainer...")
         trainer = VAEFinetuner(
             vae=vae,
             config=config,
+            train_dataloader=train_dataloader,
             device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        )
-        
-        # Create dataloader and attach to trainer
-        trainer.train_dataloader = create_train_dataloader(
-            image_paths=train_image_paths,
-            captions=train_captions,
-            bucket_manager=bucket_manager,
-            batch_size=config.batch_size,
-            num_workers=config.num_workers,  # Use config value
-            vae_cache=vae_cache,
-            text_cache=None,
-            shuffle=True,
-            pin_memory=True,
-            drop_last=True
         )
         
         return trainer
         
     except Exception as e:
-        import traceback
         logger.error("VAE training setup failed with error: %s", str(e))
         logger.error("Full traceback:\n%s", traceback.format_exc())
         raise

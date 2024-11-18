@@ -29,6 +29,15 @@ class SDXLTrainer:
         val_dataloader: Optional[torch.utils.data.DataLoader] = None,
         device: str = "cuda",
     ):
+        """Initialize SDXL trainer.
+        
+        Args:
+            config: Training configuration
+            models: Dictionary of model components
+            train_dataloader: Training data loader
+            val_dataloader: Optional validation data loader
+            device: Target device for training
+        """
         self.config = config
         self.models = models
         self.device = torch.device(device)
@@ -38,14 +47,25 @@ class SDXLTrainer:
         self.train_dataloader = self._setup_dataloader(train_dataloader)
         self.val_dataloader = self._setup_dataloader(val_dataloader) if val_dataloader else None
         
-        # Initialize components
+        # Initialize components with updated config
         self.components = initialize_training_components(config, models)
         self.metrics_manager = MetricsManager()
+        
+        # Setup progress tracking
+        self.progress = ProgressTracker(
+            description="SDXL Training",
+            total_steps=config.num_epochs * len(train_dataloader),
+            log_steps=10,
+            save_steps=1000,
+            eval_steps=1000
+        )
         
         # Move models to device
         for name, model in self.models.items():
             if isinstance(model, torch.nn.Module):
                 model.to(self.device)
+                if config.gradient_checkpointing and hasattr(model, 'enable_gradient_checkpointing'):
+                    model.enable_gradient_checkpointing()
                 model.train()
         
         # Setup EMA models if enabled
@@ -53,17 +73,25 @@ class SDXLTrainer:
         if config.use_ema:
             for name, model in self.models.items():
                 if isinstance(model, torch.nn.Module) and name in ['unet', 'text_encoder', 'text_encoder_2']:
-                    ema_model = setup_ema_model(model, self.device)
+                    ema_model = setup_ema_model(
+                        model=model,
+                        device=self.device,
+                        power=0.75,  # default value
+                        update_after_step=config.ema.update_after_step,
+                        max_value=0.9999,  # default value
+                        min_value=0,  # default value
+                        inv_gamma=1  # default value
+                    )
                     if ema_model is not None:
                         self.ema_models[name] = ema_model
         
-        # Initialize wandb
+        # Initialize wandb with proper config
         self.wandb_run = None
-        if hasattr(config, 'use_wandb') and config.use_wandb:
+        if config.wandb.use_wandb:
             self.wandb_run = wandb.init(
-                project=config.wandb_project,
-                name=config.wandb_run_name,
-                config=config.__dict__
+                project=config.wandb.wandb_project,
+                name=config.wandb.wandb_run_name,
+                config=vars(config)  # Use vars() instead of __dict__
             )
         
         # Initialize state tracker
@@ -104,57 +132,58 @@ class SDXLTrainer:
     def train(self, save_dir: str):
         """Execute training loop with validation."""
         try:
-            with ProgressTracker(
+            progress = ProgressTracker(
                 "SDXL Training",
                 total=self.config.num_epochs,
                 wandb_run=self.wandb_run
-            ) as progress:
-                for epoch in range(self.config.num_epochs):
-                    # Training epoch
-                    epoch_metrics = self.train_epoch(epoch)
+            )
+            
+            for epoch in range(self.config.num_epochs):
+                # Training epoch
+                epoch_metrics = self.train_epoch(epoch)
+                
+                # Update EMA models
+                if self.ema_models:
+                    for ema_model in self.ema_models.values():
+                        ema_model.step(epoch)
+                
+                # Update progress with epoch metrics
+                progress.update(1, epoch_metrics)
+                
+                # Generate validation images
+                if epoch % self.config.validation_epochs == 0:
+                    self.validate(epoch)
                     
-                    # Update EMA models
-                    if self.ema_models:
-                        for ema_model in self.ema_models.values():
-                            ema_model.step(epoch)
+                # Save checkpoint
+                if epoch % self.config.save_epochs == 0:
+                    # Create pipeline instance for saving
+                    pipeline = StableDiffusionXLPipeline(
+                        vae=self.models["vae"],
+                        text_encoder=self.models["text_encoder"],
+                        text_encoder_2=self.models["text_encoder_2"],
+                        tokenizer=self.models["tokenizer"],
+                        tokenizer_2=self.models["tokenizer_2"],
+                        unet=self.models["unet"],
+                        scheduler=self.models["scheduler"]
+                    )
                     
-                    # Update progress with epoch metrics
-                    progress.update(1, epoch_metrics)
+                    # Save in diffusers format
+                    save_diffusers_format(
+                        pipeline=pipeline,
+                        output_dir=os.path.join(save_dir, f"epoch_{epoch}"),
+                        save_vae=getattr(self.config, "save_vae", True),
+                        use_safetensors=getattr(self.config, "use_safetensors", True)
+                    )
                     
-                    # Generate validation images
-                    if epoch % self.config.validation_epochs == 0:
-                        self.validate(epoch)
-                        
-                    # Save checkpoint
-                    if epoch % self.config.save_epochs == 0:
-                        # Create pipeline instance for saving
-                        pipeline = StableDiffusionXLPipeline(
-                            vae=self.models["vae"],
-                            text_encoder=self.models["text_encoder"],
-                            text_encoder_2=self.models["text_encoder_2"],
-                            tokenizer=self.models["tokenizer"],
-                            tokenizer_2=self.models["tokenizer_2"],
-                            unet=self.models["unet"],
-                            scheduler=self.models["scheduler"]
-                        )
-                        
-                        # Save in diffusers format
-                        save_diffusers_format(
+                    # Optionally save checkpoint
+                    if getattr(self.config, "save_checkpoint", False):
+                        save_checkpoint(
                             pipeline=pipeline,
-                            output_dir=os.path.join(save_dir, f"epoch_{epoch}"),
+                            checkpoint_path=os.path.join(save_dir, f"checkpoint_epoch_{epoch}.safetensors"),
                             save_vae=getattr(self.config, "save_vae", True),
                             use_safetensors=getattr(self.config, "use_safetensors", True)
                         )
-                        
-                        # Optionally save checkpoint
-                        if getattr(self.config, "save_checkpoint", False):
-                            save_checkpoint(
-                                pipeline=pipeline,
-                                checkpoint_path=os.path.join(save_dir, f"checkpoint_epoch_{epoch}.safetensors"),
-                                save_vae=getattr(self.config, "save_vae", True),
-                                use_safetensors=getattr(self.config, "use_safetensors", True)
-                            )
-                        
+                    
         except Exception as e:
             logger.error(f"Training failed with error: {str(e)}")
             raise
@@ -173,59 +202,60 @@ class SDXLTrainer:
                 if isinstance(model, torch.nn.Module):
                     model.train()
             
-            with ProgressTracker(
+            progress = ProgressTracker(
                 f"Epoch {epoch}",
                 total=num_batches,
                 wandb_run=self.wandb_run,
                 log_interval=0.1
-            ) as progress:
-                for batch_idx, batch in enumerate(self.train_dataloader):
-                    try:
-                        # Move batch to device
-                        batch = {k: v.to(self.device) if torch.is_tensor(v) else v 
-                                for k, v in batch.items()}
-                        
-                        # Store text encoder outputs in state tracker
-                        if 'text_encoder_hidden_states' in batch:
-                            self.state_tracker.store_text_encoder_outputs(
-                                text_encoder_hidden_states=batch.get('text_encoder_hidden_states'),
-                                text_encoder_2_hidden_states=batch.get('text_encoder_2_hidden_states'),
-                                prompt_embeds=batch.get('prompt_embeds'),
-                                pooled_prompt_embeds=batch.get('pooled_prompt_embeds')
-                            )
-                        
-                        # Training step
-                        loss, metrics_dict = train_step(
-                            self.config,
-                            self.models,
-                            self.components['optimizer'],
-                            self.components['scheduler'],
-                            batch,
-                            self.device,
-                            self.dtype,
-                            self.components['grad_accumulator'],
-                            self.components['scaler']
+            )
+            
+            for batch_idx, batch in enumerate(self.train_dataloader):
+                try:
+                    # Move batch to device
+                    batch = {k: v.to(self.device) if torch.is_tensor(v) else v 
+                            for k, v in batch.items()}
+                    
+                    # Store text encoder outputs in state tracker
+                    if 'text_encoder_hidden_states' in batch:
+                        self.state_tracker.store_text_encoder_outputs(
+                            text_encoder_hidden_states=batch.get('text_encoder_hidden_states'),
+                            text_encoder_2_hidden_states=batch.get('text_encoder_2_hidden_states'),
+                            prompt_embeds=batch.get('prompt_embeds'),
+                            pooled_prompt_embeds=batch.get('pooled_prompt_embeds')
                         )
-                        
-                        # Get state from tracker and add to metrics
-                        state = self.state_tracker.get_state()
-                        if state['latents'] is not None:
-                            metrics_dict.update({
-                                'current_timestep': state['current_timestep'],
-                                'latents_mean': state['latents'].mean().item(),
-                                'latents_std': state['latents'].std().item(),
-                            })
-                        
-                        total_loss += loss.item()
-                        
-                        # Update metrics and progress
-                        metrics_dict['loss'] = loss.item()
-                        metrics_dict['learning_rate'] = self.components['scheduler'].get_last_lr()[0]
-                        progress.update(1, metrics_dict)
-                        
-                    except Exception as batch_error:
-                        logger.error(f"Error processing batch {batch_idx}: {str(batch_error)}")
-                        continue
+                    
+                    # Training step
+                    loss, metrics_dict = train_step(
+                        self.config,
+                        self.models,
+                        self.components['optimizer'],
+                        self.components['scheduler'],
+                        batch,
+                        self.device,
+                        self.dtype,
+                        self.components['grad_accumulator'],
+                        self.components['scaler']
+                    )
+                    
+                    # Get state from tracker and add to metrics
+                    state = self.state_tracker.get_state()
+                    if state['latents'] is not None:
+                        metrics_dict.update({
+                            'current_timestep': state['current_timestep'],
+                            'latents_mean': state['latents'].mean().item(),
+                            'latents_std': state['latents'].std().item(),
+                        })
+                    
+                    total_loss += loss.item()
+                    
+                    # Update metrics and progress
+                    metrics_dict['loss'] = loss.item()
+                    metrics_dict['learning_rate'] = self.components['scheduler'].get_last_lr()[0]
+                    progress.update(1, metrics_dict)
+                    
+                except Exception as batch_error:
+                    logger.error(f"Error processing batch {batch_idx}: {str(batch_error)}")
+                    continue
             
             avg_loss = total_loss / num_batches
             return {'epoch': epoch, 'avg_loss': avg_loss, **metrics_dict}
@@ -329,37 +359,38 @@ class SDXLTrainer:
                 "an astronaut riding a horse on mars"
             ])
             
-            with ProgressTracker(
+            progress = ProgressTracker(
                 f"Generating Validation Images - Epoch {epoch}",
                 total=len(validation_prompts),
                 wandb_run=self.wandb_run
-            ) as progress:
-                generated_paths = generate_validation_images(
-                    pipeline=pipeline,
-                    prompts=validation_prompts,
-                    save_dir=val_dir,
-                    device=self.device,
-                    num_inference_steps=getattr(self.config, "validation_num_inference_steps", 28),
-                    guidance_scale=getattr(self.config, "validation_guidance_scale", 5.0),
-                    height=getattr(self.config, "validation_image_height", 1024),
-                    width=getattr(self.config, "validation_image_width", 1024),
-                    num_images_per_prompt=1,
-                    progress_callback=progress.update
-                )
-                
-                # Log images to wandb
-                if self.wandb_run is not None:
-                    for path in generated_paths:
-                        self.wandb_run.log({
-                            f"validation/image_{os.path.basename(path)}": wandb.Image(path)
-                        }, step=epoch)
-                
-                logger.info(f"Generated {len(generated_paths)} validation images for epoch {epoch}")
-                
-                # Set models back to train mode
-                for model in self.models.values():
-                    if isinstance(model, torch.nn.Module):
-                        model.train()
+            )
+            
+            generated_paths = generate_validation_images(
+                pipeline=pipeline,
+                prompts=validation_prompts,
+                save_dir=val_dir,
+                device=self.device,
+                num_inference_steps=getattr(self.config, "validation_num_inference_steps", 28),
+                guidance_scale=getattr(self.config, "validation_guidance_scale", 5.0),
+                height=getattr(self.config, "validation_image_height", 1024),
+                width=getattr(self.config, "validation_image_width", 1024),
+                num_images_per_prompt=1,
+                progress_callback=progress.update
+            )
+            
+            # Log images to wandb
+            if self.wandb_run is not None:
+                for path in generated_paths:
+                    self.wandb_run.log({
+                        f"validation/image_{os.path.basename(path)}": wandb.Image(path)
+                    }, step=epoch)
+            
+            logger.info(f"Generated {len(generated_paths)} validation images for epoch {epoch}")
+            
+            # Set models back to train mode
+            for model in self.models.values():
+                if isinstance(model, torch.nn.Module):
+                    model.train()
                     
         except Exception as e:
             logger.error(f"Failed to generate validation images at epoch {epoch}: {str(e)}")

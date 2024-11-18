@@ -1,12 +1,4 @@
-"""Ultra-optimized VAE finetuner with GPU acceleration.
-
-This module provides a highly optimized VAE finetuner with:
-- Mixed precision training
-- CUDA graph support 
-- Memory-efficient operations
-- Dynamic batch sizing
-- Advanced caching
-"""
+"""Ultra-optimized VAE finetuner with GPU acceleration."""
 
 import torch
 import torch.nn as nn
@@ -15,24 +7,53 @@ from torch.cuda.amp import autocast, GradScaler
 from torch.utils.data import DataLoader
 import logging
 from typing import Dict, Any, Optional, Tuple, List
-from dataclasses import dataclass
+from collections import defaultdict
 from contextlib import nullcontext
 import weakref
+from pathlib import Path
 from src.utils.progress import ProgressTracker
+from src.config.args import VAEConfig
+import torchvision.transforms as T
 
 logger = logging.getLogger(__name__)
 
-@dataclass(frozen=True)
-class VAEConfig:
-    """Immutable VAE configuration."""
-    learning_rate: float = 1e-4
-    batch_size: int = 1
-    max_grad_norm: Optional[float] = 1.0
-    mixed_precision: str = "fp16"  # "no", "fp16", or "bf16"
-    enable_cuda_graphs: bool = True
-    cache_size: int = 32
-    num_warmup_steps: int = 100
 
+class PerceptualLoss(nn.Module):
+    """Perceptual loss using VGG16 features."""
+    
+    def __init__(self, resize=True):
+        super().__init__()
+        from torchvision.models import vgg16
+        from torchvision.transforms import Resize, InterpolationMode
+        
+        vgg = vgg16(pretrained=True).eval()
+        self.slice1 = nn.Sequential(*vgg.features[:4]).eval()
+        self.slice2 = nn.Sequential(*vgg.features[4:9]).eval()
+        self.slice3 = nn.Sequential(*vgg.features[9:16]).eval()
+        
+        for param in self.parameters():
+            param.requires_grad = False
+            
+        self.resize = Resize(224, interpolation=InterpolationMode.BICUBIC) if resize else None
+        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
+    def forward(self, x: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Calculate perceptual loss between input and target images."""
+        if self.resize:
+            x = self.resize(x)
+            target = self.resize(target)
+            
+        x = (x - self.mean) / self.std
+        target = (target - self.mean) / self.std
+        
+        loss = 0.0
+        for slice_model in [self.slice1, self.slice2, self.slice3]:
+            x_feat = slice_model(x)
+            target_feat = slice_model(target)
+            loss += F.mse_loss(x_feat, target_feat)
+            
+        return loss
 class CachedTensor:
     """Memory-efficient tensor cache with weak references."""
     
@@ -70,18 +91,43 @@ class VAEFinetuner:
         self,
         vae: nn.Module,
         config: VAEConfig,
+        train_dataloader: DataLoader,
         device: torch.device
     ):
-        self.vae = vae
+        """Initialize VAE finetuner.
+        
+        Args:
+            vae: VAE model to finetune
+            config: VAE training configuration
+            train_dataloader: Training data loader
+            device: Target device for training
+        """
+        self.vae = vae.to(device)
         self.config = config
+        self.train_dataloader = train_dataloader
         self.device = device
         
-        # Initialize optimizer and scaler
+        # Initialize optimizer with config parameters
         self.optimizer = torch.optim.AdamW(
             self.vae.parameters(),
-            lr=config.learning_rate
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay if hasattr(config, 'weight_decay') else 0.0,
+            betas=(config.adam_beta1 if hasattr(config, 'adam_beta1') else 0.9,
+                  config.adam_beta2 if hasattr(config, 'adam_beta2') else 0.999),
+            eps=config.adam_epsilon if hasattr(config, 'adam_epsilon') else 1e-8
         )
-        self.scaler = GradScaler() if config.mixed_precision != "no" else None
+        
+        # Setup mixed precision training
+        self.scaler = GradScaler() if config.mixed_precision == "fp16" else None
+        
+        # Setup progress tracking
+        self.progress = ProgressTracker(
+            description="VAE Training",
+            total_steps=config.num_epochs * len(train_dataloader),
+            log_steps=10,
+            save_steps=100,
+            eval_steps=100
+        )
         
         # Setup CUDA graphs if enabled
         self._cuda_graphs = {}
@@ -91,10 +137,14 @@ class VAEFinetuner:
         # Initialize tensor cache
         self.tensor_cache = CachedTensor(config.cache_size)
         
+        # Enable gradient checkpointing if configured
+        if config.gradient_checkpointing:
+            self.vae.enable_gradient_checkpointing()
+        
         # Track training state
         self.step = 0
-        self._warmup_steps = 0
-    
+        self._warmup_steps = config.num_warmup_steps
+
     def _setup_cuda_graphs(self) -> None:
         """Initialize CUDA graphs for common operations."""
         try:
@@ -143,6 +193,10 @@ class VAEFinetuner:
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """Execute optimized training step."""
         try:
+            # Move batch to device
+            batch = {k: v.to(self.device, non_blocking=True) 
+                    for k, v in batch.items()}
+            
             # Determine precision context
             if self.config.mixed_precision == "fp16":
                 ctx = autocast(dtype=torch.float16)
@@ -154,6 +208,7 @@ class VAEFinetuner:
             # Forward pass with mixed precision
             with ctx:
                 # Try CUDA graph first
+                output = None
                 if self._cuda_graphs and self.step > self._warmup_steps:
                     output = self._run_cuda_graph(
                         batch["pixel_values"],
@@ -163,12 +218,28 @@ class VAEFinetuner:
                 if output is None:  # Fall back to regular forward
                     output = self.vae(batch["pixel_values"])
                 
-                # Calculate reconstruction loss
-                loss = F.mse_loss(
+                # Calculate losses
+                recon_loss = F.mse_loss(
                     output.sample,
                     batch["pixel_values"],
                     reduction="mean"
                 )
+                
+                # Add KL divergence loss if configured
+                if self.config.kl_weight > 0:
+                    kl_loss = output.latent_dist.kl().mean()
+                    loss = recon_loss + self.config.kl_weight * kl_loss
+                else:
+                    kl_loss = torch.tensor(0.0, device=self.device)
+                    loss = recon_loss
+                
+                # Add perceptual loss if configured
+                if self.config.perceptual_weight > 0 and hasattr(self, 'perceptual_loss'):
+                    perceptual_loss = PerceptualLoss(
+                        output.sample, 
+                        batch["pixel_values"]
+                    )
+                    loss = loss + self.config.perceptual_weight * perceptual_loss
             
             # Backward pass with automatic mixed precision
             if self.scaler is not None:
@@ -206,6 +277,8 @@ class VAEFinetuner:
             # Gather metrics
             metrics = {
                 "loss": loss.item(),
+                "recon_loss": recon_loss.item(),
+                "kl_loss": kl_loss.item(),
                 "cache_hit_rate": self.tensor_cache.hit_rate,
                 "learning_rate": self.optimizer.param_groups[0]["lr"],
             }
@@ -215,93 +288,55 @@ class VAEFinetuner:
         except Exception as e:
             logger.error(f"Training step failed: {e}")
             raise
-    
-    def train(
-        self,
-        train_dataloader: DataLoader,
-        num_epochs: int,
-        callbacks: Optional[List[Any]] = None,
-        wandb_run: Optional[Any] = None
-    ) -> Dict[str, List[float]]:
+
+    def train(self) -> Dict[str, List[float]]:
         """Execute training loop with optimizations."""
-        history = {"loss": [], "cache_hit_rate": []}
-        total_loss = 0.0
-        
         try:
-            logger.info(f"Starting VAE training for {num_epochs} epochs...")
+            logger.info(f"Starting VAE training for {self.config.num_epochs} epochs...")
             
-            for epoch in range(num_epochs):
-                epoch_loss = 0.0
-                num_batches = len(train_dataloader)
+            history = defaultdict(list)
+            self.vae.train()
+            
+            for epoch in range(self.config.num_epochs):
+                epoch_metrics = defaultdict(float)
+                num_batches = len(self.train_dataloader)
                 
-                logger.info(f"Starting epoch {epoch+1}/{num_epochs}")
-                
-                for batch_idx, batch in enumerate(train_dataloader):
-                    # Move batch to device
-                    batch = {k: v.to(self.device, non_blocking=True) 
-                            for k, v in batch.items()}
-                    
-                    # Execute training step
-                    loss, metrics = self.train_step(batch)
-                    epoch_loss += loss.item()
+                # Training loop
+                for batch in self.train_dataloader:
+                    __, step_metrics = self.train_step(batch)
                     
                     # Update metrics
-                    current_metrics = {
-                        "loss": loss.item(),
-                        "avg_loss": epoch_loss / (batch_idx + 1),
-                        **metrics
-                    }
+                    for k, v in step_metrics.items():
+                        epoch_metrics[k] += v
+                        history[k].append(v)
                     
-                    # Log progress periodically
-                    if (batch_idx + 1) % 10 == 0:
+                    # Log progress
+                    if self.progress.should_log(self.step):
+                        avg_metrics = {
+                            k: v / (self.step % num_batches + 1)
+                            for k, v in epoch_metrics.items()
+                        }
                         logger.info(
-                            f"Epoch {epoch+1}/{num_epochs} "
-                            f"[{batch_idx+1}/{num_batches}] "
-                            f"Loss: {loss.item():.4f}"
+                            f"Epoch {epoch+1}/{self.config.num_epochs} "
+                            f"Step {self.step}: {avg_metrics}"
                         )
                     
-                    # Update history
-                    for k, v in current_metrics.items():
-                        if k in history:
-                            history[k].append(v)
-                    
-                    # Execute callbacks
-                    if callbacks:
-                        for callback in callbacks:
-                            callback(self, current_metrics)
+                    # Save checkpoint if configured
+                    if self.progress.should_save(self.step):
+                        save_path = Path(self.config.output_dir) / f"vae_step_{self.step}.pt"
+                        self.save(save_path)
+                        logger.info(f"Saved checkpoint to {save_path}")
                 
-                # Calculate and log epoch metrics
-                avg_epoch_loss = epoch_loss / num_batches
-                epoch_metrics = {
-                    "epoch": epoch + 1,
-                    "avg_epoch_loss": avg_epoch_loss,
-                    **{k: sum(v[-num_batches:]) / num_batches 
-                       for k, v in history.items()}
+                # Log epoch summary
+                avg_epoch_metrics = {
+                    k: v / num_batches for k, v in epoch_metrics.items()
                 }
-                
                 logger.info(
-                    f"Epoch {epoch+1}/{num_epochs} completed - "
-                    f"Average Loss: {avg_epoch_loss:.4f}"
+                    f"Epoch {epoch+1} completed: {avg_epoch_metrics}"
                 )
-                
-                if wandb_run:
-                    wandb_run.log(epoch_metrics)
-                
-                total_loss += epoch_loss
             
-            # Log final summary
-            final_metrics = {
-                "total_epochs": num_epochs,
-                "final_avg_loss": total_loss / (num_epochs * num_batches),
-                "final_cache_hit_rate": history["cache_hit_rate"][-1]
-            }
             logger.info("Training completed successfully!")
-            logger.info(f"Final metrics: {final_metrics}")
-            
-            if wandb_run:
-                wandb_run.log(final_metrics)
-            
-            return history
+            return dict(history)
             
         except Exception as e:
             logger.error(f"Training loop failed: {e}")
@@ -334,6 +369,7 @@ class VAEFinetuner:
             finetuner = cls(
                 vae=None,  # User must provide VAE model
                 config=config,
+                train_dataloader=None,  # User must provide train_dataloader
                 device=device
             )
             
@@ -390,4 +426,5 @@ def setup_vae_finetuner(
         num_warmup_steps=num_warmup_steps
     )
     
-    return VAEFinetuner(vae=vae, config=config, device=device)
+    return VAEFinetuner(vae=vae, config=config, train_dataloader=None, device=device)
+
