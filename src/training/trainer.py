@@ -23,31 +23,10 @@ class SDXLTrainer:
     ):
         self.config = config
         self.models = models
-        self.train_dataloader = train_dataloader
-        self.val_dataloader = val_dataloader
+        self.train_dataloader = self._setup_dataloader(train_dataloader)
+        self.val_dataloader = self._setup_dataloader(val_dataloader) if val_dataloader else None
         self.device = torch.device(device)
         self.dtype = torch.float16 if config.mixed_precision == "fp16" else torch.float32
-        
-        # Ensure DataLoader uses spawn method
-        if torch.cuda.is_available():
-            train_dataloader = torch.utils.data.DataLoader(
-                train_dataloader.dataset,
-                batch_size=train_dataloader.batch_size,
-                shuffle=True,
-                num_workers=train_dataloader.num_workers,
-                multiprocessing_context='spawn'
-            )
-            if val_dataloader is not None:
-                val_dataloader = torch.utils.data.DataLoader(
-                    val_dataloader.dataset,
-                    batch_size=val_dataloader.batch_size,
-                    shuffle=False,
-                    num_workers=val_dataloader.num_workers,
-                    multiprocessing_context='spawn'
-                )
-        
-        self.train_dataloader = train_dataloader
-        self.val_dataloader = val_dataloader
         
         # Initialize components (optimizer, scheduler, etc.)
         self.components = initialize_training_components(config, models)
@@ -59,6 +38,23 @@ class SDXLTrainer:
                 model.to(self.device)
                 model.train()  # Ensure training mode
             
+    def _setup_dataloader(self, dataloader):
+        """Setup DataLoader with proper multiprocessing context."""
+        if not dataloader:
+            return None
+            
+        if torch.cuda.is_available():
+            return torch.utils.data.DataLoader(
+                dataloader.dataset,
+                batch_size=dataloader.batch_size,
+                shuffle=isinstance(dataloader, torch.utils.data.DataLoader) and dataloader.shuffle,
+                num_workers=dataloader.num_workers,
+                multiprocessing_context='spawn',
+                persistent_workers=True,  # Keep workers alive between iterations
+                pin_memory=True  # Enable pinned memory for faster GPU transfer
+            )
+        return dataloader
+        
     def train(self, save_dir: str):
         """Execute training loop with validation."""
         for epoch in range(self.config.num_epochs):

@@ -3,11 +3,12 @@
 import torch
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
-from typing import Dict, List, Tuple, Optional, Union
+from typing import Dict, List, Tuple, Optional, Union, Any
 from PIL import Image
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from multiprocessing import RLock
+from multiprocessing import RLock, Manager
+from multiprocessing.managers import DictProxy
 from collections import defaultdict
 from torch.cuda import amp
 import os
@@ -25,7 +26,7 @@ class MultiAspectDataset(Dataset):
     """Ultra-optimized dataset for multi-aspect ratio training."""
     
     __slots__ = ('image_paths', 'captions', 'bucket_manager', 'vae_cache',
-                 'text_cache', '_lock', '_executor', '_stats', '_image_cache',
+                 'text_cache', '_stats', '_image_cache',
                  '_transform_cache', '_batch_cache', 'num_workers', 'caption_processor')
     
     def __init__(
@@ -52,52 +53,46 @@ class MultiAspectDataset(Dataset):
             caption_dropout_rate=caption_dropout
         )
         
-        # Rest of initialization remains the same
+        # Use multiprocessing Manager for shared state
+        manager = Manager()
+        self._stats = manager.dict()
+        self._image_cache = manager.dict()
+        self._transform_cache = manager.dict()
+        self._batch_cache = manager.dict()
+        
         self.num_workers = num_workers
-        self._lock = RLock()
-        self._executor = ThreadPoolExecutor(max_workers=num_workers)
-        self._stats = defaultdict(int)
         
-        self._image_cache = {}
-        self._transform_cache = {}
-        self._batch_cache = {}
-        
-        self._parallel_preprocess_images()
+        # Process images
+        self._preprocess_images()
     
-    def _parallel_preprocess_images(self) -> None:
-        """Pre-process images in parallel for faster access."""
+    def _preprocess_images(self) -> None:
+        """Pre-process images using multiprocessing Pool."""
+        from multiprocessing import Pool
+        
         chunk_size = max(1, len(self.image_paths) // (self.num_workers * 4))
         chunks = [self.image_paths[i:i + chunk_size] 
                  for i in range(0, len(self.image_paths), chunk_size)]
         
-        futures = [
-            self._executor.submit(self._preprocess_chunk, chunk)
-            for chunk in chunks
-        ]
-        
-        for future in futures:
-            future.result()
+        with Pool(processes=self.num_workers) as pool:
+            pool.map(self._preprocess_chunk, chunks)
     
     def _preprocess_chunk(self, paths: List[str]) -> None:
         """Process a chunk of images."""
         for path in paths:
             try:
-                # Validate image
                 if not validate_image(path):
                     logger.warning(f"Invalid image: {path}")
                     continue
                 
-                # Get image dimensions
                 with Image.open(path) as img:
                     width, height = img.size
                 
-                # Add to bucket manager
                 self.bucket_manager.add_image(path, width, height)
-                self._stats['processed'] += 1
+                self._stats['processed'] = self._stats.get('processed', 0) + 1
                 
             except Exception as e:
                 logger.error(f"Error processing {path}: {e}")
-                self._stats['errors'] += 1
+                self._stats['errors'] = self._stats.get('errors', 0) + 1
     
     @lru_cache(maxsize=1024)
     def _load_image(self, path: str) -> Image.Image:
@@ -189,27 +184,24 @@ class MultiAspectDataset(Dataset):
     
     def get_batch(self, bucket: Bucket) -> Optional[Dict[str, torch.Tensor]]:
         """Get a batch for a specific bucket with caching."""
-        # Get images for this bucket
         images = self.bucket_manager.group_by_bucket([self.image_paths])[bucket]
         
         if not images or len(images) < bucket.batch_size:
             return None
         
-        # Select random batch
         batch_indices = torch.randperm(len(images))[:bucket.batch_size]
         batch_paths = [images[i] for i in batch_indices]
         
-        # Check cache
-        cache_key = tuple(batch_paths)
+        # Use string key for cache
+        cache_key = "|".join(batch_paths)
         cached = self._batch_cache.get(cache_key)
         if cached is not None:
-            self._stats['cache_hits'] += 1
+            self._stats['cache_hits'] = self._stats.get('cache_hits', 0) + 1
             return cached
         
-        # Prepare batch
         batch = self._prepare_batch(batch_paths, bucket)
         self._batch_cache[cache_key] = batch
-        self._stats['cache_misses'] += 1
+        self._stats['cache_misses'] = self._stats.get('cache_misses', 0) + 1
         
         return batch
     
@@ -240,16 +232,14 @@ class MultiAspectDataset(Dataset):
     
     def get_stats(self) -> Dict[str, int]:
         """Get dataset statistics."""
-        with self._lock:
-            return dict(self._stats)
+        return dict(self._stats)
     
     def clear_caches(self) -> None:
         """Clear all caches."""
-        with self._lock:
-            self._image_cache.clear()
-            self._transform_cache.clear()
-            self._batch_cache.clear()
-            self._stats.clear()
+        self._image_cache.clear()
+        self._transform_cache.clear()
+        self._batch_cache.clear()
+        self._stats.clear()
 
 
 def create_train_dataloader(

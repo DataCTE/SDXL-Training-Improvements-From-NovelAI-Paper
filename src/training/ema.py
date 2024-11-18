@@ -113,35 +113,21 @@ class EMAModel:
     def step(self, optimization_step: Optional[int] = None) -> None:
         """Execute EMA update step with optimizations."""
         try:
-            with self._lock:
-                # Get current step
-                if optimization_step is None:
-                    self._optimization_step += 1
-                    optimization_step = self._optimization_step
-                
-                # Skip if before update_after_step
-                if optimization_step <= self.update_after_step:
-                    return
-                
-                # Calculate decay rate
-                decay = self._get_decay(optimization_step)
-                
-                # Update each parameter
-                with autocast('cuda'):
-                    for name, param in self._model().named_parameters():
-                        if param.requires_grad:
-                            shadow = self._shadow_params[name]
-                            
-                            # Try CUDA graph first
-                            if self.use_cuda_graph and "update" in self._cuda_graphs:
-                                g, static_param = self._cuda_graphs["update"]
-                                static_param.copy_(shadow)
-                                g.replay()
-                                shadow.copy_(static_param)
-                            else:
-                                # Fallback to regular update
-                                shadow.lerp_(param.data, 1 - decay)
-                
+            if optimization_step is None:
+                self._optimization_step += 1
+                optimization_step = self._optimization_step
+            
+            if optimization_step <= self.update_after_step:
+                return
+            
+            decay = self._get_decay(optimization_step)
+            
+            with autocast('cuda'):
+                for name, param in self._model().named_parameters():
+                    if param.requires_grad:
+                        shadow = self._shadow_params[name]
+                        shadow.lerp_(param.data, 1 - decay)
+                        
         except Exception as e:
             logger.error(f"EMA step failed: {e}")
             raise
@@ -152,13 +138,12 @@ class EMAModel:
             if model is None:
                 model = self._model()
             
-            with self._lock:
-                for name, param in model.named_parameters():
-                    if param.requires_grad:
-                        param.data.copy_(
-                            self._shadow_params[name].data,
-                            non_blocking=True
-                        )
+            for name, param in model.named_parameters():
+                if param.requires_grad:
+                    param.data.copy_(
+                        self._shadow_params[name].data,
+                        non_blocking=True
+                    )
                         
         except Exception as e:
             logger.error(f"EMA copy failed: {e}")
@@ -170,11 +155,10 @@ class EMAModel:
             if device is None:
                 device = self.device
             
-            with self._lock:
-                for shadow in self._shadow_params.values():
-                    shadow.to(device=device, non_blocking=True)
+            for shadow in self._shadow_params.values():
+                shadow.to(device=device, non_blocking=True)
                 
-                self.device = device
+            self.device = device
                 
         except Exception as e:
             logger.error(f"EMA device transfer failed: {e}")
