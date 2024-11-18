@@ -52,7 +52,6 @@ def main():
                 train_data_dir=config.train_data_dir,
                 output_dir=config.output_dir,
                 config=config.vae_args,
-                validation_config=validation_config,
                 wandb_run=config.wandb.use_wandb
             )
             vae_trainer.train()

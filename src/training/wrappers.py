@@ -116,7 +116,6 @@ def train_vae(
     config: Optional[VAEConfig] = None,
     token_dropout: float = 0.0,  
     caption_dropout: float = 0.0,
-    validation_config: Optional[ValidationConfig] = None,
     **kwargs
 ) -> VAEFinetuner:
     """High-level wrapper for VAE finetuning with improvements."""
