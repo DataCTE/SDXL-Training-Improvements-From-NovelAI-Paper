@@ -109,6 +109,9 @@ class TrainingConfig:
     learning_rate: float = DEFAULTS["training"]["learning_rate"]
     max_grad_norm: float = DEFAULTS["training"]["max_grad_norm"]
     warmup_steps: int = DEFAULTS["training"]["warmup_steps"]
+    save_checkpoints: bool = False
+    use_tag_weighting: bool = False
+    rescale_cfg: bool = False
     save_epochs: int = DEFAULTS["training"]["save_epochs"]
     
     # Model and training mode configuration
@@ -150,6 +153,16 @@ def parse_args() -> TrainingConfig:
     # Required arguments
     parser.add_argument("--model_path", type=str, required=True, help="Path to pretrained model")
     parser.add_argument("--data_dir", type=str, required=True, help="Training data directory")
+    parser.add_argument("--warmup_steps", type=int, default=DEFAULTS["training"]["warmup_steps"],
+                       help="Number of warmup steps")
+    parser.add_argument("--save_checkpoints", action="store_true",
+                       help="Enable checkpoint saving")
+    parser.add_argument("--use_tag_weighting", action="store_true",
+                       default=False,
+                       help="Enable tag weighting for training")
+    parser.add_argument("--rescale_cfg", action="store_true",
+                       default=False,
+                       help="Enable CFG rescaling")
     
     # Optional arguments with defaults from json
     parser.add_argument("--output_dir", type=str, default=DEFAULTS["training"]["output_dir"])
@@ -230,6 +243,7 @@ def parse_args() -> TrainingConfig:
         save_epochs=args.save_epochs,
         use_ema=args.use_ema,
         use_8bit_adam=args.use_8bit_adam,
+        warmup_steps=args.warmup_steps,  # Add new field
     )
     
     # Update optimizer config
