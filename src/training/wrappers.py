@@ -52,8 +52,11 @@ def train_sdxl(
             models_dict = models
             
         vae_cache = VAECache(
+            vae=models_dict['vae'],
             cache_dir=str(output_dir / "vae_cache"),
-            vae=models_dict['vae']
+            max_cache_size=10000,  # Reasonable default
+            num_workers=4,  # Reasonable default for parallel processing
+            batch_size=8  # Optimal batch size for most GPUs
         )
         text_embedding_cache = TextEmbeddingCache(
             cache_dir=str(output_dir / "text_embeds_cache"),

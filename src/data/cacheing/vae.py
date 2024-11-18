@@ -9,20 +9,40 @@ import threading
 from collections import OrderedDict
 import logging
 from torch.cuda import amp
+from pathlib import Path
+import os
+from .memory import MemoryCache, MemoryManager
 
 logger = logging.getLogger(__name__)
 
 class VAECache:
     """Ultra-optimized VAE encoding cache with parallel processing."""
     
-    __slots__ = ('vae', '_cache', '_lock', '_executor', '_batch_size',
-                 '_max_cache_size', '_stats', '_scaler')
+    __slots__ = ('vae', '_memory_cache', '_lock', '_executor', '_batch_size',
+                 '_stats', '_scaler', '_cache_dir', '_max_cache_size')
     
-    def __init__(self, vae: nn.Module, max_cache_size: int = 10000,
-                 num_workers: int = 4, batch_size: int = 8):
-        """Initialize VAE cache with optimized defaults."""
+    def __init__(self, vae: nn.Module, cache_dir: Optional[str] = None,
+                 max_cache_size: int = 10000, num_workers: int = 4,
+                 batch_size: int = 8):
+        """Initialize VAE cache with optimized defaults.
+        
+        Args:
+            vae: VAE model to use for encoding
+            cache_dir: Optional directory to save cached tensors
+            max_cache_size: Maximum number of items to keep in cache
+            num_workers: Number of worker threads for parallel processing
+            batch_size: Batch size for parallel processing
+        """
         self.vae = vae.eval()  # Ensure eval mode
-        self._cache = OrderedDict()
+        self._cache_dir = Path(cache_dir) if cache_dir else None
+        
+        # Initialize memory management
+        if self._cache_dir:
+            os.makedirs(self._cache_dir, exist_ok=True)
+            self._memory_cache = MemoryCache(str(self._cache_dir))
+        else:
+            self._memory_cache = MemoryManager()
+            
         self._lock = threading.RLock()
         self._executor = ThreadPoolExecutor(max_workers=num_workers)
         self._batch_size = batch_size
@@ -42,13 +62,13 @@ class VAECache:
     
     def _should_evict(self) -> bool:
         """Check if cache needs eviction."""
-        return len(self._cache) >= self._max_cache_size
+        return len(self._memory_cache) >= self._max_cache_size
     
     def _evict_items(self) -> None:
         """Efficient batch eviction."""
         with self._lock:
             while self._should_evict():
-                _, tensor = self._cache.popitem(last=False)
+                _, tensor = self._memory_cache.popitem(last=False)
                 if isinstance(tensor, torch.Tensor):
                     tensor.detach_()
                     del tensor
@@ -100,7 +120,7 @@ class VAECache:
         
         for i, image in enumerate(images):
             key = self._get_cache_key(image)
-            cached = self._cache.get(key)
+            cached = self._memory_cache.get(key)
             
             if cached is not None:
                 encoded_list.append(cached)
@@ -120,7 +140,7 @@ class VAECache:
                 key = self._get_cache_key(images[i])
                 if self._should_evict():
                     self._evict_items()
-                self._cache[key] = encoded.detach()
+                self._memory_cache.put(key, encoded.detach())
                 encoded_list.append(encoded)
         
         # Combine results maintaining order
@@ -129,19 +149,18 @@ class VAECache:
     def clear(self) -> None:
         """Efficient cache clearing."""
         with self._lock:
-            self._cache.clear()
+            self._memory_cache.clear()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-                torch.cuda.memory.empty_cache()
     
     def get_stats(self) -> Dict[str, int]:
         """Get cache statistics."""
         with self._lock:
-            return dict(self._stats)
+            return {**self._stats, **self._memory_cache.get_stats()}
     
     def __len__(self) -> int:
         """Get cache size."""
-        return len(self._cache)
+        return len(self._memory_cache)
     
     def __del__(self) -> None:
         """Clean shutdown."""
