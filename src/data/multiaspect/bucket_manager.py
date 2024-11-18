@@ -15,8 +15,7 @@ from typing import Dict, List, Tuple, Set, Optional
 import torch
 from collections import defaultdict
 import logging
-from concurrent.futures import ThreadPoolExecutor
-import threading
+from multiprocessing import Pool, Manager, RLock
 from dataclasses import dataclass
 from torch.cuda import amp
 
@@ -44,26 +43,40 @@ class Bucket:
         """Fast resolution calculation."""
         return self.width * self.height
 
+def _process_chunk(args: Tuple[List[str], Dict]) -> Dict[Bucket, List[str]]:
+    """Standalone function for parallel processing."""
+    paths, image_buckets = args
+    groups: Dict[Bucket, List[str]] = defaultdict(list)
+    for path in paths:
+        bucket = image_buckets.get(path)
+        if bucket is not None:
+            groups[bucket].append(path)
+    return dict(groups)
+
 class BucketManager:
     """Ultra-optimized bucket manager for multi-aspect ratio training."""
     
-    __slots__ = ('_buckets', '_image_buckets', '_lock', '_executor',
-                 '_max_resolution', '_batch_sizes', '_stats', '_bucket_cache')
+    __slots__ = ('_buckets', '_image_buckets', '_max_resolution', 
+                 '_batch_sizes', '_stats', '_bucket_cache', '_num_workers')
     
-    def __init__(self, max_resolution: int = 1024 * 1024,
-                 min_batch_size: int = 1, max_batch_size: int = 32,
-                 num_workers: int = 4):
+    def __init__(
+        self,
+        max_resolution: int = 1024 * 1024,
+        min_batch_size: int = 1,
+        max_batch_size: int = 32,
+        num_workers: int = 4
+    ):
         """Initialize with pre-computed lookup tables."""
-        self._buckets: Set[Bucket] = set()
-        self._image_buckets: Dict[str, Bucket] = {}
-        self._lock = threading.RLock()
-        self._executor = ThreadPoolExecutor(max_workers=num_workers)
+        manager = Manager()
+        self._buckets = manager.list()
+        self._image_buckets = manager.dict()
         self._max_resolution = max_resolution
         self._batch_sizes = range(min_batch_size, max_batch_size + 1)
-        self._stats = defaultdict(int)
+        self._stats = manager.dict()
+        self._bucket_cache = manager.dict()
+        self._num_workers = num_workers
         
-        # Pre-compute bucket cache for common resolutions
-        self._bucket_cache = {}
+        # Pre-compute bucket cache
         self._precompute_buckets()
     
     def _precompute_buckets(self) -> None:
@@ -96,20 +109,19 @@ class BucketManager:
     
     def add_image(self, image_path: str, width: int, height: int) -> None:
         """Add image to bucket system with minimal locking."""
-        with self._lock:
-            if image_path in self._image_buckets:
-                return
+        if image_path in self._image_buckets:
+            return
             
-            # Try cache first
-            key = (width, height)
-            bucket = self._bucket_cache.get(key)
-            if bucket is None:
-                bucket = self._compute_optimal_bucket(width, height)
-                self._bucket_cache[key] = bucket
-            
-            self._buckets.add(bucket)
-            self._image_buckets[image_path] = bucket
-            self._stats['images_added'] += 1
+        # Try cache first
+        key = (width, height)
+        bucket = self._bucket_cache.get(key)
+        if bucket is None:
+            bucket = self._compute_optimal_bucket(width, height)
+            self._bucket_cache[key] = bucket
+        
+        self._buckets.append(bucket)
+        self._image_buckets[image_path] = bucket
+        self._stats['images_added'] += 1
     
     def get_bucket(self, image_path: str) -> Optional[Bucket]:
         """Ultra-fast bucket lookup."""
@@ -117,7 +129,7 @@ class BucketManager:
     
     def get_all_buckets(self) -> Set[Bucket]:
         """Get all unique buckets."""
-        return self._buckets.copy()
+        return set(self._buckets)
     
     def get_bucket_for_resolution(self, width: int, height: int) -> Bucket:
         """Get optimal bucket for resolution with caching."""
@@ -130,27 +142,24 @@ class BucketManager:
     
     def group_by_bucket(self, image_paths: List[str]) -> Dict[Bucket, List[str]]:
         """Group images by bucket using parallel processing."""
+        if not image_paths:
+            return {}
+            
         # Split work into chunks
-        chunk_size = max(1, len(image_paths) // (self._executor._max_workers * 4))
+        chunk_size = max(1, len(image_paths) // (self._num_workers * 4))
         chunks = [image_paths[i:i + chunk_size] 
                  for i in range(0, len(image_paths), chunk_size)]
         
-        def process_chunk(paths: List[str]) -> Dict[Bucket, List[str]]:
-            groups: Dict[Bucket, List[str]] = defaultdict(list)
-            for path in paths:
-                bucket = self._image_buckets.get(path)
-                if bucket is not None:
-                    groups[bucket].append(path)
-            return groups
+        # Prepare arguments for parallel processing
+        chunk_args = [(chunk, dict(self._image_buckets)) for chunk in chunks]
         
         # Process chunks in parallel
-        futures = [self._executor.submit(process_chunk, chunk) 
-                  for chunk in chunks]
+        with Pool(processes=self._num_workers) as pool:
+            chunk_results = pool.map(_process_chunk, chunk_args)
         
         # Merge results efficiently
         result: Dict[Bucket, List[str]] = defaultdict(list)
-        for future in futures:
-            chunk_result = future.result()
+        for chunk_result in chunk_results:
             for bucket, paths in chunk_result.items():
                 result[bucket].extend(paths)
         
@@ -158,18 +167,16 @@ class BucketManager:
     
     def get_stats(self) -> Dict[str, int]:
         """Get bucket statistics."""
-        with self._lock:
-            stats = dict(self._stats)
-            stats['total_buckets'] = len(self._buckets)
-            stats['total_images'] = len(self._image_buckets)
-            return stats
+        stats = dict(self._stats)
+        stats['total_buckets'] = len(self._buckets)
+        stats['total_images'] = len(self._image_buckets)
+        return stats
     
     def clear(self) -> None:
         """Clear all buckets."""
-        with self._lock:
-            self._buckets.clear()
-            self._image_buckets.clear()
-            self._stats.clear()
+        self._buckets.clear()
+        self._image_buckets.clear()
+        self._stats.clear()
     
     def __len__(self) -> int:
         """Get total number of images."""

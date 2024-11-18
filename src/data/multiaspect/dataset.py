@@ -3,24 +3,43 @@
 import torch
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
-from typing import Dict, List, Tuple, Optional, Union, Any
-from PIL import Image
+from typing import Dict, List, Tuple, Optional
 import logging
-from concurrent.futures import ThreadPoolExecutor
-from multiprocessing import RLock, Manager
-from multiprocessing.managers import DictProxy
-from collections import defaultdict
-from torch.cuda import amp
-import os
+from multiprocessing import Manager
 from functools import lru_cache
-
 from src.data.image_processing.validation import validate_image
 from src.data.cacheing.vae import VAECache
 from src.data.cacheing.text_embeds import TextEmbeddingCache
 from src.data.multiaspect.bucket_manager import Bucket, BucketManager
-from src.data.prompt.caption_processor import CaptionProcessor, load_captions
+from src.data.prompt.caption_processor import CaptionProcessor
+from PIL import Image
 
 logger = logging.getLogger(__name__)
+
+# Add this at module level
+def _preprocess_chunk(args) -> Tuple[int, int]:
+    """Standalone function for preprocessing image chunks."""
+    paths, bucket_manager = args
+    processed = 0
+    errors = 0
+    
+    for path in paths:
+        try:
+            if not validate_image(path):
+                logger.warning(f"Invalid image: {path}")
+                continue
+            
+            with Image.open(path) as img:
+                width, height = img.size
+            
+            bucket_manager.add_image(path, width, height)
+            processed += 1
+            
+        except Exception as e:
+            logger.error(f"Error processing {path}: {e}")
+            errors += 1
+            
+    return processed, errors
 
 class MultiAspectDataset(Dataset):
     """Ultra-optimized dataset for multi-aspect ratio training."""
@@ -46,6 +65,7 @@ class MultiAspectDataset(Dataset):
         self.bucket_manager = bucket_manager
         self.vae_cache = vae_cache
         self.text_cache = text_cache
+        self.num_workers = num_workers
         
         # Initialize caption processor
         self.caption_processor = CaptionProcessor(
@@ -60,8 +80,6 @@ class MultiAspectDataset(Dataset):
         self._transform_cache = manager.dict()
         self._batch_cache = manager.dict()
         
-        self.num_workers = num_workers
-        
         # Process images
         self._preprocess_images()
     
@@ -69,30 +87,24 @@ class MultiAspectDataset(Dataset):
         """Pre-process images using multiprocessing Pool."""
         from multiprocessing import Pool
         
+        # Split images into chunks
         chunk_size = max(1, len(self.image_paths) // (self.num_workers * 4))
         chunks = [self.image_paths[i:i + chunk_size] 
                  for i in range(0, len(self.image_paths), chunk_size)]
         
+        # Prepare arguments for each chunk
+        chunk_args = [(chunk, self.bucket_manager) for chunk in chunks]
+        
+        # Process chunks in parallel
         with Pool(processes=self.num_workers) as pool:
-            pool.map(self._preprocess_chunk, chunks)
-    
-    def _preprocess_chunk(self, paths: List[str]) -> None:
-        """Process a chunk of images."""
-        for path in paths:
-            try:
-                if not validate_image(path):
-                    logger.warning(f"Invalid image: {path}")
-                    continue
-                
-                with Image.open(path) as img:
-                    width, height = img.size
-                
-                self.bucket_manager.add_image(path, width, height)
-                self._stats['processed'] = self._stats.get('processed', 0) + 1
-                
-            except Exception as e:
-                logger.error(f"Error processing {path}: {e}")
-                self._stats['errors'] = self._stats.get('errors', 0) + 1
+            results = pool.map(_preprocess_chunk, chunk_args)
+            
+        # Aggregate results
+        total_processed = sum(p for p, _ in results)
+        total_errors = sum(e for _, e in results)
+        
+        self._stats['processed'] = total_processed
+        self._stats['errors'] = total_errors
     
     @lru_cache(maxsize=1024)
     def _load_image(self, path: str) -> Image.Image:
@@ -150,29 +162,19 @@ class MultiAspectDataset(Dataset):
         paths: List[str],
         bucket: Bucket
     ) -> Dict[str, torch.Tensor]:
-        """Prepare a batch of data with parallel processing."""
-        # Load and transform images in parallel
-        image_futures = [
-            self._executor.submit(self._load_image, path)
-            for path in paths
-        ]
+        """Prepare a batch of data."""
+        # Process images
+        pixel_values = []
+        for path in paths:
+            image = self._load_image(path)
+            tensor = self._transform_image(image, bucket)
+            pixel_values.append(tensor)
+            
+        # Process text embeddings
+        text_embeddings = [self._prepare_text(path) for path in paths]
         
-        transform_futures = [
-            self._executor.submit(self._transform_image, future.result(), bucket)
-            for future in image_futures
-        ]
-        
-        # Prepare text embeddings in parallel
-        text_futures = [
-            self._executor.submit(self._prepare_text, path)
-            for path in paths
-        ]
-        
-        # Gather results
-        pixel_values = torch.stack([future.result() for future in transform_futures])
-        text_embeddings = [future.result() for future in text_futures]
-        
-        # Stack text embeddings
+        # Stack results
+        pixel_values = torch.stack(pixel_values)
         encoder_hidden_states = torch.stack([e[0] for e in text_embeddings])
         pooled_outputs = torch.stack([e[1] for e in text_embeddings])
         

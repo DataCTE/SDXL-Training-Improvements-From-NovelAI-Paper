@@ -12,14 +12,17 @@ from torch.cuda import amp
 from pathlib import Path
 import os
 from .memory import MemoryCache, MemoryManager
+from multiprocessing import Manager
+from multiprocessing import Pool
 
 logger = logging.getLogger(__name__)
 
 class VAECache:
     """Ultra-optimized VAE encoding cache with parallel processing."""
     
-    __slots__ = ('vae', '_memory_cache', '_lock', '_executor', '_batch_size',
-                 '_stats', '_scaler', '_cache_dir', '_max_cache_size')
+    __slots__ = ('vae', '_memory_cache', '_batch_size', '_stats',
+                 '_scaler', '_cache_dir', '_max_cache_size', '_manager',
+                 '_num_workers', '_pool')
     
     def __init__(self, vae: nn.Module, cache_dir: Optional[str] = None,
                  max_cache_size: int = 10000, num_workers: int = 4,
@@ -33,15 +36,15 @@ class VAECache:
             num_workers: Number of worker threads for parallel processing
             batch_size: Batch size for parallel processing
         """
-        # Initialize thread safety first
-        self._lock = threading.RLock()
-        self._executor = ThreadPoolExecutor(max_workers=num_workers)
+        # Initialize multiprocessing components
+        self._manager = Manager()
+        self._stats = self._manager.dict({'hits': 0, 'misses': 0, 'evictions': 0})
+        self._num_workers = num_workers
         
         # Initialize model and parameters
         self.vae = vae.eval()  # Ensure eval mode
         self._batch_size = batch_size
         self._max_cache_size = max_cache_size
-        self._stats = {'hits': 0, 'misses': 0, 'evictions': 0}
         self._scaler = amp.GradScaler()  # Fixed: removed device_type parameter
         
         # Initialize cache last
@@ -51,6 +54,9 @@ class VAECache:
             self._memory_cache = MemoryCache(str(self._cache_dir))
         else:
             self._memory_cache = MemoryManager()
+        
+        # Initialize process pool
+        self._pool = Pool(processes=num_workers) if num_workers > 0 else None
         
         # Pre-warm CUDA
         if torch.cuda.is_available():
@@ -68,13 +74,16 @@ class VAECache:
     
     def _evict_items(self) -> None:
         """Efficient batch eviction."""
-        with self._lock:
-            while self._should_evict():
-                _, tensor = self._memory_cache.popitem(last=False)
-                if isinstance(tensor, torch.Tensor):
-                    tensor.detach_()
-                    del tensor
-                self._stats['evictions'] += 1
+        while self._should_evict() and self._memory_cache:
+            try:
+                key = next(iter(self._memory_cache))
+                del self._memory_cache[key]
+                self._stats['evictions'] = self._stats.get('evictions', 0) + 1
+            except (StopIteration, RuntimeError):
+                break
+            
+        if self._should_evict() and torch.cuda.is_available():
+            torch.cuda.empty_cache()
     
     @torch.no_grad()
     def _encode_batch(self, images: torch.Tensor) -> torch.Tensor:
@@ -92,18 +101,14 @@ class VAECache:
         batch_size = self._batch_size
         num_images = images.shape[0]
         
-        if num_images <= batch_size:
+        if num_images <= batch_size or not self._pool:
             return self._encode_batch(images)
             
         # Split into optimal batches
         batches = torch.split(images, batch_size)
-        futures = [
-            self._executor.submit(self._encode_batch, batch)
-            for batch in batches
-        ]
         
-        # Gather results efficiently
-        encoded = [future.result() for future in futures]
+        # Process batches in parallel
+        encoded = self._pool.map(self._encode_batch, batches)
         return torch.cat(encoded, dim=0)
     
     def encode(self, images: torch.Tensor) -> torch.Tensor:
@@ -150,15 +155,13 @@ class VAECache:
     
     def clear(self) -> None:
         """Efficient cache clearing."""
-        with self._lock:
-            self._memory_cache.clear()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        self._memory_cache.clear()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     
     def get_stats(self) -> Dict[str, int]:
         """Get cache statistics."""
-        with self._lock:
-            return {**self._stats, **self._memory_cache.get_stats()}
+        return dict(self._stats)
     
     def __len__(self) -> int:
         """Get cache size."""
@@ -167,4 +170,6 @@ class VAECache:
     def __del__(self) -> None:
         """Clean shutdown."""
         self.clear()
-        self._executor.shutdown(wait=False)
+        if self._pool:
+            self._pool.close()
+            self._pool.join()

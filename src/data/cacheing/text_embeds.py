@@ -21,6 +21,8 @@ import os
 from .memory import MemoryCache, MemoryManager
 import random
 import multiprocessing
+from multiprocessing import Manager
+from multiprocessing import Pool
 
 logger = logging.getLogger(__name__)
 
@@ -32,9 +34,9 @@ class TextEmbeddingCache:
     """Ultra-optimized text embedding cache with parallel processing."""
     
     __slots__ = ('tokenizer1', 'tokenizer2', 'text_encoder1', 'text_encoder2',
-                 '_memory_cache', '_lock', '_executor', '_batch_size',
-                 '_max_cache_size', '_stats', '_scaler', '_cache_dir',
-                 'dropout_rate')
+                 '_memory_cache', '_batch_size', '_max_cache_size', '_stats',
+                 '_scaler', '_cache_dir', 'dropout_rate', '_manager',
+                 '_num_workers', '_pool')
     
     def __init__(
         self,
@@ -49,9 +51,10 @@ class TextEmbeddingCache:
         dropout_rate: float = 0.1
     ):
         """Initialize text embedding cache with optimized defaults."""
-        # Initialize thread safety first
-        self._lock = threading.RLock()
-        self._executor = ThreadPoolExecutor(max_workers=num_workers)
+        # Initialize multiprocessing components
+        self._manager = Manager()
+        self._stats = self._manager.dict({'hits': 0, 'misses': 0, 'evictions': 0})
+        self._num_workers = num_workers
         
         # Initialize models and parameters
         self.text_encoder1 = text_encoder1.eval()
@@ -60,17 +63,19 @@ class TextEmbeddingCache:
         self.tokenizer2 = tokenizer2
         self._batch_size = batch_size
         self._max_cache_size = max_cache_size
-        self._stats = {'hits': 0, 'misses': 0, 'evictions': 0}
         self._scaler = amp.GradScaler()
         self.dropout_rate = dropout_rate
         
-        # Initialize cache last
+        # Initialize cache
         self._cache_dir = Path(cache_dir) if cache_dir else None
         if self._cache_dir:
             os.makedirs(self._cache_dir, exist_ok=True)
             self._memory_cache = MemoryCache(str(self._cache_dir))
         else:
             self._memory_cache = MemoryManager()
+            
+        # Initialize process pool
+        self._pool = Pool(processes=num_workers) if num_workers > 0 else None
         
         # Pre-warm CUDA
         if torch.cuda.is_available():
@@ -114,20 +119,17 @@ class TextEmbeddingCache:
         batch_size = self._batch_size
         num_texts = len(texts)
         
-        if num_texts <= batch_size:
+        if num_texts <= batch_size or not self._pool:
             return self._encode_batch(texts)
             
         # Split into optimal batches
         batches = [texts[i:i + batch_size] 
                   for i in range(0, num_texts, batch_size)]
         
-        futures = [
-            self._executor.submit(self._encode_batch, batch)
-            for batch in batches
-        ]
+        # Process batches in parallel
+        results = self._pool.map(self._encode_batch, batches)
         
         # Gather results efficiently
-        results = [future.result() for future in futures]
         embed1 = torch.cat([r[0] for r in results], dim=0)
         embed2 = torch.cat([r[1] for r in results], dim=0)
         
@@ -174,15 +176,13 @@ class TextEmbeddingCache:
         
     def clear(self) -> None:
         """Efficient cache clearing."""
-        with self._lock:
-            self._memory_cache.clear()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        self._memory_cache.clear()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
                 
     def get_stats(self) -> Dict[str, int]:
         """Get cache statistics."""
-        with self._lock:
-            return {**self._stats, **self._memory_cache.get_stats()}
+        return {**self._stats, **self._memory_cache.get_stats()}
             
     def __len__(self) -> int:
         """Get cache size."""
@@ -191,7 +191,9 @@ class TextEmbeddingCache:
     def __del__(self) -> None:
         """Clean shutdown."""
         self.clear()
-        self._executor.shutdown(wait=False)
+        if self._pool:
+            self._pool.close()
+            self._pool.join()
         
     def process_text(self, text: str, training: bool = True) -> Tuple[torch.Tensor, torch.Tensor]:
         """Process text and return embeddings with optional dropout during training."""
