@@ -1,127 +1,233 @@
 """
-Text embeddings caching functionality for SDXL training.
+Ultra-optimized text embedding cache system.
 
-This module provides specialized caching for text embeddings with efficient
-memory management and disk persistence.
+This module provides an ultra-optimized text embedding cache with parallel processing, 
+mixed precision, and efficient memory management.
 """
 
-import logging
 import torch
-from typing import Optional, List, Any, Dict, Tuple
-from tqdm import tqdm
-
-from .memory import MemoryCache
+import torch.nn as nn
+from typing import Dict, List, Optional, Tuple, Union
+import numpy as np
+from concurrent.futures import ThreadPoolExecutor
+import threading
+from collections import OrderedDict
+import logging
+from torch.cuda import amp
+import hashlib
+from transformers import CLIPTextModel, CLIPTokenizer
 
 logger = logging.getLogger(__name__)
 
 class TextEmbeddingCache:
-    """Manages caching of text embeddings.
+    """Ultra-optimized text embedding cache with parallel processing."""
     
-    This class provides efficient caching of text embeddings with memory
-    management and disk persistence capabilities.
-    
-    Attributes:
-        cache_dir: Directory for storing cached embeddings
-        text_encoder: Text encoder model for generating embeddings
-        memory_cache: Memory cache instance for storage
-    """
+    __slots__ = ('tokenizer1', 'tokenizer2', 'text_encoder1', 'text_encoder2',
+                 '_cache', '_lock', '_executor', '_batch_size', '_max_cache_size',
+                 '_stats', '_scaler')
     
     def __init__(
         self,
-        cache_dir: str = "text_embeds_cache",
-        text_encoder: Optional[Any] = None
-    ) -> None:
-        """Initialize the text embeddings cache.
+        tokenizer1: CLIPTokenizer,
+        tokenizer2: CLIPTokenizer,
+        text_encoder1: CLIPTextModel,
+        text_encoder2: CLIPTextModel,
+        max_cache_size: int = 10000,
+        num_workers: int = 4,
+        batch_size: int = 32
+    ):
+        """Initialize text embedding cache with optimized defaults."""
+        self.tokenizer1 = tokenizer1
+        self.tokenizer2 = tokenizer2
+        self.text_encoder1 = text_encoder1.eval()
+        self.text_encoder2 = text_encoder2.eval()
         
-        Args:
-            cache_dir: Directory for storing cached embeddings
-            text_encoder: Text encoder model for generating embeddings
-        """
-        self.memory_cache = MemoryCache(cache_dir)
-        self.text_encoder = text_encoder
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self._cache = OrderedDict()
+        self._lock = threading.RLock()
+        self._executor = ThreadPoolExecutor(max_workers=num_workers)
+        self._batch_size = batch_size
+        self._max_cache_size = max_cache_size
+        self._stats = {'hits': 0, 'misses': 0, 'evictions': 0}
+        self._scaler = amp.GradScaler()
         
-        if text_encoder is not None:
-            self.text_encoder.to(self.device)
-            
-    def get_embeddings(
+        # Pre-warm CUDA
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.memory.empty_cache()
+            torch.cuda.set_per_process_memory_fraction(0.8)
+    
+    def _get_cache_key(self, text: str) -> str:
+        """Ultra-fast cache key generation using SHA-256."""
+        return hashlib.sha256(text.encode()).hexdigest()
+    
+    def _should_evict(self) -> bool:
+        """Check if cache needs eviction."""
+        return len(self._cache) >= self._max_cache_size
+    
+    def _evict_items(self) -> None:
+        """Efficient batch eviction."""
+        with self._lock:
+            while self._should_evict():
+                _, tensors = self._cache.popitem(last=False)
+                for tensor in tensors:
+                    if isinstance(tensor, torch.Tensor):
+                        tensor.detach_()
+                        del tensor
+                self._stats['evictions'] += 1
+    
+    @torch.no_grad()
+    def _encode_text_batch(
         self,
-        text: str,
-        return_pooled: bool = True
-    ) -> Optional[Tuple[torch.Tensor, Optional[torch.Tensor]]]:
-        """Get text embeddings from cache or compute them.
+        texts: List[str]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Optimized batch text encoding with mixed precision."""
+        # Tokenize
+        tokens1 = self.tokenizer1(
+            texts,
+            padding="max_length",
+            max_length=self.tokenizer1.model_max_length,
+            truncation=True,
+            return_tensors="pt",
+        )
+        tokens2 = self.tokenizer2(
+            texts,
+            padding="max_length",
+            max_length=self.tokenizer2.model_max_length,
+            truncation=True,
+            return_tensors="pt",
+        )
         
-        Args:
-            text: Input text to get embeddings for
-            return_pooled: Whether to return pooled embeddings
+        if torch.cuda.is_available():
+            tokens1 = tokens1.to('cuda')
+            tokens2 = tokens2.to('cuda')
             
-        Returns:
-            Tuple of (text_embeddings, pooled_embeddings) if available
-        """
-        cache_key = f"{text}_{return_pooled}"
-        cached = self.memory_cache.get(cache_key)
-        
-        if cached is not None:
-            return cached
+        # Encode with mixed precision
+        with amp.autocast():
+            encoder1_hidden = self.text_encoder1(
+                tokens1.input_ids,
+                attention_mask=tokens1.attention_mask
+            )[0]
             
-        if self.text_encoder is not None:
-            with torch.amp.autocast('cuda', enabled=True):
-                with torch.no_grad():
-                    inputs = self.text_encoder.tokenizer(
-                        text,
-                        padding="max_length",
-                        max_length=self.text_encoder.max_length,
-                        truncation=True,
-                        return_tensors="pt"
-                    )
-                    inputs = {k: v.to(self.device) for k, v in inputs.items()}
-                    
-                    outputs = self.text_encoder(**inputs)
-                    text_embeddings = outputs.last_hidden_state
-                    pooled_embeddings = outputs.pooler_output if return_pooled else None
-                    
-                    # Move to CPU to save GPU memory
-                    embeddings = (
-                        text_embeddings.cpu(),
-                        pooled_embeddings.cpu() if pooled_embeddings is not None else None
-                    )
-                    
-            self.memory_cache.put(cache_key, embeddings)
-            return embeddings
+            encoder2_hidden = self.text_encoder2(
+                tokens2.input_ids,
+                attention_mask=tokens2.attention_mask
+            )[0]
             
-        return None
-        
-    def process_batch(
+            # Scale outputs
+            encoder1_hidden = self._scaler.scale(encoder1_hidden)
+            encoder2_hidden = self._scaler.scale(encoder2_hidden)
+            
+            # Move to CPU if needed
+            if torch.cuda.is_available():
+                encoder1_hidden = encoder1_hidden.cpu()
+                encoder2_hidden = encoder2_hidden.cpu()
+                tokens1 = tokens1.cpu()
+                tokens2 = tokens2.cpu()
+            
+        return encoder1_hidden, encoder2_hidden, tokens1.attention_mask, tokens2.attention_mask
+    
+    def _parallel_encode(
         self,
-        texts: List[str],
-        return_pooled: bool = True,
-        pbar: Optional[tqdm] = None
-    ) -> Dict[str, Tuple[torch.Tensor, Optional[torch.Tensor]]]:
-        """Process a batch of texts to get their embeddings.
+        texts: List[str]
+    ) -> List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Parallel batch processing with optimal batch size."""
+        batch_size = self._batch_size
+        num_texts = len(texts)
         
-        Args:
-            texts: List of input texts
-            return_pooled: Whether to return pooled embeddings
-            pbar: Optional progress bar
+        if num_texts <= batch_size:
+            return [self._encode_text_batch(texts)]
             
-        Returns:
-            Dictionary mapping texts to their embeddings
-        """
-        results = {}
-        batch_size = 64  # Process in batches for memory efficiency
+        # Split into optimal batches
+        batches = [
+            texts[i:i + batch_size]
+            for i in range(0, num_texts, batch_size)
+        ]
         
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i:i + batch_size]
-            for text in batch:
-                embeddings = self.get_embeddings(text, return_pooled)
-                if embeddings is not None:
-                    results[text] = embeddings
-                    
-            if pbar is not None:
-                pbar.update(len(batch))
-                
-        return results
+        # Process in parallel
+        futures = [
+            self._executor.submit(self._encode_text_batch, batch)
+            for batch in batches
+        ]
         
-    def offload_to_disk(self) -> None:
-        """Offload cache to disk."""
-        self.memory_cache.offload_to_disk()
+        return [future.result() for future in futures]
+    
+    def encode_text(
+        self,
+        text: Union[str, List[str]]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Ultra-fast text encoding with caching."""
+        # Handle single text
+        if isinstance(text, str):
+            texts = [text]
+            single = True
+        else:
+            texts = text
+            single = False
+            
+        # Check cache for each text
+        encoded_list = []
+        uncached_indices = []
+        uncached_texts = []
+        
+        for i, t in enumerate(texts):
+            key = self._get_cache_key(t)
+            cached = self._cache.get(key)
+            
+            if cached is not None:
+                encoded_list.append(cached)
+                self._stats['hits'] += 1
+            else:
+                uncached_indices.append(i)
+                uncached_texts.append(t)
+                self._stats['misses'] += 1
+        
+        # Process uncached texts in parallel
+        if uncached_texts:
+            batch_results = self._parallel_encode(uncached_texts)
+            
+            # Flatten results
+            all_results = []
+            for batch in batch_results:
+                for i in range(len(batch[0])):
+                    result = tuple(x[i] for x in batch)
+                    all_results.append(result)
+            
+            # Cache new encodings
+            for i, result in zip(uncached_indices, all_results):
+                key = self._get_cache_key(texts[i])
+                if self._should_evict():
+                    self._evict_items()
+                self._cache[key] = result
+                encoded_list.append(result)
+        
+        # Combine results maintaining order
+        if single:
+            return encoded_list[0]
+            
+        # Stack tensors from tuples
+        return tuple(
+            torch.stack([x[i] for x in encoded_list])
+            for i in range(4)
+        )
+    
+    def clear(self) -> None:
+        """Efficient cache clearing."""
+        with self._lock:
+            self._cache.clear()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.memory.empty_cache()
+    
+    def get_stats(self) -> Dict[str, int]:
+        """Get cache statistics."""
+        with self._lock:
+            return dict(self._stats)
+    
+    def __len__(self) -> int:
+        """Get cache size."""
+        return len(self._cache)
+    
+    def __del__(self) -> None:
+        """Clean shutdown."""
+        self.clear()
+        self._executor.shutdown(wait=False)

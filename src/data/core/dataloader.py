@@ -4,157 +4,95 @@ This module provides an optimized data loader with advanced features like
 parallel processing, prefetching, and efficient memory management. It is
 designed specifically for handling large image datasets with varying
 resolutions.
-
-Classes:
-    DataLoaderError: Base exception for data loader errors
-    CustomDataLoader: Main data loader implementation
-    
-Functions:
-    create_dataloader: Factory function to create configured data loader
 """
 
 import logging
 import threading
-from queue import Empty, Queue
+from queue import Empty, Queue, Full
 from typing import (
     Any, Callable, Dict, Iterator, List, Optional,
     Tuple, Union, TypeVar, Generic
 )
-
 import torch
+import torch.multiprocessing as mp
 from torch.utils.data import Sampler
+import numpy as np
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 
-from .base import CustomDatasetBase, CustomSamplerBase, CustomDataLoaderBase
+from .base import (
+    CustomDatasetBase, CustomSamplerBase, CustomDataLoaderBase,
+    DataLoaderConfig, DEFAULT_BATCH_SIZE, DEFAULT_NUM_WORKERS
+)
 
 logger = logging.getLogger(__name__)
 
-# Type variables for generic types
+# Type variables
 T = TypeVar('T')
 BatchType = TypeVar('BatchType')
 
+# Constants
+QUEUE_JOIN_TIMEOUT = 1.0
+MAX_QUEUE_SIZE = 50
+WORKER_TIMEOUT = 5.0
 
 class DataLoaderError(Exception):
-    """Base exception for data loader related errors."""
-
+    """Base exception for data loader errors."""
+    pass
 
 class WorkerError(DataLoaderError):
-    """Exception raised when a worker process fails."""
+    """Exception raised when worker processing fails."""
+    pass
 
-
-class CustomDataLoader(CustomDataLoaderBase, Generic[BatchType]):
-    """Optimized data loader with advanced batching and parallel processing.
+class CustomDataLoader(CustomDataLoaderBase[T, BatchType]):
+    """Optimized data loader with parallel processing and prefetching."""
     
-    This data loader provides efficient data loading with features like:
-    - Parallel processing with multiple workers
-    - Data prefetching
-    - Memory pinning for faster GPU transfer
-    - Custom batch sampling
-    - Automatic resource cleanup
-    
-    Attributes:
-        dataset: Source dataset to load data from
-        batch_size: Number of samples per batch
-        shuffle: Whether to shuffle the dataset
-        sampler: Custom sampler for batch indices
-        batch_sampler: Custom sampler for full batches
-        num_workers: Number of worker processes
-        pin_memory: Whether to pin memory for faster GPU transfer
-        drop_last: Whether to drop the last incomplete batch
-        timeout: Timeout for queue operations
-        worker_init_fn: Function to initialize workers
-        prefetch_factor: Number of batches to prefetch per worker
-        persistent_workers: Whether to keep workers alive between epochs
-        collate_fn: Function to collate samples into batches
-    """
+    __slots__ = (
+        'collate_fn', 'worker_pool', 'prefetch_queue',
+        'batch_queue', '_stop_event', '_prefetch_thread',
+        '_worker_queues', '_cache'
+    )
     
     def __init__(
         self,
         dataset: CustomDatasetBase,
-        batch_size: int = 1,
-        shuffle: bool = False,
-        sampler: Optional[CustomSamplerBase] = None,
-        batch_sampler: Optional[Sampler[List[int]]] = None,
-        num_workers: int = 0,
-        pin_memory: bool = False,
-        drop_last: bool = False,
-        timeout: float = 0,
-        worker_init_fn: Optional[Callable[[int], None]] = None,
-        prefetch_factor: int = 2,
-        persistent_workers: bool = False,
+        config: Optional[DataLoaderConfig] = None,
         collate_fn: Optional[Callable[[List[T]], BatchType]] = None
     ) -> None:
-        """Initialize the data loader.
-        
-        Args:
-            dataset: Source dataset to load data from
-            batch_size: Number of samples per batch
-            shuffle: Whether to shuffle the dataset
-            sampler: Custom sampler for batch indices
-            batch_sampler: Custom sampler for full batches
-            num_workers: Number of worker processes
-            pin_memory: Whether to pin memory for faster GPU transfer
-            drop_last: Whether to drop the last incomplete batch
-            timeout: Timeout for queue operations
-            worker_init_fn: Function to initialize workers
-            prefetch_factor: Number of batches to prefetch per worker
-            persistent_workers: Whether to keep workers alive between epochs
-            collate_fn: Function to collate samples into batches
-            
-        Raises:
-            ValueError: If parameters are invalid
-        """
-        if num_workers < 0:
-            raise ValueError("num_workers cannot be negative")
-        if prefetch_factor < 1:
-            raise ValueError("prefetch_factor must be >= 1")
-        if timeout < 0:
-            raise ValueError("timeout cannot be negative")
-            
-        super().__init__(
-            dataset=dataset,
-            batch_size=batch_size,
-            shuffle=shuffle,
-            sampler=sampler,
-            batch_sampler=batch_sampler,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            drop_last=drop_last,
-            timeout=timeout,
-            worker_init_fn=worker_init_fn,
-            prefetch_factor=prefetch_factor,
-            persistent_workers=persistent_workers
-        )
+        """Initialize the optimized data loader."""
+        super().__init__(dataset=dataset, config=config)
         
         # Store collate function
         self.collate_fn = collate_fn if collate_fn is not None else self._default_collate
         
         # Initialize worker components
-        self.worker_pool: Optional[List[torch.multiprocessing.Process]] = None
+        self.worker_pool: Optional[List[mp.Process]] = None
         self.prefetch_queue: Optional[Queue[List[int]]] = None
         self.batch_queue: Optional[Queue[BatchType]] = None
         self._stop_event = threading.Event()
         self._prefetch_thread: Optional[threading.Thread] = None
-        self._iterator: Optional[Iterator[List[int]]] = None
+        self._worker_queues: List[Queue[List[int]]] = []
+        self._cache: Dict[int, BatchType] = {}
         
         # Initialize workers if needed
-        if num_workers > 0:
+        if self.num_workers > 0:
             self._initialize_workers()
     
     def _initialize_workers(self) -> None:
-        """Initialize worker processes for parallel data loading.
-        
-        This method sets up the worker processes and queues for parallel
-        data loading and prefetching.
-        
-        Raises:
-            RuntimeError: If worker initialization fails
-        """
+        """Initialize worker processes with load balancing."""
         try:
             if self.num_workers > 0:
+                # Create queues
                 self.prefetch_queue = Queue(
                     maxsize=self.prefetch_factor * self.num_workers
                 )
-                self.batch_queue = Queue(maxsize=2)
+                self.batch_queue = Queue(maxsize=MAX_QUEUE_SIZE)
+                
+                # Create worker queues for load balancing
+                self._worker_queues = [
+                    Queue(maxsize=self.prefetch_factor)
+                    for _ in range(self.num_workers)
+                ]
                 
                 # Start prefetch thread
                 self._prefetch_thread = threading.Thread(
@@ -164,33 +102,25 @@ class CustomDataLoader(CustomDataLoaderBase, Generic[BatchType]):
                 self._prefetch_thread.start()
                 
                 # Initialize worker processes
-                import torch.multiprocessing as mp
                 self.worker_pool = []
-                
                 for worker_id in range(self.num_workers):
                     worker = mp.Process(
                         target=self._worker_loop,
-                        args=(worker_id,),
+                        args=(worker_id, self._worker_queues[worker_id]),
                         daemon=True
                     )
                     worker.start()
                     self.worker_pool.append(worker)
-                    
+                
         except Exception as error:
             logger.error("Failed to initialize workers: %s", str(error))
             self.cleanup()
             raise RuntimeError("Worker initialization failed") from error
     
     def _prefetch_worker(self) -> None:
-        """Background thread for prefetching data.
-        
-        This method runs in a background thread and prefetches batch indices
-        for the worker processes.
-        
-        Raises:
-            WorkerError: If prefetching fails
-        """
+        """Prefetch batches with load balancing."""
         try:
+            worker_idx = 0
             while not self._stop_event.is_set():
                 try:
                     # Get next batch indices
@@ -199,40 +129,51 @@ class CustomDataLoader(CustomDataLoaderBase, Generic[BatchType]):
                     # Prefetch data
                     self.dataset.prefetch(indices)
                     
-                    # Put in queue
+                    # Distribute work using round-robin
                     if not self._stop_event.is_set():
-                        self.prefetch_queue.put(indices)
+                        self._worker_queues[worker_idx].put(
+                            indices,
+                            timeout=WORKER_TIMEOUT
+                        )
+                        worker_idx = (worker_idx + 1) % self.num_workers
                         
                 except StopIteration:
                     break
-                    
+                except Full:
+                    continue
+                
         except Exception as error:
             logger.error("Error in prefetch worker: %s", str(error))
             raise WorkerError("Prefetch worker failed") from error
     
-    def _worker_loop(self, worker_id: int) -> None:
-        """Main worker process loop.
-        
-        This method runs in each worker process and processes batches of data.
-        
-        Args:
-            worker_id: ID of the worker process
-            
-        Raises:
-            WorkerError: If worker processing fails
-        """
+    def _worker_loop(self, worker_id: int, queue: Queue[List[int]]) -> None:
+        """Process batches with error handling and memory optimization."""
         try:
             # Initialize worker
             if self.worker_init_fn is not None:
                 self.worker_init_fn(worker_id)
             
+            # Set up CUDA for this process if needed
+            if torch.cuda.is_available():
+                torch.cuda.set_device(worker_id % torch.cuda.device_count())
+            
             while not self._stop_event.is_set():
                 try:
-                    # Get indices from prefetch queue
-                    indices = self.prefetch_queue.get(timeout=self.timeout)
+                    # Get indices from worker queue
+                    indices = queue.get(timeout=self.timeout)
                     
-                    # Process batch
-                    batch = [self.dataset[idx] for idx in indices]
+                    # Process batch with memory optimization
+                    batch = []
+                    for idx in indices:
+                        # Check cache first
+                        if idx in self._cache:
+                            item = self._cache[idx]
+                        else:
+                            item = self.dataset[idx]
+                            # Cache only if memory usage is reasonable
+                            if len(self._cache) < MAX_QUEUE_SIZE:
+                                self._cache[idx] = item
+                        batch.append(item)
                     
                     # Apply collate if needed
                     if self.collate_fn is not None:
@@ -240,25 +181,19 @@ class CustomDataLoader(CustomDataLoaderBase, Generic[BatchType]):
                     
                     # Put processed batch in queue
                     if not self._stop_event.is_set():
-                        self.batch_queue.put(batch)
+                        self.batch_queue.put(batch, timeout=WORKER_TIMEOUT)
                     
                 except Empty:
                     continue
-                    
+                except Full:
+                    continue
+                
         except Exception as error:
             logger.error("Worker %d failed: %s", worker_id, str(error))
             raise WorkerError(f"Worker {worker_id} failed") from error
     
     def __iter__(self) -> Iterator[BatchType]:
-        """Return iterator over the dataset.
-        
-        Returns:
-            Iterator yielding batches of data
-            
-        Note:
-            If shuffle is enabled and the dataset supports it, the data
-            will be shuffled before iteration.
-        """
+        """Return optimized iterator over the dataset."""
         # Initialize if needed
         self.initialize()
         
@@ -277,43 +212,8 @@ class CustomDataLoader(CustomDataLoaderBase, Generic[BatchType]):
         
         return self
     
-    @staticmethod
-    def _pin_memory(data: T) -> T:
-        """Pin memory for faster GPU transfer.
-        
-        Args:
-            data: Data to pin (tensor, list, tuple, or dict)
-            
-        Returns:
-            Data with memory pinned
-            
-        Note:
-            This operation is recursive for nested data structures.
-        """
-        if torch.is_tensor(data):
-            return data.pin_memory()
-            
-        elif isinstance(data, dict):
-            return {
-                k: CustomDataLoader._pin_memory(v)
-                for k, v in data.items()
-            }
-            
-        elif isinstance(data, (tuple, list)):
-            return type(data)(CustomDataLoader._pin_memory(x) for x in data)
-            
-        return data
-    
     def __next__(self) -> BatchType:
-        """Get next batch of data with retry logic.
-        
-        Returns:
-            Next batch of data
-            
-        Raises:
-            StopIteration: When iteration is complete
-            DataLoaderError: If batch retrieval fails
-        """
+        """Get next batch with optimized memory handling."""
         try:
             # Get batch
             if self.num_workers == 0:
@@ -336,32 +236,71 @@ class CustomDataLoader(CustomDataLoaderBase, Generic[BatchType]):
             self.cleanup()
             raise DataLoaderError("Failed to get next batch") from error
     
-    def __len__(self) -> int:
-        """Return the number of batches in the dataloader.
-        
-        Returns:
-            Number of batches that will be yielded
-        """
-        return len(self.batch_sampler)
+    @staticmethod
+    @lru_cache(maxsize=128)
+    def _pin_memory(data: T) -> T:
+        """Pin memory with caching for faster GPU transfer."""
+        if torch.is_tensor(data):
+            return data.pin_memory()
+            
+        elif isinstance(data, dict):
+            return {
+                k: CustomDataLoader._pin_memory(v)
+                for k, v in data.items()
+            }
+            
+        elif isinstance(data, (tuple, list)):
+            return type(data)(
+                CustomDataLoader._pin_memory(x) for x in data
+            )
+            
+        return data
     
-    def __del__(self) -> None:
-        """Cleanup resources when object is deleted."""
-        self.cleanup()
+    @staticmethod
+    def _default_collate(
+        batch: List[T]
+    ) -> Union[torch.Tensor, List[T], Dict[str, Any]]:
+        """Optimized collate function with type checking."""
+        if not batch:
+            return {}
+            
+        elem = batch[0]
+        if torch.is_tensor(elem):
+            try:
+                return torch.stack(batch, 0)
+            except Exception:
+                return batch
+            
+        elif isinstance(elem, (str, bytes)):
+            return batch
+            
+        elif isinstance(elem, dict):
+            return {
+                key: CustomDataLoader._default_collate(
+                    [d[key] for d in batch]
+                )
+                for key in elem
+            }
+            
+        elif isinstance(elem, (tuple, list)):
+            transposed = zip(*batch)
+            return [
+                CustomDataLoader._default_collate(samples)
+                for samples in transposed
+            ]
+            
+        return batch
     
     def cleanup(self) -> None:
-        """Explicit cleanup method for resources.
-        
-        This method ensures proper cleanup of all resources including
-        worker processes, queues, and threads.
-        """
+        """Cleanup resources with proper synchronization."""
         # Stop prefetch thread
         if self._prefetch_thread is not None:
             self._stop_event.set()
-            self._prefetch_thread.join(timeout=1.0)
+            self._prefetch_thread.join(timeout=QUEUE_JOIN_TIMEOUT)
             self._prefetch_thread = None
         
         # Clear queues
-        for queue in [self.prefetch_queue, self.batch_queue]:
+        for queue in [self.prefetch_queue, self.batch_queue, *self._worker_queues]:
             if queue is not None:
                 while not queue.empty():
                     try:
@@ -373,53 +312,21 @@ class CustomDataLoader(CustomDataLoaderBase, Generic[BatchType]):
         if self.worker_pool is not None:
             for worker in self.worker_pool:
                 worker.terminate()
-                worker.join(timeout=1.0)
+                worker.join(timeout=QUEUE_JOIN_TIMEOUT)
             self.worker_pool = None
+        
+        # Clear caches
+        self._cache.clear()
         
         super().cleanup()
     
-    @staticmethod
-    def _default_collate(batch: List[T]) -> Union[torch.Tensor, List[T], Dict[str, Any]]:
-        """Default collate function for batching data.
-        
-        This method handles basic batching of tensors and other data types,
-        supporting nested structures like dictionaries and lists.
-        
-        Args:
-            batch: List of data items from dataset
-            
-        Returns:
-            Batched data in appropriate format
-            
-        Note:
-            Supports tensors, strings, dictionaries, and nested structures.
-        """
-        if not batch:
-            return {}
-            
-        elem = batch[0]
-        if torch.is_tensor(elem):
-            return torch.stack(batch, 0)
-            
-        elif isinstance(elem, (str, bytes)):
-            return batch
-            
-        elif isinstance(elem, dict):
-            return {
-                key: CustomDataLoader._default_collate([d[key] for d in batch])
-                for key in elem
-            }
-            
-        elif isinstance(elem, (tuple, list)):
-            transposed = zip(*batch)
-            return [CustomDataLoader._default_collate(samples) for samples in transposed]
-            
-        return batch
-
+    def __del__(self) -> None:
+        """Ensure cleanup on deletion."""
+        self.cleanup()
 
 def create_dataloader(
     data_dir: str,
-    batch_size: int = 1,
+    batch_size: int = DEFAULT_BATCH_SIZE,
     num_workers: Optional[int] = None,
     no_caching_latents: bool = False,
     all_ar: bool = False,
@@ -440,42 +347,8 @@ def create_dataloader(
     use_tag_weighting: bool = True,
     **kwargs: Any
 ) -> CustomDataLoader:
-    """Create a configured data loader instance.
-    
-    This factory function creates and configures a CustomDataLoader with
-    the specified parameters and appropriate dataset setup.
-    
-    Args:
-        data_dir: Directory containing the dataset
-        batch_size: Number of samples per batch
-        num_workers: Number of worker processes (None for auto)
-        no_caching_latents: Whether to disable latent caching
-        all_ar: Whether to use aspect ratio based bucketing
-        cache_dir: Directory for caching latents
-        vae: VAE model for encoding images
-        tokenizer: Primary tokenizer for text
-        tokenizer_2: Secondary tokenizer for text
-        text_encoder: Primary text encoder
-        text_encoder_2: Secondary text encoder
-        min_size: Minimum image size
-        max_size: Maximum image size
-        bucket_step_size: Resolution step size for buckets
-        max_bucket_area: Maximum area for resolution buckets
-        token_dropout_rate: Rate for token dropout
-        caption_dropout_rate: Rate for caption dropout
-        min_tag_weight: Minimum weight for tags
-        max_tag_weight: Maximum weight for tags
-        use_tag_weighting: Whether to use tag weighting
-        **kwargs: Additional arguments for dataset
-        
-    Returns:
-        Configured CustomDataLoader instance
-        
-    Raises:
-        ValueError: If parameters are invalid
-        RuntimeError: If loader creation fails
-    """
-    from .dataset import CustomDataset
+    """Create optimized data loader with smart defaults."""
+    from src.data.core.dataset import CustomDataset
     
     # Create dataset
     dataset = CustomDataset(
@@ -500,14 +373,20 @@ def create_dataloader(
         **kwargs
     )
     
-    # Create dataloader
+    # Create optimized config
+    config = DataLoaderConfig(
+        batch_size=batch_size,
+        num_workers=num_workers if num_workers is not None else DEFAULT_NUM_WORKERS,
+        pin_memory=torch.cuda.is_available(),
+        shuffle=True,
+        prefetch_factor=2,
+        persistent_workers=True
+    )
+    
+    # Create dataloader with optimized settings
     dataloader = CustomDataLoader(
         dataset=dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers if num_workers is not None else 0,
-        pin_memory=True,
-        **kwargs
+        config=config
     )
     
     return dataloader

@@ -1,204 +1,253 @@
 """
-Image conversion utilities for SDXL training pipeline.
+Ultra-optimized image manipulation module with GPU acceleration.
 
 This module provides thread-safe conversion between PyTorch tensors and PIL Images
 with caching for improved performance. It also includes utilities for image
 statistics and normalization.
 """
 
-import logging
-from dataclasses import dataclass
-from functools import lru_cache
-from threading import Lock
-from typing import Dict, Optional, Tuple
-
 import torch
+import torch.nn.functional as F
+from torch.cuda import amp
 import numpy as np
+from typing import Tuple, Optional, Dict, List, Union
+import kornia
 from PIL import Image
-
-from src.data.image_processing.validation import validate_tensor, validate_image
+import cv2
+from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+import threading
+from functools import lru_cache
+import numba
+import logging
+from enum import Enum
 
 logger = logging.getLogger(__name__)
 
+# Define manipulation modes as enum for type safety
+class ManipulationMode(str, Enum):
+    RESIZE = 'resize'
+    CROP = 'crop'
+    ROTATE = 'rotate'
+    FLIP = 'flip'
+    COLOR = 'color'
+    NOISE = 'noise'
+    BLUR = 'blur'
 
 @dataclass(frozen=True)
-class ImageStats:
-    """Statistics for image normalization.
-    
-    Attributes:
-        mean: Mean values per channel
-        std: Standard deviation values per channel
-        min_val: Minimum pixel values per channel
-        max_val: Maximum pixel values per channel
-    """
-    mean: Tuple[float, ...]
-    std: Tuple[float, ...]
-    min_val: Tuple[float, ...]
-    max_val: Tuple[float, ...]
+class ManipConfig:
+    """Immutable manipulation configuration."""
+    device: str = 'cuda'
+    batch_size: int = 32
+    num_workers: int = 4
+    cache_size: int = 1024
+    use_mixed_precision: bool = True
+    memory_efficient: bool = True
 
+@numba.jit(nopython=True, parallel=True)
+def _fast_normalize(img: np.ndarray) -> np.ndarray:
+    """Ultra-fast normalization using Numba."""
+    return (img.astype(np.float32) - 127.5) / 127.5
 
-class ImageConverter:
-    """Thread-safe image conversion utilities with caching.
+class ImageManipulator:
+    """Ultra-optimized image manipulation with GPU acceleration."""
     
-    This class provides efficient and thread-safe conversion between PyTorch
-    tensors and PIL Images with caching for improved performance.
-    """
+    __slots__ = ('config', '_executor', '_lock', '_cache', '_stats')
     
-    def __init__(self, cache_size: int = 1024) -> None:
-        """Initialize the converter.
-        
-        Args:
-            cache_size: Maximum number of items in each cache
-        """
-        if cache_size <= 0:
-            raise ValueError("cache_size must be positive")
+    def __init__(
+        self,
+        config: Optional[ManipConfig] = None
+    ):
+        """Initialize with optimized defaults."""
+        self.config = config or ManipConfig()
+        self._executor = ThreadPoolExecutor(max_workers=self.config.num_workers)
+        self._lock = threading.RLock()
+        self._cache = {}
+        self._stats = {'cache_hits': 0, 'cache_misses': 0}
+    
+    @torch.no_grad()
+    def process_batch(
+        self,
+        images: List[Union[np.ndarray, torch.Tensor, Image.Image]],
+        mode: ManipulationMode,
+        **kwargs
+    ) -> torch.Tensor:
+        """Process a batch of images with the specified manipulation."""
+        if not images:
+            raise ValueError("Empty image batch")
             
-        self._cache_size = cache_size
-        self._tensor_to_pil_cache: Dict[int, Image.Image] = {}
-        self._pil_to_tensor_cache: Dict[int, torch.Tensor] = {}
-        self._lock = Lock()
+        batch_size = min(len(images), self.config.batch_size)
         
+        # Convert to tensors in parallel
+        futures = [
+            self._executor.submit(self._to_tensor, img)
+            for img in images[:batch_size]
+        ]
+        
+        # Gather results maintaining order
+        tensors = [future.result() for future in futures]
+        
+        # Stack efficiently
+        with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
+            batch = torch.stack(tensors, dim=0)
+            
+            # Apply manipulation
+            if mode == ManipulationMode.RESIZE:
+                return self._resize_batch(batch, **kwargs)
+            elif mode == ManipulationMode.CROP:
+                return self._crop_batch(batch, **kwargs)
+            elif mode == ManipulationMode.ROTATE:
+                return self._rotate_batch(batch, **kwargs)
+            elif mode == ManipulationMode.FLIP:
+                return self._flip_batch(batch, **kwargs)
+            elif mode == ManipulationMode.COLOR:
+                return self._color_batch(batch, **kwargs)
+            elif mode == ManipulationMode.NOISE:
+                return self._noise_batch(batch, **kwargs)
+            elif mode == ManipulationMode.BLUR:
+                return self._blur_batch(batch, **kwargs)
+            else:
+                raise ValueError(f"Unknown manipulation mode: {mode}")
+    
+    def _to_tensor(
+        self,
+        image: Union[np.ndarray, torch.Tensor, Image.Image]
+    ) -> torch.Tensor:
+        """Convert image to tensor efficiently."""
+        if isinstance(image, torch.Tensor):
+            tensor = image
+        elif isinstance(image, np.ndarray):
+            with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
+                tensor = torch.from_numpy(image).permute(2, 0, 1)
+        else:  # PIL Image
+            with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
+                tensor = torch.from_numpy(np.array(image)).permute(2, 0, 1)
+        
+        if self.config.device == 'cuda':
+            tensor = tensor.pin_memory().to(
+                device='cuda',
+                non_blocking=True,
+                memory_format=torch.channels_last
+            )
+        
+        return tensor
+    
+    @torch.no_grad()
+    def _resize_batch(
+        self,
+        batch: torch.Tensor,
+        size: Tuple[int, int],
+        mode: str = 'bilinear'
+    ) -> torch.Tensor:
+        """Efficient batch resize operation."""
+        with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
+            return F.interpolate(
+                batch,
+                size=size,
+                mode=mode,
+                align_corners=False
+            )
+    
+    @torch.no_grad()
+    def _crop_batch(
+        self,
+        batch: torch.Tensor,
+        size: Tuple[int, int],
+        random: bool = False
+    ) -> torch.Tensor:
+        """Efficient batch crop operation."""
+        with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
+            if random:
+                return kornia.augmentation.RandomCrop(size)(batch)
+            else:
+                return kornia.augmentation.CenterCrop(size)(batch)
+    
+    @torch.no_grad()
+    def _rotate_batch(
+        self,
+        batch: torch.Tensor,
+        angle: float,
+        center: Optional[Tuple[int, int]] = None
+    ) -> torch.Tensor:
+        """Efficient batch rotation."""
+        with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
+            return kornia.geometry.transform.rotate(
+                batch,
+                angle=torch.tensor([angle]).expand(batch.size(0)),
+                center=center
+            )
+    
+    @torch.no_grad()
+    def _flip_batch(
+        self,
+        batch: torch.Tensor,
+        horizontal: bool = True
+    ) -> torch.Tensor:
+        """Efficient batch flip operation."""
+        with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
+            if horizontal:
+                return kornia.geometry.transform.hflip(batch)
+            else:
+                return kornia.geometry.transform.vflip(batch)
+    
+    @torch.no_grad()
+    def _color_batch(
+        self,
+        batch: torch.Tensor,
+        brightness: float = 0,
+        contrast: float = 0,
+        saturation: float = 0,
+        hue: float = 0
+    ) -> torch.Tensor:
+        """Efficient batch color adjustment."""
+        with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
+            if brightness != 0:
+                batch = kornia.enhance.adjust_brightness(batch, brightness)
+            if contrast != 0:
+                batch = kornia.enhance.adjust_contrast(batch, contrast)
+            if saturation != 0:
+                batch = kornia.enhance.adjust_saturation(batch, saturation)
+            if hue != 0:
+                batch = kornia.enhance.adjust_hue(batch, hue)
+            return batch
+    
+    @torch.no_grad()
+    def _noise_batch(
+        self,
+        batch: torch.Tensor,
+        std: float = 0.1,
+        mean: float = 0
+    ) -> torch.Tensor:
+        """Add efficient GPU-accelerated noise."""
+        with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
+            noise = torch.randn_like(batch) * std + mean
+            return torch.clamp(batch + noise, -1, 1)
+    
+    @torch.no_grad()
+    def _blur_batch(
+        self,
+        batch: torch.Tensor,
+        kernel_size: int = 3,
+        sigma: float = 1.5
+    ) -> torch.Tensor:
+        """Efficient batch blur operation."""
+        with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
+            return kornia.filters.gaussian_blur2d(
+                batch,
+                kernel_size=(kernel_size, kernel_size),
+                sigma=(sigma, sigma)
+            )
+    
+    def get_stats(self) -> Dict[str, int]:
+        """Get processing statistics."""
+        with self._lock:
+            return dict(self._stats)
+    
     def clear_cache(self) -> None:
         """Clear all caches."""
         with self._lock:
-            self._tensor_to_pil_cache.clear()
-            self._pil_to_tensor_cache.clear()
-
-    @staticmethod
-    def _hash_tensor(tensor: torch.Tensor) -> int:
-        """Generate hash for tensor caching."""
-        return hash(tensor.data_ptr())
-
-    @staticmethod
-    def _hash_image(image: Image.Image) -> int:
-        """Generate hash for PIL image caching."""
-        return hash(image.tobytes())
-    
-    def tensor_to_pil(
-        self,
-        tensor: torch.Tensor,
-        normalize: bool = True,
-        denormalize: bool = False,
-        mean: Optional[Tuple[float, ...]] = None,
-        std: Optional[Tuple[float, ...]] = None
-    ) -> Image.Image:
-        """Convert a torch tensor to PIL Image.
-        
-        Args:
-            tensor: Input tensor (C,H,W) or (B,C,H,W)
-            normalize: Whether to normalize to [0,255]
-            denormalize: Whether to denormalize using mean/std
-            mean: Channel means for denormalization
-            std: Channel stds for denormalization
-            
-        Returns:
-            Converted PIL Image
-        """
-        validate_tensor(tensor)
-        
-        # Use cache if available
-        tensor_hash = self._hash_tensor(tensor)
-        with self._lock:
-            if tensor_hash in self._tensor_to_pil_cache:
-                return self._tensor_to_pil_cache[tensor_hash]
-        
-        # Process tensor
-        if tensor.ndim == 4:
-            tensor = tensor[0]  # Take first batch item
-            
-        if denormalize and mean is not None and std is not None:
-            for t, m, s in zip(tensor, mean, std):
-                t.mul_(s).add_(m)
-                
-        if normalize:
-            tensor = tensor.mul(255).clamp(0, 255).byte()
-            
-        # Convert to PIL
-        image = Image.fromarray(tensor.permute(1, 2, 0).cpu().numpy())
-        
-        # Cache result
-        with self._lock:
-            if len(self._tensor_to_pil_cache) >= self._cache_size:
-                self._tensor_to_pil_cache.pop(next(iter(self._tensor_to_pil_cache)))
-            self._tensor_to_pil_cache[tensor_hash] = image
-            
-        return image
-    
-    def pil_to_tensor(
-        self,
-        image: Image.Image,
-        device: Optional[torch.device] = None,
-        dtype: Optional[torch.dtype] = None,
-        normalize: bool = True
-    ) -> torch.Tensor:
-        """Convert PIL Image to torch tensor.
-        
-        Args:
-            image: Input PIL image
-            device: Target device for tensor
-            dtype: Target dtype for tensor
-            normalize: Whether to normalize to [0,1]
-            
-        Returns:
-            Converted tensor
-        """
-        validate_image(image)
-        
-        # Use cache if available
-        image_hash = self._hash_image(image)
-        with self._lock:
-            if image_hash in self._pil_to_tensor_cache:
-                tensor = self._pil_to_tensor_cache[image_hash]
-                if device is not None:
-                    tensor = tensor.to(device)
-                if dtype is not None:
-                    tensor = tensor.to(dtype)
-                return tensor
-        
-        # Convert to tensor
-        tensor = torch.from_numpy(
-            np.array(image.convert('RGB'))
-        ).permute(2, 0, 1)
-        
-        if normalize:
-            tensor = tensor.float().div(255)
-            
-        if device is not None:
-            tensor = tensor.to(device)
-        if dtype is not None:
-            tensor = tensor.to(dtype)
-            
-        # Cache result
-        with self._lock:
-            if len(self._pil_to_tensor_cache) >= self._cache_size:
-                self._pil_to_tensor_cache.pop(next(iter(self._pil_to_tensor_cache)))
-            self._pil_to_tensor_cache[image_hash] = tensor
-            
-        return tensor
-
-
-@lru_cache(maxsize=128)
-def get_image_stats(size: Tuple[int, int]) -> ImageStats:
-    """Calculate optimal normalization stats for given image size.
-    
-    Args:
-        size: Image size as (width, height)
-        
-    Returns:
-        ImageStats object containing normalization statistics
-    """
-    # Calculate stats based on reference area of 1024x1024
-    ref_area = 1024 * 1024
-    actual_area = size[0] * size[1]
-    scale = (actual_area / ref_area) ** 0.5
-    
-    return ImageStats(
-        mean=(0.5, 0.5, 0.5),
-        std=(0.5 / scale, 0.5 / scale, 0.5 / scale),
-        min_val=(0.0, 0.0, 0.0),
-        max_val=(1.0, 1.0, 1.0)
-    )
-
+            self._cache.clear()
+            self._stats.clear()
 
 # Create global instance
-converter = ImageConverter()
+manipulator = ImageManipulator()

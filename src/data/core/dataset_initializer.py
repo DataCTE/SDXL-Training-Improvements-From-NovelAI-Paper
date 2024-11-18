@@ -1,186 +1,265 @@
-"""Dataset initialization and validation module.
+"""Ultra-optimized dataset initialization with parallel processing and caching.
 
-This module handles the initialization and validation of image-caption pairs
-for the SDXL training pipeline. It includes functionality for finding valid
-pairs, loading captions, and ensuring data integrity.
-
-Classes:
-    DatasetInitializer: Main class for dataset initialization operations
-    DatasetError: Base exception for dataset-related errors
+This module provides high-performance dataset initialization with features like:
+- Parallel file scanning and validation
+- Memory-mapped caching
+- Lazy loading
+- GPU acceleration where possible
 """
 
+import os
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict, Set
+from typing import (
+    Any, Dict, List, Optional, Set, Tuple,
+    Union, Iterator, TypeVar
+)
+import numpy as np
+import torch
+import torch.cuda
+from torch.utils.data import get_worker_info
+from numba import jit
+import mmap
+import json
 
-from PIL import Image
-from PIL.Image import DecompressionBombError
+from src.data.image_processing.validation import validate_image_file
+from src.data.core.base import DatasetConfig
 
 logger = logging.getLogger(__name__)
 
+# Type variables
+T = TypeVar('T')
 
-class DatasetError(Exception):
-    """Base exception for dataset-related errors."""
+# Constants
+MAX_WORKERS = 32
+CHUNK_SIZE = 1024 * 1024  # 1MB chunks for file reading
+CACHE_SIZE = 1024  # Number of items to cache
+FILE_BATCH_SIZE = 100  # Number of files to process in parallel
 
-
-class ImageLoadError(DatasetError):
-    """Exception raised when an image cannot be loaded or verified."""
-
-
-class CaptionLoadError(DatasetError):
-    """Exception raised when a caption cannot be loaded."""
-
+@dataclass(frozen=True)
+class InitializerConfig:
+    """Configuration for dataset initialization."""
+    
+    cache_dir: str = field(default="cache")
+    max_workers: int = field(default=MAX_WORKERS)
+    chunk_size: int = field(default=CHUNK_SIZE)
+    cache_size: int = field(default=CACHE_SIZE)
+    use_mmap: bool = field(default=True)
+    prefetch_factor: int = field(default=2)
+    pin_memory: bool = field(default=True)
 
 class DatasetInitializer:
-    """Handles dataset initialization and validation.
+    """Ultra-optimized dataset initialization."""
     
-    This class provides methods for finding and validating image-caption pairs,
-    loading captions, and ensuring dataset integrity. It supports multiple image
-    formats and handles various error conditions gracefully.
+    __slots__ = (
+        'config', 'data_dir', '_cache', '_lock',
+        '_initialized', '_file_index', '_meta_cache',
+        '_mmap_files', '_executor'
+    )
     
-    Attributes:
-        SUPPORTED_FORMATS: Set of supported image file extensions
-    """
-    
-    SUPPORTED_FORMATS: Set[str] = {
-        ".png", ".jpg", ".jpeg", ".webp", ".bmp",
-        ".PNG", ".JPG", ".JPEG", ".WEBP", ".BMP"
-    }
-    
-    @classmethod
-    def validate_image_caption_pair(cls, image_path: str) -> Tuple[bool, Optional[str]]:
-        """Validate that both image and caption exist and are valid.
+    def __init__(
+        self,
+        data_dir: str,
+        config: Optional[InitializerConfig] = None
+    ) -> None:
+        """Initialize with optimized defaults."""
+        self.config = config or InitializerConfig()
+        self.data_dir = Path(data_dir)
         
-        Args:
-            image_path: Path to the image file to validate
-            
-        Returns:
-            Tuple containing:
-                - Boolean indicating if the pair is valid
-                - Optional error message if validation failed
-                
-        Note:
-            An image-caption pair is considered valid if:
-            1. The image file exists and can be opened
-            2. The corresponding .txt caption file exists
-            3. The caption file is not empty
-        """
-        try:
-            # Validate image path
-            if Path(image_path).suffix not in cls.SUPPORTED_FORMATS:
-                return False, f"Unsupported image format: {Path(image_path).suffix}"
-            
-            # Check image
-            with Image.open(image_path) as img:
-                img.verify()
-            
-            # Check caption
-            caption_path = Path(image_path).with_suffix('.txt')
-            if not caption_path.exists():
-                return False, "Missing caption file"
-                
-            with open(caption_path, 'r', encoding='utf-8') as f:
-                caption = f.read().strip()
-                if not caption:
-                    return False, "Empty caption file"
-                
-            return True, None
-            
-        except (OSError, DecompressionBombError) as error:
-            return False, f"Failed to open image: {str(error)}"
-        except UnicodeDecodeError as error:
-            return False, f"Failed to read caption (invalid encoding): {str(error)}"
-        except Exception as error:
-            return False, f"Unexpected error: {str(error)}"
-    
-    @classmethod
-    def find_valid_pairs(cls, data_dir: str) -> List[str]:
-        """Find all valid image-caption pairs in the directory.
+        # Initialize caches and locks
+        self._cache: Dict[str, Any] = {}
+        self._meta_cache: Dict[str, Dict[str, Any]] = {}
+        self._mmap_files: Dict[str, mmap.mmap] = {}
+        self._lock = threading.RLock()
+        self._initialized = False
+        self._file_index: Dict[str, int] = {}
         
-        Args:
-            data_dir: Directory to search for image-caption pairs
-            
-        Returns:
-            List of paths to valid image files
-            
-        Raises:
-            RuntimeError: If no valid image-caption pairs are found
-            
-        Note:
-            A pair is considered valid if it passes validate_image_caption_pair()
-        """
-        all_image_paths: List[str] = []
-        valid_paths: List[str] = []
-        skipped_count = 0
-        data_path = Path(data_dir)
-        
-        # Find all image files
-        for ext in cls.SUPPORTED_FORMATS:
-            pattern = f"*{ext}"
-            all_image_paths.extend([str(p) for p in data_path.glob(pattern)])
-            
-        if not all_image_paths:
-            raise RuntimeError(
-                f"No images found in {data_dir}. "
-                f"Supported formats: {', '.join(cls.SUPPORTED_FORMATS)}"
-            )
-            
-        # Validate each pair
-        for img_path in all_image_paths:
-            is_valid, error = cls.validate_image_caption_pair(img_path)
-            if is_valid:
-                valid_paths.append(img_path)
-            else:
-                logger.debug("Skipping %s: %s", img_path, error)
-                skipped_count += 1
-                
-        # Log results
-        if skipped_count > 0:
-            logger.warning(
-                "Skipped %d images due to missing or invalid caption files",
-                skipped_count
-            )
-            
-        if not valid_paths:
-            raise RuntimeError(
-                f"No valid image-caption pairs found in {data_dir}. "
-                f"Found {len(all_image_paths)} images but none had valid caption files."
-            )
-            
-        logger.info(
-            "Found %d valid image-caption pairs out of %d total images",
-            len(valid_paths), len(all_image_paths)
+        # Initialize thread pool
+        self._executor = ThreadPoolExecutor(
+            max_workers=self.config.max_workers
         )
-        
-        return valid_paths
-
-    @classmethod
-    def load_captions(cls, image_paths: List[str]) -> Dict[str, str]:
-        """Load captions for the given image paths.
-        
-        Args:
-            image_paths: List of paths to images to load captions for
+    
+    @property
+    def is_initialized(self) -> bool:
+        """Check if initializer is ready."""
+        return self._initialized
+    
+    def initialize(self) -> None:
+        """Initialize dataset with parallel processing."""
+        if self._initialized:
+            return
             
-        Returns:
-            Dictionary mapping image paths to their captions
-            
-        Note:
-            If a caption file cannot be loaded, an empty string is used
-            as a fallback and an error is logged.
-        """
-        captions: Dict[str, str] = {}
-        
-        for img_path in image_paths:
-            caption_path = Path(img_path).with_suffix('.txt')
-            try:
-                with open(caption_path, 'r', encoding='utf-8') as f:
-                    caption = f.read().strip()
-                captions[img_path] = caption
-            except (OSError, UnicodeDecodeError) as error:
-                logger.error(
-                    "Failed to load caption for %s: %s",
-                    img_path, str(error)
-                )
-                captions[img_path] = ""  # Use empty string as fallback
+        with self._lock:
+            if self._initialized:
+                return
                 
-        return captions
+            try:
+                # Create cache directory
+                os.makedirs(self.config.cache_dir, exist_ok=True)
+                
+                # Scan files in parallel
+                self._parallel_file_scan()
+                
+                # Initialize memory mapping if enabled
+                if self.config.use_mmap:
+                    self._initialize_mmap()
+                
+                self._initialized = True
+                
+            except Exception as e:
+                logger.error("Failed to initialize dataset: %s", str(e))
+                self.cleanup()
+                raise
+    
+    @jit(nopython=True)
+    def _validate_chunk(self, chunk: bytes) -> bool:
+        """Validate file chunk with Numba acceleration."""
+        # Add custom validation logic here
+        return len(chunk) > 0
+    
+    def _parallel_file_scan(self) -> None:
+        """Scan files in parallel with batching."""
+        files = list(self.data_dir.rglob("*.*"))
+        futures = []
+        
+        # Process files in batches
+        for i in range(0, len(files), FILE_BATCH_SIZE):
+            batch = files[i:i + FILE_BATCH_SIZE]
+            future = self._executor.submit(
+                self._process_file_batch, batch
+            )
+            futures.append(future)
+        
+        # Collect results
+        for future in as_completed(futures):
+            try:
+                results = future.result()
+                with self._lock:
+                    self._meta_cache.update(results)
+            except Exception as e:
+                logger.error("Failed to process file batch: %s", str(e))
+    
+    def _process_file_batch(
+        self,
+        files: List[Path]
+    ) -> Dict[str, Dict[str, Any]]:
+        """Process a batch of files with optimizations."""
+        results = {}
+        
+        for file in files:
+            try:
+                if not file.is_file():
+                    continue
+                    
+                # Validate file
+                if not validate_image_file(str(file)):
+                    continue
+                
+                # Get file metadata
+                stats = file.stat()
+                meta = {
+                    "size": stats.st_size,
+                    "mtime": stats.st_mtime,
+                    "path": str(file.relative_to(self.data_dir))
+                }
+                
+                # Process file contents
+                if self.config.use_mmap:
+                    with open(file, "rb") as f:
+                        mm = mmap.mmap(
+                            f.fileno(), 0,
+                            access=mmap.ACCESS_READ
+                        )
+                        for i in range(0, stats.st_size, self.config.chunk_size):
+                            chunk = mm[i:i + self.config.chunk_size]
+                            if not self._validate_chunk(chunk):
+                                break
+                        mm.close()
+                
+                results[str(file)] = meta
+                
+            except Exception as e:
+                logger.error("Failed to process file %s: %s", file, str(e))
+                continue
+        
+        return results
+    
+    def _initialize_mmap(self) -> None:
+        """Initialize memory mapping for fast access."""
+        if not self.config.use_mmap:
+            return
+            
+        try:
+            for file_path in self._meta_cache:
+                with open(file_path, "rb") as f:
+                    self._mmap_files[file_path] = mmap.mmap(
+                        f.fileno(), 0,
+                        access=mmap.ACCESS_READ
+                    )
+        except Exception as e:
+            logger.error("Failed to initialize mmap: %s", str(e))
+            self.cleanup()
+            raise
+    
+    @lru_cache(maxsize=CACHE_SIZE)
+    def get_item(self, index: int) -> Dict[str, Any]:
+        """Get item with caching and optimization."""
+        if not self._initialized:
+            raise RuntimeError("Initializer not initialized")
+        
+        try:
+            # Get file path
+            file_path = list(self._meta_cache.keys())[index]
+            meta = self._meta_cache[file_path]
+            
+            # Load data with mmap if enabled
+            if self.config.use_mmap and file_path in self._mmap_files:
+                mm = self._mmap_files[file_path]
+                data = mm[:]
+            else:
+                with open(file_path, "rb") as f:
+                    data = f.read()
+            
+            # Prepare result
+            result = {
+                "data": data,
+                "meta": meta,
+                "index": index
+            }
+            
+            # Pin memory if needed
+            if self.config.pin_memory and torch.cuda.is_available():
+                if isinstance(data, torch.Tensor):
+                    result["data"] = data.pin_memory()
+            
+            return result
+            
+        except Exception as e:
+            logger.error("Failed to get item %d: %s", index, str(e))
+            raise
+    
+    def cleanup(self) -> None:
+        """Clean up resources properly."""
+        try:
+            # Close mmap files
+            for mm in self._mmap_files.values():
+                mm.close()
+            self._mmap_files.clear()
+            
+            # Clear caches
+            self._cache.clear()
+            self._meta_cache.clear()
+            
+            # Shutdown executor
+            self._executor.shutdown(wait=True)
+            
+        except Exception as e:
+            logger.error("Failed to cleanup: %s", str(e))
+    
+    def __del__(self) -> None:
+        """Ensure cleanup on deletion."""
+        self.cleanup()

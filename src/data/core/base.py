@@ -11,374 +11,264 @@ The module includes three main abstract base classes:
 
 These classes provide a foundation for building efficient and feature-rich
 data loading pipelines with proper type checking and error handling.
-
-Classes:
-    DatasetError: Base exception for dataset related errors
-    CustomDatasetBase: Abstract base class for datasets
-    CustomSamplerBase: Abstract base class for samplers
-    CustomDataLoaderBase: Abstract base class for data loaders
 """
 
 from abc import ABC, abstractmethod
 from typing import (
     Any, Callable, Dict, Generic, Iterator, List, Optional,
-    Sequence, Tuple, TypeVar, Union
+    Sequence, Tuple, TypeVar, Union, Final
 )
-
+from dataclasses import dataclass, field
+import threading
+from queue import Queue
 import torch
 from torch.utils.data import Sampler
+import numpy as np
+from concurrent.futures import ThreadPoolExecutor
+import logging
+from functools import lru_cache
+
+# Configure logging
+logger = logging.getLogger(__name__)
 
 # Type variables for generic types
 T = TypeVar('T')
 BatchType = TypeVar('BatchType')
 SamplerState = Dict[str, Any]
 
+# Constants
+DEFAULT_CACHE_SIZE: Final[int] = 1024
+DEFAULT_PREFETCH_SIZE: Final[int] = 2
+DEFAULT_BATCH_SIZE: Final[int] = 32
+DEFAULT_NUM_WORKERS: Final[int] = 4
+
+@dataclass(frozen=True)
+class DatasetConfig:
+    """Immutable dataset configuration."""
+    cache_size: int = DEFAULT_CACHE_SIZE
+    prefetch_size: int = DEFAULT_PREFETCH_SIZE
+    num_workers: int = DEFAULT_NUM_WORKERS
+    pin_memory: bool = True
+    use_cuda: bool = True
+    mixed_precision: bool = True
 
 class DatasetError(Exception):
     """Base exception for dataset related errors."""
-
+    pass
 
 class InitializationError(DatasetError):
     """Exception raised when initialization fails."""
+    pass
 
-
-class CustomDatasetBase(ABC, Generic[T]):
-    """Abstract base class for custom datasets with enhanced functionality.
+class CustomDatasetBase(Generic[T], ABC):
+    """Abstract base class for datasets with advanced features."""
     
-    This class provides a foundation for implementing custom datasets with
-    features like lazy initialization, batch fetching, and prefetching.
+    __slots__ = ('_length', '_initialized', '_config', '_cache', '_prefetch_queue', '_executor')
     
-    Attributes:
-        _length: Optional cached length of the dataset
-        _initialized: Whether the dataset has been initialized
-        
-    Note:
-        Subclasses must implement __len__ and __getitem__ methods.
-    """
-    
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        config: Optional[DatasetConfig] = None
+    ) -> None:
         """Initialize the dataset base class."""
+        self._config = config or DatasetConfig()
         self._length: Optional[int] = None
         self._initialized: bool = False
+        self._cache: Dict[int, T] = {}
+        self._prefetch_queue: Queue[int] = Queue(maxsize=self._config.prefetch_size)
+        self._executor = ThreadPoolExecutor(max_workers=self._config.num_workers)
     
-    @abstractmethod
-    def __len__(self) -> int:
-        """Return the total number of items in the dataset.
-        
-        Returns:
-            Number of items in the dataset
-            
-        Raises:
-            NotImplementedError: Must be implemented by subclass
-        """
-        raise NotImplementedError
-    
-    @abstractmethod
-    def __getitem__(self, idx: Union[int, slice]) -> T:
-        """Get a single item or slice of items from the dataset.
-        
-        Args:
-            idx: Index or slice to retrieve
-            
-        Returns:
-            Dataset item(s) at the specified index/slice
-            
-        Raises:
-            NotImplementedError: Must be implemented by subclass
-            IndexError: If index is out of bounds
-        """
-        raise NotImplementedError
+    @property
+    def is_initialized(self) -> bool:
+        """Check if dataset has been initialized."""
+        return self._initialized
     
     def initialize(self) -> None:
-        """Optional initialization method for lazy loading.
-        
-        This method should be called before using the dataset if it requires
-        any setup or resource allocation.
-        
-        Raises:
-            InitializationError: If initialization fails
-        """
+        """Optional initialization method for lazy loading."""
         try:
             self._initialized = True
         except Exception as error:
             raise InitializationError("Dataset initialization failed") from error
     
-    @property
-    def is_initialized(self) -> bool:
-        """Check if dataset has been initialized.
-        
-        Returns:
-            True if dataset is initialized, False otherwise
-        """
-        return self._initialized
+    @abstractmethod
+    def __len__(self) -> int:
+        """Return the total number of items in the dataset."""
+        raise NotImplementedError
+    
+    @abstractmethod
+    def __getitem__(self, idx: Union[int, slice]) -> T:
+        """Get a single item or slice of items from the dataset."""
+        raise NotImplementedError
     
     def get_batch(self, indices: Sequence[int]) -> List[T]:
-        """Efficiently get multiple items at once.
-        
-        Args:
-            indices: Sequence of indices to retrieve
-            
-        Returns:
-            List of dataset items at the specified indices
-            
-        Raises:
-            IndexError: If any index is out of bounds
-        """
+        """Efficiently get multiple items at once with caching."""
         try:
-            return [self[idx] for idx in indices]
-        except IndexError as error:
-            raise IndexError(f"Invalid indices in batch: {error}") from error
+            # Check cache first
+            batch = []
+            missing_indices = []
+            
+            for idx in indices:
+                if idx in self._cache:
+                    batch.append(self._cache[idx])
+                else:
+                    missing_indices.append(idx)
+            
+            # Load missing items in parallel
+            if missing_indices:
+                futures = [
+                    self._executor.submit(self.__getitem__, idx)
+                    for idx in missing_indices
+                ]
+                items = [future.result() for future in futures]
+                
+                # Update cache and batch
+                for idx, item in zip(missing_indices, items):
+                    self._cache[idx] = item
+                    batch.append(item)
+                
+                # Maintain cache size
+                if len(self._cache) > self._config.cache_size:
+                    # Remove oldest items
+                    remove_count = len(self._cache) - self._config.cache_size
+                    for _ in range(remove_count):
+                        self._cache.pop(next(iter(self._cache)))
+            
+            return batch
+            
+        except Exception as error:
+            logger.error("Failed to get batch: %s", str(error))
+            raise DatasetError(f"Failed to get batch: {error}") from error
     
     def prefetch(self, indices: Sequence[int]) -> None:
-        """Optional prefetch method for optimization.
-        
-        This method can be implemented to preload data that will be needed
-        soon, improving data loading performance.
-        
-        Args:
-            indices: Sequence of indices to prefetch
+        """Prefetch items into cache for future use."""
+        try:
+            for idx in indices:
+                if idx not in self._cache and not self._prefetch_queue.full():
+                    self._prefetch_queue.put_nowait(idx)
             
-        Note:
-            Default implementation does nothing
-        """
-        pass
+            # Start prefetch in background
+            def _prefetch_worker():
+                while not self._prefetch_queue.empty():
+                    idx = self._prefetch_queue.get_nowait()
+                    if idx not in self._cache:
+                        try:
+                            self._cache[idx] = self.__getitem__(idx)
+                        except Exception as e:
+                            logger.warning("Failed to prefetch item %d: %s", idx, str(e))
+            
+            self._executor.submit(_prefetch_worker)
+            
+        except Exception as error:
+            logger.warning("Prefetch failed: %s", str(error))
     
     def cleanup(self) -> None:
-        """Optional cleanup method for releasing resources.
-        
-        This method should be called when the dataset is no longer needed
-        to free any allocated resources.
-        """
-        pass
+        """Release resources."""
+        self._cache.clear()
+        self._executor.shutdown(wait=False)
 
-
-class CustomSamplerBase(ABC, Generic[T]):
-    """Abstract base class for custom samplers with enhanced functionality.
+class CustomSamplerBase(Generic[T], ABC):
+    """Abstract base class for samplers with state management."""
     
-    This class provides a foundation for implementing custom samplers with
-    features like state management and epoch tracking.
-    
-    Attributes:
-        data_source: Dataset to sample from
-        _iterator: Current iterator instance
-        _epoch: Current epoch number
-        
-    Note:
-        Subclasses must implement __iter__ and __len__ methods.
-    """
+    __slots__ = ('data_source', '_iterator', '_epoch', '_state')
     
     def __init__(self, data_source: CustomDatasetBase[T]) -> None:
-        """Initialize the sampler.
-        
-        Args:
-            data_source: Dataset to sample from
-        """
+        """Initialize the sampler."""
         self.data_source = data_source
         self._iterator: Optional[Iterator[int]] = None
         self._epoch: int = 0
+        self._state: SamplerState = {}
     
     @abstractmethod
     def __iter__(self) -> Iterator[int]:
-        """Return iterator over dataset indices.
-        
-        Returns:
-            Iterator yielding dataset indices
-            
-        Raises:
-            NotImplementedError: Must be implemented by subclass
-        """
+        """Return iterator over indices."""
         raise NotImplementedError
     
     @abstractmethod
     def __len__(self) -> int:
-        """Return the number of samples in the sampler.
-        
-        Returns:
-            Number of samples
-            
-        Raises:
-            NotImplementedError: Must be implemented by subclass
-        """
+        """Return the number of samples."""
         raise NotImplementedError
     
-    def set_epoch(self, epoch: int) -> None:
-        """Set the epoch for reproducibility.
-        
-        Args:
-            epoch: Epoch number to set
-            
-        Raises:
-            ValueError: If epoch is negative
-        """
-        if epoch < 0:
-            raise ValueError("Epoch number cannot be negative")
-        self._epoch = epoch
-    
-    @property
-    def epoch(self) -> int:
-        """Get current epoch.
-        
-        Returns:
-            Current epoch number
-        """
-        return self._epoch
-    
     def state_dict(self) -> SamplerState:
-        """Get sampler state for checkpointing.
-        
-        Returns:
-            Dictionary containing sampler state
-        """
+        """Get sampler state for checkpointing."""
         return {
             'epoch': self._epoch,
-            'iterator_state': getattr(self._iterator, 'state', None)
+            'state': self._state
         }
     
     def load_state_dict(self, state_dict: SamplerState) -> None:
-        """Load sampler state from checkpoint.
-        
-        Args:
-            state_dict: Dictionary containing sampler state
-        """
+        """Load sampler state from checkpoint."""
         self._epoch = state_dict.get('epoch', 0)
-        if hasattr(self._iterator, 'load_state'):
-            self._iterator.load_state(state_dict.get('iterator_state'))
+        self._state = state_dict.get('state', {})
 
+@dataclass
+class DataLoaderConfig:
+    """Configuration for data loader."""
+    batch_size: int = DEFAULT_BATCH_SIZE
+    shuffle: bool = True
+    num_workers: int = DEFAULT_NUM_WORKERS
+    pin_memory: bool = True
+    drop_last: bool = False
+    timeout: float = 0
+    prefetch_factor: int = 2
+    persistent_workers: bool = False
+    worker_init_fn: Optional[Callable[[int], None]] = None
 
-class CustomDataLoaderBase(ABC, Generic[T, BatchType]):
-    """Abstract base class for custom data loaders with enhanced functionality.
+class CustomDataLoaderBase(Generic[T, BatchType], ABC):
+    """Abstract base class for data loaders with worker management."""
     
-    This class provides a foundation for implementing custom data loaders with
-    features like worker management, batch sampling, and state management.
-    
-    Attributes:
-        dataset: Source dataset
-        batch_size: Number of samples per batch
-        num_workers: Number of worker processes
-        pin_memory: Whether to pin memory for faster GPU transfer
-        drop_last: Whether to drop the last incomplete batch
-        timeout: Timeout for queue operations
-        worker_init_fn: Function to initialize workers
-        prefetch_factor: Number of batches to prefetch per worker
-        persistent_workers: Whether to keep workers alive between epochs
-        batch_sampler: Sampler for batches
-        sampler: Sampler for individual samples
-        
-    Note:
-        Subclasses must implement __iter__ method.
-    """
+    __slots__ = (
+        'config', 'dataset', 'batch_size', 'num_workers',
+        'pin_memory', 'drop_last', 'timeout', 'worker_init_fn',
+        'prefetch_factor', 'persistent_workers', 'batch_sampler',
+        'sampler', '_initialized', '_iterator'
+    )
     
     def __init__(
-        self, 
+        self,
         dataset: CustomDatasetBase[T],
-        batch_size: int = 1,
-        shuffle: bool = False,
-        sampler: Optional[CustomSamplerBase[T]] = None,
-        batch_sampler: Optional[Sampler[List[int]]] = None,
-        num_workers: int = 0,
-        pin_memory: bool = False,
-        drop_last: bool = False,
-        timeout: float = 0,
-        worker_init_fn: Optional[Callable[[int], None]] = None,
-        prefetch_factor: int = 2,
-        persistent_workers: bool = False
+        config: Optional[DataLoaderConfig] = None
     ) -> None:
-        """Initialize the data loader.
+        """Initialize the data loader."""
+        self.config = config or DataLoaderConfig()
         
-        Args:
-            dataset: Source dataset
-            batch_size: Number of samples per batch
-            shuffle: Whether to shuffle the dataset
-            sampler: Custom sampler for batch indices
-            batch_sampler: Custom sampler for full batches
-            num_workers: Number of worker processes
-            pin_memory: Whether to pin memory for faster GPU transfer
-            drop_last: Whether to drop the last incomplete batch
-            timeout: Timeout for queue operations
-            worker_init_fn: Function to initialize workers
-            prefetch_factor: Number of batches to prefetch per worker
-            persistent_workers: Whether to keep workers alive between epochs
-            
-        Raises:
-            ValueError: If parameters are invalid
-        """
-        if batch_size <= 0:
+        if self.config.batch_size <= 0:
             raise ValueError("batch_size must be positive")
-        if num_workers < 0:
+        if self.config.num_workers < 0:
             raise ValueError("num_workers cannot be negative")
-        if prefetch_factor < 1:
+        if self.config.prefetch_factor < 1:
             raise ValueError("prefetch_factor must be >= 1")
-        if timeout < 0:
+        if self.config.timeout < 0:
             raise ValueError("timeout cannot be negative")
         
         self.dataset = dataset
-        self.batch_size = batch_size
-        self.num_workers = num_workers
-        self.pin_memory = pin_memory
-        self.drop_last = drop_last
-        self.timeout = timeout
-        self.worker_init_fn = worker_init_fn
-        self.prefetch_factor = prefetch_factor
-        self.persistent_workers = persistent_workers
+        self.batch_size = self.config.batch_size
+        self.num_workers = self.config.num_workers
+        self.pin_memory = self.config.pin_memory
+        self.drop_last = self.config.drop_last
+        self.timeout = self.config.timeout
+        self.worker_init_fn = self.config.worker_init_fn
+        self.prefetch_factor = self.config.prefetch_factor
+        self.persistent_workers = self.config.persistent_workers
         
-        # Initialize batch_sampler and sampler
+        # Initialize samplers
         self.batch_sampler: Optional[Sampler[List[int]]] = None
         self.sampler: Optional[Union[Sampler[int], CustomSamplerBase[T]]] = None
         
-        # Handle sampler configuration
-        if batch_sampler is not None:
-            if batch_size > 1 or shuffle or sampler is not None or drop_last:
-                raise ValueError('batch_sampler is mutually exclusive with other parameters')
-            self.batch_sampler = batch_sampler
+        if self.config.shuffle:
+            self.sampler = torch.utils.data.RandomSampler(dataset)
         else:
-            if sampler is None:
-                if shuffle:
-                    sampler = torch.utils.data.RandomSampler(dataset)
-                else:
-                    sampler = torch.utils.data.SequentialSampler(dataset)
-            self.sampler = sampler
-            
-            # Create batch sampler if not provided
-            self.batch_sampler = torch.utils.data.BatchSampler(
-                self.sampler,
-                batch_size=batch_size,
-                drop_last=drop_last
-            )
-            
+            self.sampler = torch.utils.data.SequentialSampler(dataset)
+        
+        self.batch_sampler = torch.utils.data.BatchSampler(
+            self.sampler,
+            batch_size=self.batch_size,
+            drop_last=self.drop_last
+        )
+        
         self._initialized = False
         self._iterator: Optional[Iterator[BatchType]] = None
     
-    @abstractmethod
-    def __iter__(self) -> Iterator[BatchType]:
-        """Return iterator over the dataset.
-        
-        Returns:
-            Iterator yielding batches of data
-            
-        Raises:
-            NotImplementedError: Must be implemented by subclass
-        """
-        raise NotImplementedError
-    
-    def __len__(self) -> int:
-        """Return the number of batches in the dataloader.
-        
-        Returns:
-            Number of batches
-        """
-        if self.batch_sampler is not None:
-            return len(self.batch_sampler)
-        else:
-            return (len(self.sampler) + self.batch_size - 1) // self.batch_size
-    
     def initialize(self) -> None:
-        """Initialize the dataloader and its dataset.
-        
-        This method ensures the dataset is initialized before use.
-        
-        Raises:
-            InitializationError: If initialization fails
-        """
+        """Initialize the dataloader and dataset."""
         if not self._initialized:
             try:
                 if not self.dataset.is_initialized:
@@ -387,34 +277,34 @@ class CustomDataLoaderBase(ABC, Generic[T, BatchType]):
             except Exception as error:
                 raise InitializationError("DataLoader initialization failed") from error
     
-    def cleanup(self) -> None:
-        """Cleanup resources.
-        
-        This method ensures proper cleanup of all resources including
-        the iterator and dataset.
-        """
-        if self._iterator is not None:
-            del self._iterator
-            self._iterator = None
-        self.dataset.cleanup()
+    @abstractmethod
+    def __iter__(self) -> Iterator[BatchType]:
+        """Return iterator over the dataset."""
+        raise NotImplementedError
+    
+    def __len__(self) -> int:
+        """Return the number of batches."""
+        if self.batch_sampler is not None:
+            return len(self.batch_sampler)
+        else:
+            return (len(self.sampler) + self.batch_size - 1) // self.batch_size
     
     def state_dict(self) -> Dict[str, Any]:
-        """Get dataloader state for checkpointing.
-        
-        Returns:
-            Dictionary containing dataloader state
-        """
+        """Get dataloader state for checkpointing."""
         return {
             'initialized': self._initialized,
             'iterator_state': getattr(self._iterator, 'state', None) if self._iterator else None
         }
     
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
-        """Load dataloader state from checkpoint.
-        
-        Args:
-            state_dict: Dictionary containing dataloader state
-        """
+        """Load dataloader state from checkpoint."""
         self._initialized = state_dict.get('initialized', False)
         if self._iterator and hasattr(self._iterator, 'load_state'):
             self._iterator.load_state(state_dict.get('iterator_state'))
+    
+    def cleanup(self) -> None:
+        """Cleanup resources."""
+        if self._iterator is not None:
+            del self._iterator
+            self._iterator = None
+        self.dataset.cleanup()

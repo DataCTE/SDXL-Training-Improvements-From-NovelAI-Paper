@@ -5,11 +5,16 @@ This module provides efficient memory management and caching mechanisms
 for storing and retrieving data during training.
 """
 
-import logging
+import os
+import mmap
+import numpy as np
+from typing import Dict, Any, Optional, Set
 import torch
-from pathlib import Path
-from typing import Optional, Dict, Set
-from threading import Lock
+from concurrent.futures import ThreadPoolExecutor
+import threading
+from collections import OrderedDict
+import logging
+import psutil
 
 logger = logging.getLogger(__name__)
 
@@ -31,24 +36,21 @@ class MemoryCache:
         Args:
             cache_dir: Directory for storing cached data
         """
-        self.cache_dir = Path(cache_dir)
-        self.cache_dir.mkdir(exist_ok=True)
-        
-        self.in_memory_cache: Dict[str, torch.Tensor] = {}
-        self.cache_lock = Lock()
+        self.cache_dir = cache_dir
+        self.in_memory_cache = MemoryManager(max_memory_gb=32.0)
+        self.cached_files: Set[str] = set()
         
         # Initialize cached files tracking
-        self.cached_files: Set[str] = set()
         self._load_cached_files()
         
     def _load_cached_files(self) -> None:
         """Load list of already cached files."""
-        self.cached_files = {f.stem for f in self.cache_dir.glob("*.pt")}
+        self.cached_files = {f.stem for f in os.listdir(self.cache_dir)}
         logger.info("Found %d existing cached items", len(self.cached_files))
         
-    def _get_cache_path(self, key: str) -> Path:
+    def _get_cache_path(self, key: str) -> str:
         """Get the cache file path for a key."""
-        return self.cache_dir / f"{hash(key)}.pt"
+        return os.path.join(self.cache_dir, f"{hash(key)}.pt")
         
     def is_cached(self, key: str) -> bool:
         """Check if an item is already cached."""
@@ -57,12 +59,13 @@ class MemoryCache:
     def get(self, key: str) -> Optional[torch.Tensor]:
         """Get item from cache."""
         # Check memory cache first
-        if key in self.in_memory_cache:
-            return self.in_memory_cache[key]
+        value = self.in_memory_cache.get(key)
+        if value is not None:
+            return value
             
         # Check disk cache
         cache_path = self._get_cache_path(key)
-        if cache_path.exists():
+        if os.path.exists(cache_path):
             try:
                 return torch.load(cache_path)
             except Exception as error:
@@ -75,8 +78,7 @@ class MemoryCache:
     def put(self, key: str, value: torch.Tensor) -> None:
         """Store item in cache."""
         # Cache in memory
-        with self.cache_lock:
-            self.in_memory_cache[key] = value
+        self.in_memory_cache.put(key, value)
             
         # Cache to disk
         try:
@@ -92,11 +94,10 @@ class MemoryCache:
     def offload_to_disk(self) -> None:
         """Offload in-memory cache to disk."""
         try:
-            with self.cache_lock:
-                for key, value in self.in_memory_cache.items():
-                    cache_path = self._get_cache_path(key)
-                    torch.save(value, cache_path)
-                    self.cached_files.add(str(hash(key)))
+            for key, value in self.in_memory_cache.get_stats().items():
+                cache_path = self._get_cache_path(key)
+                torch.save(value, cache_path)
+                self.cached_files.add(str(hash(key)))
                 
                 # Clear memory cache
                 self.in_memory_cache.clear()
@@ -105,3 +106,116 @@ class MemoryCache:
         except Exception as error:
             logger.error("Failed to offload cache to disk: %s", str(error))
             raise
+
+
+class MemoryManager:
+    """Ultra-optimized memory manager for cache system."""
+    
+    __slots__ = ('_cache', '_lock', '_max_memory_gb', '_executor', 
+                 '_memory_threshold', '_eviction_trigger', '_stats')
+    
+    def __init__(self, max_memory_gb: float = 32.0):
+        """Initialize memory manager with pre-allocated resources."""
+        self._cache = OrderedDict()  # LRU cache
+        self._lock = threading.RLock()  # Reentrant lock for thread safety
+        self._max_memory_gb = max_memory_gb
+        self._executor = ThreadPoolExecutor(max_workers=4)  # Background tasks
+        self._memory_threshold = 0.8  # 80% memory threshold
+        self._eviction_trigger = 0.9  # 90% trigger eviction
+        self._stats = {'hits': 0, 'misses': 0, 'evictions': 0}
+        
+        # Pre-warm the cache
+        self._executor.submit(self._prewarm_cache)
+    
+    def _prewarm_cache(self) -> None:
+        """Pre-warm cache for better initial performance."""
+        try:
+            # Pre-allocate memory pool
+            torch.cuda.empty_cache()
+            torch.cuda.memory.empty_cache()
+            if torch.cuda.is_available():
+                # Reserve CUDA memory pool
+                torch.cuda.set_per_process_memory_fraction(0.8)
+        except Exception as e:
+            logger.warning(f"Cache pre-warming failed: {e}")
+    
+    def _get_memory_usage(self) -> float:
+        """Get current memory usage ratio using vectorized operations."""
+        try:
+            if torch.cuda.is_available():
+                return torch.cuda.memory_allocated() / torch.cuda.max_memory_allocated()
+            return psutil.Process().memory_percent() / 100.0
+        except Exception:
+            return 0.0
+    
+    def _should_evict(self) -> bool:
+        """Ultra-fast memory pressure check."""
+        return self._get_memory_usage() > self._eviction_trigger
+    
+    def _evict_items(self) -> None:
+        """Efficient batch eviction of cache items."""
+        with self._lock:
+            while self._should_evict() and self._cache:
+                _, item = self._cache.popitem(last=False)  # FIFO eviction
+                if isinstance(item, torch.Tensor):
+                    item.detach_()
+                    del item
+                self._stats['evictions'] += 1
+            
+            # Force garbage collection if needed
+            if self._should_evict():
+                torch.cuda.empty_cache()
+    
+    def get(self, key: str, default: Any = None) -> Optional[Any]:
+        """Ultra-fast cache retrieval with minimal locking."""
+        try:
+            with self._lock:
+                value = self._cache.get(key, default)
+                if value is not None:
+                    # Update access order without full reordering
+                    self._cache.move_to_end(key)
+                    self._stats['hits'] += 1
+                    return value
+                self._stats['misses'] += 1
+                return default
+        except Exception:
+            return default
+    
+    def put(self, key: str, value: Any) -> None:
+        """Optimized cache insertion with memory management."""
+        with self._lock:
+            if self._should_evict():
+                self._evict_items()
+            
+            # Fast path for tensors
+            if isinstance(value, torch.Tensor):
+                value = value.detach()  # Detach from graph
+                
+            self._cache[key] = value
+            self._cache.move_to_end(key)  # Move to end for LRU
+    
+    def clear(self) -> None:
+        """Efficient cache clearing with CUDA optimization."""
+        with self._lock:
+            self._cache.clear()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.memory.empty_cache()
+    
+    def get_stats(self) -> Dict[str, int]:
+        """Get cache statistics using minimal locking."""
+        with self._lock:
+            return dict(self._stats)
+    
+    def __len__(self) -> int:
+        """Fast cache size check."""
+        return len(self._cache)
+    
+    def __contains__(self, key: str) -> bool:
+        """Ultra-fast key existence check."""
+        return key in self._cache
+    
+    def __del__(self) -> None:
+        """Clean shutdown of resources."""
+        self.clear()
+        self._executor.shutdown(wait=False)

@@ -1,265 +1,184 @@
+"""Ultra-optimized EMA implementation with GPU acceleration.
+
+This module provides a highly optimized EMA model with:
+- Thread-safe operations
+- CUDA graph support
+- Mixed precision support
+- Memory-efficient parameter updates
+- Weak reference management
+"""
+
 import torch
 import logging
-from typing import Optional, Union
-from diffusers import StableDiffusionXLPipeline
+import threading
+from typing import Optional, Union, Dict, Any
+import weakref
 
 logger = logging.getLogger(__name__)
 
 class EMAModel:
+    """Thread-safe EMA model with GPU acceleration."""
     
     def __init__(
         self,
         model: torch.nn.Module,
-        model_path: str,
-        decay: float = 0.9999,
-        update_after_step: int = 100,
+        power: float = 0.75,
+        max_value: float = 0.9999,
+        min_value: float = 0.0,
+        update_after_step: int = 0,
+        inv_gamma: float = 1.0,
         device: Optional[Union[str, torch.device]] = None,
-        update_every: int = 1,
-        use_ema_warmup: bool = True,
-        power: float = 2/3,
-        min_decay: float = 0.0,
-        max_decay: float = 0.9999,
-        mixed_precision: str = "bf16",
-        jit_compile: bool = False,
-        gradient_checkpointing: bool = True,
+        jit_compile: bool = True,
+        use_cuda_graph: bool = True,
     ):
-        """Initialize EMA model with enhanced configuration and optimizations."""
-        self.decay = decay
-        self.update_after_step = update_after_step
-        self.update_every = update_every
-        self.use_ema_warmup = use_ema_warmup
+        """Initialize EMA model with optimizations."""
         self.power = power
-        self.min_decay = min_decay
-        self.max_decay = max_decay
+        self.max_value = max_value
+        self.min_value = min_value
+        self.update_after_step = update_after_step
+        self.inv_gamma = inv_gamma
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.jit_compile = jit_compile
+        self.use_cuda_graph = use_cuda_graph and torch.cuda.is_available()
         
-        # Handle device initialization
-        if device is None or (isinstance(device, str) and device.lower() == 'auto'):
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        else:
-            self.device = device if isinstance(device, torch.device) else torch.device(device)
-            
-        self.mixed_precision = mixed_precision
+        # Store weak reference to avoid memory leaks
+        self._model = weakref.ref(model)
         
-        # Load and optimize EMA model
-        logger.info("Loading EMA model from %s", model_path)
-        try:
-            self._initialize_ema_model(
-                model_path=model_path,
-                model=model,
-                jit_compile=jit_compile,
-                gradient_checkpointing=gradient_checkpointing
-            )
-            self._log_config()
-        except Exception as e:
-            logger.error("Failed to load EMA model: %s", str(e))
-            raise
-            
-        self.optimization_step = 0
-
-    def _initialize_ema_model(
-        self,
-        model_path: str,
-        model: torch.nn.Module,
-        jit_compile: bool,
-        gradient_checkpointing: bool
-    ) -> None:
-        """Initialize and optimize EMA model with proper configuration."""
-        # Determine dtype based on mixed precision setting
-        dtype = self._get_dtype()
+        # Initialize thread safety
+        self._lock = threading.Lock()
+        self._initialized = False
+        self._optimization_step = 0
+        self._cuda_graphs = {}
         
-        # Load pipeline with optimized settings
-        pipeline = StableDiffusionXLPipeline.from_pretrained(
-            model_path,
-            torch_dtype=dtype if str(self.device).startswith("cuda") else torch.float32
-        )
+        # Register parameters
+        self._shadow_params = {}
+        self._register_parameters()
         
-        # Setup UNet model
-        self.ema_model = pipeline.unet.to(self.device)
-        self.ema_model.eval()
-        self.ema_model.requires_grad_(False)
-        
-        # Enable memory optimizations
-        self._enable_optimizations(gradient_checkpointing)
-        
-        # JIT compile if requested
-        if jit_compile and torch.cuda.is_available():
-            logger.info("JIT compiling EMA model...")
-            self.ema_model = torch.compile(self.ema_model)
-        
-        # Initialize weights
-        self.copy_from(model)
-
-    @torch.no_grad()
-    def _get_dtype(self) -> torch.dtype:
-        """Get appropriate dtype based on mixed precision setting."""
-        if self.mixed_precision == "fp16":
-            return torch.float16
-        elif self.mixed_precision == "bf16":
-            return torch.bfloat16
-        return torch.float32
-
-    def _enable_optimizations(self, gradient_checkpointing: bool) -> None:
-        """Enable memory and performance optimizations."""
-        if hasattr(self.ema_model, 'enable_xformers_memory_efficient_attention'):
-            self.ema_model.enable_xformers_memory_efficient_attention()
-        if gradient_checkpointing and hasattr(self.ema_model, 'enable_gradient_checkpointing'):
-            self.ema_model.enable_gradient_checkpointing()
-
-    @torch.no_grad()
-    def _get_decay_rate(self) -> float:
-        """Calculate current decay rate with optimized computation."""
-        step = max(0, self.optimization_step - self.update_after_step - 1)
-        
-        if self.use_ema_warmup and step <= self.update_after_step:
-            decay = min(
-                self.max_decay,
-                (1 + step / self.update_after_step) ** -self.power
-            )
-        else:
-            decay = self.decay
-            
-        return max(self.min_decay, min(decay, self.max_decay))
-
-    @torch.no_grad()
-    def step(self, model: torch.nn.Module) -> None:
-        """Optimized EMA update step."""
-        self.optimization_step += 1
-        
-        if (self.optimization_step <= self.update_after_step or 
-            self.optimization_step % self.update_every != 0):
-            return
-            
-        decay = self._get_decay_rate()
-        
-        # Batch update parameters
-        model_params = dict(model.named_parameters())
-        ema_params = dict(self.ema_model.named_parameters())
-        
-        for name, param in model_params.items():
-            if name in ema_params:
-                ema_param = ema_params[name]
-                if param.device != ema_param.device:
-                    param = param.to(ema_param.device)
-                ema_param.copy_(
-                    ema_param * decay + param.data * (1 - decay)
-                )
-
-    def _log_config(self) -> None:
-        """Log current configuration with enhanced details."""
-        logger.info("\nEMA Model Configuration:")
-        logger.info("- Device: %s", self.device)
-        logger.info("- Mixed Precision: %s", self.mixed_precision)
-        logger.info("- Base Decay Rate: %s", self.decay)
-        logger.info("- Update After Step: %s", self.update_after_step)
-        logger.info("- Update Every: %s", self.update_every)
-        logger.info("- EMA Warmup: %s", self.use_ema_warmup)
-        logger.info("- Min/Max Decay: %s/%s", self.min_decay, self.max_decay)
-
-    @torch.no_grad()
-    def copy_to(self, model: torch.nn.Module) -> None:
-        """Optimized parameter copy to target model."""
-        model_dict = model.state_dict()
-        ema_dict = self.ema_model.state_dict()
-        
-        for key in model_dict:
-            if key in ema_dict:
-                if model_dict[key].shape == ema_dict[key].shape:
-                    model_dict[key].copy_(ema_dict[key])
-                else:
-                    logger.warning(
-                        "Shape mismatch for parameter %s: "
-                        "EMA shape %s, "
-                        "Model shape %s",
-                        key, ema_dict[key].shape, model_dict[key].shape
-                    )
-        model.load_state_dict(model_dict)
-
-    @torch.no_grad()
-    def copy_from(self, model: torch.nn.Module) -> None:
-        """Optimized parameter copy from source model."""
-        ema_dict = self.ema_model.state_dict()
-        model_dict = model.state_dict()
-        
-        for key in ema_dict:
-            if key in model_dict:
-                if ema_dict[key].shape == model_dict[key].shape:
-                    ema_dict[key].copy_(model_dict[key])
-                else:
-                    logger.warning(
-                        "Shape mismatch for parameter %s: "
-                        "EMA shape %s, "
-                        "Model shape %s",
-                        key, ema_dict[key].shape, model_dict[key].shape
-                    )
-        self.ema_model.load_state_dict(ema_dict)
-
-    def get_model(self) -> torch.nn.Module:
-        """Get the EMA model."""
-        return self.ema_model
-
-    def to(self, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None) -> 'EMAModel':
-        """Move EMA model to specified device and dtype."""
-        if device is not None:
-            self.device = device
-            self.ema_model.to(device)
-        if dtype is not None:
-            self.ema_model.to(dtype=dtype)
-        return self
-
-def setup_ema_model(
-    model: torch.nn.Module,
-    model_path: str,
-    decay: float = 0.9999,
-    update_after_step: int = 100,
-    device: Optional[Union[str, torch.device]] = None,
-    update_every: int = 1,
-    use_ema_warmup: bool = True,
-    power: float = 2/3,
-    min_decay: float = 0.0,
-    max_decay: float = 0.9999,
-    mixed_precision: str = "bf16",
-    jit_compile: bool = False,
-    gradient_checkpointing: bool = True,
-) -> Optional[EMAModel]:
-    """
-    Set up an EMA model for training.
+        # Initialize CUDA graph if available
+        if self.use_cuda_graph:
+            self._init_cuda_graph()
     
-    Args:
-        model: The base model to create EMA from
-        model_path: Path to the model checkpoint
-        decay: EMA decay rate
-        update_after_step: Number of steps before starting EMA updates
-        device: Device to place the model on
-        update_every: Update frequency for EMA weights
-        use_ema_warmup: Whether to use EMA warmup
-        power: Power factor for EMA decay
-        min_decay: Minimum decay rate
-        max_decay: Maximum decay rate
-        mixed_precision: Mixed precision mode ("no", "fp16", "bf16")
-        jit_compile: Whether to JIT compile the model
-        gradient_checkpointing: Whether to use gradient checkpointing
-        
-    Returns:
-        Configured EMAModel instance or None if setup fails
-    """
-    try:
-        ema = EMAModel(
-            model=model,
-            model_path=model_path,
-            decay=decay,
-            update_after_step=update_after_step,
-            device=device,
-            update_every=update_every,
-            use_ema_warmup=use_ema_warmup,
-            power=power,
-            min_decay=min_decay,
-            max_decay=max_decay,
-            mixed_precision=mixed_precision,
-            jit_compile=jit_compile,
-            gradient_checkpointing=gradient_checkpointing,
-        )
-        logger.info("Successfully initialized EMA model")
-        return ema
-    except Exception as e:
-        logger.error(f"Failed to initialize EMA model: {str(e)}")
-        return None
+    def _register_parameters(self) -> None:
+        """Register and optimize model parameters."""
+        for name, param in self._model().named_parameters():
+            if param.requires_grad:
+                # Create shadow parameter
+                shadow = param.detach().clone()
+                if self.jit_compile:
+                    shadow = torch.jit.script(shadow)
+                self._shadow_params[name] = shadow.to(device=self.device)
+    
+    def _init_cuda_graph(self) -> None:
+        """Initialize CUDA graphs for common operations."""
+        try:
+            if not self.use_cuda_graph:
+                return
+                
+            # Create static inputs for graph capture
+            static_param = next(iter(self._shadow_params.values()))
+            static_decay = torch.tensor(0.99, device=self.device)
+            
+            # Capture parameter update graph
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                for _ in range(3):  # Warmup
+                    static_param.lerp_(static_param, static_decay)
+            
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                static_param.lerp_(static_param, static_decay)
+            
+            self._cuda_graphs["update"] = (g, static_param)
+            
+            torch.cuda.current_stream().wait_stream(s)
+            
+        except Exception as e:
+            logger.warning(f"Failed to initialize CUDA graph: {e}")
+            self.use_cuda_graph = False
+    
+    def _get_decay(self, optimization_step: int) -> float:
+        """Calculate optimal decay rate."""
+        step = max(0, optimization_step - self.update_after_step - 1)
+        value = 1 - (1 + step / self.inv_gamma) ** -self.power
+        return max(self.min_value, min(value, self.max_value))
+    
+    @torch.no_grad()
+    def step(self, optimization_step: Optional[int] = None) -> None:
+        """Execute EMA update step with optimizations."""
+        try:
+            with self._lock:
+                # Get current step
+                if optimization_step is None:
+                    self._optimization_step += 1
+                    optimization_step = self._optimization_step
+                
+                # Skip if before update_after_step
+                if optimization_step <= self.update_after_step:
+                    return
+                
+                # Calculate decay rate
+                decay = self._get_decay(optimization_step)
+                
+                # Update each parameter
+                for name, param in self._model().named_parameters():
+                    if param.requires_grad:
+                        shadow = self._shadow_params[name]
+                        
+                        # Try CUDA graph first
+                        if self.use_cuda_graph and "update" in self._cuda_graphs:
+                            g, static_param = self._cuda_graphs["update"]
+                            static_param.copy_(shadow)
+                            g.replay()
+                            shadow.copy_(static_param)
+                        else:
+                            # Fallback to regular update
+                            shadow.lerp_(param.data, 1 - decay)
+                
+        except Exception as e:
+            logger.error(f"EMA step failed: {e}")
+            raise
+    
+    def copy_to(self, model: Optional[torch.nn.Module] = None) -> None:
+        """Copy EMA parameters to target model."""
+        try:
+            if model is None:
+                model = self._model()
+            
+            with self._lock:
+                for name, param in model.named_parameters():
+                    if param.requires_grad:
+                        param.data.copy_(
+                            self._shadow_params[name].data,
+                            non_blocking=True
+                        )
+                        
+        except Exception as e:
+            logger.error(f"EMA copy failed: {e}")
+            raise
+    
+    def to(self, device: Optional[Union[str, torch.device]] = None) -> None:
+        """Move EMA parameters to device."""
+        try:
+            if device is None:
+                device = self.device
+            
+            with self._lock:
+                for shadow in self._shadow_params.values():
+                    shadow.to(device=device, non_blocking=True)
+                
+                self.device = device
+                
+        except Exception as e:
+            logger.error(f"EMA device transfer failed: {e}")
+            raise
+    
+    def get_decay_value(self, optimization_step: Optional[int] = None) -> float:
+        """Get current decay value."""
+        if optimization_step is None:
+            optimization_step = self._optimization_step
+        return self._get_decay(optimization_step)
+    
+    def get_model(self) -> torch.nn.Module:
+        """Get reference to original model."""
+        return self._model()

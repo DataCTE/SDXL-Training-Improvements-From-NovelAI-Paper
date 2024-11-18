@@ -1,194 +1,149 @@
-"""
-VAE-specific caching functionality for SDXL training.
+"""Ultra-optimized VAE encoding cache system."""
 
-This module provides specialized caching for VAE latents using multi-GPU processing
-with optimized memory management and throughput.
-"""
-
-import logging
 import torch
-import torch.multiprocessing as mp
-from pathlib import Path
-from typing import Optional, List, Any
-from queue import Empty
-from tqdm import tqdm
-
-from .memory import MemoryCache
-
-# Set the start method to 'spawn' for CUDA multiprocessing
-if mp.get_start_method(allow_none=True) != 'spawn':
-    mp.set_start_method('spawn', force=True)
+import torch.nn as nn
+from typing import Dict, Optional, Tuple
+import numpy as np
+from concurrent.futures import ThreadPoolExecutor
+import threading
+from collections import OrderedDict
+import logging
+from torch.cuda import amp
 
 logger = logging.getLogger(__name__)
 
-class GPUWorker:
-    """Worker class for processing VAE encoding on a specific GPU."""
-    
-    def __init__(self, gpu_id: int, worker_id: int, vae: Any,
-                 queue_in: mp.Queue, queue_out: mp.Queue) -> None:
-        """Initialize the GPU worker."""
-        self.gpu_id = gpu_id
-        self.worker_id = worker_id
-        self.device = torch.device(f'cuda:{gpu_id}')
-        self.vae = vae.to(self.device)
-        self.queue_in = queue_in
-        self.queue_out = queue_out
-        
-        # Enable cudnn benchmarking for faster convolutions
-        torch.backends.cudnn.benchmark = True
-        logger.info("Initialized worker %d on GPU %d", worker_id, gpu_id)
-        
-    def process_batch(self) -> None:
-        """Process batches from the input queue."""
-        while True:
-            try:
-                batch_data = self.queue_in.get(timeout=5)
-                if batch_data is None:  # Stop signal
-                    break
-                    
-                batch_tensor, batch_paths = batch_data
-                
-                if not isinstance(batch_tensor, torch.Tensor):
-                    batch_tensor = torch.stack(batch_tensor)
-                
-                batch_tensor = batch_tensor.to(self.device, non_blocking=True)
-                
-                with torch.amp.autocast('cuda', enabled=True):
-                    with torch.no_grad():
-                        chunk_size = 64
-                        all_latents = []
-                        
-                        for i in range(0, len(batch_tensor), chunk_size):
-                            chunk = batch_tensor[i:i + chunk_size]
-                            latents_chunk = self.vae.encode(chunk).latent_dist.sample()
-                            all_latents.append(latents_chunk.cpu())
-                            
-                        latents = torch.cat(all_latents, dim=0)
-                
-                del batch_tensor
-                del all_latents
-                torch.cuda.empty_cache()
-                
-                self.queue_out.put((batch_paths, latents))
-                
-            except Empty:
-                continue
-            except Exception as error:
-                logger.error(
-                    "GPU %d worker %d error: %s",
-                    self.gpu_id, self.worker_id, str(error)
-                )
-                self.queue_out.put((None, None))
-                continue
-
 class VAECache:
-    """Manages distributed caching of VAE latents."""
+    """Ultra-optimized VAE encoding cache with parallel processing."""
     
-    def __init__(
-        self,
-        cache_dir: str = "vae_cache",
-        vae: Optional[torch.nn.Module] = None,
-        workers_per_gpu: int = 20
-    ) -> None:
-        """Initialize the VAE cache."""
-        self.memory_cache = MemoryCache(cache_dir)
-        self.vae = vae
+    __slots__ = ('vae', '_cache', '_lock', '_executor', '_batch_size',
+                 '_max_cache_size', '_stats', '_scaler')
+    
+    def __init__(self, vae: nn.Module, max_cache_size: int = 10000,
+                 num_workers: int = 4, batch_size: int = 8):
+        """Initialize VAE cache with optimized defaults."""
+        self.vae = vae.eval()  # Ensure eval mode
+        self._cache = OrderedDict()
+        self._lock = threading.RLock()
+        self._executor = ThreadPoolExecutor(max_workers=num_workers)
+        self._batch_size = batch_size
+        self._max_cache_size = max_cache_size
+        self._stats = {'hits': 0, 'misses': 0, 'evictions': 0}
+        self._scaler = amp.GradScaler()
         
-        # Configure GPU resources
-        self.num_gpus = torch.cuda.device_count()
-        if self.num_gpus == 0:
-            self.device = torch.device("cpu")
-            self.num_gpus = 1
-            workers_per_gpu = 1
+        # Pre-warm CUDA
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.memory.empty_cache()
+            torch.cuda.set_per_process_memory_fraction(0.8)
+    
+    def _get_cache_key(self, image: torch.Tensor) -> str:
+        """Ultra-fast cache key generation."""
+        return f"{image.shape}_{hash(image.data.cpu().numpy().tobytes())}"
+    
+    def _should_evict(self) -> bool:
+        """Check if cache needs eviction."""
+        return len(self._cache) >= self._max_cache_size
+    
+    def _evict_items(self) -> None:
+        """Efficient batch eviction."""
+        with self._lock:
+            while self._should_evict():
+                _, tensor = self._cache.popitem(last=False)
+                if isinstance(tensor, torch.Tensor):
+                    tensor.detach_()
+                    del tensor
+                self._stats['evictions'] += 1
+    
+    @torch.no_grad()
+    def _encode_batch(self, images: torch.Tensor) -> torch.Tensor:
+        """Optimized batch encoding with mixed precision."""
+        if not torch.cuda.is_available():
+            return self.vae.encode(images)[0].sample()
             
-        self.workers_per_gpu = workers_per_gpu
-        self.total_workers = self.num_gpus * workers_per_gpu
+        # Use mixed precision for faster encoding
+        with amp.autocast():
+            encoded = self.vae.encode(images)[0]
+            return self._scaler.scale(encoded).sample()
+    
+    def _parallel_encode(self, images: torch.Tensor) -> torch.Tensor:
+        """Parallel batch processing with optimal batch size."""
+        batch_size = self._batch_size
+        num_images = images.shape[0]
         
-        # Configure queues
-        self.queue_size = max(200, self.total_workers * 4)
-        self.queue_in = mp.Queue(maxsize=self.queue_size)
-        self.queue_out = mp.Queue(maxsize=self.queue_size)
-        self.workers: List[mp.Process] = []
+        if num_images <= batch_size:
+            return self._encode_batch(images)
+            
+        # Split into optimal batches
+        batches = torch.split(images, batch_size)
+        futures = [
+            self._executor.submit(self._encode_batch, batch)
+            for batch in batches
+        ]
         
-    def get_latents(
-        self, image_path: str, image_tensor: Optional[torch.Tensor] = None
-    ) -> Optional[torch.Tensor]:
-        """Get VAE latents from cache or compute them."""
-        # Try to get from cache first
-        latents = self.memory_cache.get(image_path)
-        if latents is not None:
-            return latents
+        # Gather results efficiently
+        encoded = [future.result() for future in futures]
+        return torch.cat(encoded, dim=0)
+    
+    def encode(self, images: torch.Tensor) -> torch.Tensor:
+        """Ultra-fast VAE encoding with caching."""
+        if not isinstance(images, torch.Tensor):
+            raise TypeError("Input must be a torch.Tensor")
             
-        # Compute latents if we have the VAE and image tensor
-        if self.vae is not None and image_tensor is not None:
-            device = torch.device(f'cuda:{0}')
-            with torch.amp.autocast('cuda', enabled=True):
-                with torch.no_grad():
-                    image_tensor = image_tensor.to(device)
-                    latents = self.vae.encode(image_tensor).latent_dist.sample()
-                    latents = latents.cpu()
+        # Process single vs batch
+        if images.ndim == 3:
+            images = images.unsqueeze(0)
             
-            if latents is not None:
-                self.memory_cache.put(image_path, latents)
-                return latents
+        # Check cache for each image
+        encoded_list = []
+        uncached_indices = []
+        uncached_images = []
         
-        return None
+        for i, image in enumerate(images):
+            key = self._get_cache_key(image)
+            cached = self._cache.get(key)
+            
+            if cached is not None:
+                encoded_list.append(cached)
+                self._stats['hits'] += 1
+            else:
+                uncached_indices.append(i)
+                uncached_images.append(image)
+                self._stats['misses'] += 1
         
-    def process_batch(
-        self, image_tensors: torch.Tensor, batch_paths: List[str]
-    ) -> None:
-        """Queue a batch for processing."""
-        batch_size = 64
-        for i in range(0, len(image_tensors), batch_size):
-            batch_tensor = image_tensors[i:i + batch_size]
-            batch_path = batch_paths[i:i + batch_size]
-            self.queue_in.put((batch_tensor, batch_path))
+        # Process uncached images in parallel
+        if uncached_images:
+            uncached_batch = torch.stack(uncached_images)
+            encoded_batch = self._parallel_encode(uncached_batch)
             
-    def initialize_workers(self) -> None:
-        """Initialize GPU workers for parallel computation."""
-        if self.vae is not None:
-            worker_id = 0
-            for gpu_id in range(self.num_gpus):
-                for _ in range(self.workers_per_gpu):
-                    worker = mp.Process(
-                        target=GPUWorker(
-                            gpu_id, worker_id, self.vae,
-                            self.queue_in, self.queue_out
-                        ).process_batch
-                    )
-                    worker.start()
-                    self.workers.append(worker)
-                    worker_id += 1
-                    
-    def process_results(self, pbar: Optional[tqdm] = None) -> None:
-        """Process results from GPU workers."""
-        try:
-            batch_paths, latents = self.queue_out.get(timeout=5)
-            if batch_paths is None:
-                return
-                
-            for idx, path in enumerate(batch_paths):
-                self.memory_cache.put(path, latents[idx])
-            
-            if pbar is not None:
-                pbar.update(len(batch_paths))
-                
-        except Empty:
-            pass
-            
-    def close_workers(self) -> None:
-        """Close worker processes."""
-        for _ in range(self.total_workers):
-            self.queue_in.put(None)
-            
-        for worker in self.workers:
-            worker.join()
-            
-        while not self.queue_in.empty():
-            self.queue_in.get()
-        while not self.queue_out.empty():
-            self.queue_out.get()
-            
-    def offload_to_disk(self) -> None:
-        """Offload cache to disk."""
-        self.memory_cache.offload_to_disk()
+            # Cache new encodings
+            for i, encoded in zip(uncached_indices, encoded_batch):
+                key = self._get_cache_key(images[i])
+                if self._should_evict():
+                    self._evict_items()
+                self._cache[key] = encoded.detach()
+                encoded_list.append(encoded)
+        
+        # Combine results maintaining order
+        return torch.stack(encoded_list)
+    
+    def clear(self) -> None:
+        """Efficient cache clearing."""
+        with self._lock:
+            self._cache.clear()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.memory.empty_cache()
+    
+    def get_stats(self) -> Dict[str, int]:
+        """Get cache statistics."""
+        with self._lock:
+            return dict(self._stats)
+    
+    def __len__(self) -> int:
+        """Get cache size."""
+        return len(self._cache)
+    
+    def __del__(self) -> None:
+        """Clean shutdown."""
+        self.clear()
+        self._executor.shutdown(wait=False)

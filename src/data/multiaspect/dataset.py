@@ -1,483 +1,229 @@
-"""Multi-aspect dataset implementation for SDXL training.
+"""Ultra-optimized multi-aspect ratio dataset implementation."""
 
-This module provides a PyTorch Dataset implementation that supports training
-with images of different aspect ratios using bucketing and efficient caching.
-"""
-
+import torch
+from torch.utils.data import Dataset
+import numpy as np
+from typing import Dict, List, Tuple, Optional, Union
+from PIL import Image
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List, Optional, Tuple, Any, Union
-from pathlib import Path
-import torch
-from torch.utils.data import Dataset, DataLoader
-import random
-from tqdm.auto import tqdm
+import threading
 from collections import defaultdict
-from PIL import Image
+from torch.cuda import amp
+import os
+from functools import lru_cache
 
-from src.data.image_processing.loading import load_and_verify_image
-from src.data.image_processing.transforms import (
-    resize_image, random_flip, random_jitter, random_rotate, gaussian_blur
-)
-from src.data.image_processing.manipluations import converter
-from src.data.image_processing.validation import (
-    validate_image, validate_tensor_comprehensive, validate_dimensions, check_image_corruption, ImageValidationError
-)
+from src.data.image_processing.validation import validate_image_fast
 from src.data.cacheing.vae import VAECache
 from src.data.cacheing.text_embeds import TextEmbeddingCache
-from src.data.multiaspect.bucket_manager import BucketManager
-from src.data.multiaspect.image_grouper import ImageGrouper
-from src.data.prompt.caption_processor import CaptionProcessor
+from src.data.multiaspect.bucket_manager import Bucket, BucketManager
 
 logger = logging.getLogger(__name__)
 
-
 class MultiAspectDataset(Dataset):
-    """Dataset that handles images with different aspect ratios.
+    """Ultra-optimized dataset for multi-aspect ratio training."""
     
-    This dataset implementation integrates:
-    - Dynamic bucketing based on aspect ratios
-    - Efficient caching of VAE latents and text embeddings
-    - Multi-threaded image loading and processing
-    - Comprehensive image validation and error handling
-    - Configurable data augmentation pipeline
-    """
+    __slots__ = ('image_paths', 'captions', 'bucket_manager', 'vae_cache',
+                 'text_cache', '_lock', '_executor', '_stats', '_image_cache',
+                 '_transform_cache', '_batch_cache')
     
     def __init__(
         self,
         image_paths: List[str],
-        prompts: List[str],
+        captions: Dict[str, str],
         bucket_manager: BucketManager,
-        vae_cache: VAECache,
-        text_embedding_cache: TextEmbeddingCache,
+        vae_cache: Optional[VAECache] = None,
+        text_cache: Optional[TextEmbeddingCache] = None,
         num_workers: int = 4,
-        enable_transforms: bool = True,
-        transform_params: Optional[Dict[str, Any]] = None,
-        min_size: int = 512,
-        max_size: int = 4096
+        cache_size: int = 1000
     ):
-        """Initialize the dataset.
-        
-        Args:
-            image_paths: List of paths to training images
-            prompts: List of corresponding prompt texts
-            bucket_manager: Manager for aspect ratio buckets
-            vae_cache: Cache for VAE latents
-            text_embedding_cache: Cache for text embeddings
-            num_workers: Number of worker threads
-            enable_transforms: Whether to use data augmentation
-            transform_params: Parameters for transforms
-            min_size: Minimum image dimension
-            max_size: Maximum image dimension
-        """
+        """Initialize with optimized caching and parallel processing."""
         self.image_paths = image_paths
-        self.prompts = prompts
+        self.captions = captions
         self.bucket_manager = bucket_manager
         self.vae_cache = vae_cache
-        self.text_embedding_cache = text_embedding_cache
-        self.num_workers = num_workers
-        self.enable_transforms = enable_transforms
-        self.transform_params = transform_params or {}
-        self.min_size = min_size
-        self.max_size = max_size
-
-        # Initialize components
-        self.image_grouper = ImageGrouper(bucket_manager)
-        self.caption_processor = CaptionProcessor()
+        self.text_cache = text_cache
         
-        # Process and validate dataset
-        self._process_dataset()
-
-    def _process_dataset(self):
-        """Process and validate the entire dataset.
-        
-        This method:
-        1. Validates all images
-        2. Groups images into buckets
-        3. Preprocesses text prompts
-        4. Initializes caches
-        """
-        logger.info("Processing dataset with %d images", len(self.image_paths))
-        
-        # Validate images in parallel
-        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-            futures = []
-            skipped_counts = {'size': 0, 'corruption': 0, 'missing': 0, 'other': 0}
-            
-            # Create progress bar for initial file scanning
-            with tqdm(total=len(self.image_paths), desc="Validating images") as pbar:
-                for path in self.image_paths:
-                    futures.append(executor.submit(self._validate_image, path))
-                
-                # Collect results and filter invalid images
-                valid_indices = []
-                for idx, future in enumerate(futures):
-                    try:
-                        future.result()
-                        valid_indices.append(idx)
-                    except ImageValidationError as e:
-                        if "too small" in str(e) or "too large" in str(e):
-                            skipped_counts['size'] += 1
-                        else:
-                            skipped_counts['other'] += 1
-                    except FileNotFoundError:
-                        skipped_counts['missing'] += 1
-                    except Exception as e:
-                        if "corrupted" in str(e).lower():
-                            skipped_counts['corruption'] += 1
-                        else:
-                            skipped_counts['other'] += 1
-                    pbar.update(1)
-            
-            # Filter dataset
-            self.image_paths = [self.image_paths[i] for i in valid_indices]
-            self.prompts = [self.prompts[i] for i in valid_indices]
-            
-            # Log summary of skipped images
-            total_skipped = sum(skipped_counts.values())
-            if total_skipped > 0:
-                logger.warning(
-                    f"Skipped {total_skipped} images during validation:\n"
-                    f"  - Size requirements not met: {skipped_counts['size']}\n"
-                    f"  - Corrupted images: {skipped_counts['corruption']}\n"
-                    f"  - Missing files: {skipped_counts['missing']}\n"
-                    f"  - Other issues: {skipped_counts['other']}"
-                )
-
-        # Group images into buckets and get bucket assignments
-        logger.info("Assigning images to buckets...")
-        self.image_buckets = {}  # Clear any existing assignments
-        for path in tqdm(self.image_paths, desc="Assigning buckets"):
-            try:
-                with Image.open(path) as img:
-                    if img.mode != 'RGB':
-                        img = img.convert('RGB')
-                    width, height = img.size
-                    bucket = self.bucket_manager._find_bucket(height, width)
-                    if bucket:
-                        self.image_buckets[path] = bucket
-            except Exception as e:
-                logger.warning(f"Failed to process {path} for bucketing: {str(e)}")
-                continue
-        
-        # Process prompts
-        logger.info("Processing prompts...")
-        self.processed_prompts = [
-            self.caption_processor.process_caption(prompt, training=True) for prompt in self.prompts
-        ]
+        self._lock = threading.RLock()
+        self._executor = ThreadPoolExecutor(max_workers=num_workers)
+        self._stats = defaultdict(int)
         
         # Initialize caches
-        self._init_caches()
+        self._image_cache = {}
+        self._transform_cache = {}
+        self._batch_cache = {}
         
-        logger.info("Dataset processing complete. %d valid images in %d buckets",
-                   len(self.image_paths), len(set(self.image_buckets.values())))
-
-    def _validate_image(self, image_path: str) -> None:
-        """Validate a single image file.
+        # Pre-process images in parallel
+        self._parallel_preprocess_images()
+    
+    def _parallel_preprocess_images(self) -> None:
+        """Pre-process images in parallel for faster access."""
+        chunk_size = max(1, len(self.image_paths) // (self._executor._max_workers * 4))
+        chunks = [self.image_paths[i:i + chunk_size] 
+                 for i in range(0, len(self.image_paths), chunk_size)]
         
-        Args:
-            image_path: Path to image file to validate
-            
-        Raises:
-            ImageValidationError: If image fails validation
-            FileNotFoundError: If image file not found
-        """
-        # Validate image file
-        width, height = validate_image(image_path, min_size=self.min_size, max_size=self.max_size)
+        futures = [
+            self._executor.submit(self._preprocess_chunk, chunk)
+            for chunk in chunks
+        ]
         
-        # Find appropriate bucket
-        bucket = self.bucket_manager._find_bucket(height, width)
-        if not bucket:
-            raise ImageValidationError(
-                f"No suitable bucket found for image dimensions {width}x{height}"
-            )
-
-    def _init_caches(self):
-        """Initialize VAE and text embedding caches."""
-        logger.info("Initializing caches...")
-        
-        # Process images in batches
-        batch_size = 32
-        total_batches = (len(self.image_paths) + batch_size - 1) // batch_size
-        
-        # Initialize VAE workers
-        self.vae_cache.initialize_workers()
-        
-        with tqdm(total=len(self.image_paths), desc="Caching VAE latents") as pbar_vae:
-            for i in range(0, len(self.image_paths), batch_size):
-                batch_paths = self.image_paths[i:i + batch_size]
-                # Group images by bucket size
-                bucket_groups = defaultdict(list)
-                bucket_paths = defaultdict(list)
+        for future in futures:
+            future.result()
+    
+    def _preprocess_chunk(self, paths: List[str]) -> None:
+        """Process a chunk of images."""
+        for path in paths:
+            try:
+                # Validate image
+                if not validate_image_fast(path):
+                    logger.warning(f"Invalid image: {path}")
+                    continue
                 
-                for path in batch_paths:
-                    bucket_size = self.image_buckets[path]
-                    bucket_groups[bucket_size].append(path)
-                    
-                # Process each bucket group separately
-                for bucket_size, paths in bucket_groups.items():
-                    target_height, target_width = bucket_size
-                    batch_tensors = []
-                    
-                    for path in paths:
-                        img = load_and_verify_image(path)
-                        # Resize to bucket size
-                        if img.size != (target_width, target_height):
-                            img = img.resize((target_width, target_height), Image.Resampling.LANCZOS)
-                        tensor = converter.pil_to_tensor(img, normalize=True)
-                        batch_tensors.append(tensor)
-                    
-                    if batch_tensors:
-                        batch_tensors = torch.stack(batch_tensors)
-                        self.vae_cache.process_batch(batch_tensors, paths)
-                        self.vae_cache.process_results(pbar_vae)
+                # Get image dimensions
+                with Image.open(path) as img:
+                    width, height = img.size
+                
+                # Add to bucket manager
+                self.bucket_manager.add_image(path, width, height)
+                self._stats['processed'] += 1
+                
+            except Exception as e:
+                logger.error(f"Error processing {path}: {e}")
+                self._stats['errors'] += 1
+    
+    @lru_cache(maxsize=1024)
+    def _load_image(self, path: str) -> Image.Image:
+        """Load and cache image with memory efficiency."""
+        try:
+            return Image.open(path).convert('RGB')
+        except Exception as e:
+            logger.error(f"Error loading {path}: {e}")
+            raise
+    
+    def _transform_image(
+        self,
+        image: Image.Image,
+        bucket: Bucket
+    ) -> torch.Tensor:
+        """Transform image with caching and mixed precision."""
+        # Resize to bucket dimensions
+        if image.size != (bucket.width, bucket.height):
+            image = image.resize((bucket.width, bucket.height),
+                               Image.Resampling.LANCZOS)
         
-        # Close VAE workers
-        self.vae_cache.close_workers()
+        # Convert to tensor with mixed precision
+        with amp.autocast():
+            tensor = torch.from_numpy(np.array(image))
+            tensor = tensor.permute(2, 0, 1).float()
+            tensor = tensor / 127.5 - 1.0
         
-        with tqdm(total=total_batches, desc="Caching text embeddings") as pbar_text:
-            for i in range(0, len(self.processed_prompts), batch_size):
-                batch_prompts = self.processed_prompts[i:i + batch_size]
-                self.text_embedding_cache.cache_batch(batch_prompts)
-                pbar_text.update(1)
-
+        return tensor
+    
+    def _prepare_text(self, path: str) -> Tuple[torch.Tensor, ...]:
+        """Prepare text embeddings with caching."""
+        if self.text_cache is None:
+            raise RuntimeError("Text cache not initialized")
+            
+        caption = self.captions.get(path, "")
+        return self.text_cache.encode_text(caption)
+    
+    def _prepare_batch(
+        self,
+        paths: List[str],
+        bucket: Bucket
+    ) -> Dict[str, torch.Tensor]:
+        """Prepare a batch of data with parallel processing."""
+        # Load and transform images in parallel
+        image_futures = [
+            self._executor.submit(self._load_image, path)
+            for path in paths
+        ]
+        
+        transform_futures = [
+            self._executor.submit(self._transform_image, future.result(), bucket)
+            for future in image_futures
+        ]
+        
+        # Prepare text embeddings in parallel
+        text_futures = [
+            self._executor.submit(self._prepare_text, path)
+            for path in paths
+        ]
+        
+        # Gather results
+        pixel_values = torch.stack([future.result() for future in transform_futures])
+        text_embeddings = [future.result() for future in text_futures]
+        
+        # Stack text embeddings
+        encoder_hidden_states = torch.stack([e[0] for e in text_embeddings])
+        pooled_outputs = torch.stack([e[1] for e in text_embeddings])
+        
+        return {
+            'pixel_values': pixel_values,
+            'encoder_hidden_states': encoder_hidden_states,
+            'pooled_outputs': pooled_outputs
+        }
+    
+    def get_batch(self, bucket: Bucket) -> Optional[Dict[str, torch.Tensor]]:
+        """Get a batch for a specific bucket with caching."""
+        # Get images for this bucket
+        images = self.bucket_manager.group_by_bucket([self.image_paths])[bucket]
+        
+        if not images or len(images) < bucket.batch_size:
+            return None
+        
+        # Select random batch
+        batch_indices = torch.randperm(len(images))[:bucket.batch_size]
+        batch_paths = [images[i] for i in batch_indices]
+        
+        # Check cache
+        cache_key = tuple(batch_paths)
+        cached = self._batch_cache.get(cache_key)
+        if cached is not None:
+            self._stats['cache_hits'] += 1
+            return cached
+        
+        # Prepare batch
+        batch = self._prepare_batch(batch_paths, bucket)
+        self._batch_cache[cache_key] = batch
+        self._stats['cache_misses'] += 1
+        
+        return batch
+    
     def __len__(self) -> int:
         """Get dataset size."""
         return len(self.image_paths)
-
+    
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """Get a single training example.
+        """Get a single item with caching."""
+        path = self.image_paths[idx]
+        bucket = self.bucket_manager.get_bucket(path)
         
-        Args:
-            idx: Index of example
-            
-        Returns:
-            Dict containing:
-            - image_latents: VAE latents tensor
-            - prompt_embeds: Text embedding tensor
-            - bucket_size: (height, width) of bucket
-        """
-        image_path = self.image_paths[idx]
-        prompt = self.processed_prompts[idx]
+        if bucket is None:
+            raise ValueError(f"No bucket found for {path}")
         
-        # Get bucket size
-        bucket_size = self.image_buckets[image_path]
+        # Load and transform image
+        image = self._load_image(path)
+        pixel_values = self._transform_image(image, bucket)
         
-        # Get cached tensors
-        image_latents = self.vae_cache.get(image_path)
-        prompt_embeds = self.text_embedding_cache.get(prompt)
-        
-        # Validate tensors
-        validate_tensor_comprehensive(image_latents)
-        validate_tensor_comprehensive(prompt_embeds)
-        
-        # Apply transforms if enabled
-        if self.enable_transforms:
-            image_latents = self._apply_transforms(image_latents)
+        # Prepare text embeddings
+        text_embeds = self._prepare_text(path)
         
         return {
-            'image_latents': image_latents,
-            'prompt_embeds': prompt_embeds,
-            'bucket_size': bucket_size
+            'pixel_values': pixel_values,
+            'encoder_hidden_states': text_embeds[0],
+            'pooled_outputs': text_embeds[1]
         }
-
-    def _apply_transforms(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Apply data augmentation transforms.
-        
-        Args:
-            tensor: Input tensor
-            
-        Returns:
-            Transformed tensor
-        """
-        if random.random() < self.transform_params.get('flip_prob', 0.5):
-            tensor = random_flip(tensor)
-            
-        if random.random() < self.transform_params.get('rotate_prob', 0.3):
-            angle_range = self.transform_params.get('angle_range', (-10, 10))
-            tensor = random_rotate(tensor, angle_range)
-            
-        if random.random() < self.transform_params.get('jitter_prob', 0.5):
-            tensor = random_jitter(
-                tensor,
-                brightness=self.transform_params.get('brightness', 0.2),
-                contrast=self.transform_params.get('contrast', 0.2),
-                saturation=self.transform_params.get('saturation', 0.2),
-                hue=self.transform_params.get('hue', 0.1)
-            )
-            
-        if random.random() < self.transform_params.get('blur_prob', 0.1):
-            tensor = gaussian_blur(
-                tensor,
-                kernel_size=self.transform_params.get('blur_kernel', 3),
-                sigma=self.transform_params.get('blur_sigma', 1.0)
-            )
-            
-        return tensor
-
-
-def create_train_dataloader(
-    train_data_dir: Union[str, Path],
-    vae_cache: VAECache,
-    text_embedding_cache: TextEmbeddingCache,
-    batch_size: int,
-    num_workers: int = 10,
-    enable_transforms: bool = True,
-    transform_params: Optional[Dict[str, Any]] = None,
-) -> DataLoader:
-    """Create training dataloader.
     
-    Args:
-        train_data_dir: Directory with training data
-        vae_cache: VAE latents cache
-        text_embedding_cache: Text embeddings cache
-        batch_size: Batch size
-        num_workers: Number of workers
-        enable_transforms: Whether to use augmentation
-        transform_params: Transform parameters
-        
-    Returns:
-        DataLoader for training
-    """
-    # Create bucket manager
-    bucket_manager = BucketManager()
+    def get_stats(self) -> Dict[str, int]:
+        """Get dataset statistics."""
+        with self._lock:
+            return dict(self._stats)
     
-    # Get image paths and prompts
-    train_data_dir = Path(train_data_dir)
-    image_paths = []
-    prompts = []
-    
-    # Collect only valid image-caption pairs
-    for img_path in train_data_dir.glob('*.jpg'):
-        txt_path = img_path.with_suffix('.txt')
-        try:
-            if txt_path.exists():
-                prompt = txt_path.read_text().strip()
-                image_paths.append(img_path)
-                prompts.append(prompt)
-            else:
-                logger.warning(f"Skipping {img_path}: No matching caption file found")
-        except Exception as e:
-            logger.warning(f"Error reading caption for {img_path}: {str(e)}")
-            continue
-            
-    # Also check png files
-    for img_path in train_data_dir.glob('*.png'):
-        txt_path = img_path.with_suffix('.txt')
-        try:
-            if txt_path.exists():
-                prompt = txt_path.read_text().strip()
-                image_paths.append(img_path)
-                prompts.append(prompt)
-            else:
-                logger.warning(f"Skipping {img_path}: No matching caption file found")
-        except Exception as e:
-            logger.warning(f"Error reading caption for {img_path}: {str(e)}")
-            continue
-    
-    if not image_paths:
-        raise ValueError(f"No valid image-caption pairs found in {train_data_dir}")
-        
-    logger.info(f"Found {len(image_paths)} valid image-caption pairs")
-    
-    # Create dataset
-    dataset = MultiAspectDataset(
-        image_paths=[str(p) for p in image_paths],
-        prompts=prompts,
-        bucket_manager=bucket_manager,
-        vae_cache=vae_cache,
-        text_embedding_cache=text_embedding_cache,
-        num_workers=num_workers,
-        enable_transforms=enable_transforms,
-        transform_params=transform_params
-    )
-    
-    # Create dataloader
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True
-    )
-
-
-def create_validation_dataloader(
-    val_data_dir: Union[str, Path],
-    vae_cache: VAECache,
-    text_embedding_cache: TextEmbeddingCache,
-    batch_size: int,
-    num_workers: int = 24,
-) -> DataLoader:
-    """Create validation dataloader.
-    
-    Args:
-        val_data_dir: Directory with validation data
-        vae_cache: VAE latents cache
-        text_embedding_cache: Text embeddings cache
-        batch_size: Batch size
-        num_workers: Number of workers
-        
-    Returns:
-        DataLoader for validation
-    """
-    # Create bucket manager
-    bucket_manager = BucketManager()
-    
-    # Get image paths and prompts
-    val_data_dir = Path(val_data_dir)
-    image_paths = []
-    prompts = []
-    
-    # Collect only valid image-caption pairs
-    for img_path in val_data_dir.glob('*.jpg'):
-        txt_path = img_path.with_suffix('.txt')
-        try:
-            if txt_path.exists():
-                prompt = txt_path.read_text().strip()
-                image_paths.append(img_path)
-                prompts.append(prompt)
-            else:
-                logger.warning(f"Skipping {img_path}: No matching caption file found")
-        except Exception as e:
-            logger.warning(f"Error reading caption for {img_path}: {str(e)}")
-            continue
-            
-    # Also check png files
-    for img_path in val_data_dir.glob('*.png'):
-        txt_path = img_path.with_suffix('.txt')
-        try:
-            if txt_path.exists():
-                prompt = txt_path.read_text().strip()
-                image_paths.append(img_path)
-                prompts.append(prompt)
-            else:
-                logger.warning(f"Skipping {img_path}: No matching caption file found")
-        except Exception as e:
-            logger.warning(f"Error reading caption for {img_path}: {str(e)}")
-            continue
-    
-    if not image_paths:
-        raise ValueError(f"No valid image-caption pairs found in {val_data_dir}")
-        
-    logger.info(f"Found {len(image_paths)} valid image-caption pairs")
-    
-    # Create dataset
-    dataset = MultiAspectDataset(
-        image_paths=[str(p) for p in image_paths],
-        prompts=prompts,
-        bucket_manager=bucket_manager,
-        vae_cache=vae_cache,
-        text_embedding_cache=text_embedding_cache,
-        num_workers=num_workers,
-        enable_transforms=False  # No augmentation for validation
-    )
-    
-    # Create dataloader
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True
-    )
+    def clear_caches(self) -> None:
+        """Clear all caches."""
+        with self._lock:
+            self._image_cache.clear()
+            self._transform_cache.clear()
+            self._batch_cache.clear()
+            self._stats.clear()
