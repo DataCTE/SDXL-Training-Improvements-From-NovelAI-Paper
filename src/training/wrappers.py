@@ -5,7 +5,7 @@ from pathlib import Path
 from dataclasses import asdict
 
 from src.training.trainer import SDXLTrainer, TrainingConfig
-from src.training.vae_finetuner import VAEFineTuner
+from src.training.vae_finetuner import VAEFinetuner
 from src.data.multiaspect.dataset import create_train_dataloader, create_validation_dataloader
 from src.models.model_loader import create_sdxl_models, create_vae_model
 from src.data.cacheing.vae import VAECache
@@ -117,7 +117,7 @@ def train_vae(
     gradient_checkpointing: bool = False,
     use_channel_scaling: bool = True,
     **kwargs
-) -> VAEFineTuner:
+) -> VAEFinetuner:
     """
     High-level wrapper for VAE finetuning with improvements.
     
@@ -135,7 +135,7 @@ def train_vae(
         **kwargs: Additional VAE training parameters
         
     Returns:
-        Trained VAEFineTuner instance
+        Trained VAEFinetuner instance
     """
     # Create output directory
     output_dir = Path(output_dir)
@@ -154,7 +154,7 @@ def train_vae(
     )
     
     # Initialize trainer
-    trainer = VAEFineTuner(
+    trainer = VAEFinetuner(
         vae=vae,
         learning_rate=learning_rate,
         mixed_precision=mixed_precision,
@@ -167,7 +167,7 @@ def train_vae(
     return trainer
 
 def export_model(
-    trainer: Union[SDXLTrainer, VAEFineTuner],
+    trainer: Union[SDXLTrainer, VAEFinetuner],
     output_dir: Union[str, Path],
     model_format: str = "safetensors",
     half_precision: bool = True
@@ -199,7 +199,7 @@ def export_model(
                 
             logger.info(f"Exported {name} to {save_path}")
     
-    elif isinstance(trainer, VAEFineTuner):
+    elif isinstance(trainer, VAEFinetuner):
         # Export VAE model
         if half_precision:
             trainer.vae = trainer.vae.half()
