@@ -39,15 +39,24 @@ class SDXLTrainer:
                 model.train()  # Ensure training mode
             
     def _setup_dataloader(self, dataloader):
-        """Setup DataLoader with proper multiprocessing context."""
+        """Setup and validate the dataloader."""
         if not dataloader:
             return None
             
         if torch.cuda.is_available():
+            # Get shuffle parameter from dataloader config instead of attribute
+            shuffle = False
+            if isinstance(dataloader, torch.utils.data.DataLoader):
+                # Access the dataset's sampler to determine if shuffling is enabled
+                shuffle = dataloader.sampler is None or isinstance(
+                    dataloader.sampler, 
+                    torch.utils.data.RandomSampler
+                )
+            
             return torch.utils.data.DataLoader(
                 dataloader.dataset,
                 batch_size=dataloader.batch_size,
-                shuffle=isinstance(dataloader, torch.utils.data.DataLoader) and dataloader.shuffle,
+                shuffle=shuffle,
                 num_workers=dataloader.num_workers,
                 multiprocessing_context='spawn',
                 persistent_workers=True,  # Keep workers alive between iterations
