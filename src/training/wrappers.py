@@ -3,6 +3,7 @@ import logging
 from typing import Dict, Any, Optional, Union, List
 from pathlib import Path
 from dataclasses import asdict
+from PIL import Image
 
 from src.training.trainer import SDXLTrainer, TrainingConfig
 from src.training.vae_finetuner import VAEFinetuner
@@ -78,8 +79,23 @@ def train_sdxl(
         train_image_paths = [str(p) for p in Path(train_data_dir).glob("*.[jJ][pP][gG]")]
         train_captions = load_captions(train_image_paths)
         
-        # Create bucket manager
-        bucket_manager = BucketManager(train_image_paths)
+        # Create bucket manager with proper parameters
+        bucket_manager = BucketManager(
+            max_resolution=1024 * 1024,  # Default max resolution
+            min_batch_size=1,
+            max_batch_size=config.batch_size,
+            num_workers=config.num_workers if hasattr(config, 'num_workers') else 4
+        )
+        
+        # Add images to bucket manager
+        for image_path in train_image_paths:
+            try:
+                # Get image dimensions
+                with Image.open(image_path) as img:
+                    width, height = img.size
+                bucket_manager.add_image(image_path, width, height)
+            except Exception as e:
+                logger.warning(f"Failed to process {image_path}: {e}")
         
         # Create train dataloader
         train_dataloader = create_train_dataloader(
