@@ -15,9 +15,11 @@ from typing import Dict, List, Tuple, Set, Optional
 import torch
 from collections import defaultdict
 import logging
-from multiprocessing import Pool, Manager, RLock
+from multiprocessing import Pool, Manager
 from dataclasses import dataclass
 from torch.cuda import amp
+from PIL import Image
+from src.data.image_processing.validation import validate_image
 
 logger = logging.getLogger(__name__)
 
@@ -43,15 +45,7 @@ class Bucket:
         """Fast resolution calculation."""
         return self.width * self.height
 
-def _process_chunk(args: Tuple[List[str], Dict]) -> Dict[Bucket, List[str]]:
-    """Standalone function for parallel processing."""
-    paths, image_buckets = args
-    groups: Dict[Bucket, List[str]] = defaultdict(list)
-    for path in paths:
-        bucket = image_buckets.get(path)
-        if bucket is not None:
-            groups[bucket].append(path)
-    return dict(groups)
+
 
 class BucketManager:
     """Ultra-optimized bucket manager for multi-aspect ratio training."""
@@ -72,7 +66,13 @@ class BucketManager:
         self._image_buckets = manager.dict()
         self._max_resolution = max_resolution
         self._batch_sizes = range(min_batch_size, max_batch_size + 1)
-        self._stats = manager.dict()
+        self._stats = manager.dict({
+            'images_added': 0,
+            'total_buckets': 0,
+            'total_images': 0,
+            'errors': 0,
+            'processed': 0
+        })
         self._bucket_cache = manager.dict()
         self._num_workers = num_workers
         
@@ -121,7 +121,7 @@ class BucketManager:
         
         self._buckets.append(bucket)
         self._image_buckets[image_path] = bucket
-        self._stats['images_added'] += 1
+        self._stats['images_added'] = self._stats.get('images_added', 0) + 1
     
     def get_bucket(self, image_path: str) -> Optional[Bucket]:
         """Ultra-fast bucket lookup."""
@@ -145,23 +145,14 @@ class BucketManager:
         if not image_paths:
             return {}
             
-        # Split work into chunks
-        chunk_size = max(1, len(image_paths) // (self._num_workers * 4))
-        chunks = [image_paths[i:i + chunk_size] 
-                 for i in range(0, len(image_paths), chunk_size)]
-        
-        # Prepare arguments for parallel processing
-        chunk_args = [(chunk, dict(self._image_buckets)) for chunk in chunks]
-        
-        # Process chunks in parallel
-        with Pool(processes=self._num_workers) as pool:
-            chunk_results = pool.map(_process_chunk, chunk_args)
-        
-        # Merge results efficiently
+        # Create result dictionary
         result: Dict[Bucket, List[str]] = defaultdict(list)
-        for chunk_result in chunk_results:
-            for bucket, paths in chunk_result.items():
-                result[bucket].extend(paths)
+        
+        # Process each image path
+        for path in image_paths:
+            bucket = self._image_buckets.get(path)
+            if bucket is not None:
+                result[bucket].append(path)
         
         return dict(result)
     
@@ -181,3 +172,31 @@ class BucketManager:
     def __len__(self) -> int:
         """Get total number of images."""
         return len(self._image_buckets)
+
+def _process_chunk(args: Tuple[List[str], BucketManager]) -> Dict[str, int]:
+    """Standalone function for parallel processing."""
+    paths, bucket_manager = args
+    processed = 0
+    errors = 0
+    
+    for path in paths:
+        try:
+            if not validate_image(path):
+                logger.warning(f"Invalid image: {path}")
+                errors += 1
+                continue
+            
+            with Image.open(path) as img:
+                width, height = img.size
+            
+            bucket_manager.add_image(path, width, height)
+            processed += 1
+            
+        except Exception as e:
+            logger.error(f"Failed to process {path}: {e}")
+            errors += 1
+            
+    return {
+        'processed': processed,
+        'errors': errors
+    }

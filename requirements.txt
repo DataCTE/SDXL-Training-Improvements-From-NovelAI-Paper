@@ -14,3 +14,4 @@ realesrgan
 spacy>=3.8.0
 scikit-learn
 kornia
+heapq

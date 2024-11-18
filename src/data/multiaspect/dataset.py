@@ -7,39 +7,16 @@ from typing import Dict, List, Tuple, Optional
 import logging
 from multiprocessing import Manager
 from functools import lru_cache
-from src.data.image_processing.validation import validate_image
 from src.data.cacheing.vae import VAECache
 from src.data.cacheing.text_embeds import TextEmbeddingCache
-from src.data.multiaspect.bucket_manager import Bucket, BucketManager
+from src.data.multiaspect.bucket_manager import Bucket, BucketManager, _process_chunk
 from src.data.prompt.caption_processor import CaptionProcessor
 from PIL import Image
+from multiprocessing import Pool
 
 logger = logging.getLogger(__name__)
 
-# Add this at module level
-def _preprocess_chunk(args) -> Tuple[int, int]:
-    """Standalone function for preprocessing image chunks."""
-    paths, bucket_manager = args
-    processed = 0
-    errors = 0
-    
-    for path in paths:
-        try:
-            if not validate_image(path):
-                logger.warning(f"Invalid image: {path}")
-                continue
-            
-            with Image.open(path) as img:
-                width, height = img.size
-            
-            bucket_manager.add_image(path, width, height)
-            processed += 1
-            
-        except Exception as e:
-            logger.error(f"Error processing {path}: {e}")
-            errors += 1
-            
-    return processed, errors
+
 
 class MultiAspectDataset(Dataset):
     """Ultra-optimized dataset for multi-aspect ratio training."""
@@ -85,24 +62,30 @@ class MultiAspectDataset(Dataset):
     
     def _preprocess_images(self) -> None:
         """Pre-process images using multiprocessing Pool."""
-        from multiprocessing import Pool
+        # Initialize stats
+        self._stats.update({
+            'processed': 0,
+            'errors': 0,
+            'cache_hits': 0,
+            'cache_misses': 0
+        })
         
-        # Split images into chunks
         chunk_size = max(1, len(self.image_paths) // (self.num_workers * 4))
         chunks = [self.image_paths[i:i + chunk_size] 
                  for i in range(0, len(self.image_paths), chunk_size)]
         
-        # Prepare arguments for each chunk
-        chunk_args = [(chunk, self.bucket_manager) for chunk in chunks]
-        
         # Process chunks in parallel
         with Pool(processes=self.num_workers) as pool:
-            results = pool.map(_preprocess_chunk, chunk_args)
+            results = pool.map(
+                _process_chunk,
+                [(chunk, self.bucket_manager) for chunk in chunks]
+            )
             
         # Aggregate results
-        total_processed = sum(p for p, _ in results)
-        total_errors = sum(e for _, e in results)
+        total_processed = sum(r['processed'] for r in results)
+        total_errors = sum(r['errors'] for r in results)
         
+        # Update stats atomically
         self._stats['processed'] = total_processed
         self._stats['errors'] = total_errors
     
