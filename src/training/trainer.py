@@ -11,8 +11,8 @@ from src.utils.progress import ProgressTracker
 from src.models.StateTracker import StateTracker
 import wandb
 import os
+from src.models.model_loader import save_diffusers_format, save_checkpoint
 from src.models.SDXL.pipeline import StableDiffusionXLPipeline
-from src.models.model_saver import ModelSaver
 
 
 logger = logging.getLogger(__name__)
@@ -127,22 +127,33 @@ class SDXLTrainer:
                         
                     # Save checkpoint
                     if epoch % self.config.save_epochs == 0:
-                        ModelSaver.save_diffusers_checkpoint(
-                            pipeline=StableDiffusionXLPipeline(
-                                vae=self.models["vae"],
-                                text_encoder=self.models["text_encoder"],
-                                text_encoder_2=self.models["text_encoder_2"],
-                                tokenizer=self.models["tokenizer"],
-                                tokenizer_2=self.models["tokenizer_2"],
-                                unet=self.models["unet"],
-                                scheduler=self.models["scheduler"]
-                            ),
-                            save_dir=save_dir,
-                            models=self.models,
-                            epoch=epoch,
-                            push_to_hub=getattr(self.config, 'push_to_hub', False),
-                            repo_id=getattr(self.config, 'hub_repo_id', None)
+                        # Create pipeline instance for saving
+                        pipeline = StableDiffusionXLPipeline(
+                            vae=self.models["vae"],
+                            text_encoder=self.models["text_encoder"],
+                            text_encoder_2=self.models["text_encoder_2"],
+                            tokenizer=self.models["tokenizer"],
+                            tokenizer_2=self.models["tokenizer_2"],
+                            unet=self.models["unet"],
+                            scheduler=self.models["scheduler"]
                         )
+                        
+                        # Save in diffusers format
+                        save_diffusers_format(
+                            pipeline=pipeline,
+                            output_dir=os.path.join(save_dir, f"epoch_{epoch}"),
+                            save_vae=getattr(self.config, "save_vae", True),
+                            use_safetensors=getattr(self.config, "use_safetensors", True)
+                        )
+                        
+                        # Optionally save checkpoint
+                        if getattr(self.config, "save_checkpoint", False):
+                            save_checkpoint(
+                                pipeline=pipeline,
+                                checkpoint_path=os.path.join(save_dir, f"checkpoint_epoch_{epoch}.safetensors"),
+                                save_vae=getattr(self.config, "save_vae", True),
+                                use_safetensors=getattr(self.config, "use_safetensors", True)
+                            )
                         
         except Exception as e:
             logger.error(f"Training failed with error: {str(e)}")

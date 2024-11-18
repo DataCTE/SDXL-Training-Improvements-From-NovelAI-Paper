@@ -15,7 +15,9 @@ from src.data.cacheing.text_embeds import TextEmbeddingCache
 from src.data.multiaspect.bucket_manager import BucketManager
 from src.data.image_processing.validation import validate_image
 from src.data.prompt.caption_processor import load_captions
-from src.models.model_saver import save_checkpoint, load_checkpoint, save_diffusers_format
+from src.models.model_loader import save_checkpoint, load_checkpoint, save_diffusers_format
+from src.models.SDXL.pipeline import StableDiffusionXLPipeline
+import traceback
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +34,7 @@ def train_sdxl(
     **kwargs
 ) -> SDXLTrainer:
     """
-    High-level wrapper for training SDXL models with improvements from NovelAI paper.
+    High-level wrapper for training SDXL models with improvements.
     
     Args:
         train_data_dir: Directory containing training data
@@ -41,7 +43,6 @@ def train_sdxl(
         pretrained_model_path: Optional path to pretrained model weights
         resume_from_checkpoint: Optional path to resume training from checkpoint
         models: Optional pre-loaded model dictionary
-        validation_config: Optional validation configuration parameters
         **kwargs: Additional training configuration parameters
         
     Returns:
@@ -69,31 +70,33 @@ def train_sdxl(
         else:
             models_dict = models
             
+        # Setup caches
         vae_cache = VAECache(
             vae=models_dict['vae'],
             cache_dir=str(output_dir / "vae_cache"),
-            max_cache_size=10000,
-            num_workers=4,
-            batch_size=8
+            max_cache_size=config.cache_size,
+            num_workers=config.num_workers,
+            batch_size=config.batch_size
         )
+        
         text_embedding_cache = TextEmbeddingCache(
             text_encoder1=models_dict['text_encoder'],
             text_encoder2=models_dict['text_encoder_2'],
             tokenizer1=models_dict['tokenizer'],
             tokenizer2=models_dict['tokenizer_2'],
             cache_dir=str(output_dir / "text_embeds_cache"),
-            max_cache_size=10000,
-            num_workers=4,
-            batch_size=32
+            max_cache_size=config.cache_size,
+            num_workers=config.num_workers,
+            batch_size=config.batch_size
         )
         
         # Get image paths and captions
         train_image_paths = [str(p) for p in Path(train_data_dir).glob("*.[jJ][pP][gG]")]
         train_captions = load_captions(train_image_paths)
         
-        # Create bucket manager with proper parameters
+        # Create bucket manager
         bucket_manager = BucketManager(
-            max_resolution=1024 * 1024,  # Default max resolution
+            max_resolution=config.max_resolution,
             min_batch_size=1,
             max_batch_size=config.batch_size,
             num_workers=config.num_workers
@@ -102,7 +105,6 @@ def train_sdxl(
         # Add images to bucket manager
         for image_path in train_image_paths:
             try:
-                # Get image dimensions
                 with Image.open(image_path) as img:
                     width, height = img.size
                 bucket_manager.add_image(image_path, width, height)
@@ -120,6 +122,7 @@ def train_sdxl(
             text_cache=text_embedding_cache
         )
         
+        # Create validation dataloader if validation data provided
         val_dataloader = None
         if val_data_dir:
             val_image_paths = [str(p) for p in Path(val_data_dir).glob("*.[jJ][pP][gG]")]
@@ -137,15 +140,30 @@ def train_sdxl(
         
         # Resume from checkpoint if specified
         if resume_from_checkpoint:
-            trainer = save_diffusers_format(
-                resume_from_checkpoint,
-                train_dataloader,
-                val_dataloader
+            # Create pipeline from checkpoint
+            pipeline = StableDiffusionXLPipeline(
+                vae=models_dict["vae"],
+                text_encoder=models_dict["text_encoder"],
+                text_encoder_2=models_dict["text_encoder_2"],
+                tokenizer=models_dict["tokenizer"],
+                tokenizer_2=models_dict["tokenizer_2"],
+                unet=models_dict["unet"],
+                scheduler=models_dict["scheduler"]
             )
+            
+            # Load checkpoint
+            load_checkpoint(resume_from_checkpoint, pipeline)
             logger.info(f"Resumed training from {resume_from_checkpoint}")
-            return trainer
+            
+            # Update models dict with loaded weights
+            models_dict.update({
+                "vae": pipeline.vae,
+                "text_encoder": pipeline.text_encoder,
+                "text_encoder_2": pipeline.text_encoder_2,
+                "unet": pipeline.unet
+            })
         
-        # Create new training instance
+        # Create trainer
         trainer = SDXLTrainer(
             config=config,
             models=models_dict,
@@ -156,7 +174,6 @@ def train_sdxl(
         return trainer
         
     except Exception as e:
-        import traceback
         logger.error("SDXL training setup failed with error: %s", str(e))
         logger.error("Full traceback:\n%s", traceback.format_exc())
         raise

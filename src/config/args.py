@@ -101,6 +101,11 @@ class TrainingConfig:
     output_dir: str = DEFAULTS["training"]["output_dir"]
     cache_dir: Optional[str] = None
     no_caching: bool = False
+    cache_size: int = DEFAULTS["training"]["cache_size"]
+    
+    # Image configuration
+    max_resolution: int = DEFAULTS["training"]["max_resolution"]
+    resolution_type: str = DEFAULTS["training"]["resolution_type"]
     
     # Training hyperparameters
     batch_size: int = DEFAULTS["training"]["batch_size"]
@@ -187,6 +192,18 @@ def parse_args() -> TrainingConfig:
                        choices=["no", "fp16", "bf16"])
     parser.add_argument("--max_grad_norm", type=float, default=DEFAULTS["training"]["max_grad_norm"])
     parser.add_argument("--save_epochs", type=int, default=DEFAULTS["training"]["save_epochs"])
+    parser.add_argument("--cache_size", type=int, 
+                       default=DEFAULTS["training"]["cache_size"],
+                       help="Size of the cache for VAE and text embeddings")
+    
+    # Add resolution arguments
+    parser.add_argument("--max_resolution", type=int, 
+                       default=DEFAULTS["training"]["max_resolution"],
+                       help="Maximum resolution for training images")
+    parser.add_argument("--resolution_type", type=str,
+                       default=DEFAULTS["training"]["resolution_type"],
+                       choices=["pixel", "area"],
+                       help="How to interpret max_resolution (pixel or area based)")
     
     # Training mode and related settings
     parser.add_argument("--training_mode", type=str, default=DEFAULTS["training"]["training_mode"],
@@ -274,6 +291,9 @@ def parse_args() -> TrainingConfig:
         pretrained_model_path=args.pretrained_model_path,
         train_data_dir=args.train_data_dir,
         output_dir=args.output_dir,
+        cache_size=args.cache_size,
+        max_resolution=args.max_resolution,
+        resolution_type=args.resolution_type,
         batch_size=args.batch_size,
         num_epochs=args.num_epochs,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -287,7 +307,7 @@ def parse_args() -> TrainingConfig:
         save_epochs=args.save_epochs,
         use_ema=args.use_ema,
         use_8bit_adam=args.use_8bit_adam,
-        warmup_steps=args.warmup_steps,  # Add new field
+        warmup_steps=args.warmup_steps,
     )
     
     # Update optimizer config

@@ -13,6 +13,9 @@ from src.data.multiaspect.bucket_manager import Bucket, BucketManager, _process_
 from src.data.prompt.caption_processor import CaptionProcessor
 from PIL import Image
 from multiprocessing import Pool
+from typing import Dict, List, Tuple, Optional, Union
+from pathlib import Path
+from src.config.args import TrainingConfig
 
 logger = logging.getLogger(__name__)
 
@@ -288,106 +291,123 @@ class MultiAspectDataset(Dataset):
 def create_train_dataloader(
     image_paths: List[str],
     captions: Dict[str, str],
-    bucket_manager: BucketManager,
-    batch_size: int,
-    num_workers: int = 4,
+    config: TrainingConfig,
+    bucket_manager: Optional[BucketManager] = None,
     vae_cache: Optional[VAECache] = None,
     text_cache: Optional[TextEmbeddingCache] = None,
-    token_dropout: float = 0.1,
-    caption_dropout: float = 0.1,
-    rarity_factor: float = 0.9,
-    emphasis_factor: float = 1.2,
-    shuffle: bool = True,
-    pin_memory: bool = True,
-    drop_last: bool = True,
 ) -> DataLoader:
-    """
-    Create an optimized DataLoader for training.
+    """Create an optimized DataLoader for training.
     
     Args:
         image_paths: List of paths to training images
         captions: Dictionary mapping image paths to their captions
-        bucket_manager: BucketManager instance for aspect ratio bucketing
-        batch_size: Number of samples per batch
-        num_workers: Number of worker processes for data loading
+        config: Training configuration
+        bucket_manager: Optional BucketManager instance
         vae_cache: Optional VAE cache for faster encoding
         text_cache: Optional text embedding cache
-        token_dropout: Rate at which individual tokens are dropped during training
-        caption_dropout: Rate at which entire captions are dropped during training
-        rarity_factor: Factor for weighting rare tags
-        emphasis_factor: Factor for emphasis tag weighting
-        shuffle: Whether to shuffle the dataset
-        pin_memory: If True, pin memory for faster GPU transfer
-        drop_last: Whether to drop the last incomplete batch
         
     Returns:
         DataLoader configured for training
     """
+    # Create bucket manager if not provided
+    if bucket_manager is None:
+        bucket_manager = BucketManager(
+            max_resolution=config.max_resolution,
+            min_batch_size=1,
+            max_batch_size=config.batch_size,
+            num_workers=config.num_workers
+        )
+        
+        # Add images to bucket manager
+        for image_path in image_paths:
+            try:
+                with Image.open(image_path) as img:
+                    width, height = img.size
+                bucket_manager.add_image(image_path, width, height)
+            except Exception as e:
+                logger.warning(f"Failed to process {image_path}: {e}")
+    
+    # Create dataset
     dataset = MultiAspectDataset(
         image_paths=image_paths,
         captions=captions,
         bucket_manager=bucket_manager,
         vae_cache=vae_cache,
         text_cache=text_cache,
-        num_workers=num_workers,
-        token_dropout=token_dropout,
-        caption_dropout=caption_dropout,
-        rarity_factor=rarity_factor,
-        emphasis_factor=emphasis_factor
+        num_workers=config.num_workers,
+        token_dropout=config.tag_weighting.token_dropout_rate,
+        caption_dropout=config.tag_weighting.caption_dropout_rate,
+        rarity_factor=config.tag_weighting.rarity_factor,
+        emphasis_factor=config.tag_weighting.emphasis_factor
     )
     
     return DataLoader(
         dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        drop_last=drop_last
+        batch_size=config.batch_size,
+        shuffle=True,
+        num_workers=config.num_workers,
+        pin_memory=True,
+        drop_last=True
     )
-
 
 def create_validation_dataloader(
     image_paths: List[str],
     captions: Dict[str, str],
-    bucket_manager: BucketManager,
-    batch_size: int,
-    num_workers: int = 4,
+    config: TrainingConfig,
+    bucket_manager: Optional[BucketManager] = None,
     vae_cache: Optional[VAECache] = None,
     text_cache: Optional[TextEmbeddingCache] = None,
-    pin_memory: bool = True,
 ) -> DataLoader:
-    """
-    Create an optimized DataLoader for validation.
+    """Create an optimized DataLoader for validation.
     
     Args:
         image_paths: List of paths to validation images
         captions: Dictionary mapping image paths to their captions
-        bucket_manager: BucketManager instance for aspect ratio bucketing
-        batch_size: Number of samples per batch
-        num_workers: Number of worker processes for data loading
+        config: Training configuration
+        bucket_manager: Optional BucketManager instance
         vae_cache: Optional VAE cache for faster encoding
         text_cache: Optional text embedding cache
-        pin_memory: If True, pin memory for faster GPU transfer
         
     Returns:
         DataLoader configured for validation
     """
+    # Create bucket manager if not provided
+    if bucket_manager is None:
+        bucket_manager = BucketManager(
+            max_resolution=config.max_resolution,
+            min_batch_size=1,
+            max_batch_size=config.batch_size,
+            num_workers=config.num_workers
+        )
+        
+        # Add images to bucket manager
+        for image_path in image_paths:
+            try:
+                with Image.open(image_path) as img:
+                    width, height = img.size
+                bucket_manager.add_image(image_path, width, height)
+            except Exception as e:
+                logger.warning(f"Failed to process {image_path}: {e}")
+    
+    # Create dataset with no dropout for validation
     dataset = MultiAspectDataset(
         image_paths=image_paths,
         captions=captions,
         bucket_manager=bucket_manager,
         vae_cache=vae_cache,
         text_cache=text_cache,
-        num_workers=num_workers,
-        token_dropout=0.0,  # No dropout for validation
-        caption_dropout=0.0  # No dropout for validation
+        num_workers=config.num_workers,
+        token_dropout=0.0,
+        caption_dropout=0.0,
+        rarity_factor=config.tag_weighting.rarity_factor,
+        emphasis_factor=config.tag_weighting.emphasis_factor
     )
     
     return DataLoader(
         dataset,
-        batch_size=batch_size,
-        shuffle=False,  # No shuffling for validation
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        drop_last=False  # Keep all samples for validation
+        batch_size=config.batch_size,
+        shuffle=False,
+        num_workers=config.num_workers,
+        pin_memory=True,
+        drop_last=False
     )
