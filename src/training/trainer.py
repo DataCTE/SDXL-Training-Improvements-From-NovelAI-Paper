@@ -4,9 +4,11 @@ from typing import Dict, Any, Optional
 from src.config.args import TrainingConfig
 from src.training.training_steps import train_step
 from src.training.training_utils import initialize_training_components
-from src.training.validation import generate_validation_images
+from src.training.validation import run_validation
 from src.training.metrics import MetricsManager
 from src.training.ema import setup_ema_model
+from src.utils.progress import ProgressTracker
+import wandb
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +53,15 @@ class SDXLTrainer:
         else:
             self.ema_model = None
         
+        # Initialize wandb if enabled
+        self.wandb_run = None
+        if hasattr(config, 'use_wandb') and config.use_wandb:
+            self.wandb_run = wandb.init(
+                project=config.wandb_project,
+                name=config.wandb_run_name,
+                config=config.__dict__
+            )
+        
     def _setup_dataloader(self, dataloader):
         """Setup and validate the dataloader."""
         if not dataloader:
@@ -79,17 +90,25 @@ class SDXLTrainer:
         
     def train(self, save_dir: str):
         """Execute training loop with validation."""
-        for epoch in range(self.config.num_epochs):
-            # Training epoch
-            self.train_epoch(epoch)
-            
-            # Validation
-            if self.val_dataloader and epoch % self.config.validation_epochs == 0:
-                self.validate(epoch)
+        with ProgressTracker(
+            "Training Progress",
+            total=self.config.num_epochs,
+            wandb_run=self.wandb_run
+        ) as progress:
+            for epoch in range(self.config.num_epochs):
+                # Training epoch
+                epoch_metrics = self.train_epoch(epoch)
                 
-            # Save checkpoint
-            if epoch % self.config.save_epochs == 0:
-                self.save_checkpoint(save_dir, epoch)
+                # Update progress with epoch metrics
+                progress.update(1, epoch_metrics)
+                
+                # Validation
+                if self.val_dataloader and epoch % self.config.validation_epochs == 0:
+                    self.validate(epoch)
+                    
+                # Save checkpoint
+                if epoch % self.config.save_epochs == 0:
+                    self.save_checkpoint(save_dir, epoch)
                 
     def train_epoch(self, epoch: int):
         """Execute single training epoch."""
@@ -101,37 +120,39 @@ class SDXLTrainer:
             if isinstance(model, torch.nn.Module):
                 model.train()
         
-        for batch_idx, batch in enumerate(self.train_dataloader):
-            # Move batch to device and handle text embeddings
-            batch = {k: v.to(self.device) if torch.is_tensor(v) else v 
-                    for k, v in batch.items()}
-            
-            # Training step
-            loss, metrics_dict = train_step(
-                self.config,
-                self.models,
-                self.components['optimizer'],
-                self.components['scheduler'],
-                batch,
-                self.device,
-                self.dtype,
-                self.components['grad_accumulator'],
-                self.components['scaler']
-            )
-            
-            total_loss += loss.item()
-            
-            # Update metrics
-            for metric_name, metric_value in metrics_dict.items():
-                self.metrics_manager.update_metric(metric_name, metric_value)
-            
-            # Log progress
-            if batch_idx % 10 == 0:
-                metrics_str = " ".join([f"{k}: {v:.4f}" for k, v in metrics_dict.items()])
-                logger.info(f"Epoch {epoch} [{batch_idx}/{num_batches}]: {metrics_str}")
+        with ProgressTracker(
+            f"Epoch {epoch}",
+            total=num_batches,
+            wandb_run=self.wandb_run,
+            log_interval=0.1  # Log every 10% of batches
+        ) as progress:
+            for batch in self.train_dataloader:
+                # Move batch to device and handle text embeddings
+                batch = {k: v.to(self.device) if torch.is_tensor(v) else v 
+                        for k, v in batch.items()}
                 
+                # Training step
+                loss, metrics_dict = train_step(
+                    self.config,
+                    self.models,
+                    self.components['optimizer'],
+                    self.components['scheduler'],
+                    batch,
+                    self.device,
+                    self.dtype,
+                    self.components['grad_accumulator'],
+                    self.components['scaler']
+                )
+                
+                total_loss += loss.item()
+                
+                # Update metrics and progress
+                metrics_dict['loss'] = loss.item()
+                metrics_dict['learning_rate'] = self.components['scheduler'].get_last_lr()[0]
+                progress.update(1, metrics_dict)
+        
         avg_loss = total_loss / num_batches
-        logger.info(f"Epoch {epoch} completed. Average loss: {avg_loss:.4f}")
+        return {'epoch': epoch, 'avg_loss': avg_loss, **metrics_dict}
         
     def validate(self, epoch: int):
         """Run validation loop."""
@@ -139,32 +160,60 @@ class SDXLTrainer:
         for name, model in self.models.items():
             if isinstance(model, torch.nn.Module):
                 model.eval()
-                
-        generate_validation_images(
-            self.config,
-            self.models,
-            self.val_dataloader,
-            self.device,
-            self.dtype
-        )
-        logger.info(f"Validation images saved for epoch {epoch}")
+
+        with ProgressTracker(
+            f"Validation Epoch {epoch}",
+            total=len(self.val_dataloader) if self.val_dataloader else 0,
+            wandb_run=self.wandb_run
+        ) as progress:
+            metrics = run_validation(
+                self.config,
+                self.models,
+                self.components,
+                self.device,
+                self.dtype,
+                epoch,
+                self.metrics_manager,
+                progress_callback=progress.update
+            )
+            
+            if self.wandb_run:
+                # Log validation metrics to wandb and images
+                self.wandb_run.log(metrics)
+                self.wandb_run.log({
+                    'validation_images': [wandb.Image(image_path) for image_path in metrics['validation_images']]
+                })
         
     def save_checkpoint(self, save_dir: str, epoch: int):
         """Save training checkpoint."""
-        checkpoint = {
-            'epoch': epoch,
-            'model_state': {name: model.state_dict() 
-                          for name, model in self.models.items()},
-            'optimizer_state': self.components['optimizer'].state_dict(),
-            'config': self.config,
-        }
-        
-        if 'ema_model' in self.components:
-            checkpoint['ema_state'] = self.components['ema_model'].state_dict()
+        with ProgressTracker(
+            f"Saving checkpoint for epoch {epoch}",
+            total=1,
+            wandb_run=self.wandb_run
+        ) as progress:
+            checkpoint = {
+                'epoch': epoch,
+                'model_state': {name: model.state_dict() 
+                              for name, model in self.models.items()},
+                'optimizer_state': self.components['optimizer'].state_dict(),
+                'config': self.config,
+            }
             
-        save_path = f"{save_dir}/checkpoint_epoch_{epoch}.pt"
-        torch.save(checkpoint, save_path)
-        logger.info(f"Saved checkpoint to {save_path}")
+            if 'ema_model' in self.components:
+                checkpoint['ema_state'] = self.components['ema_model'].state_dict()
+                
+            save_path = f"{save_dir}/checkpoint_epoch_{epoch}.pt"
+            torch.save(checkpoint, save_path)
+            
+            if self.wandb_run:
+                artifact = wandb.Artifact(
+                    name=f"checkpoint-epoch-{epoch}",
+                    type="model"
+                )
+                artifact.add_file(save_path)
+                self.wandb_run.log_artifact(artifact)
+            
+            progress.update(1, {'checkpoint_path': save_path})
         
     @classmethod
     def load_checkpoint(cls, checkpoint_path: str, train_dataloader, val_dataloader=None):

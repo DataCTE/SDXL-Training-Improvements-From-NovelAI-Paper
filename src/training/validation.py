@@ -1,12 +1,14 @@
 import torch
 import logging
 import os
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Callable
 from contextlib import nullcontext
 from src.training.metrics import MetricsManager
 from src.training.loss_functions import forward_pass
 from src.models.SDXL.pipeline import StableDiffusionXLPipeline
 from src.data.prompt.caption_processor import CaptionProcessor
+from src.utils.progress import ProgressTracker
+
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +23,7 @@ def generate_validation_images(
     height: int = 1024,
     width: int = 1024,
     num_images_per_prompt: int = 1,
+    progress_callback: Optional[Callable] = None
 ) -> List[str]:
     """Generate validation images using SDXL pipeline."""
     os.makedirs(save_dir, exist_ok=True)
@@ -35,7 +38,6 @@ def generate_validation_images(
             if caption_processor is not None:
                 tags, weights = caption_processor.process_caption(prompt, training=False)
                 if tags:
-                    # Join tags with weights into a weighted prompt
                     prompt = ", ".join(
                         f"{{{tag}}}" if weight > 1.5 else 
                         f"{{{{{tag}}}}}" if weight > 2.0 else 
@@ -59,6 +61,12 @@ def generate_validation_images(
                     save_path = os.path.join(save_dir, f"val_{idx}_{img_idx}.png")
                     image.save(save_path)
                     generated_paths.append(save_path)
+                
+                if progress_callback:
+                    progress_callback(1, {
+                        'current_prompt': prompt,
+                        'images_generated': len(generated_paths)
+                    })
                     
         except Exception as e:
             logger.error(f"Failed to generate validation image for prompt {prompt}: {str(e)}")
@@ -78,6 +86,7 @@ def run_validation(
     dtype: torch.dtype,
     global_step: int,
     metrics_manager: Optional[MetricsManager] = None,
+    progress_callback: Optional[Callable] = None,
 ) -> Dict[str, float]:
     """Run validation with proper error handling and metrics tracking."""
     try:
@@ -107,6 +116,12 @@ def run_validation(
                         )
                     total_val_loss += val_loss.item()
                     num_val_steps += 1
+                    
+                    if progress_callback:
+                        progress_callback(1, {
+                            'val_loss': val_loss.item(),
+                            'avg_val_loss': total_val_loss / num_val_steps
+                        })
 
             avg_val_loss = total_val_loss / num_val_steps if num_val_steps > 0 else 0.0
             metrics["val_loss"] = avg_val_loss
@@ -133,18 +148,26 @@ def run_validation(
             caption_processor = components.get("caption_processor")
             
             save_dir = os.path.join(args.output_dir, f"validation_images/step_{global_step}")
-            generated_paths = generate_validation_images(
-                pipeline=pipeline,
-                prompts=args.validation_prompts,
-                save_dir=save_dir,
-                device=device,
-                caption_processor=caption_processor,
-                num_inference_steps=getattr(args, "validation_num_inference_steps", 28),
-                guidance_scale=getattr(args, "validation_guidance_scale", 5.5),
-                height=getattr(args, "validation_image_height", 1024),
-                width=getattr(args, "validation_image_width", 1024),
-                num_images_per_prompt=getattr(args, "validation_num_images_per_prompt", 1),
-            )
+            
+            # Create a nested progress tracker for image generation
+            with ProgressTracker(
+                "Generating Validation Images",
+                total=len(args.validation_prompts),
+                wandb_run=None  # We'll handle wandb logging at the parent level
+            ) as img_progress:
+                generated_paths = generate_validation_images(
+                    pipeline=pipeline,
+                    prompts=args.validation_prompts,
+                    save_dir=save_dir,
+                    device=device,
+                    caption_processor=caption_processor,
+                    num_inference_steps=getattr(args, "validation_num_inference_steps", 28),
+                    guidance_scale=getattr(args, "validation_guidance_scale", 5.5),
+                    height=getattr(args, "validation_image_height", 1024),
+                    width=getattr(args, "validation_image_width", 1024),
+                    num_images_per_prompt=getattr(args, "validation_num_images_per_prompt", 1),
+                    progress_callback=img_progress.update
+                )
             
             metrics["num_validation_images"] = len(generated_paths)
             logger.info(

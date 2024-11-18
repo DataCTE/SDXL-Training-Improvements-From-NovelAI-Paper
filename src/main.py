@@ -9,65 +9,79 @@ from training.wrappers import train_sdxl, train_vae
 from utils.logging import setup_logging
 from models.model_loader import load_models
 from data.image_processing.validation import ValidationConfig
+from utils.progress import ProgressTracker
 
 logger = logging.getLogger(__name__)
 
 def main():
     """Main training function."""
     try:
-        # Parse arguments
-        config = parse_args()
-        
-        # Setup logging
-        setup_logging(
-            log_dir=Path(config.output_dir) / "logs",
-            log_level=logging.INFO
-        )
-        
-        # Create validation config
-        validation_config = ValidationConfig(
-            min_size=512,
-            max_size=2048,
-            min_aspect=0.4,
-            max_aspect=2.5,
-            check_content=True,
-            device=config.device
-        )
-        
-        # Load models
-        logger.info("Loading models...")
-        models = load_models(config)
-        
-        # Train VAE if enabled
-        if config.vae_args.enable_vae_finetuning:
-            logger.info("Starting VAE finetuning...")
-            vae_trainer = train_vae(
+        with ProgressTracker("Initializing Training Pipeline", total=5) as progress:
+            # Parse arguments
+            progress.update(1, {"status": "Parsing arguments"})
+            config = parse_args()
+            
+            # Setup logging
+            progress.update(1, {"status": "Setting up logging"})
+            setup_logging(
+                log_dir=Path(config.output_dir) / "logs",
+                log_level=logging.INFO
+            )
+            
+            # Create validation config
+            progress.update(1, {"status": "Creating validation config"})
+            validation_config = ValidationConfig(
+                min_size=512,
+                max_size=2048,
+                min_aspect=0.4,
+                max_aspect=2.5,
+                check_content=True,
+                device=config.device
+            )
+            
+            # Load models
+            progress.update(1, {"status": "Loading models"})
+            logger.info("Loading models...")
+            models = load_models(config)
+            
+            # Initialize training components
+            progress.update(1, {"status": "Initializing training"})
+            
+            # Train VAE if enabled
+            if config.vae_args.enable_vae_finetuning:
+                logger.info("Starting VAE finetuning...")
+                vae_trainer = train_vae(
+                    train_data_dir=config.train_data_dir,
+                    output_dir=config.output_dir,
+                    config=config.vae_args,
+                    validation_config=validation_config,
+                    wandb_run=config.use_wandb  # Pass wandb flag if using wandb
+                )
+                # Run VAE training
+                vae_trainer.train()
+                models["vae"] = vae_trainer.vae
+            
+            # Train SDXL
+            logger.info("Starting SDXL training...")
+            trainer = train_sdxl(
                 train_data_dir=config.train_data_dir,
                 output_dir=config.output_dir,
-                config=config.vae_args,
-                validation_config=validation_config
+                pretrained_model_path=config.pretrained_model_path,
+                models=models,
+                validation_config=validation_config,
+                config=config,  # Pass full config
+                wandb_run=config.use_wandb  # Pass wandb flag if using wandb
             )
-            # Run VAE training
-            vae_trainer.train()
-            models["vae"] = vae_trainer.vae
-        
-        # Train SDXL
-        logger.info("Starting SDXL training...")
-        trainer = train_sdxl(
-            train_data_dir=config.train_data_dir,
-            output_dir=config.output_dir,
-            pretrained_model_path=config.pretrained_model_path,
-            models=models,
-            validation_config=validation_config,
-            config=config  # Pass full config
-        )
-        
-        # Run SDXL training
-        trainer.train(save_dir=config.output_dir)
-        
-        # Save final model
-        trainer.save_checkpoint(config.output_dir, config.num_epochs)
-        logger.info("Training completed successfully!")
+            
+            # Run SDXL training
+            trainer.train(save_dir=config.output_dir)
+            
+            # Save final model
+            with ProgressTracker("Saving Final Model", total=1) as save_progress:
+                trainer.save_checkpoint(config.output_dir, config.num_epochs)
+                save_progress.update(1, {"status": "Model saved successfully"})
+                
+            logger.info("Training completed successfully!")
         
     except Exception as e:
         import traceback
