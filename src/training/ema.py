@@ -174,47 +174,18 @@ class EMAModel:
         """Get reference to original model."""
         return self._model()
 
-def setup_ema_model(
-    model: torch.nn.Module,
-    model_path: Optional[str] = None,
-    power: float = 0.75,
-    max_value: float = 0.9999,
-    min_value: float = 0.0,
-    update_after_step: int = 0,
-    inv_gamma: float = 1.0,
-    device: Optional[Union[str, torch.device]] = None,
-    jit_compile: bool = True,
-    use_cuda_graph: bool = True,
-) -> Optional[EMAModel]:
-    """Set up an optimized EMA model for training."""
+def setup_ema_model(self, model):
+    """Properly set up EMA model."""
+    if not isinstance(model, torch.nn.Module):
+        logger.error("Model must be an instance of torch.nn.Module")
+        return None
+        
     try:
-        # Create EMA model
-        ema_model = EMAModel(
-            model=model,
-            power=power,
-            max_value=max_value,
-            min_value=min_value,
-            update_after_step=update_after_step,
-            inv_gamma=inv_gamma,
-            device=device,
-            jit_compile=jit_compile,
-            use_cuda_graph=use_cuda_graph,
-        )
-        
-        # Load checkpoint if exists
-        if model_path:
-            try:
-                checkpoint = torch.load(model_path, map_location=device)
-                if "ema_state_dict" in checkpoint:
-                    for name, param in checkpoint["ema_state_dict"].items():
-                        if name in ema_model._shadow_params:
-                            ema_model._shadow_params[name].copy_(param)
-                    logger.info(f"Loaded EMA checkpoint from {model_path}")
-            except Exception as e:
-                logger.warning(f"Failed to load EMA checkpoint: {e}")
-        
+        ema_model = type(model)().to(self.device)  # Create new instance
+        ema_model.load_state_dict(model.state_dict())  # Copy parameters
+        for param in ema_model.parameters():
+            param.requires_grad_(False)  # No gradient needed
         return ema_model
-        
     except Exception as e:
-        logger.error(f"Failed to set up EMA model: {e}")
+        logger.error(f"Failed to set up EMA model: {str(e)}")
         return None

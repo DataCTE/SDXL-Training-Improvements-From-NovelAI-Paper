@@ -26,34 +26,24 @@ class SDXLTrainer:
     ):
         self.config = config
         self.models = models
-        self.train_dataloader = self._setup_dataloader(train_dataloader)
-        self.val_dataloader = self._setup_dataloader(val_dataloader) if val_dataloader else None
         self.device = torch.device(device)
         self.dtype = torch.float16 if config.mixed_precision == "fp16" else torch.float32
         
-        # Initialize components (optimizer, scheduler, etc.)
+        # Initialize with single process dataloader
+        self.train_dataloader = self._setup_dataloader(train_dataloader)
+        self.val_dataloader = self._setup_dataloader(val_dataloader) if val_dataloader else None
+        
+        # Initialize components
         self.components = initialize_training_components(config, models)
         self.metrics_manager = MetricsManager()
         
-        # Move only torch.nn.Module models to device
+        # Move models to device
         for name, model in self.models.items():
             if isinstance(model, torch.nn.Module):
                 model.to(self.device)
-                model.train()  # Ensure training mode
-            
-        # Setup EMA if enabled in config
-        if hasattr(config, 'use_ema') and config.use_ema:
-            self.ema_model = setup_ema_model(
-                model=self.models['unet'],  # Usually EMA is applied to UNet
-                device=self.device,
-                power=getattr(config, 'ema_power', 0.75),
-                max_value=getattr(config, 'ema_max_value', 0.9999),
-                update_after_step=getattr(config, 'ema_update_after_step', 0)
-            )
-        else:
-            self.ema_model = None
-        
-        # Initialize wandb if enabled
+                model.train()
+    
+        # Initialize wandb
         self.wandb_run = None
         if hasattr(config, 'use_wandb') and config.use_wandb:
             self.wandb_run = wandb.init(
@@ -61,38 +51,62 @@ class SDXLTrainer:
                 name=config.wandb_run_name,
                 config=config.__dict__
             )
-        
+    
+        # Initialize cleanup handlers
+        self._cleanup_handlers = []
+        self._setup_cleanup_handlers()
+                
+    def __del__(self):
+        """Cleanup resources when trainer is destroyed."""
+        try:
+            # Run all cleanup handlers
+            for cleanup_handler in self._cleanup_handlers:
+                try:
+                    cleanup_handler()
+                except Exception as e:
+                    logger.error(f"Error during cleanup: {str(e)}")
+            
+            # Clear components
+            self.components.clear()
+            
+            # Clear models
+            self.models.clear()
+            
+            # Force garbage collection
+            import gc
+            gc.collect()
+            
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+        except Exception as e:
+            logger.error(f"Error during trainer cleanup: {str(e)}")
+            
     def _setup_dataloader(self, dataloader):
         """Setup and validate the dataloader."""
         if not dataloader:
             return None
-        
-        if torch.cuda.is_available():
-            # Preserve the original dataloader if it already has the correct settings
-            if (getattr(dataloader, 'pin_memory', False) and 
-                getattr(dataloader, 'persistent_workers', False) and
-                dataloader.multiprocessing_context == 'spawn'):
-                return dataloader
             
-            # Get shuffle parameter from dataloader config
-            shuffle = False
-            if isinstance(dataloader, torch.utils.data.DataLoader):
-                shuffle = dataloader.sampler is None or isinstance(
-                    dataloader.sampler, 
-                    torch.utils.data.RandomSampler
+        try:
+            if torch.cuda.is_available():
+                # Get existing settings
+                batch_size = dataloader.batch_size
+                dataset = dataloader.dataset
+                
+                
+                # Create new dataloader with single process if there are pickling issues
+                return torch.utils.data.DataLoader(
+                    dataset,
+                    batch_size=batch_size,
+                    shuffle=isinstance(dataloader.sampler, torch.utils.data.RandomSampler),
+                    num_workers=0,  # Force single process to avoid pickling issues
+                    pin_memory=True,
+                    collate_fn=getattr(dataloader, 'collate_fn', None)
                 )
-            
-            # Create new dataloader with spawn context and shared memory
-            return torch.utils.data.DataLoader(
-                dataloader.dataset,
-                batch_size=dataloader.batch_size,
-                shuffle=shuffle,
-                num_workers=dataloader.num_workers if hasattr(dataloader, 'num_workers') else 0,
-                multiprocessing_context='spawn' if dataloader.num_workers > 0 else None,
-                persistent_workers=True if dataloader.num_workers > 0 else False,
-                pin_memory=True
-            )
-        return dataloader
+            return dataloader
+        except Exception as e:
+            logger.error(f"Error setting up dataloader: {e}")
+            raise
         
     def train(self, save_dir: str):
         """Execute training loop with validation."""
@@ -118,47 +132,57 @@ class SDXLTrainer:
                 
     def train_epoch(self, epoch: int):
         """Execute single training epoch."""
-        total_loss = 0
-        num_batches = len(self.train_dataloader)
-        
-        # Set models to training mode
-        for name, model in self.models.items():
-            if isinstance(model, torch.nn.Module):
-                model.train()
-        
-        with ProgressTracker(
-            f"Epoch {epoch}",
-            total=num_batches,
-            wandb_run=self.wandb_run,
-            log_interval=0.1  # Log every 10% of batches
-        ) as progress:
-            for batch in self.train_dataloader:
-                # Move batch to device and handle text embeddings
-                batch = {k: v.to(self.device) if torch.is_tensor(v) else v 
-                        for k, v in batch.items()}
-                
-                # Training step
-                loss, metrics_dict = train_step(
-                    self.config,
-                    self.models,
-                    self.components['optimizer'],
-                    self.components['scheduler'],
-                    batch,
-                    self.device,
-                    self.dtype,
-                    self.components['grad_accumulator'],
-                    self.components['scaler']
-                )
-                
-                total_loss += loss.item()
-                
-                # Update metrics and progress
-                metrics_dict['loss'] = loss.item()
-                metrics_dict['learning_rate'] = self.components['scheduler'].get_last_lr()[0]
-                progress.update(1, metrics_dict)
-        
-        avg_loss = total_loss / num_batches
-        return {'epoch': epoch, 'avg_loss': avg_loss, **metrics_dict}
+        try:
+            total_loss = 0
+            num_batches = len(self.train_dataloader)
+            
+            # Set models to training mode
+            for name, model in self.models.items():
+                if isinstance(model, torch.nn.Module):
+                    model.train()
+            
+            with ProgressTracker(
+                f"Epoch {epoch}",
+                total=num_batches,
+                wandb_run=self.wandb_run,
+                log_interval=0.1
+            ) as progress:
+                for batch_idx, batch in enumerate(self.train_dataloader):
+                    try:
+                        # Move batch to device and handle text embeddings
+                        batch = {k: v.to(self.device) if torch.is_tensor(v) else v 
+                                for k, v in batch.items()}
+                        
+                        # Training step
+                        loss, metrics_dict = train_step(
+                            self.config,
+                            self.models,
+                            self.components['optimizer'],
+                            self.components['scheduler'],
+                            batch,
+                            self.device,
+                            self.dtype,
+                            self.components['grad_accumulator'],
+                            self.components['scaler']
+                        )
+                        
+                        total_loss += loss.item()
+                        
+                        # Update metrics and progress
+                        metrics_dict['loss'] = loss.item()
+                        metrics_dict['learning_rate'] = self.components['scheduler'].get_last_lr()[0]
+                        progress.update(1, metrics_dict)
+                        
+                    except Exception as batch_error:
+                        logger.error(f"Error processing batch {batch_idx}: {str(batch_error)}")
+                        continue  # Skip to next batch on error
+            
+            avg_loss = total_loss / num_batches
+            return {'epoch': epoch, 'avg_loss': avg_loss, **metrics_dict}
+            
+        except Exception as e:
+            logger.error(f"Error in epoch {epoch}: {str(e)}")
+            raise
         
     def validate(self, epoch: int):
         """Run validation loop."""
@@ -249,8 +273,19 @@ class SDXLTrainer:
         
     def _setup_ema_model(self, model):
         """Properly set up EMA model."""
-        import copy
-        ema_model = copy.deepcopy(model)
-        for param in ema_model.parameters():
-            param.detach_()
-        return ema_model
+        try:
+            if not isinstance(model, torch.nn.Module):
+                raise ValueError("Model must be a torch.nn.Module instance")
+            
+            # Create a deep copy on the same device
+            ema_model = type(model)().to(model.device)
+            ema_model.load_state_dict(model.state_dict())
+            
+            # Ensure no gradients are computed for EMA model
+            for param in ema_model.parameters():
+                param.requires_grad_(False)
+            
+            return ema_model
+        except Exception as e:
+            logger.error(f"Failed to set up EMA model: {str(e)}")
+            return None
