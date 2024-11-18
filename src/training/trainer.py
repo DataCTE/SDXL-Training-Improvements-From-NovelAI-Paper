@@ -66,25 +66,31 @@ class SDXLTrainer:
         """Setup and validate the dataloader."""
         if not dataloader:
             return None
-            
+        
         if torch.cuda.is_available():
-            # Get shuffle parameter from dataloader config instead of attribute
+            # Preserve the original dataloader if it already has the correct settings
+            if (getattr(dataloader, 'pin_memory', False) and 
+                getattr(dataloader, 'persistent_workers', False) and
+                dataloader.multiprocessing_context == 'spawn'):
+                return dataloader
+            
+            # Get shuffle parameter from dataloader config
             shuffle = False
             if isinstance(dataloader, torch.utils.data.DataLoader):
-                # Access the dataset's sampler to determine if shuffling is enabled
                 shuffle = dataloader.sampler is None or isinstance(
                     dataloader.sampler, 
                     torch.utils.data.RandomSampler
                 )
             
+            # Create new dataloader with spawn context and shared memory
             return torch.utils.data.DataLoader(
                 dataloader.dataset,
                 batch_size=dataloader.batch_size,
                 shuffle=shuffle,
-                num_workers=dataloader.num_workers,
-                multiprocessing_context='spawn',
-                persistent_workers=True,  # Keep workers alive between iterations
-                pin_memory=True  # Enable pinned memory for faster GPU transfer
+                num_workers=dataloader.num_workers if hasattr(dataloader, 'num_workers') else 0,
+                multiprocessing_context='spawn' if dataloader.num_workers > 0 else None,
+                persistent_workers=True if dataloader.num_workers > 0 else False,
+                pin_memory=True
             )
         return dataloader
         
