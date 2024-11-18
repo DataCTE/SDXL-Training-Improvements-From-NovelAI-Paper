@@ -29,17 +29,7 @@ def main():
             log_dir=Path(config.output_dir) / "logs",
             log_level=logging.INFO
         )
-        
-        # Create validation config
-        logger.info("Creating validation config...")
-        validation_config = ValidationConfig(
-            min_size=512,
-            max_size=2048,
-            min_aspect=0.4,
-            max_aspect=2.5,
-            check_content=True,
-            device=config.device
-        )
+
         
         # Load models
         logger.info("Loading models...")
@@ -64,7 +54,6 @@ def main():
             output_dir=config.output_dir,
             pretrained_model_path=config.pretrained_model_path,
             models=models,
-            validation_config=validation_config,
             config=config,
             wandb_run=config.wandb.use_wandb
         )
