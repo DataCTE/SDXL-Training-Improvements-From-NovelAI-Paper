@@ -228,82 +228,81 @@ class VAEFinetuner:
         total_loss = 0.0
         
         try:
-            with ProgressTracker(
-                "VAE Training",
-                total=num_epochs,
-                wandb_run=wandb_run
-            ) as epoch_progress:
-                for epoch in range(num_epochs):
-                    epoch_loss = 0.0
-                    num_batches = len(train_dataloader)
+            logger.info(f"Starting VAE training for {num_epochs} epochs...")
+            
+            for epoch in range(num_epochs):
+                epoch_loss = 0.0
+                num_batches = len(train_dataloader)
+                
+                logger.info(f"Starting epoch {epoch+1}/{num_epochs}")
+                
+                for batch_idx, batch in enumerate(train_dataloader):
+                    # Move batch to device
+                    batch = {k: v.to(self.device, non_blocking=True) 
+                            for k, v in batch.items()}
                     
-                    # Create progress tracker for batches
-                    with ProgressTracker(
-                        f"VAE Epoch {epoch+1}/{num_epochs}",
-                        total=num_batches,
-                        wandb_run=wandb_run
-                    ) as batch_progress:
-                        for batch_idx, batch in enumerate(train_dataloader):
-                            # Move batch to device
-                            batch = {
-                                k: v.to(self.device, non_blocking=True)
-                                for k, v in batch.items()
-                            }
-                            
-                            # Execute training step
-                            loss, metrics = self.train_step(batch)
-                            epoch_loss += loss.item()
-                            
-                            # Update metrics with current loss
-                            current_metrics = {
-                                "loss": loss.item(),
-                                "avg_loss": epoch_loss / (batch_idx + 1),
-                                **metrics
-                            }
-                            
-                            # Update batch progress
-                            batch_progress.update(1, current_metrics)
-                            
-                            # Update history
-                            for k, v in current_metrics.items():
-                                if k in history:
-                                    history[k].append(v)
-                            
-                            # Execute callbacks
-                            if callbacks:
-                                for callback in callbacks:
-                                    callback(self, current_metrics)
-                        
-                        # Calculate epoch metrics
-                        avg_epoch_loss = epoch_loss / num_batches
-                        epoch_metrics = {
-                            "epoch": epoch + 1,
-                            "avg_epoch_loss": avg_epoch_loss,
-                            **{k: sum(v[-num_batches:]) / num_batches 
-                               for k, v in history.items()}
-                        }
-                        
-                        # Update epoch progress
-                        epoch_progress.update(1, epoch_metrics)
-                        
-                        # Log epoch summary
+                    # Execute training step
+                    loss, metrics = self.train_step(batch)
+                    epoch_loss += loss.item()
+                    
+                    # Update metrics
+                    current_metrics = {
+                        "loss": loss.item(),
+                        "avg_loss": epoch_loss / (batch_idx + 1),
+                        **metrics
+                    }
+                    
+                    # Log progress periodically
+                    if (batch_idx + 1) % 10 == 0:
                         logger.info(
-                            f"Epoch {epoch+1}/{num_epochs} - "
-                            f"Average Loss: {avg_epoch_loss:.4f}"
+                            f"Epoch {epoch+1}/{num_epochs} "
+                            f"[{batch_idx+1}/{num_batches}] "
+                            f"Loss: {loss.item():.4f}"
                         )
                     
-                    total_loss += epoch_loss
+                    # Update history
+                    for k, v in current_metrics.items():
+                        if k in history:
+                            history[k].append(v)
+                    
+                    # Execute callbacks
+                    if callbacks:
+                        for callback in callbacks:
+                            callback(self, current_metrics)
                 
-                # Log final training summary
-                final_metrics = {
-                    "total_epochs": num_epochs,
-                    "final_avg_loss": total_loss / (num_epochs * num_batches),
-                    "final_cache_hit_rate": history["cache_hit_rate"][-1]
+                # Calculate and log epoch metrics
+                avg_epoch_loss = epoch_loss / num_batches
+                epoch_metrics = {
+                    "epoch": epoch + 1,
+                    "avg_epoch_loss": avg_epoch_loss,
+                    **{k: sum(v[-num_batches:]) / num_batches 
+                       for k, v in history.items()}
                 }
-                epoch_progress.finish(final_metrics)
                 
-                return history
+                logger.info(
+                    f"Epoch {epoch+1}/{num_epochs} completed - "
+                    f"Average Loss: {avg_epoch_loss:.4f}"
+                )
                 
+                if wandb_run:
+                    wandb_run.log(epoch_metrics)
+                
+                total_loss += epoch_loss
+            
+            # Log final summary
+            final_metrics = {
+                "total_epochs": num_epochs,
+                "final_avg_loss": total_loss / (num_epochs * num_batches),
+                "final_cache_hit_rate": history["cache_hit_rate"][-1]
+            }
+            logger.info("Training completed successfully!")
+            logger.info(f"Final metrics: {final_metrics}")
+            
+            if wandb_run:
+                wandb_run.log(final_metrics)
+            
+            return history
+            
         except Exception as e:
             logger.error(f"Training loop failed: {e}")
             raise

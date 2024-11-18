@@ -24,98 +24,91 @@ def train_sdxl(
     models: Optional[Dict[str, Any]] = None,
     **kwargs
 ) -> SDXLTrainer:
-    with ProgressTracker("Setting up SDXL Training", total=6) as progress:
-        # Setup configuration
-        progress.update(1, {"status": "Creating configuration"})
-        config = TrainingConfig(
-            pretrained_model_path=str(pretrained_model_path) if pretrained_model_path else "",
-            train_data_dir=str(train_data_dir),
-            output_dir=str(output_dir),
-            **kwargs
-        )
+    """Setup SDXL training pipeline."""
+    logger.info("Setting up SDXL training pipeline...")
+    
+    # Setup configuration
+    logger.info("Creating configuration...")
+    config = TrainingConfig(
+        pretrained_model_path=str(pretrained_model_path) if pretrained_model_path else "",
+        train_data_dir=str(train_data_dir),
+        output_dir=str(output_dir),
+        **kwargs
+    )
+    
+    # Create models
+    logger.info("Creating models...")
+    if models is None:
+        models_dict, _ = create_sdxl_models(pretrained_model_path)
+    else:
+        models_dict = models
         
-        # Create models
-        progress.update(1, {"status": "Creating models"})
-        if models is None:
-            models_dict, _ = create_sdxl_models(pretrained_model_path)
+    # Initialize components
+    logger.info("Initializing components...")
+    training_components = initialize_training_components(config, models_dict)
+    
+    # Process images
+    logger.info("Processing training images...")
+    train_image_paths = []
+    for path in Path(train_data_dir).glob("*.[jJ][pP][gG]"):
+        if validate_image(str(path)):
+            train_image_paths.append(str(path))
         else:
-            models_dict = models
-            
-        # Initialize components
-        progress.update(1, {"status": "Initializing components"})
-        training_components = initialize_training_components(config, models_dict)
+            logger.warning(f"Skipping invalid image: {path}")
+    
+    bucket_manager = BucketManager(train_image_paths)
+    
+    # Load captions
+    logger.info("Loading captions...")
+    train_captions = load_captions(train_image_paths)
+    
+    # Create dataloaders
+    logger.info("Creating dataloaders...")
+    train_dataloader = create_train_dataloader(
+        image_paths=train_image_paths,
+        captions=train_captions,
+        bucket_manager=bucket_manager,
+        batch_size=config.batch_size,
+        num_workers=config.num_workers,
+        vae_cache=training_components.get('vae_cache'),
+        text_cache=training_components.get('text_cache')
+    )
+    
+    # Handle validation data if provided
+    val_dataloader = None
+    if val_data_dir:
+        logger.info("Processing validation data...")
+        val_image_paths = []
+        for path in Path(val_data_dir).glob("*.[jJ][pP][gG]"):
+            if validate_image(str(path)):
+                val_image_paths.append(str(path))
+            else:
+                logger.warning(f"Skipping invalid validation image: {path}")
         
-        # Process images and create bucket manager
-        progress.update(1, {"status": "Processing images"})
-        train_image_paths = []
-        with ProgressTracker("Validating Images", total=len(list(Path(train_data_dir).glob("*.[jJ][pP][gG]")))) as img_progress:
-            for path in Path(train_data_dir).glob("*.[jJ][pP][gG]"):
-                if validate_image(str(path)):
-                    train_image_paths.append(str(path))
-                    img_progress.update(1, {"valid_image": str(path)})
-                else:
-                    logger.warning(f"Skipping invalid image: {path}")
-                    img_progress.update(1, {"invalid_image": str(path)})
+        val_bucket_manager = BucketManager(val_image_paths)
+        val_captions = load_captions(val_image_paths)
         
-        bucket_manager = BucketManager(train_image_paths)
-        
-        # Load captions
-        progress.update(1, {"status": "Loading captions"})
-        train_captions = load_captions(train_image_paths)
-        
-        # Create dataloaders
-        progress.update(1, {"status": "Creating dataloaders"})
-        train_dataloader = create_train_dataloader(
-            image_paths=train_image_paths,
-            captions=train_captions,
-            bucket_manager=bucket_manager,
+        val_dataloader = create_validation_dataloader(
+            image_paths=val_image_paths,
+            captions=val_captions,
+            bucket_manager=val_bucket_manager,
             batch_size=config.batch_size,
             num_workers=config.num_workers,
             vae_cache=training_components.get('vae_cache'),
-            text_cache=training_components.get('text_cache'),
-            token_dropout=config.token_dropout,
-            caption_dropout=config.caption_dropout,
-            shuffle=True,
-            pin_memory=True,
-            drop_last=True
+            text_cache=training_components.get('text_cache')
         )
-        
-        val_dataloader = None
-        if val_data_dir:
-            val_image_paths = []
-            val_captions = {}
-            with ProgressTracker("Processing Validation Data", total=len(list(Path(val_data_dir).glob("*.[jJ][pP][gG]")))) as val_progress:
-                for path in Path(val_data_dir).glob("*.[jJ][pP][gG]"):
-                    if validate_image(str(path)):
-                        val_image_paths.append(str(path))
-                        val_progress.update(1, {"valid_image": str(path)})
-                    else:
-                        logger.warning(f"Skipping invalid validation image: {path}")
-                        val_progress.update(1, {"invalid_image": str(path)})
-            
-            val_bucket_manager = BucketManager(val_image_paths)
-            val_captions = load_captions(val_image_paths)
-            
-            val_dataloader = create_validation_dataloader(
-                image_paths=val_image_paths,
-                captions=val_captions,
-                bucket_manager=val_bucket_manager,
-                batch_size=config.batch_size,
-                num_workers=config.num_workers,
-                vae_cache=training_components.get('vae_cache'),
-                text_cache=training_components.get('text_cache')
-            )
-        
-        # Create trainer
-        trainer = SDXLTrainer(
-            config=config,
-            models=models_dict,
-            train_dataloader=train_dataloader,
-            val_dataloader=val_dataloader,
-            device=config.device
-        )
-        
-        return trainer
+    
+    # Create trainer
+    logger.info("Creating SDXL trainer...")
+    trainer = SDXLTrainer(
+        config=config,
+        models=models_dict,
+        train_dataloader=train_dataloader,
+        val_dataloader=val_dataloader,
+        device=config.device
+    )
+    
+    return trainer
 
 def train_vae(
     train_data_dir: Union[str, Path],
