@@ -13,7 +13,7 @@ from torch.cuda import amp
 import os
 from functools import lru_cache
 
-from src.data.image_processing.validation import validate_image_fast
+from src.data.image_processing.validation import validate_image
 from src.data.cacheing.vae import VAECache
 from src.data.cacheing.text_embeds import TextEmbeddingCache
 from src.data.multiaspect.bucket_manager import Bucket, BucketManager
@@ -75,7 +75,7 @@ class MultiAspectDataset(Dataset):
         for path in paths:
             try:
                 # Validate image
-                if not validate_image_fast(path):
+                if not validate_image(path):
                     logger.warning(f"Invalid image: {path}")
                     continue
                 
