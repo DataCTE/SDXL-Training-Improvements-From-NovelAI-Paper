@@ -91,7 +91,7 @@ class SDXLTrainer:
     def train(self, save_dir: str):
         """Execute training loop with validation."""
         with ProgressTracker(
-            "Training Progress",
+            "SDXL Training",
             total=self.config.num_epochs,
             wandb_run=self.wandb_run
         ) as progress:
@@ -213,7 +213,10 @@ class SDXLTrainer:
                 artifact.add_file(save_path)
                 self.wandb_run.log_artifact(artifact)
             
-            progress.update(1, {'checkpoint_path': save_path})
+            progress.update(1, {
+                'status': 'Checkpoint saved',
+                'path': save_path
+            })
         
     @classmethod
     def load_checkpoint(cls, checkpoint_path: str, train_dataloader, val_dataloader=None):

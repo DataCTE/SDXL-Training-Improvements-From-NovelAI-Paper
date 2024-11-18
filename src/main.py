@@ -41,40 +41,42 @@ def main():
             
             # Load models
             progress.update(1, {"status": "Loading models"})
-            logger.info("Loading models...")
             models = load_models(config)
             
-            # Initialize training components
+            # Initialize training
             progress.update(1, {"status": "Initializing training"})
             
             # Train VAE if enabled
             if config.vae_args.enable_vae_finetuning:
-                logger.info("Starting VAE finetuning...")
-                vae_trainer = train_vae(
-                    train_data_dir=config.train_data_dir,
-                    output_dir=config.output_dir,
-                    config=config.vae_args,
-                    validation_config=validation_config,
-                    wandb_run=config.use_wandb  # Pass wandb flag if using wandb
-                )
-                # Run VAE training
-                vae_trainer.train()
-                models["vae"] = vae_trainer.vae
+                with ProgressTracker("VAE Finetuning", total=2) as vae_progress:
+                    vae_progress.update(1, {"status": "Setting up VAE trainer"})
+                    vae_trainer = train_vae(
+                        train_data_dir=config.train_data_dir,
+                        output_dir=config.output_dir,
+                        config=config.vae_args,
+                        validation_config=validation_config,
+                        wandb_run=config.use_wandb
+                    )
+                    
+                    vae_progress.update(1, {"status": "Running VAE training"})
+                    vae_trainer.train()
+                    models["vae"] = vae_trainer.vae
             
             # Train SDXL
-            logger.info("Starting SDXL training...")
-            trainer = train_sdxl(
-                train_data_dir=config.train_data_dir,
-                output_dir=config.output_dir,
-                pretrained_model_path=config.pretrained_model_path,
-                models=models,
-                validation_config=validation_config,
-                config=config,  # Pass full config
-                wandb_run=config.use_wandb  # Pass wandb flag if using wandb
-            )
-            
-            # Run SDXL training
-            trainer.train(save_dir=config.output_dir)
+            with ProgressTracker("SDXL Training", total=2) as sdxl_progress:
+                sdxl_progress.update(1, {"status": "Setting up SDXL trainer"})
+                trainer = train_sdxl(
+                    train_data_dir=config.train_data_dir,
+                    output_dir=config.output_dir,
+                    pretrained_model_path=config.pretrained_model_path,
+                    models=models,
+                    validation_config=validation_config,
+                    config=config,
+                    wandb_run=config.use_wandb
+                )
+                
+                sdxl_progress.update(1, {"status": "Running SDXL training"})
+                trainer.train(save_dir=config.output_dir)
             
             # Save final model
             with ProgressTracker("Saving Final Model", total=1) as save_progress:
@@ -82,11 +84,10 @@ def main():
                 save_progress.update(1, {"status": "Model saved successfully"})
                 
             logger.info("Training completed successfully!")
-        
+            
     except Exception as e:
-        import traceback
-        logger.error("Training failed with error: %s", str(e))
-        logger.error("Full traceback:\n%s", traceback.format_exc())
+        logger.error(f"Training failed: {str(e)}")
+        logger.error(f"Traceback:\n{traceback.format_exc()}")
         sys.exit(1)
 
 if __name__ == "__main__":
