@@ -34,7 +34,9 @@ class MultiAspectDataset(Dataset):
         text_cache: Optional[TextEmbeddingCache] = None,
         num_workers: int = 4,
         token_dropout: float = 0.1,
-        caption_dropout: float = 0.1
+        caption_dropout: float = 0.1,
+        rarity_factor: float = 0.9,
+        emphasis_factor: float = 1.2,
     ):
         """Initialize with optimized caching and parallel processing."""
         self.image_paths = image_paths
@@ -47,7 +49,10 @@ class MultiAspectDataset(Dataset):
         # Initialize caption processor
         self.caption_processor = CaptionProcessor(
             token_dropout_rate=token_dropout,
-            caption_dropout_rate=caption_dropout
+            caption_dropout_rate=caption_dropout,
+            rarity_factor=rarity_factor,
+            emphasis_factor=emphasis_factor,
+            num_workers=num_workers
         )
         
         # Use multiprocessing Manager for shared state
@@ -290,6 +295,8 @@ def create_train_dataloader(
     text_cache: Optional[TextEmbeddingCache] = None,
     token_dropout: float = 0.1,
     caption_dropout: float = 0.1,
+    rarity_factor: float = 0.9,
+    emphasis_factor: float = 1.2,
     shuffle: bool = True,
     pin_memory: bool = True,
     drop_last: bool = True,
@@ -307,6 +314,8 @@ def create_train_dataloader(
         text_cache: Optional text embedding cache
         token_dropout: Rate at which individual tokens are dropped during training
         caption_dropout: Rate at which entire captions are dropped during training
+        rarity_factor: Factor for weighting rare tags
+        emphasis_factor: Factor for emphasis tag weighting
         shuffle: Whether to shuffle the dataset
         pin_memory: If True, pin memory for faster GPU transfer
         drop_last: Whether to drop the last incomplete batch
@@ -322,7 +331,9 @@ def create_train_dataloader(
         text_cache=text_cache,
         num_workers=num_workers,
         token_dropout=token_dropout,
-        caption_dropout=caption_dropout
+        caption_dropout=caption_dropout,
+        rarity_factor=rarity_factor,
+        emphasis_factor=emphasis_factor
     )
     
     return DataLoader(

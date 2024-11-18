@@ -21,9 +21,6 @@ def _get_tag_weighter_config(
     caption_dropout_rate: float = 0.1,
     rarity_factor: float = 0.9,
     emphasis_factor: float = 1.2,
-    min_tag_freq: int = 10,
-    min_cluster_size: int = 5,
-    similarity_threshold: float = 0.3,
 ) -> Dict[str, Any]:
     """Cache tag weighter configuration."""
     return {
@@ -31,25 +28,10 @@ def _get_tag_weighter_config(
         "caption_dropout_rate": caption_dropout_rate,
         "rarity_factor": rarity_factor,
         "emphasis_factor": emphasis_factor,
-        "min_tag_freq": min_tag_freq,
-        "min_cluster_size": min_cluster_size,
-        "similarity_threshold": similarity_threshold,
     }
 
 def setup_tag_weighter(args) -> Optional[CaptionProcessor]:
-    """
-    Initialize tag weighting system with CaptionProcessor.
-    
-    Args:
-        args: Configuration arguments containing tag weighting settings
-        
-    Returns:
-        Configured CaptionProcessor instance or None if tag weighting is disabled
-        
-    Raises:
-        ValueError: If required configuration is missing
-        RuntimeError: If initialization fails
-    """
+    """Initialize tag weighting system with CaptionProcessor."""
     try:
         if not getattr(args, "use_tag_weighting", False):
             return None
@@ -60,9 +42,6 @@ def setup_tag_weighter(args) -> Optional[CaptionProcessor]:
             caption_dropout_rate=args.tag_weighting.caption_dropout_rate,
             rarity_factor=args.tag_weighting.rarity_factor,
             emphasis_factor=args.tag_weighting.emphasis_factor,
-            min_tag_freq=args.tag_weighting.min_tag_freq,
-            min_cluster_size=args.tag_weighting.min_cluster_size,
-            similarity_threshold=args.tag_weighting.similarity_threshold,
         )
 
         # Initialize processor
@@ -73,31 +52,6 @@ def setup_tag_weighter(args) -> Optional[CaptionProcessor]:
     except Exception as e:
         logger.error("Failed to initialize tag weighter: %s", str(e))
         raise
-
-def _validate_components(components: Dict[str, Any]) -> None:
-    """Validate initialized components."""
-    required_components = ["optimizer", "train_dataloader"]
-    for component in required_components:
-        if component not in components:
-            raise ValueError(f"Missing required component: {component}")
-
-def _cleanup_failed_initialization(components: Dict[str, Any]) -> None:
-    """Clean up resources in case of failed initialization."""
-    try:
-        # Clean up CUDA memory
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        # Close dataloaders
-        for key in ["train_dataloader", "val_dataloader"]:
-            if key in components:
-                try:
-                    components[key].dataset.close()
-                except:
-                    pass
-
-    except Exception as e:
-        logger.error("Cleanup failed: %s", str(e))
 
 def initialize_training_components(
     config: Any,
@@ -137,13 +91,11 @@ def initialize_training_components(
     if config.use_ema:
         components["ema_model"] = setup_ema_model(
             model=models["unet"],
+            device=models["unet"].device,
             power=0.75,
             max_value=config.ema.decay,
             update_after_step=config.ema.update_after_step,
-            inv_gamma=1.0,
-            device=config.device if hasattr(config, "device") else "cuda",
-            jit_compile=True,
-            use_cuda_graph=True
+            inv_gamma=1.0
         )
     
     return components

@@ -174,12 +174,25 @@ class EMAModel:
         """Get reference to original model."""
         return self._model()
 
-def setup_ema_model(model: torch.nn.Module, device: torch.device) -> Optional[EMAModel]:
+def setup_ema_model(
+    model: torch.nn.Module,
+    device: torch.device,
+    power: float = 0.75,
+    max_value: float = 0.9999,
+    min_value: float = 0.0,
+    update_after_step: int = 100,
+    inv_gamma: float = 1.0,
+) -> Optional[EMAModel]:
     """Properly set up EMA model.
     
     Args:
         model: Base model to create EMA from
         device: Device to place EMA model on
+        power: Power value for EMA decay calculation
+        max_value: Maximum EMA decay rate
+        min_value: Minimum EMA decay rate
+        update_after_step: Start EMA updates after this many steps
+        inv_gamma: Inverse gamma value for decay calculation
         
     Returns:
         EMAModel instance or None if setup fails
@@ -188,15 +201,15 @@ def setup_ema_model(model: torch.nn.Module, device: torch.device) -> Optional[EM
         if not isinstance(model, torch.nn.Module):
             raise ValueError("Model must be an instance of torch.nn.Module")
             
-        # Create EMA model instance with optimized settings
+        # Create EMA model instance
         ema_model = EMAModel(
             model=model,
-            power=0.75,  # Standard EMA power
-            max_value=0.9999,
-            update_after_step=100,
-            device=device,
-            jit_compile=False,  # Disable JIT to avoid serialization issues
-            use_cuda_graph=False  # Disable CUDA graphs for stability
+            power=power,
+            max_value=max_value,
+            min_value=min_value,
+            update_after_step=update_after_step,
+            inv_gamma=inv_gamma,
+            device=device
         )
         
         return ema_model
