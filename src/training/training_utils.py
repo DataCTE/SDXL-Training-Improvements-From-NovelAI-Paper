@@ -112,23 +112,24 @@ def initialize_training_components(
     # Setup optimizer
     logger.info(f"Setting up {config.optimizer.optimizer_type} optimizer with learning rate {config.optimizer.learning_rate}")
     components["optimizer"] = setup_optimizer(
-        model=models["unet"],  # Added 'model=' for clarity
+        model=models["unet"],
         learning_rate=config.optimizer.learning_rate,
         weight_decay=config.optimizer.weight_decay,
         optimizer_type=config.optimizer.optimizer_type,
-        use_8bit_optimizer=config.optimizer.use_8bit_adam,  # Changed from use_8bit_adam
-        adam_beta1=config.optimizer.adam_beta1,  # Added missing parameters
+        use_8bit_optimizer=config.optimizer.use_8bit_adam,
+        adam_beta1=config.optimizer.adam_beta1,
         adam_beta2=config.optimizer.adam_beta2,
         adam_epsilon=config.optimizer.adam_epsilon
     )
     
-    # Setup scheduler
+    # Setup scheduler using get_cosine_schedule_with_warmup instead of setup_scheduler
     if config.scheduler.use_scheduler:
-        components["scheduler"] = setup_scheduler(
+        components["scheduler"] = get_cosine_schedule_with_warmup(
             optimizer=components["optimizer"],
             num_warmup_steps=config.scheduler.num_warmup_steps,
             num_training_steps=config.scheduler.num_training_steps,
-            num_cycles=config.scheduler.num_cycles
+            num_cycles=config.scheduler.num_cycles,
+            device=config.device if hasattr(config, "device") else "cuda"
         )
     
     # Setup gradient scaler for mixed precision training
