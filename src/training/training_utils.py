@@ -7,6 +7,14 @@ from src.training.optimizers.setup_optimizers import setup_optimizer
 from src.training.ema import setup_ema_model
 from src.training.vae_finetuner import setup_vae_finetuner
 from src.training.loss_functions import get_cosine_schedule_with_warmup
+import warnings
+from torch.cuda.amp import GradScaler
+from torch.optim import Optimizer
+from torch.optim.lr_scheduler import LRScheduler
+
+# Suppress the specific deprecation warning
+warnings.filterwarnings("ignore", category=FutureWarning, 
+                       message=".*torch.cuda.amp.GradScaler.*")
 
 logger = logging.getLogger(__name__)
 
@@ -95,75 +103,49 @@ def _cleanup_failed_initialization(components: Dict[str, Any]) -> None:
         logger.error("Cleanup failed: %s", str(e))
 
 def initialize_training_components(
-    args,
-    models: Dict[str, Any],
+    config: Any,
+    models: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """
-    Initialize all training components with proper error handling.
-    
-    Args:
-        args: Training configuration
-        models: Dictionary containing models
-        
-    Returns:
-        Dictionary of initialized components
-        
-    Raises:
-        ValueError: If initialization fails
-    """
+    """Initialize all training components."""
     components = {}
-    try:
-        # Set up optimizer
-        optimizer = setup_optimizer(
-            model=models.get("unet", None),  # Primary model for training
-            optimizer_type=args.optimizer.optimizer_type if hasattr(args.optimizer, "optimizer_type") else "adamw",
-            learning_rate=args.optimizer.learning_rate if hasattr(args.optimizer, "learning_rate") else 1e-5,
-            weight_decay=args.optimizer.weight_decay if hasattr(args.optimizer, "weight_decay") else 1e-2,
-            adam_beta1=args.optimizer.adam_beta1 if hasattr(args.optimizer, "adam_beta1") else 0.9,
-            adam_beta2=args.optimizer.adam_beta2 if hasattr(args.optimizer, "adam_beta2") else 0.999,
-            adam_epsilon=args.optimizer.adam_epsilon if hasattr(args.optimizer, "adam_epsilon") else 1e-8,
-            use_8bit_optimizer=args.optimizer.use_8bit_adam if hasattr(args.optimizer, "use_8bit_adam") else False
+    
+    # Setup optimizer
+    logger.info(f"Setting up {config.optimizer.optimizer_type} optimizer with learning rate {config.optimizer.learning_rate}")
+    components["optimizer"] = setup_optimizer(
+        model=models["unet"],  # Added 'model=' for clarity
+        learning_rate=config.optimizer.learning_rate,
+        weight_decay=config.optimizer.weight_decay,
+        optimizer_type=config.optimizer.optimizer_type,
+        use_8bit_optimizer=config.optimizer.use_8bit_adam,  # Changed from use_8bit_adam
+        adam_beta1=config.optimizer.adam_beta1,  # Added missing parameters
+        adam_beta2=config.optimizer.adam_beta2,
+        adam_epsilon=config.optimizer.adam_epsilon
+    )
+    
+    # Setup scheduler
+    if config.scheduler.use_scheduler:
+        components["scheduler"] = setup_scheduler(
+            optimizer=components["optimizer"],
+            num_warmup_steps=config.scheduler.num_warmup_steps,
+            num_training_steps=config.scheduler.num_training_steps,
+            num_cycles=config.scheduler.num_cycles
         )
-        components["optimizer"] = optimizer
-
-        # Set up learning rate scheduler
-        if args.scheduler.use_scheduler:
-            scheduler = get_cosine_schedule_with_warmup(
-                optimizer,
-                num_warmup_steps=args.scheduler.num_warmup_steps,
-                num_training_steps=args.scheduler.num_training_steps,
-                num_cycles=args.scheduler.num_cycles if hasattr(args.scheduler, "num_cycles") else 1
-            )
-            components["scheduler"] = scheduler
-
-        # Set up AMP scaler
-        if args.mixed_precision != "no":
-            components["scaler"] = torch.cuda.amp.GradScaler()
-
-        # Set up EMA
-        if args.use_ema:
-            components["ema_model"] = setup_ema_model(
-                model=models.get("unet", None),
-                model_path=args.model_path if hasattr(args, "model_path") else None,
-                device=args.device if hasattr(args, "device") else "cuda",
-                decay=args.ema.decay if hasattr(args.ema, "decay") else 0.9999,
-                update_after_step=args.ema.update_after_step if hasattr(args.ema, "update_after_step") else 100,
-                mixed_precision=args.mixed_precision if hasattr(args, "mixed_precision") else "no"
-            )
-
-        # Set up tag weighter
-        components["tag_weighter"] = setup_tag_weighter(args)
-
-        # Set up VAE finetuner
-        if hasattr(args, "vae_args") and hasattr(args.vae_args, "enable_vae_finetuning") and args.vae_args.enable_vae_finetuning:
-            components["vae_finetuner"] = setup_vae_finetuner(args.vae_args, models)
-
-        # Validate components
-        _validate_components(components)
-        logger.info("Training components initialized successfully")
-        return components
-
-    except Exception as e:
-        logger.error("Failed to initialize training components: %s", str(e))
-        _cleanup_failed_initialization(components)
-        raise
+    
+    # Setup gradient scaler for mixed precision training
+    if config.mixed_precision != "no":
+        components["scaler"] = GradScaler("cuda")
+    
+    # Setup EMA using custom implementation
+    if config.use_ema:
+        components["ema_model"] = setup_ema_model(
+            model=models["unet"],
+            power=0.75,
+            max_value=config.ema.decay,
+            update_after_step=config.ema.update_after_step,
+            inv_gamma=1.0,
+            device=config.device if hasattr(config, "device") else "cuda",
+            jit_compile=True,
+            use_cuda_graph=True
+        )
+    
+    return components
