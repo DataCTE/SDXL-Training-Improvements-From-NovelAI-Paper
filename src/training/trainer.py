@@ -33,7 +33,7 @@ class SDXLTrainer:
             train_dataloader = torch.utils.data.DataLoader(
                 train_dataloader.dataset,
                 batch_size=train_dataloader.batch_size,
-                shuffle=train_dataloader.shuffle,
+                shuffle=True,
                 num_workers=train_dataloader.num_workers,
                 multiprocessing_context='spawn'
             )
@@ -41,7 +41,7 @@ class SDXLTrainer:
                 val_dataloader = torch.utils.data.DataLoader(
                     val_dataloader.dataset,
                     batch_size=val_dataloader.batch_size,
-                    shuffle=val_dataloader.shuffle,
+                    shuffle=False,
                     num_workers=val_dataloader.num_workers,
                     multiprocessing_context='spawn'
                 )
