@@ -38,6 +38,9 @@ class SDXLTrainer:
             val_dataloader: Optional validation data loader
             device: Target device for training
         """
+        # Initialize cleanup handlers first
+        self._cleanup_handlers = []
+        
         self.config = config
         self.models = models
         self.device = torch.device(device)
@@ -76,33 +79,28 @@ class SDXLTrainer:
                     ema_model = setup_ema_model(
                         model=model,
                         device=self.device,
-                        power=0.75,  # default value
+                        power=0.75,
                         update_after_step=config.ema.update_after_step,
-                        max_value=0.9999,  # default value
-                        min_value=0,  # default value
-                        inv_gamma=1  # default value
+                        max_value=0.9999,
+                        min_value=0,
+                        inv_gamma=1
                     )
                     if ema_model is not None:
                         self.ema_models[name] = ema_model
         
-        # Initialize wandb with proper config
+        # Initialize wandb
         self.wandb_run = None
         if config.wandb.use_wandb:
             self.wandb_run = wandb.init(
                 project=config.wandb.wandb_project,
                 name=config.wandb.wandb_run_name,
-                config=vars(config)  # Use vars() instead of __dict__
+                config=vars(config)
             )
         
-        # Initialize state tracker
+        # Initialize state tracker without adding callback
         self.state_tracker = StateTracker()
         
-        # Add state tracker to pipeline components
-        if 'unet' in self.models:
-            self.models['unet'].add_callback(self.state_tracker)
-        
-        # Initialize cleanup handlers
-        self._cleanup_handlers = []
+        # Setup cleanup handlers
         self._setup_cleanup_handlers()
     
     def _setup_dataloader(self, dataloader):
@@ -234,7 +232,8 @@ class SDXLTrainer:
                         self.device,
                         self.dtype,
                         self.components['grad_accumulator'],
-                        self.components['scaler']
+                        self.components['scaler'],
+                        state_tracker=self.state_tracker
                     )
                     
                     # Get state from tracker and add to metrics
