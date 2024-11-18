@@ -299,3 +299,46 @@ class VAEFinetuner:
         except Exception as e:
             logger.error(f"Failed to load model: {e}")
             raise
+
+def setup_vae_finetuner(
+    vae: nn.Module,
+    learning_rate: float = 1e-4,
+    batch_size: int = 1,
+    max_grad_norm: Optional[float] = 1.0,
+    mixed_precision: str = "fp16",
+    enable_cuda_graphs: bool = True,
+    cache_size: int = 32,
+    num_warmup_steps: int = 100,
+    device: Optional[torch.device] = None
+) -> VAEFinetuner:
+    """
+    Factory function to create and configure a VAEFinetuner instance.
+    
+    Args:
+        vae: The VAE model to finetune
+        learning_rate: Learning rate for optimization
+        batch_size: Training batch size
+        max_grad_norm: Maximum gradient norm for clipping
+        mixed_precision: Mixed precision mode ("no", "fp16", or "bf16")
+        enable_cuda_graphs: Whether to use CUDA graphs for optimization
+        cache_size: Size of tensor cache
+        num_warmup_steps: Number of warmup steps before CUDA graphs
+        device: Target device for training
+        
+    Returns:
+        Configured VAEFinetuner instance
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+    config = VAEConfig(
+        learning_rate=learning_rate,
+        batch_size=batch_size,
+        max_grad_norm=max_grad_norm,
+        mixed_precision=mixed_precision,
+        enable_cuda_graphs=enable_cuda_graphs,
+        cache_size=cache_size,
+        num_warmup_steps=num_warmup_steps
+    )
+    
+    return VAEFinetuner(vae=vae, config=config, device=device)
