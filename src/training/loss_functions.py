@@ -33,6 +33,11 @@ def _compute_snr(timesteps: torch.Tensor, sigma_data: float) -> torch.Tensor:
     """JIT-optimized SNR computation."""
     return (sigma_data ** 2) / (timesteps ** 2)
 
+@torch.jit.script
+def _compute_loss_weights(snr: torch.Tensor, min_snr_gamma: float, scale: float) -> torch.Tensor:
+    """JIT-optimized loss weight computation."""
+    return torch.minimum(snr, torch.tensor(min_snr_gamma)).div(snr).mul(scale)
+
 @lru_cache(maxsize=32)
 def _get_sigma_schedule(num_steps: int, sigma_min: float, sigma_max: float) -> torch.Tensor:
     """Cached computation of sigma schedule."""
@@ -41,11 +46,6 @@ def _get_sigma_schedule(num_steps: int, sigma_min: float, sigma_max: float) -> t
     steps = torch.arange(num_steps, dtype=torch.float32)
     sigmas = torch.exp(-steps * inv_rho) * (sigma_max - sigma_min) + sigma_min
     return sigmas
-
-@torch.jit.script
-def _compute_loss_weights(snr: torch.Tensor, min_snr_gamma: float, scale: float) -> torch.Tensor:
-    """JIT-optimized loss weight computation."""
-    return torch.minimum(snr, torch.tensor(min_snr_gamma)).div(snr).mul(scale)
 
 @autocast('cuda')
 def get_sigmas(
@@ -63,15 +63,8 @@ def get_sigmas(
     sigmas = _get_sigma_schedule(num_inference_steps, sigma_min, 14.614)
     return sigmas.to(device)
 
-@torch.jit.script
-def _apply_model(
-    model: torch.nn.Module,
-    x: torch.Tensor,
-    t: torch.Tensor,
-    text_embeddings: torch.Tensor,
-    added_cond_kwargs: Optional[Dict[str, torch.Tensor]] = None
-) -> torch.Tensor:
-    """JIT-optimized model application."""
+def apply_model(model: torch.nn.Module, x: torch.Tensor, t: torch.Tensor, text_embeddings: torch.Tensor, added_cond_kwargs: Optional[Dict[str, torch.Tensor]] = None) -> torch.Tensor:
+    """Optimized model application."""
     if added_cond_kwargs is None:
         added_cond_kwargs = {}
     return model(x, t, text_embeddings, added_cond_kwargs=added_cond_kwargs).sample
@@ -105,8 +98,8 @@ def training_loss_v_prediction(
     # Compute noisy samples efficiently
     noisy_samples = x_0 + noise * sigma.view(-1, 1, 1, 1)
     
-    # Forward pass with JIT optimization
-    v_pred = _apply_model(model, noisy_samples, timesteps_buffer, text_embeddings, added_cond_kwargs)
+    # Forward pass with optimization
+    v_pred = apply_model(model, noisy_samples, timesteps_buffer, text_embeddings, added_cond_kwargs)
     
     # Compute target
     v_target = _compute_v_target(noise, sigma)

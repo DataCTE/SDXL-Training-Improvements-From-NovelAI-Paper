@@ -30,8 +30,8 @@ class GradientAccumulator:
         self._step = 0
         self._stored_grads = weakref.WeakKeyDictionary()
     
-    @torch.jit.script
-    def _accumulate_grad(grad: torch.Tensor, stored: Optional[torch.Tensor]) -> torch.Tensor:
+    def _accumulate_grad(self, grad: torch.Tensor, stored: Optional[torch.Tensor]) -> torch.Tensor:
+        """Optimized gradient accumulation."""
         if stored is None:
             return grad.clone()
         return stored + grad
@@ -57,13 +57,8 @@ class GradientAccumulator:
             return True
         return False
 
-@torch.jit.script
-def _update_ema(
-    ema_param: torch.Tensor,
-    model_param: torch.Tensor,
-    decay: float
-) -> None:
-    """JIT-optimized EMA update."""
+def update_ema(ema_param: torch.Tensor, model_param: torch.Tensor, decay: float) -> None:
+    """Optimized EMA update."""
     ema_param.copy_(ema_param * decay + model_param * (1 - decay))
 
 def update_ema_model(
@@ -75,7 +70,7 @@ def update_ema_model(
     with torch.no_grad():
         for ema_param, model_param in zip(ema_model.parameters(), model.parameters()):
             if model_param.requires_grad:
-                _update_ema(ema_param.data, model_param.data, decay)
+                update_ema(ema_param.data, model_param.data, decay)
 
 @autocast('cuda')
 def train_step(
