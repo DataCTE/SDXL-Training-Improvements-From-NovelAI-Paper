@@ -38,13 +38,29 @@ class EMAConfig:
 
 @dataclass
 class VAEConfig:
+    # Basic training params
     enable_vae_finetuning: bool = False
     vae_path: Optional[str] = None
     learning_rate: float = 1e-6
+    batch_size: int = 1
+    num_epochs: int = 1
+    
+    # Training optimizations
+    mixed_precision: str = "fp16"
+    use_8bit_adam: bool = False
+    gradient_checkpointing: bool = False
+    max_grad_norm: float = 1.0
+    
+    # VAE specific settings
+    use_channel_scaling: bool = True
+    enable_cuda_graphs: bool = False
+    cache_size: int = 10000
+    num_warmup_steps: int = 100
+    
+    # Additional settings from original config
     train_freq: int = 10
     kl_weight: float = 0.0
     perceptual_weight: float = 0.0
-    use_channel_scaling: bool = True
     initial_scale_factor: float = 1.0
 
 @dataclass
@@ -186,7 +202,6 @@ def parse_args() -> TrainingConfig:
     parser.add_argument("--cache_dir", type=str, default="latents_cache")
     parser.add_argument("--no_caching", action="store_true")
     
-    
     # Wandb arguments
     parser.add_argument("--use_wandb", action="store_true", help="Enable Weights & Biases logging")
     parser.add_argument("--wandb_project", type=str, help="W&B project name")
@@ -211,6 +226,35 @@ def parse_args() -> TrainingConfig:
     # Add tag processing arguments
     parser.add_argument("--use_tag_weighting", action="store_true",
                       help="Enable tag weighting based on frequency and emphasis")
+    
+    # VAE Training Arguments
+    parser.add_argument("--enable_vae_finetuning", action="store_true",
+                      help="Enable VAE finetuning")
+    parser.add_argument("--vae_path", type=str,
+                      help="Path to pretrained VAE model")
+    parser.add_argument("--vae_learning_rate", type=float, default=1e-6,
+                      help="Learning rate for VAE training")
+    parser.add_argument("--vae_batch_size", type=int, default=1,
+                      help="Batch size for VAE training")
+    parser.add_argument("--vae_num_epochs", type=int, default=1,
+                      help="Number of epochs for VAE training")
+    parser.add_argument("--vae_mixed_precision", type=str, default="fp16",
+                      choices=["no", "fp16", "bf16"],
+                      help="Mixed precision mode for VAE training")
+    parser.add_argument("--vae_use_8bit_adam", action="store_true",
+                      help="Use 8-bit Adam optimizer for VAE")
+    parser.add_argument("--vae_gradient_checkpointing", action="store_true",
+                      help="Enable gradient checkpointing for VAE")
+    parser.add_argument("--vae_max_grad_norm", type=float, default=1.0,
+                      help="Maximum gradient norm for VAE training")
+    parser.add_argument("--vae_use_channel_scaling", action="store_true",
+                      help="Enable channel scaling for VAE")
+    parser.add_argument("--vae_enable_cuda_graphs", action="store_true",
+                      help="Enable CUDA graphs for VAE")
+    parser.add_argument("--vae_cache_size", type=int, default=10000,
+                      help="Cache size for VAE training")
+    parser.add_argument("--vae_num_warmup_steps", type=int, default=100,
+                      help="Number of warmup steps for VAE training")
     
     args = parser.parse_args()
     
@@ -260,5 +304,20 @@ def parse_args() -> TrainingConfig:
     config.wandb.wandb_project = args.wandb_project
     config.wandb.wandb_run_name = args.wandb_run_name
     config.wandb.logging_steps = args.logging_steps
+
+    # Update VAE config
+    config.vae_args.enable_vae_finetuning = args.enable_vae_finetuning
+    config.vae_args.vae_path = args.vae_path
+    config.vae_args.learning_rate = args.vae_learning_rate
+    config.vae_args.batch_size = args.vae_batch_size
+    config.vae_args.num_epochs = args.vae_num_epochs
+    config.vae_args.mixed_precision = args.vae_mixed_precision
+    config.vae_args.use_8bit_adam = args.vae_use_8bit_adam
+    config.vae_args.gradient_checkpointing = args.vae_gradient_checkpointing
+    config.vae_args.max_grad_norm = args.vae_max_grad_norm
+    config.vae_args.use_channel_scaling = args.vae_use_channel_scaling
+    config.vae_args.enable_cuda_graphs = args.vae_enable_cuda_graphs
+    config.vae_args.cache_size = args.vae_cache_size
+    config.vae_args.num_warmup_steps = args.vae_num_warmup_steps
     
     return config

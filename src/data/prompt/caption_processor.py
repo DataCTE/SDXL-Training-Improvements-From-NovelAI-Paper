@@ -609,3 +609,29 @@ class CaptionProcessor:
             results.append(result)
             
         return results
+
+def load_captions(image_paths: List[str]) -> Dict[str, str]:
+    """Load captions for a list of image paths.
+    
+    Args:
+        image_paths: List of paths to images
+        
+    Returns:
+        Dictionary mapping image paths to their captions
+    """
+    captions = {}
+    processor = CaptionProcessor()
+    
+    for image_path in image_paths:
+        # Get caption file path by replacing image extension with .txt
+        caption_path = Path(image_path).with_suffix('.txt')
+        weight, error = processor.process_caption_file(caption_path)
+        
+        if error:
+            logger.warning(f"Error loading caption for {image_path}: {error}")
+            captions[image_path] = ""
+        else:
+            with open(caption_path, 'r', encoding='utf-8') as f:
+                captions[image_path] = f.read().strip()
+    
+    return captions

@@ -10,8 +10,13 @@ from src.data.multiaspect.dataset import create_train_dataloader, create_validat
 from src.models.model_loader import create_sdxl_models, create_vae_model
 from src.data.cacheing.vae import VAECache
 from src.data.cacheing.text_embeds import TextEmbeddingCache
+from src.data.multiaspect.bucket_manager import BucketManager
+from src.data.image_processing.validation import validate_image
+from src.data.prompt.caption_processor import load_captions
+from src.config.args import VAEConfig
 
 logger = logging.getLogger(__name__)
+
 
 def train_sdxl(
     train_data_dir: Union[str, Path],
@@ -59,33 +64,47 @@ def train_sdxl(
             batch_size=8
         )
         text_embedding_cache = TextEmbeddingCache(
-            text_encoder1=models_dict['text_encoder1'],
-            text_encoder2=models_dict['text_encoder2'],
-            tokenizer1=models_dict['tokenizer1'],
-            tokenizer2=models_dict['tokenizer2'],
+            text_encoder1=models_dict['text_encoder_one'],
+            text_encoder2=models_dict['text_encoder_two'],
+            tokenizer1=models_dict['tokenizer_one'],
+            tokenizer2=models_dict['tokenizer_two'],
             cache_dir=str(output_dir / "text_embeds_cache"),
             max_cache_size=10000,
             num_workers=4,
             batch_size=32
         )
         
-        # Create dataloaders
+        # Get image paths and captions
+        train_image_paths = [str(p) for p in Path(train_data_dir).glob("*.[jJ][pP][gG]")]
+        train_captions = load_captions(train_image_paths)
+        
+        # Create bucket manager
+        bucket_manager = BucketManager(train_image_paths)
+        
+        # Create train dataloader
         train_dataloader = create_train_dataloader(
-            train_data_dir,
-            vae_cache=vae_cache,
-            text_embedding_cache=text_embedding_cache,
+            image_paths=train_image_paths,
+            captions=train_captions,
+            bucket_manager=bucket_manager,
             batch_size=config.batch_size,
-            num_workers=config.num_workers if hasattr(config, 'num_workers') else 4
+            num_workers=config.num_workers if hasattr(config, 'num_workers') else 4,
+            vae_cache=vae_cache,
+            text_cache=text_embedding_cache
         )
         
         val_dataloader = None
         if val_data_dir:
+            val_image_paths = [str(p) for p in Path(val_data_dir).glob("*.[jJ][pP][gG]")]
+            val_captions = load_captions(val_image_paths)
+            
             val_dataloader = create_validation_dataloader(
-                val_data_dir,
-                vae_cache=vae_cache,
-                text_embedding_cache=text_embedding_cache,
+                image_paths=val_image_paths,
+                captions=val_captions,
+                bucket_manager=bucket_manager,
                 batch_size=config.batch_size,
-                num_workers=config.num_workers if hasattr(config, 'num_workers') else 4
+                num_workers=config.num_workers if hasattr(config, 'num_workers') else 4,
+                vae_cache=vae_cache,
+                text_cache=text_embedding_cache
             )
         
         # Resume from checkpoint if specified
@@ -117,63 +136,75 @@ def train_sdxl(
 def train_vae(
     train_data_dir: Union[str, Path],
     output_dir: Union[str, Path],
-    pretrained_vae_path: Optional[str] = None,
-    learning_rate: float = 1e-6,
-    batch_size: int = 1,
-    num_epochs: int = 1,
-    mixed_precision: str = "fp16",
-    use_8bit_adam: bool = False,
-    gradient_checkpointing: bool = False,
-    use_channel_scaling: bool = True,
+    config: Optional[VAEConfig] = None,
     **kwargs
 ) -> VAEFinetuner:
     """
     High-level wrapper for VAE finetuning with improvements.
-    
-    Args:
-        train_data_dir: Directory containing training data
-        output_dir: Directory to save checkpoints and outputs
-        pretrained_vae_path: Optional path to pretrained VAE weights
-        learning_rate: Learning rate for training
-        batch_size: Batch size for training
-        num_epochs: Number of training epochs
-        mixed_precision: Mixed precision training mode
-        use_8bit_adam: Whether to use 8-bit Adam optimizer
-        gradient_checkpointing: Whether to use gradient checkpointing
-        use_channel_scaling: Whether to use channel-wise scaling
-        **kwargs: Additional VAE training parameters
-        
-    Returns:
-        Trained VAEFinetuner instance
     """
-    # Create output directory
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Create VAE model
-    vae = create_vae_model(pretrained_vae_path)
-    
-    # Create dataloader
-    load_dataloader = create_train_dataloader(
-        train_data_dir,
-        vae_cache=None,
-        text_embedding_cache=None,
-        batch_size=batch_size,
-        num_workers=4
-    )
-    
-    # Initialize trainer
-    trainer = VAEFinetuner(
-        vae=vae,
-        learning_rate=learning_rate,
-        mixed_precision=mixed_precision,
-        use_8bit_adam=use_8bit_adam,
-        gradient_checkpointing=gradient_checkpointing,
-        use_channel_scaling=use_channel_scaling,
-        **kwargs
-    )
-    
-    return trainer
+    try:
+        # Create output directory
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Use provided config or create default
+        if config is None:
+            config = VAEConfig(**kwargs)
+        
+        # Create VAE model
+        vae = create_vae_model(config.vae_path)
+        
+        # Setup VAE cache
+        vae_cache = VAECache(
+            vae=vae,
+            cache_dir=str(output_dir / "vae_cache"),
+            max_cache_size=config.cache_size,
+            num_workers=4,
+            batch_size=config.batch_size
+        )
+        
+        # Get and validate image paths
+        train_image_paths = []
+        for path in Path(train_data_dir).glob("*.[jJ][pP][gG]"):
+            if validate_image(str(path)):
+                train_image_paths.append(str(path))
+            else:
+                logger.warning(f"Skipping invalid image: {path}")
+        
+        # Create bucket manager
+        bucket_manager = BucketManager(train_image_paths)
+        
+        # Create empty captions dict (VAE training doesn't need captions)
+        train_captions = {path: "" for path in train_image_paths}
+        
+        # Create dataloader
+        train_dataloader = create_train_dataloader(
+            image_paths=train_image_paths,
+            captions=train_captions,
+            bucket_manager=bucket_manager,
+            batch_size=config.batch_size,
+            num_workers=4,
+            vae_cache=vae_cache,
+            text_cache=None,
+            shuffle=True,
+            pin_memory=True,
+            drop_last=True
+        )
+        
+        # Initialize trainer
+        trainer = VAEFinetuner(
+            vae=vae,
+            config=config,
+            device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        )
+        
+        return trainer
+        
+    except Exception as e:
+        import traceback
+        logger.error("VAE training setup failed with error: %s", str(e))
+        logger.error("Full traceback:\n%s", traceback.format_exc())
+        raise
 
 def export_model(
     trainer: Union[SDXLTrainer, VAEFinetuner],
