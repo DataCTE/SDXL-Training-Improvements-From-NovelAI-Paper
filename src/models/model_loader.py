@@ -24,11 +24,10 @@ def create_sdxl_models(
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             
-        # Load individual components first
+        # Load individual components
         models = {}
         
         # Load VAE
-        vae_path = vae_path or os.path.join(pretrained_model_path, "vae")
         models["vae"] = AutoencoderKL.from_pretrained(
             pretrained_model_path,
             subfolder="vae",
@@ -37,23 +36,28 @@ def create_sdxl_models(
         
         # Load text encoders and tokenizers
         models["text_encoder"] = CLIPTextModel.from_pretrained(
-            os.path.join(pretrained_model_path, "text_encoder"),
+            pretrained_model_path,
+            subfolder="text_encoder",
             torch_dtype=dtype
         )
         models["text_encoder_2"] = CLIPTextModelWithProjection.from_pretrained(
-            os.path.join(pretrained_model_path, "text_encoder_2"),
+            pretrained_model_path,
+            subfolder="text_encoder_2",
             torch_dtype=dtype
         )
         models["tokenizer"] = CLIPTokenizer.from_pretrained(
-            os.path.join(pretrained_model_path, "tokenizer")
+            pretrained_model_path,
+            subfolder="tokenizer"
         )
         models["tokenizer_2"] = CLIPTokenizer.from_pretrained(
-            os.path.join(pretrained_model_path, "tokenizer_2")
+            pretrained_model_path,
+            subfolder="tokenizer_2"
         )
         
         # Load UNet
         models["unet"] = UNet2DConditionModel.from_pretrained(
-            os.path.join(pretrained_model_path, "unet"),
+            pretrained_model_path,
+            subfolder="unet",
             torch_dtype=dtype
         )
         
