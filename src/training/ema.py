@@ -13,6 +13,7 @@ import logging
 import threading
 from typing import Optional, Union, Dict, Any
 import weakref
+from torch.amp import autocast
 
 logger = logging.getLogger(__name__)
 
@@ -121,19 +122,20 @@ class EMAModel:
                 decay = self._get_decay(optimization_step)
                 
                 # Update each parameter
-                for name, param in self._model().named_parameters():
-                    if param.requires_grad:
-                        shadow = self._shadow_params[name]
-                        
-                        # Try CUDA graph first
-                        if self.use_cuda_graph and "update" in self._cuda_graphs:
-                            g, static_param = self._cuda_graphs["update"]
-                            static_param.copy_(shadow)
-                            g.replay()
-                            shadow.copy_(static_param)
-                        else:
-                            # Fallback to regular update
-                            shadow.lerp_(param.data, 1 - decay)
+                with autocast('cuda'):
+                    for name, param in self._model().named_parameters():
+                        if param.requires_grad:
+                            shadow = self._shadow_params[name]
+                            
+                            # Try CUDA graph first
+                            if self.use_cuda_graph and "update" in self._cuda_graphs:
+                                g, static_param = self._cuda_graphs["update"]
+                                static_param.copy_(shadow)
+                                g.replay()
+                                shadow.copy_(static_param)
+                            else:
+                                # Fallback to regular update
+                                shadow.lerp_(param.data, 1 - decay)
                 
         except Exception as e:
             logger.error(f"EMA step failed: {e}")
@@ -182,3 +184,48 @@ class EMAModel:
     def get_model(self) -> torch.nn.Module:
         """Get reference to original model."""
         return self._model()
+
+def setup_ema_model(
+    model: torch.nn.Module,
+    model_path: Optional[str] = None,
+    power: float = 0.75,
+    max_value: float = 0.9999,
+    min_value: float = 0.0,
+    update_after_step: int = 0,
+    inv_gamma: float = 1.0,
+    device: Optional[Union[str, torch.device]] = None,
+    jit_compile: bool = True,
+    use_cuda_graph: bool = True,
+) -> Optional[EMAModel]:
+    """Set up an optimized EMA model for training."""
+    try:
+        # Create EMA model
+        ema_model = EMAModel(
+            model=model,
+            power=power,
+            max_value=max_value,
+            min_value=min_value,
+            update_after_step=update_after_step,
+            inv_gamma=inv_gamma,
+            device=device,
+            jit_compile=jit_compile,
+            use_cuda_graph=use_cuda_graph,
+        )
+        
+        # Load checkpoint if exists
+        if model_path:
+            try:
+                checkpoint = torch.load(model_path, map_location=device)
+                if "ema_state_dict" in checkpoint:
+                    for name, param in checkpoint["ema_state_dict"].items():
+                        if name in ema_model._shadow_params:
+                            ema_model._shadow_params[name].copy_(param)
+                    logger.info(f"Loaded EMA checkpoint from {model_path}")
+            except Exception as e:
+                logger.warning(f"Failed to load EMA checkpoint: {e}")
+        
+        return ema_model
+        
+    except Exception as e:
+        logger.error(f"Failed to set up EMA model: {e}")
+        return None

@@ -1,178 +1,169 @@
-"""Ultra-optimized training steps for SDXL with GPU acceleration.
-
-This module provides highly optimized training steps with:
-- Mixed precision training
-- Memory-efficient operations
-- CUDA graph support
-- Gradient accumulation
-- Dynamic loss scaling
-- Automatic mixed precision (AMP)
-"""
+"""Ultra-optimized training steps with maximum GPU acceleration."""
 
 import torch
 import logging
 from typing import Dict, Any, Optional, Tuple
-from contextlib import nullcontext
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 import torch.distributed as dist
 from src.training.metrics import MetricsManager
 from src.training.loss_functions import forward_pass
+import weakref
+from functools import lru_cache
 
 logger = logging.getLogger(__name__)
 
+# Pre-allocated buffers for common operations
+_buffers = {}
+
+def _get_or_create_buffer(key: str, shape: tuple, device: torch.device) -> torch.Tensor:
+    """Get or create a pre-allocated buffer."""
+    global _buffers
+    buffer_key = f"{key}_{shape}_{device}"
+    if buffer_key not in _buffers:
+        _buffers[buffer_key] = torch.empty(shape, device=device)
+    return _buffers[buffer_key]
+
 class GradientAccumulator:
-    """Efficient gradient accumulation with GPU support."""
-    
-    def __init__(self, model: torch.nn.Module, accumulation_steps: int = 1):
-        self.model = model
+    """Efficient gradient accumulation with weak references."""
+    def __init__(self, accumulation_steps: int = 1):
         self.accumulation_steps = accumulation_steps
-        self.current_step = 0
-        self._grad_scaler = GradScaler()
-        self._stored_grads = {}
-        
-    def _accumulate_gradients(self) -> None:
-        """Accumulate gradients in memory-efficient way."""
-        if not self._stored_grads:
-            # First accumulation - store gradients
-            for name, param in self.model.named_parameters():
-                if param.requires_grad and param.grad is not None:
-                    self._stored_grads[name] = param.grad.detach().clone()
-        else:
-            # Add to stored gradients
-            for name, param in self.model.named_parameters():
-                if param.requires_grad and param.grad is not None:
-                    self._stored_grads[name].add_(param.grad)
+        self._step = 0
+        self._stored_grads = weakref.WeakKeyDictionary()
     
-    def step(self) -> bool:
-        """Perform gradient accumulation step."""
-        self.current_step += 1
-        self._accumulate_gradients()
-        
-        if self.current_step >= self.accumulation_steps:
-            # Apply accumulated gradients
-            for name, param in self.model.named_parameters():
-                if param.requires_grad and name in self._stored_grads:
-                    param.grad = self._stored_grads[name] / self.accumulation_steps
-            
-            # Reset state
-            self.current_step = 0
+    @torch.jit.script
+    def _accumulate_grad(grad: torch.Tensor, stored: Optional[torch.Tensor]) -> torch.Tensor:
+        if stored is None:
+            return grad.clone()
+        return stored + grad
+
+    def store_grad(self, param: torch.nn.Parameter, grad: torch.Tensor) -> None:
+        """Store gradient with weak reference."""
+        if param not in self._stored_grads:
+            self._stored_grads[param] = grad.clone()
+        else:
+            self._stored_grads[param] = self._accumulate_grad(grad, self._stored_grads[param])
+    
+    def apply_accumulated_grads(self) -> bool:
+        """Apply accumulated gradients efficiently."""
+        self._step += 1
+        if self._step >= self.accumulation_steps:
+            self._step = 0
+            for param, grad in self._stored_grads.items():
+                if param.grad is None:
+                    param.grad = grad / self.accumulation_steps
+                else:
+                    param.grad.copy_(grad / self.accumulation_steps)
             self._stored_grads.clear()
             return True
-            
         return False
 
-@torch.cuda.amp.autocast()
+@torch.jit.script
+def _update_ema(
+    ema_param: torch.Tensor,
+    model_param: torch.Tensor,
+    decay: float
+) -> None:
+    """JIT-optimized EMA update."""
+    ema_param.copy_(ema_param * decay + model_param * (1 - decay))
+
+def update_ema_model(
+    ema_model: torch.nn.Module,
+    model: torch.nn.Module,
+    decay: float = 0.9999
+) -> None:
+    """Update EMA model parameters efficiently."""
+    with torch.no_grad():
+        for ema_param, model_param in zip(ema_model.parameters(), model.parameters()):
+            if model_param.requires_grad:
+                _update_ema(ema_param.data, model_param.data, decay)
+
+@autocast('cuda')
 def train_step(
     args: Any,
     model_dict: Dict[str, torch.nn.Module],
     optimizers: Dict[str, torch.optim.Optimizer],
     schedulers: Dict[str, Any],
     batch: Dict[str, torch.Tensor],
+    batch_idx: int,
+    metrics: MetricsManager,
     device: torch.device,
-    metrics: Optional[MetricsManager] = None,
-    grad_scaler: Optional[GradScaler] = None,
-    ema_model: Optional[Any] = None,
+    dtype: torch.dtype = torch.float32,
     grad_accumulator: Optional[GradientAccumulator] = None,
+    scaler: Optional[GradScaler] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Execute optimized training step with GPU acceleration."""
     try:
         # Determine precision context
         if args.mixed_precision == "fp16":
-            ctx = autocast(dtype=torch.float16)
             dtype = torch.float16
         elif args.mixed_precision == "bf16":
-            ctx = autocast(dtype=torch.bfloat16)
             dtype = torch.bfloat16
         else:
-            ctx = nullcontext()
             dtype = torch.float32
         
         # Forward pass with mixed precision
-        with ctx:
-            loss = forward_pass(
-                args=args,
-                model_dict=model_dict,
-                batch=batch,
-                device=device,
-                dtype=dtype,
-                components={"metrics": metrics}
-            )
+        loss = forward_pass(
+            args=args,
+            model_dict=model_dict,
+            batch=batch,
+            device=device,
+            dtype=dtype,
+            components={"metrics": metrics}
+        )
         
         # Scale loss for gradient accumulation if needed
         if grad_accumulator is not None:
             loss = loss / grad_accumulator.accumulation_steps
         
-        # Backward pass with automatic mixed precision
-        if grad_scaler is not None:
-            grad_scaler.scale(loss).backward()
+        # Backward pass with mixed precision
+        if scaler is not None:
+            scaler.scale(loss).backward()
             
-            # Accumulate gradients if needed
-            if grad_accumulator is not None:
-                should_step = grad_accumulator.step()
-                if not should_step:
-                    return loss, {}
-            
-            # Unscale gradients and check for inf/nan
-            for optimizer in optimizers.values():
-                grad_scaler.unscale_(optimizer)
-            
-            # Clip gradients if configured
+            # Unscale gradients and clip if needed
             if args.max_grad_norm is not None:
-                for model in model_dict.values():
-                    torch.nn.utils.clip_grad_norm_(
-                        model.parameters(),
-                        args.max_grad_norm
-                    )
+                scaler.unscale_(optimizers["unet"])
+                torch.nn.utils.clip_grad_norm_(
+                    model_dict["unet"].parameters(),
+                    args.max_grad_norm
+                )
             
-            # Optimizer step with gradient scaling
-            for optimizer in optimizers.values():
-                grad_scaler.step(optimizer)
-            grad_scaler.update()
-            
+            # Step optimizer with gradient scaling
+            if grad_accumulator is None or grad_accumulator.apply_accumulated_grads():
+                scaler.step(optimizers["unet"])
+                scaler.update()
+                optimizers["unet"].zero_grad(set_to_none=True)
         else:
-            # Standard backward pass
             loss.backward()
             
-            # Accumulate gradients if needed
-            if grad_accumulator is not None:
-                should_step = grad_accumulator.step()
-                if not should_step:
-                    return loss, {}
-            
-            # Clip gradients if configured
+            # Clip gradients if needed
             if args.max_grad_norm is not None:
-                for model in model_dict.values():
-                    torch.nn.utils.clip_grad_norm_(
-                        model.parameters(),
-                        args.max_grad_norm
-                    )
+                torch.nn.utils.clip_grad_norm_(
+                    model_dict["unet"].parameters(),
+                    args.max_grad_norm
+                )
             
-            # Standard optimizer step
-            for optimizer in optimizers.values():
-                optimizer.step()
+            # Step optimizer
+            if grad_accumulator is None or grad_accumulator.apply_accumulated_grads():
+                optimizers["unet"].step()
+                optimizers["unet"].zero_grad(set_to_none=True)
         
-        # Zero gradients
-        for optimizer in optimizers.values():
-            optimizer.zero_grad(set_to_none=True)
+        # Update EMA model if present
+        if "ema_unet" in model_dict:
+            update_ema_model(
+                model_dict["ema_unet"],
+                model_dict["unet"],
+                getattr(args, "ema_decay", 0.9999)
+            )
         
-        # Update learning rates
+        # Update learning rate
         for scheduler in schedulers.values():
             scheduler.step()
         
-        # Update EMA model if available
-        if ema_model is not None:
-            ema_model.step()
-        
         # Gather metrics
-        metrics_dict = {}
-        if metrics is not None:
-            metrics_dict = metrics.compute()
-            metrics.reset()
-        
-        # Add gradient norm if requested
-        if args.log_grad_norm:
-            grad_norm = get_grad_norm(next(iter(model_dict.values())))
-            metrics_dict["grad_norm"] = grad_norm
+        metrics_dict = {
+            "loss": loss.item(),
+            "lr": schedulers["unet"].get_last_lr()[0]
+        }
         
         return loss, metrics_dict
         
@@ -180,19 +171,7 @@ def train_step(
         logger.error(f"Training step failed: {e}")
         raise
 
-@torch.no_grad()
-def get_grad_norm(model: torch.nn.Module) -> float:
-    """Calculate gradient norm efficiently."""
-    total_norm = 0.0
-    
-    try:
-        for param in model.parameters():
-            if param.grad is not None:
-                param_norm = param.grad.detach().data.norm(2)
-                total_norm += param_norm.item() ** 2
-        
-        return total_norm ** 0.5
-        
-    except Exception as e:
-        logger.error(f"Failed to calculate gradient norm: {e}")
-        return 0.0
+def clear_caches() -> None:
+    """Clear all caches and buffers."""
+    global _buffers
+    _buffers.clear()
