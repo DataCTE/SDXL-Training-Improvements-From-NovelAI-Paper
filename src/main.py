@@ -12,7 +12,6 @@ from data.image_processing.validation import ValidationConfig
 
 logger = logging.getLogger(__name__)
 
-
 def main():
     """Main training function."""
     try:
@@ -32,7 +31,7 @@ def main():
             min_aspect=0.4,
             max_aspect=2.5,
             check_content=True,
-            device=config.device if hasattr(config, "device") else "cuda"
+            device=config.device
         )
         
         # Load models
@@ -48,6 +47,8 @@ def main():
                 config=config.vae_args,
                 validation_config=validation_config
             )
+            # Run VAE training
+            vae_trainer.train()
             models["vae"] = vae_trainer.vae
         
         # Train SDXL
@@ -58,8 +59,11 @@ def main():
             pretrained_model_path=config.pretrained_model_path,
             models=models,
             validation_config=validation_config,
-            config=config  # Pass full config instead of individual params
+            config=config  # Pass full config
         )
+        
+        # Run SDXL training
+        trainer.train()
         
         # Save final model
         trainer.save_checkpoint(config.output_dir, config.num_epochs)

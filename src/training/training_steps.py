@@ -13,15 +13,9 @@ from functools import lru_cache
 logger = logging.getLogger(__name__)
 
 
-# Pre-allocated buffers for common operations
+# Pre-allocated buffers for training steps
 _buffers: Dict[str, torch.Tensor] = {}
 
-def _get_or_create_buffer(key: str, shape: Union[tuple, Tuple], device: torch.device) -> torch.Tensor:
-    """Get or create a pre-allocated buffer."""
-    buffer_key = f"{key}_{shape}_{device}"
-    if buffer_key not in _buffers:
-        _buffers[buffer_key] = torch.empty(shape, device=device)
-    return _buffers[buffer_key]
 
 class GradientAccumulator:
     """Efficient gradient accumulation with weak references."""
@@ -79,7 +73,6 @@ def train_step(
     optimizers: Dict[str, torch.optim.Optimizer],
     schedulers: Dict[str, Any],
     batch: Dict[str, torch.Tensor],
-    metrics: MetricsManager,
     device: torch.device,
     dtype: torch.dtype = torch.float32,
     grad_accumulator: Optional[GradientAccumulator] = None,
@@ -165,6 +158,5 @@ def train_step(
         raise
 
 def clear_caches() -> None:
-    """Clear all caches and buffers."""
-    global _buffers
+    """Clear all training step caches and buffers."""
     _buffers.clear()

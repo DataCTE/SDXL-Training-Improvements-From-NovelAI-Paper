@@ -81,11 +81,13 @@ class SDXLTrainer:
             loss, metrics_dict = train_step(
                 self.config,
                 self.models,
-                self.components,
+                self.components['optimizer'],
+                self.components['scheduler'],
                 batch,
-                self.metrics_manager,
                 self.device,
-                self.dtype
+                self.dtype,
+                self.components['grad_accumulator'],
+                self.components['scaler']
             )
             
             total_loss += loss.item()  # Get scalar value from loss tensor

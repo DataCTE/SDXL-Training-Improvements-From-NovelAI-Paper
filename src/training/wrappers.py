@@ -2,7 +2,7 @@ import torch
 import logging
 from typing import Dict, Any, Optional, Union, List
 from pathlib import Path
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, fields
 from PIL import Image
 
 from src.config.args import TrainingConfig, VAEConfig
@@ -15,9 +15,10 @@ from src.data.cacheing.text_embeds import TextEmbeddingCache
 from src.data.multiaspect.bucket_manager import BucketManager
 from src.data.image_processing.validation import validate_image
 from src.data.prompt.caption_processor import load_captions
-from src.config.args import VAEConfig
 
 logger = logging.getLogger(__name__)
+
+
 
 
 def train_sdxl(
@@ -27,7 +28,6 @@ def train_sdxl(
     pretrained_model_path: Optional[str] = None,
     resume_from_checkpoint: Optional[str] = None,
     models: Optional[Dict[str, Any]] = None,
-    validation_config: Optional[Dict[str, Any]] = None,
     **kwargs
 ) -> SDXLTrainer:
     """
@@ -50,12 +50,12 @@ def train_sdxl(
         # Remove validation_config from kwargs if present
         kwargs.pop('validation_config', None)
         
-        # Setup configuration - Update this part
+        # Setup configuration using the proper TrainingConfig
         config = TrainingConfig(
             pretrained_model_path=str(pretrained_model_path) if pretrained_model_path else "",
             train_data_dir=str(train_data_dir),
             output_dir=str(output_dir),
-            **{k: v for k, v in kwargs.items() if k in TrainingConfig.__dataclass_fields__}
+            **{k: v for k, v in kwargs.items() if k in {f.name for f in fields(TrainingConfig)}}
         )
         
         # Create output directory
@@ -95,7 +95,7 @@ def train_sdxl(
             max_resolution=1024 * 1024,  # Default max resolution
             min_batch_size=1,
             max_batch_size=config.batch_size,
-            num_workers=config.num_workers if hasattr(config, 'num_workers') else 4
+            num_workers=config.num_workers
         )
         
         # Add images to bucket manager
@@ -114,7 +114,7 @@ def train_sdxl(
             captions=train_captions,
             bucket_manager=bucket_manager,
             batch_size=config.batch_size,
-            num_workers=config.num_workers if hasattr(config, 'num_workers') else 4,
+            num_workers=config.num_workers,
             vae_cache=vae_cache,
             text_cache=text_embedding_cache
         )
@@ -129,7 +129,7 @@ def train_sdxl(
                 captions=val_captions,
                 bucket_manager=bucket_manager,
                 batch_size=config.batch_size,
-                num_workers=config.num_workers if hasattr(config, 'num_workers') else 4,
+                num_workers=config.num_workers,
                 vae_cache=vae_cache,
                 text_cache=text_embedding_cache
             )
@@ -166,9 +166,7 @@ def train_vae(
     config: Optional[VAEConfig] = None,
     **kwargs
 ) -> VAEFinetuner:
-    """
-    High-level wrapper for VAE finetuning with improvements.
-    """
+    """High-level wrapper for VAE finetuning with improvements."""
     try:
         # Create output directory
         output_dir = Path(output_dir)
@@ -186,7 +184,7 @@ def train_vae(
             vae=vae,
             cache_dir=str(output_dir / "vae_cache"),
             max_cache_size=config.cache_size,
-            num_workers=4,
+            num_workers=config.num_workers,  # Use config value
             batch_size=config.batch_size
         )
         
@@ -204,25 +202,25 @@ def train_vae(
         # Create empty captions dict (VAE training doesn't need captions)
         train_captions = {path: "" for path in train_image_paths}
         
-        # Create dataloader
-        train_dataloader = create_train_dataloader(
+        # Create and initialize trainer
+        trainer = VAEFinetuner(
+            vae=vae,
+            config=config,
+            device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        )
+        
+        # Create dataloader and attach to trainer
+        trainer.train_dataloader = create_train_dataloader(
             image_paths=train_image_paths,
             captions=train_captions,
             bucket_manager=bucket_manager,
             batch_size=config.batch_size,
-            num_workers=4,
+            num_workers=config.num_workers,  # Use config value
             vae_cache=vae_cache,
             text_cache=None,
             shuffle=True,
             pin_memory=True,
             drop_last=True
-        )
-        
-        # Initialize trainer
-        trainer = VAEFinetuner(
-            vae=vae,
-            config=config,
-            device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         )
         
         return trainer
