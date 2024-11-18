@@ -40,50 +40,64 @@ class ProgressManager:
                 TimeRemainingColumn(),
                 TimeElapsedColumn(),
                 refresh_per_second=10,
-                expand=True
+                expand=True,
+                auto_refresh=False  # Important: disable auto refresh
             )
             self._active_tasks = []
             self._is_started = False
+            self._task_stack = []  # New: stack to track nested tasks
     
     @property
-    def active_tasks(self) -> List[TaskID]:
-        """Get list of active task IDs."""
-        return self._active_tasks
-    
-    @property
-    def is_started(self) -> bool:
-        """Get progress display start status."""
-        return self._is_started
-    
-    @is_started.setter
-    def is_started(self, value: bool):
-        """Set progress display start status."""
-        self._is_started = value
+    def current_task(self) -> Optional[TaskID]:
+        """Get the current active task."""
+        return self._task_stack[-1] if self._task_stack else None
     
     def start(self):
         """Start the progress display if not already started."""
-        if not self.is_started:
+        if not self._is_started:
             self.progress.start()
-            self.is_started = True
+            self._is_started = True
     
     def stop(self):
         """Stop the progress display if started and no active tasks."""
-        if self.is_started and not self.active_tasks:
+        if self._is_started and not self._active_tasks:
             self.progress.stop()
-            self.is_started = False
+            self._is_started = False
     
-    def add_task(self, *args, **kwargs) -> TaskID:
+    def add_task(self, description: str, total: Optional[float] = None, **kwargs) -> TaskID:
         """Add a new task and track it."""
-        task_id = self.progress.add_task(*args, **kwargs)
+        # Create new task
+        task_id = self.progress.add_task(
+            description=description,
+            total=total if total is not None else float('inf'),
+            **kwargs
+        )
+        
+        # Track the task
         self._active_tasks.append(task_id)
+        self._task_stack.append(task_id)
+        
+        # Start progress if needed
+        if not self._is_started:
+            self.start()
+        
         return task_id
     
     def remove_task(self, task_id: TaskID):
         """Remove a task from tracking."""
         if task_id in self._active_tasks:
             self._active_tasks.remove(task_id)
+            if task_id in self._task_stack:
+                self._task_stack.remove(task_id)
+            
+            # Stop if no more tasks
             if not self._active_tasks:
                 self.stop()
+    
+    def update(self, task_id: TaskID, advance: float = 1, **kwargs):
+        """Update a task's progress."""
+        self.progress.update(task_id, advance=advance, **kwargs)
+        self.progress.refresh()  # Manual refresh
 
 class ProgressTracker:
     def __init__(
@@ -106,13 +120,9 @@ class ProgressTracker:
         
         # Get progress manager instance
         self.manager = ProgressManager()
-        self.manager.start()
         
         # Add task
-        self.task_id = self.manager.add_task(
-            description,
-            total=total if total is not None else float('inf')
-        )
+        self.task_id = self.manager.add_task(description, total=total)
         
         # Log initial state
         logger.info(f"Started progress tracking: {description}")
