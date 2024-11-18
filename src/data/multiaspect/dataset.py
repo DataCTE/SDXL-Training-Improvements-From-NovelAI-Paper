@@ -144,11 +144,25 @@ class MultiAspectDataset(Dataset):
                     f"  - Missing files: {skipped_counts['missing']}\n"
                     f"  - Other issues: {skipped_counts['other']}"
                 )
-            
-        # Group images into buckets
-        self.image_buckets = self.image_grouper.group_images(self.image_paths)
+
+        # Group images into buckets and get bucket assignments
+        logger.info("Assigning images to buckets...")
+        self.image_buckets = {}  # Clear any existing assignments
+        for path in tqdm(self.image_paths, desc="Assigning buckets"):
+            try:
+                with Image.open(path) as img:
+                    if img.mode != 'RGB':
+                        img = img.convert('RGB')
+                    width, height = img.size
+                    bucket = self.bucket_manager._find_bucket(height, width)
+                    if bucket:
+                        self.image_buckets[path] = bucket
+            except Exception as e:
+                logger.warning(f"Failed to process {path} for bucketing: {str(e)}")
+                continue
         
         # Process prompts
+        logger.info("Processing prompts...")
         self.processed_prompts = [
             self.caption_processor.process_caption(prompt, training=True) for prompt in self.prompts
         ]
@@ -157,7 +171,7 @@ class MultiAspectDataset(Dataset):
         self._init_caches()
         
         logger.info("Dataset processing complete. %d valid images in %d buckets",
-                   len(self.image_paths), len(self.image_buckets))
+                   len(self.image_paths), len(set(self.image_buckets.values())))
 
     def _validate_image(self, image_path: str) -> None:
         """Validate a single image file.
