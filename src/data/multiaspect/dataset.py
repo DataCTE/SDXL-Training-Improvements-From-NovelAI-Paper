@@ -12,6 +12,8 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 import random
 from tqdm.auto import tqdm
+from collections import defaultdict
+from PIL import Image
 
 from src.data.image_processing.loading import load_and_verify_image
 from src.data.image_processing.transforms import (
@@ -200,17 +202,31 @@ class MultiAspectDataset(Dataset):
         with tqdm(total=len(self.image_paths), desc="Caching VAE latents") as pbar_vae:
             for i in range(0, len(self.image_paths), batch_size):
                 batch_paths = self.image_paths[i:i + batch_size]
-                # Load images for the batch
-                batch_tensors = []
-                for path in batch_paths:
-                    img = load_and_verify_image(path)
-                    tensor = converter.pil_to_tensor(img, normalize=True)
-                    batch_tensors.append(tensor)
-                batch_tensors = torch.stack(batch_tensors)
+                # Group images by bucket size
+                bucket_groups = defaultdict(list)
+                bucket_paths = defaultdict(list)
                 
-                # Process the batch
-                self.vae_cache.process_batch(batch_tensors, batch_paths)
-                self.vae_cache.process_results(pbar_vae)
+                for path in batch_paths:
+                    bucket_size = self.image_buckets[path]
+                    bucket_groups[bucket_size].append(path)
+                    
+                # Process each bucket group separately
+                for bucket_size, paths in bucket_groups.items():
+                    target_height, target_width = bucket_size
+                    batch_tensors = []
+                    
+                    for path in paths:
+                        img = load_and_verify_image(path)
+                        # Resize to bucket size
+                        if img.size != (target_width, target_height):
+                            img = img.resize((target_width, target_height), Image.Resampling.LANCZOS)
+                        tensor = converter.pil_to_tensor(img, normalize=True)
+                        batch_tensors.append(tensor)
+                    
+                    if batch_tensors:
+                        batch_tensors = torch.stack(batch_tensors)
+                        self.vae_cache.process_batch(batch_tensors, paths)
+                        self.vae_cache.process_results(pbar_vae)
         
         # Close VAE workers
         self.vae_cache.close_workers()
