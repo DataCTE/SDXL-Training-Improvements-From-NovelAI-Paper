@@ -79,7 +79,7 @@
       },
       "text_cache": {
         "max_cache_size": 10000,
-        "num_workers": 4, 
+        "num_workers": 4,
         "batch_size": 32
       }
     },

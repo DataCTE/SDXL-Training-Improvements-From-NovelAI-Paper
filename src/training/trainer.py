@@ -1,7 +1,7 @@
 import torch
 import logging
 from typing import Dict, Any, Optional
-from dataclasses import dataclass
+from src.config.args import TrainingConfig
 from src.training.training_steps import train_step
 from src.training.training_utils import initialize_training_components
 from src.training.validation import generate_validation_images
@@ -9,22 +9,6 @@ from src.training.metrics import MetricsManager
 
 logger = logging.getLogger(__name__)
 
-@dataclass
-class TrainingConfig:
-    """Configuration for training pipeline."""
-    batch_size: int = 1
-    num_epochs: int = 100
-    learning_rate: float = 1e-5
-    mixed_precision: str = "fp16"
-    gradient_checkpointing: bool = False
-    gradient_accumulation_steps: int = 1
-    max_grad_norm: Optional[float] = 1.0
-    use_8bit_adam: bool = False
-    use_ema: bool = True
-    ema_decay: float = 0.9999
-    train_text_encoder: bool = False
-    validation_epochs: int = 5
-    save_epochs: int = 10
 
 class SDXLTrainer:
     """Main trainer class for SDXL model improvements."""
@@ -49,9 +33,10 @@ class SDXLTrainer:
         self.metrics_manager = MetricsManager()
         
         # Move only torch.nn.Module models to device
-        for _, model in self.models.items():
+        for name, model in self.models.items():
             if isinstance(model, torch.nn.Module):
                 model.to(self.device)
+                model.train()  # Ensure training mode
             
     def train(self, save_dir: str):
         """Execute training loop with validation."""
@@ -72,8 +57,13 @@ class SDXLTrainer:
         total_loss = 0
         num_batches = len(self.train_dataloader)
         
+        # Set models to training mode
+        for name, model in self.models.items():
+            if isinstance(model, torch.nn.Module):
+                model.train()
+        
         for batch_idx, batch in enumerate(self.train_dataloader):
-            # Move batch to device
+            # Move batch to device and handle text embeddings
             batch = {k: v.to(self.device) if torch.is_tensor(v) else v 
                     for k, v in batch.items()}
             
@@ -90,18 +80,27 @@ class SDXLTrainer:
                 self.components['scaler']
             )
             
-            total_loss += loss.item()  # Get scalar value from loss tensor
+            total_loss += loss.item()
+            
+            # Update metrics
+            for metric_name, metric_value in metrics_dict.items():
+                self.metrics_manager.update_metric(metric_name, metric_value)
             
             # Log progress
             if batch_idx % 10 == 0:
-                logger.info(f"Epoch {epoch} [{batch_idx}/{num_batches}]: "
-                        f"Loss: {metrics_dict['loss']:.4f}")
+                metrics_str = " ".join([f"{k}: {v:.4f}" for k, v in metrics_dict.items()])
+                logger.info(f"Epoch {epoch} [{batch_idx}/{num_batches}]: {metrics_str}")
                 
         avg_loss = total_loss / num_batches
         logger.info(f"Epoch {epoch} completed. Average loss: {avg_loss:.4f}")
         
     def validate(self, epoch: int):
         """Run validation loop."""
+        # Set models to eval mode
+        for name, model in self.models.items():
+            if isinstance(model, torch.nn.Module):
+                model.eval()
+                
         generate_validation_images(
             self.config,
             self.models,

@@ -225,6 +225,38 @@ def parse_args() -> TrainingConfig:
                           default=DEFAULTS["vae"]["mixed_precision"],
                           choices=["no", "fp16", "bf16"])
     
+    # Tag weighting arguments
+    tag_group = parser.add_argument_group('Tag weighting arguments')
+    tag_group.add_argument("--token_dropout_rate", type=float,
+                          default=DEFAULTS["tag_weighting"]["token_dropout_rate"])
+    tag_group.add_argument("--caption_dropout_rate", type=float,
+                          default=DEFAULTS["tag_weighting"]["caption_dropout_rate"])
+    tag_group.add_argument("--rarity_factor", type=float,
+                          default=DEFAULTS["tag_weighting"]["rarity_factor"])
+    tag_group.add_argument("--emphasis_factor", type=float,
+                          default=DEFAULTS["tag_weighting"]["emphasis_factor"])
+    tag_group.add_argument("--min_tag_freq", type=int,
+                          default=DEFAULTS["tag_weighting"]["min_tag_freq"])
+    tag_group.add_argument("--min_cluster_size", type=int,
+                          default=DEFAULTS["tag_weighting"]["min_cluster_size"])
+    tag_group.add_argument("--similarity_threshold", type=float,
+                          default=DEFAULTS["tag_weighting"]["similarity_threshold"])
+    
+    # Caching arguments
+    cache_group = parser.add_argument_group('Caching arguments')
+    cache_group.add_argument("--vae_cache_size", type=int,
+                           default=DEFAULTS["caching"]["vae_cache"]["max_cache_size"])
+    cache_group.add_argument("--vae_cache_workers", type=int,
+                           default=DEFAULTS["caching"]["vae_cache"]["num_workers"])
+    cache_group.add_argument("--vae_cache_batch_size", type=int,
+                           default=DEFAULTS["caching"]["vae_cache"]["batch_size"])
+    cache_group.add_argument("--text_cache_size", type=int,
+                           default=DEFAULTS["caching"]["text_cache"]["max_cache_size"])
+    cache_group.add_argument("--text_cache_workers", type=int,
+                           default=DEFAULTS["caching"]["text_cache"]["num_workers"])
+    cache_group.add_argument("--text_cache_batch_size", type=int,
+                           default=DEFAULTS["caching"]["text_cache"]["batch_size"])
+    
     args = parser.parse_args()
     
     # Convert to config
@@ -271,5 +303,22 @@ def parse_args() -> TrainingConfig:
     config.vae_args.batch_size = args.vae_batch_size
     config.vae_args.num_epochs = args.vae_num_epochs
     config.vae_args.mixed_precision = args.vae_mixed_precision
+    
+    # Update Tag Weighting config
+    config.tag_weighting.token_dropout_rate = args.token_dropout_rate
+    config.tag_weighting.caption_dropout_rate = args.caption_dropout_rate
+    config.tag_weighting.rarity_factor = args.rarity_factor
+    config.tag_weighting.emphasis_factor = args.emphasis_factor
+    config.tag_weighting.min_tag_freq = args.min_tag_freq
+    config.tag_weighting.min_cluster_size = args.min_cluster_size
+    config.tag_weighting.similarity_threshold = args.similarity_threshold
+    
+    # Update caching config
+    config.caching.vae_cache_size = args.vae_cache_size
+    config.caching.vae_cache_num_workers = args.vae_cache_workers
+    config.caching.vae_cache_batch_size = args.vae_cache_batch_size
+    config.caching.text_cache_size = args.text_cache_size
+    config.caching.text_cache_num_workers = args.text_cache_workers
+    config.caching.text_cache_batch_size = args.text_cache_batch_size
     
     return config

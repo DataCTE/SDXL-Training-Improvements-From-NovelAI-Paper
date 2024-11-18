@@ -28,6 +28,8 @@ def train_sdxl(
     pretrained_model_path: Optional[str] = None,
     resume_from_checkpoint: Optional[str] = None,
     models: Optional[Dict[str, Any]] = None,
+    token_dropout: float = 0.1,
+    caption_dropout: float = 0.1,
     **kwargs
 ) -> SDXLTrainer:
     """
@@ -83,7 +85,8 @@ def train_sdxl(
             cache_dir=str(output_dir / "text_embeds_cache"),
             max_cache_size=10000,
             num_workers=4,
-            batch_size=32
+            batch_size=32,
+            dropout_rate=token_dropout
         )
         
         # Get image paths and captions
@@ -116,7 +119,12 @@ def train_sdxl(
             batch_size=config.batch_size,
             num_workers=config.num_workers,
             vae_cache=vae_cache,
-            text_cache=text_embedding_cache
+            text_cache=text_embedding_cache,
+            token_dropout=token_dropout,
+            caption_dropout=caption_dropout,
+            shuffle=True,
+            pin_memory=True,
+            drop_last=True
         )
         
         val_dataloader = None
@@ -131,7 +139,8 @@ def train_sdxl(
                 batch_size=config.batch_size,
                 num_workers=config.num_workers,
                 vae_cache=vae_cache,
-                text_cache=text_embedding_cache
+                text_cache=text_embedding_cache,
+                pin_memory=True
             )
         
         # Resume from checkpoint if specified
@@ -164,6 +173,8 @@ def train_vae(
     train_data_dir: Union[str, Path],
     output_dir: Union[str, Path],
     config: Optional[VAEConfig] = None,
+    token_dropout: float = 0.0,  # VAE doesn't need text dropout
+    caption_dropout: float = 0.0, # VAE doesn't need caption dropout
     **kwargs
 ) -> VAEFinetuner:
     """High-level wrapper for VAE finetuning with improvements."""

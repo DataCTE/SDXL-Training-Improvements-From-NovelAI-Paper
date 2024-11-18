@@ -127,18 +127,18 @@ class MultiAspectDataset(Dataset):
         
         return tensor
     
-    def _prepare_text(self, path: str) -> Tuple[torch.Tensor, ...]:
+    def _prepare_text(self, path: str, training: bool = True) -> Tuple[torch.Tensor, torch.Tensor]:
         """Prepare text embeddings with caption processing and caching."""
         if self.text_cache is None:
             raise RuntimeError("Text cache not initialized")
             
         caption = self.captions.get(path, "")
         # Process caption to get tags and weights
-        tags, weights = self.caption_processor.process_caption(caption)
+        tags, weights = self.caption_processor.process_caption(caption, training=training)
         
         if not tags:
             # Return empty/default embeddings if no valid tags
-            return self.text_cache.encode_text("")
+            return self.text_cache.encode("")
             
         # Join tags with weights into a weighted prompt
         weighted_caption = ", ".join(
@@ -148,7 +148,7 @@ class MultiAspectDataset(Dataset):
             for tag, weight in zip(tags, weights)
         )
         
-        return self.text_cache.encode_text(weighted_caption)
+        return self.text_cache.encode(weighted_caption)
     
     def _prepare_batch(
         self,
@@ -217,7 +217,7 @@ class MultiAspectDataset(Dataset):
         """Get dataset size."""
         return len(self.image_paths)
     
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+    def __getitem__(self, idx: int, training: bool = True) -> Dict[str, torch.Tensor]:
         """Get a single item with caching."""
         path = self.image_paths[idx]
         bucket = self.bucket_manager.get_bucket(path)
@@ -230,7 +230,7 @@ class MultiAspectDataset(Dataset):
         pixel_values = self._transform_image(image, bucket)
         
         # Prepare text embeddings
-        text_embeds = self._prepare_text(path)
+        text_embeds = self._prepare_text(path, training=training)
         
         return {
             'pixel_values': pixel_values,
@@ -260,6 +260,8 @@ def create_train_dataloader(
     num_workers: int = 4,
     vae_cache: Optional[VAECache] = None,
     text_cache: Optional[TextEmbeddingCache] = None,
+    token_dropout: float = 0.1,
+    caption_dropout: float = 0.1,
     shuffle: bool = True,
     pin_memory: bool = True,
     drop_last: bool = True,
@@ -275,6 +277,8 @@ def create_train_dataloader(
         num_workers: Number of worker processes for data loading
         vae_cache: Optional VAE cache for faster encoding
         text_cache: Optional text embedding cache
+        token_dropout: Rate at which individual tokens are dropped during training
+        caption_dropout: Rate at which entire captions are dropped during training
         shuffle: Whether to shuffle the dataset
         pin_memory: If True, pin memory for faster GPU transfer
         drop_last: Whether to drop the last incomplete batch
@@ -288,7 +292,9 @@ def create_train_dataloader(
         bucket_manager=bucket_manager,
         vae_cache=vae_cache,
         text_cache=text_cache,
-        num_workers=num_workers
+        num_workers=num_workers,
+        token_dropout=token_dropout,
+        caption_dropout=caption_dropout
     )
     
     return DataLoader(
@@ -333,7 +339,9 @@ def create_validation_dataloader(
         bucket_manager=bucket_manager,
         vae_cache=vae_cache,
         text_cache=text_cache,
-        num_workers=num_workers
+        num_workers=num_workers,
+        token_dropout=0.0,  # No dropout for validation
+        caption_dropout=0.0  # No dropout for validation
     )
     
     return DataLoader(

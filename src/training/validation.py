@@ -6,6 +6,7 @@ from contextlib import nullcontext
 from src.training.metrics import MetricsManager
 from src.training.loss_functions import forward_pass
 from src.models.SDXL.pipeline import StableDiffusionXLPipeline
+from src.data.prompt.caption_processor import CaptionProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -14,28 +15,14 @@ def generate_validation_images(
     prompts: List[str],
     save_dir: str,
     device: torch.device,
-    num_inference_steps: int = 50,
-    guidance_scale: float = 7.5,
+    caption_processor: Optional[CaptionProcessor] = None,
+    num_inference_steps: int = 28,
+    guidance_scale: float = 5.0,
     height: int = 1024,
     width: int = 1024,
     num_images_per_prompt: int = 1,
 ) -> List[str]:
-    """Generate validation images using SDXL pipeline.
-    
-    Args:
-        pipeline: SDXL pipeline instance
-        prompts: List of prompts to generate images from
-        save_dir: Directory to save generated images
-        device: Device to run generation on
-        num_inference_steps: Number of denoising steps
-        guidance_scale: Classifier-free guidance scale
-        height: Image height
-        width: Image width
-        num_images_per_prompt: Number of images to generate per prompt
-        
-    Returns:
-        List of paths to generated images
-    """
+    """Generate validation images using SDXL pipeline."""
     os.makedirs(save_dir, exist_ok=True)
     generated_paths = []
     
@@ -44,6 +31,18 @@ def generate_validation_images(
     
     for idx, prompt in enumerate(prompts):
         try:
+            # Process prompt if caption processor is provided
+            if caption_processor is not None:
+                tags, weights = caption_processor.process_caption(prompt, training=False)
+                if tags:
+                    # Join tags with weights into a weighted prompt
+                    prompt = ", ".join(
+                        f"{{{tag}}}" if weight > 1.5 else 
+                        f"{{{{{tag}}}}}" if weight > 2.0 else 
+                        tag 
+                        for tag, weight in zip(tags, weights)
+                    )
+            
             with torch.no_grad():
                 output = pipeline(
                     prompt=prompt,
@@ -82,11 +81,10 @@ def run_validation(
 ) -> Dict[str, float]:
     """Run validation with proper error handling and metrics tracking."""
     try:
-        # Set eval mode
-        models["unet"].eval()
-        if getattr(args, "train_text_encoder", False):
-            models["text_encoder"].eval()
-            models["text_encoder_2"].eval()
+        # Set eval mode for all models
+        for model in models.values():
+            if isinstance(model, torch.nn.Module):
+                model.eval()
 
         metrics = {}
         
@@ -100,11 +98,16 @@ def run_validation(
             with torch.no_grad():
                 for batch in val_dataloader:
                     with torch.cuda.amp.autocast() if args.mixed_precision != "no" else nullcontext():
-                        val_loss = forward_pass(args, models, batch, device, dtype, components)
+                        val_loss = forward_pass(
+                            args,
+                            models,
+                            batch,
+                            device,
+                            dtype
+                        )
                     total_val_loss += val_loss.item()
                     num_val_steps += 1
 
-            # Compute average validation loss
             avg_val_loss = total_val_loss / num_val_steps if num_val_steps > 0 else 0.0
             metrics["val_loss"] = avg_val_loss
             
@@ -116,7 +119,6 @@ def run_validation(
 
         # Generate validation images if configured
         if hasattr(args, "validation_prompts") and args.validation_prompts:
-            # Create SDXL pipeline for inference
             pipeline = StableDiffusionXLPipeline(
                 vae=models["vae"],
                 text_encoder=models["text_encoder"],
@@ -127,18 +129,21 @@ def run_validation(
                 scheduler=models["scheduler"],
             ).to(device)
             
-            # Generate images
+            # Get caption processor if available
+            caption_processor = components.get("caption_processor")
+            
             save_dir = os.path.join(args.output_dir, f"validation_images/step_{global_step}")
             generated_paths = generate_validation_images(
                 pipeline=pipeline,
                 prompts=args.validation_prompts,
                 save_dir=save_dir,
                 device=device,
-                num_inference_steps=args.validation_num_inference_steps if hasattr(args, "validation_num_inference_steps") else 50,
-                guidance_scale=args.validation_guidance_scale if hasattr(args, "validation_guidance_scale") else 7.5,
-                height=args.validation_image_height if hasattr(args, "validation_image_height") else 1024,
-                width=args.validation_image_width if hasattr(args, "validation_image_width") else 1024,
-                num_images_per_prompt=args.validation_num_images_per_prompt if hasattr(args, "validation_num_images_per_prompt") else 1,
+                caption_processor=caption_processor,
+                num_inference_steps=getattr(args, "validation_num_inference_steps", 28),
+                guidance_scale=getattr(args, "validation_guidance_scale", 5.5),
+                height=getattr(args, "validation_image_height", 1024),
+                width=getattr(args, "validation_image_width", 1024),
+                num_images_per_prompt=getattr(args, "validation_num_images_per_prompt", 1),
             )
             
             metrics["num_validation_images"] = len(generated_paths)
