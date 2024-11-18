@@ -17,6 +17,7 @@ from src.data.image_processing.validation import validate_image
 from src.data.cacheing.vae import VAECache
 from src.data.cacheing.text_embeds import TextEmbeddingCache
 from src.data.multiaspect.bucket_manager import Bucket, BucketManager
+from src.data.prompt.caption_processor import CaptionProcessor, load_captions
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +26,7 @@ class MultiAspectDataset(Dataset):
     
     __slots__ = ('image_paths', 'captions', 'bucket_manager', 'vae_cache',
                  'text_cache', '_lock', '_executor', '_stats', '_image_cache',
-                 '_transform_cache', '_batch_cache', 'num_workers')
+                 '_transform_cache', '_batch_cache', 'num_workers', 'caption_processor')
     
     def __init__(
         self,
@@ -34,7 +35,9 @@ class MultiAspectDataset(Dataset):
         bucket_manager: BucketManager,
         vae_cache: Optional[VAECache] = None,
         text_cache: Optional[TextEmbeddingCache] = None,
-        num_workers: int = 4
+        num_workers: int = 4,
+        token_dropout: float = 0.1,
+        caption_dropout: float = 0.1
     ):
         """Initialize with optimized caching and parallel processing."""
         self.image_paths = image_paths
@@ -43,18 +46,22 @@ class MultiAspectDataset(Dataset):
         self.vae_cache = vae_cache
         self.text_cache = text_cache
         
-        # Store number of workers for parallel processing
+        # Initialize caption processor
+        self.caption_processor = CaptionProcessor(
+            token_dropout_rate=token_dropout,
+            caption_dropout_rate=caption_dropout
+        )
+        
+        # Rest of initialization remains the same
         self.num_workers = num_workers
         self._lock = threading.RLock()
         self._executor = ThreadPoolExecutor(max_workers=num_workers)
         self._stats = defaultdict(int)
         
-        # Initialize caches
         self._image_cache = {}
         self._transform_cache = {}
         self._batch_cache = {}
         
-        # Pre-process images in parallel
         self._parallel_preprocess_images()
     
     def _parallel_preprocess_images(self) -> None:
@@ -113,7 +120,7 @@ class MultiAspectDataset(Dataset):
                                Image.Resampling.LANCZOS)
         
         # Convert to tensor with mixed precision
-        with amp.autocast():
+        with torch.amp.autocast('cuda'):
             tensor = torch.from_numpy(np.array(image))
             tensor = tensor.permute(2, 0, 1).float()
             tensor = tensor / 127.5 - 1.0
@@ -121,12 +128,27 @@ class MultiAspectDataset(Dataset):
         return tensor
     
     def _prepare_text(self, path: str) -> Tuple[torch.Tensor, ...]:
-        """Prepare text embeddings with caching."""
+        """Prepare text embeddings with caption processing and caching."""
         if self.text_cache is None:
             raise RuntimeError("Text cache not initialized")
             
         caption = self.captions.get(path, "")
-        return self.text_cache.encode_text(caption)
+        # Process caption to get tags and weights
+        tags, weights = self.caption_processor.process_caption(caption)
+        
+        if not tags:
+            # Return empty/default embeddings if no valid tags
+            return self.text_cache.encode_text("")
+            
+        # Join tags with weights into a weighted prompt
+        weighted_caption = ", ".join(
+            f"{{{tag}}}" if weight > 1.5 else 
+            f"{{{{{tag}}}}}" if weight > 2.0 else 
+            tag 
+            for tag, weight in zip(tags, weights)
+        )
+        
+        return self.text_cache.encode_text(weighted_caption)
     
     def _prepare_batch(
         self,

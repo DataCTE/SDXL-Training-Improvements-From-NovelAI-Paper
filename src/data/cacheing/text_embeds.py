@@ -19,6 +19,7 @@ from transformers import CLIPTextModel, CLIPTokenizer
 from pathlib import Path
 import os
 from .memory import MemoryCache, MemoryManager
+import random
 
 logger = logging.getLogger(__name__)
 
@@ -183,3 +184,26 @@ class TextEmbeddingCache:
         """Clean shutdown."""
         self.clear()
         self._executor.shutdown(wait=False)
+        
+    def process_text(self, text: str, training: bool = True) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Process text and return embeddings with optional dropout during training."""
+        if not text or (training and random.random() < self.dropout_rate):
+            return None, None
+        
+        return self.encode(text)
+        
+    def process_batch(self, texts: List[str], training: bool = True) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        """Process a batch of texts in parallel."""
+        if not texts:
+            return []
+        
+        # Filter out empty texts and apply dropout
+        if training:
+            texts = [t for t in texts if t and random.random() > self.dropout_rate]
+        
+        if not texts:
+            return []
+        
+        # Process all texts at once using existing encode method
+        embed1_batch, embed2_batch = self.encode(texts)
+        return list(zip(embed1_batch, embed2_batch))
