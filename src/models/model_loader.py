@@ -10,6 +10,7 @@ from src.models.SDXL.pipeline import StableDiffusionXLPipeline, UNet2DConditionM
 from src.config.args import TrainingConfig
 from diffusers import EulerDiscreteScheduler
 import logging
+from safetensors.torch import save_file
 logger = logging.getLogger(__name__)
 
 def create_sdxl_models(
@@ -188,3 +189,148 @@ def load_checkpoint(checkpoint_path: str, models: Dict[str, Any]) -> Dict[str, A
         logger.error(f"Checkpoint loading failed: {str(e)}")
         logger.error(f"Traceback:\n{traceback.format_exc()}")
         raise
+
+
+def create_vae_model(
+    vae_path: str,
+    dtype: torch.dtype = torch.float32,
+    device: Optional[torch.device] = None,
+    use_safetensors: bool = True,
+    force_upcast: bool = True,
+) -> AutoencoderKL:
+    """Create VAE model from pretrained weights.
+    
+    Args:
+        vae_path: Path to pretrained VAE weights
+        dtype: Data type for model parameters
+        device: Device to load model on
+        use_safetensors: Whether to use safetensors format
+        force_upcast: Whether to force upcast VAE to float32
+        
+    Returns:
+        Initialized AutoencoderKL model
+        
+    Raises:
+        ValueError: If vae_path is invalid
+        RuntimeError: If model loading fails
+    """
+    try:
+        if not vae_path:
+            raise ValueError("VAE path cannot be empty")
+            
+        # Set default device if none provided
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            
+        # Load VAE with configuration
+        vae = AutoencoderKL.from_pretrained(
+            vae_path,
+            torch_dtype=dtype,
+            use_safetensors=use_safetensors,
+            force_upcast=force_upcast
+        )
+        
+        # Move to device and set dtype
+        if device:
+            vae = vae.to(device=device, dtype=dtype)
+            
+        # Enable memory efficient attention if available
+        if hasattr(vae, "enable_xformers_memory_efficient_attention"):
+            vae.enable_xformers_memory_efficient_attention()
+            
+        logger.info(f"Successfully loaded VAE from {vae_path}")
+        return vae
+        
+    except Exception as e:
+        logger.error(f"Failed to load VAE from {vae_path}: {str(e)}")
+        logger.error(f"Traceback:\n{traceback.format_exc()}")
+        raise RuntimeError(f"VAE loading failed: {str(e)}")
+
+def save_diffusers_format(
+    pipeline: StableDiffusionXLPipeline,
+    output_dir: str,
+    save_vae: bool = True,
+    use_safetensors: bool = True,
+) -> None:
+    """Save pipeline in diffusers format.
+    
+    Args:
+        pipeline: StableDiffusionXLPipeline instance
+        output_dir: Directory to save models to
+        save_vae: Whether to save VAE model
+        use_safetensors: Whether to use safetensors format
+    """
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Save each component
+        components = {
+            "unet": pipeline.unet,
+            "text_encoder": pipeline.text_encoder,
+            "text_encoder_2": pipeline.text_encoder_2,
+            "tokenizer": pipeline.tokenizer,
+            "tokenizer_2": pipeline.tokenizer_2,
+            "scheduler": pipeline.scheduler,
+        }
+        
+        if save_vae:
+            components["vae"] = pipeline.vae
+            
+        # Save each component
+        for name, component in components.items():
+            save_path = os.path.join(output_dir, name)
+            os.makedirs(save_path, exist_ok=True)
+            
+            if hasattr(component, "save_pretrained"):
+                component.save_pretrained(
+                    save_path,
+                    safe_serialization=use_safetensors
+                )
+                
+        # Save pipeline config
+        pipeline.save_config(output_dir)
+        
+        logger.info(f"Saved pipeline to {output_dir} in diffusers format")
+        
+    except Exception as e:
+        logger.error(f"Failed to save pipeline: {str(e)}")
+        logger.error(f"Traceback:\n{traceback.format_exc()}")
+        raise RuntimeError(f"Pipeline saving failed: {str(e)}")
+
+def save_checkpoint(
+    pipeline: StableDiffusionXLPipeline,
+    checkpoint_path: str,
+    save_vae: bool = True,
+    use_safetensors: bool = True,
+) -> None:
+    """Save pipeline as a single checkpoint file.
+    
+    Args:
+        pipeline: StableDiffusionXLPipeline instance
+        checkpoint_path: Path to save checkpoint to
+        save_vae: Whether to save VAE model
+        use_safetensors: Whether to use safetensors format
+    """
+    try:
+        # Create state dict
+        state_dict = {
+            "unet": pipeline.unet.state_dict(),
+            "text_encoder": pipeline.text_encoder.state_dict(),
+            "text_encoder_2": pipeline.text_encoder_2.state_dict(),
+        }
+        
+        if save_vae:
+            state_dict["vae"] = pipeline.vae.state_dict()
+            
+        # Save checkpoint
+        if use_safetensors:
+            save_file(state_dict, checkpoint_path)
+        else:
+            torch.save(state_dict, checkpoint_path)
+            
+        logger.info(f"Saved checkpoint to {checkpoint_path}")
+        
+    except Exception as e:
+        logger.error(f"Failed to save checkpoint: {str(e)}")
+        logger.error(f"Traceback:\n{traceback.format_exc()}")
+        raise RuntimeError(f"Checkpoint saving failed: {str(e)}")

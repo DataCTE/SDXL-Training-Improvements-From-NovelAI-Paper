@@ -15,6 +15,7 @@ from src.data.cacheing.text_embeds import TextEmbeddingCache
 from src.data.multiaspect.bucket_manager import BucketManager
 from src.data.image_processing.validation import validate_image
 from src.data.prompt.caption_processor import load_captions
+from src.models.model_saver import save_checkpoint, load_checkpoint, save_diffusers_format
 
 logger = logging.getLogger(__name__)
 
@@ -136,7 +137,7 @@ def train_sdxl(
         
         # Resume from checkpoint if specified
         if resume_from_checkpoint:
-            trainer = SDXLTrainer.load_checkpoint(
+            trainer = save_diffusers_format(
                 resume_from_checkpoint,
                 train_dataloader,
                 val_dataloader
@@ -231,52 +232,3 @@ def train_vae(
         logger.error("Full traceback:\n%s", traceback.format_exc())
         raise
 
-def export_model(
-    trainer: Union[SDXLTrainer, VAEFinetuner],
-    output_dir: Union[str, Path],
-    model_format: str = "safetensors",
-    half_precision: bool = True
-) -> None:
-    """
-    Export trained model in specified format.
-    
-    Args:
-        trainer: Trained model trainer instance
-        output_dir: Directory to save exported model
-        model_format: Format to export model in ('safetensors' or 'pytorch')
-        half_precision: Whether to export in half precision
-    """
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    if isinstance(trainer, SDXLTrainer):
-        # Export SDXL model
-        for name, model in trainer.models.items():
-            if half_precision:
-                model = model.half()
-            
-            if model_format == "safetensors":
-                save_path = output_dir / f"{name}.safetensors"
-                torch.save(model.state_dict(), save_path, _use_new_zipfile_serialization=False)
-            else:
-                save_path = output_dir / f"{name}.pt"
-                torch.save(model.state_dict(), save_path)
-                
-            logger.info(f"Exported {name} to {save_path}")
-    
-    elif isinstance(trainer, VAEFinetuner):
-        # Export VAE model
-        if half_precision:
-            trainer.vae = trainer.vae.half()
-            
-        if model_format == "safetensors":
-            save_path = output_dir / "vae.safetensors"
-            torch.save(trainer.vae.state_dict(), save_path, _use_new_zipfile_serialization=False)
-        else:
-            save_path = output_dir / "vae.pt"
-            torch.save(trainer.vae.state_dict(), save_path)
-            
-        logger.info(f"Exported VAE to {save_path}")
-    
-    else:
-        raise ValueError(f"Unsupported trainer type: {type(trainer)}")
