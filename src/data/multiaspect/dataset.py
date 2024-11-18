@@ -1,7 +1,7 @@
 """Ultra-optimized multi-aspect ratio dataset implementation."""
 
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from typing import Dict, List, Tuple, Optional, Union
 from PIL import Image
@@ -228,3 +228,97 @@ class MultiAspectDataset(Dataset):
             self._transform_cache.clear()
             self._batch_cache.clear()
             self._stats.clear()
+
+
+def create_train_dataloader(
+    image_paths: List[str],
+    captions: Dict[str, str],
+    bucket_manager: BucketManager,
+    batch_size: int,
+    num_workers: int = 4,
+    vae_cache: Optional[VAECache] = None,
+    text_cache: Optional[TextEmbeddingCache] = None,
+    shuffle: bool = True,
+    pin_memory: bool = True,
+    drop_last: bool = True,
+) -> DataLoader:
+    """
+    Create an optimized DataLoader for training.
+    
+    Args:
+        image_paths: List of paths to training images
+        captions: Dictionary mapping image paths to their captions
+        bucket_manager: BucketManager instance for aspect ratio bucketing
+        batch_size: Number of samples per batch
+        num_workers: Number of worker processes for data loading
+        vae_cache: Optional VAE cache for faster encoding
+        text_cache: Optional text embedding cache
+        shuffle: Whether to shuffle the dataset
+        pin_memory: If True, pin memory for faster GPU transfer
+        drop_last: Whether to drop the last incomplete batch
+        
+    Returns:
+        DataLoader configured for training
+    """
+    dataset = MultiAspectDataset(
+        image_paths=image_paths,
+        captions=captions,
+        bucket_manager=bucket_manager,
+        vae_cache=vae_cache,
+        text_cache=text_cache,
+        num_workers=num_workers
+    )
+    
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=drop_last
+    )
+
+
+def create_validation_dataloader(
+    image_paths: List[str],
+    captions: Dict[str, str],
+    bucket_manager: BucketManager,
+    batch_size: int,
+    num_workers: int = 4,
+    vae_cache: Optional[VAECache] = None,
+    text_cache: Optional[TextEmbeddingCache] = None,
+    pin_memory: bool = True,
+) -> DataLoader:
+    """
+    Create an optimized DataLoader for validation.
+    
+    Args:
+        image_paths: List of paths to validation images
+        captions: Dictionary mapping image paths to their captions
+        bucket_manager: BucketManager instance for aspect ratio bucketing
+        batch_size: Number of samples per batch
+        num_workers: Number of worker processes for data loading
+        vae_cache: Optional VAE cache for faster encoding
+        text_cache: Optional text embedding cache
+        pin_memory: If True, pin memory for faster GPU transfer
+        
+    Returns:
+        DataLoader configured for validation
+    """
+    dataset = MultiAspectDataset(
+        image_paths=image_paths,
+        captions=captions,
+        bucket_manager=bucket_manager,
+        vae_cache=vae_cache,
+        text_cache=text_cache,
+        num_workers=num_workers
+    )
+    
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,  # No shuffling for validation
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=False  # Keep all samples for validation
+    )
