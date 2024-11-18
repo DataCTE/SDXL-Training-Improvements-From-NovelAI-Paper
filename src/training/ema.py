@@ -46,13 +46,18 @@ class EMAModel:
         self._model = weakref.ref(model)
         
         # Initialize thread safety
-        self._lock = threading.Lock()
         self._initialized = False
         self._optimization_step = 0
         self._cuda_graphs = {}
         
-        # Register parameters
+        # Initialize parameters immediately
         self._shadow_params = {}
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if param.requires_grad:
+                    self._shadow_params[name] = param.detach().clone()
+        
+        # Register parameters
         self._register_parameters()
         
         # Initialize CUDA graph if available

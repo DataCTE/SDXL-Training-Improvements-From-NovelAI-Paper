@@ -7,7 +7,7 @@ from typing import Dict, List, Tuple, Optional, Union
 from PIL import Image
 import logging
 from concurrent.futures import ThreadPoolExecutor
-import threading
+from multiprocessing import RLock
 from collections import defaultdict
 from torch.cuda import amp
 import os
@@ -54,7 +54,7 @@ class MultiAspectDataset(Dataset):
         
         # Rest of initialization remains the same
         self.num_workers = num_workers
-        self._lock = threading.RLock()
+        self._lock = RLock()
         self._executor = ThreadPoolExecutor(max_workers=num_workers)
         self._stats = defaultdict(int)
         
