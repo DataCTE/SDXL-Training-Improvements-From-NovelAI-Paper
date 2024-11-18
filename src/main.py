@@ -8,6 +8,7 @@ from config.args import parse_args
 from training.wrappers import train_sdxl, train_vae
 from utils.logging import setup_logging
 from models.model_loader import load_models
+from data.image_processing.validation import ValidationConfig
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,16 @@ def main():
             log_level=logging.INFO
         )
         
+        # Create validation config
+        validation_config = ValidationConfig(
+            min_size=512,
+            max_size=2048,
+            min_aspect=0.4,
+            max_aspect=2.5,
+            check_content=True,
+            device=config.device if hasattr(config, "device") else "cuda"
+        )
+        
         # Load models
         logger.info("Loading models...")
         models = load_models(config)
@@ -34,7 +45,8 @@ def main():
             vae_trainer = train_vae(
                 train_data_dir=config.data_dir,
                 output_dir=config.output_dir,
-                config=config.vae_args
+                config=config.vae_args,
+                validation_config=validation_config
             )
             models["vae"] = vae_trainer.vae
         
@@ -45,15 +57,8 @@ def main():
             output_dir=config.output_dir,
             pretrained_model_path=config.model_path,
             models=models,
-            batch_size=config.batch_size,
-            num_epochs=config.num_epochs,
-            learning_rate=config.optimizer.learning_rate,
-            mixed_precision=config.mixed_precision,
-            use_8bit_adam=config.optimizer.use_8bit_adam,
-            gradient_checkpointing=config.gradient_checkpointing,
-            gradient_accumulation_steps=config.gradient_accumulation_steps,
-            max_grad_norm=config.max_grad_norm,
-            save_epochs=config.save_epochs
+            validation_config=validation_config,
+            config=config  # Pass full config instead of individual params
         )
         
         # Save final model
