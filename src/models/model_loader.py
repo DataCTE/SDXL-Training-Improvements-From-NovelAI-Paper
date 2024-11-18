@@ -17,7 +17,7 @@ from transformers import (
 )
 import logging
 from src.models.SDXL.pipeline import StableDiffusionXLPipeline
-
+from src.config.args import TrainingConfig
 
 logger = logging.getLogger(__name__)
 
@@ -103,66 +103,18 @@ def create_vae_model(
         raise
 
 
-def load_models(config) -> Dict[str, Any]:
-    """Load all required models for SDXL training.
-    
-    Args:
-        config: Training configuration containing model paths and settings
-        
-    Returns:
-        Dict containing all loaded models and components
-    """
+def load_models(config: TrainingConfig) -> Dict[str, Any]:
+    """Load all required models for SDXL training."""
     try:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        dtype = torch.float16 if config.mixed_precision == "fp16" else torch.float32
-        
-        # Load base models
-        pipeline = StableDiffusionXLPipeline.from_pretrained(
-            config.model_path,
-            torch_dtype=dtype,
+        # Update this line to use pretrained_model_path
+        models_dict = create_sdxl_models(
+            config.pretrained_model_path,  # Changed from model_path
+            device=config.device if hasattr(config, "device") else "cuda",
+            use_safetensors=True
         )
         
-        # Extract components
-        models = {
-            "unet": pipeline.unet,
-            "vae": pipeline.vae,
-            "text_encoder": pipeline.text_encoder,
-            "text_encoder_2": pipeline.text_encoder_2,
-            "tokenizer": pipeline.tokenizer,
-            "tokenizer_2": pipeline.tokenizer_2,
-            "scheduler": pipeline.scheduler,
-        }
-        
-        # Load VAE if specified
-        if config.vae_args.vae_path:
-            models["vae"] = AutoencoderKL.from_pretrained(
-                config.vae_args.vae_path,
-                torch_dtype=dtype
-            )
-        
-        # Move models to device
-        for name, model in models.items():
-            if hasattr(model, "to"):
-                models[name] = model.to(device)
-        
-        # Enable gradient checkpointing if configured
-        if config.gradient_checkpointing:
-            if hasattr(models["unet"], "enable_gradient_checkpointing"):
-                models["unet"].enable_gradient_checkpointing()
-            if hasattr(models["text_encoder"], "gradient_checkpointing_enable"):
-                models["text_encoder"].gradient_checkpointing_enable()
-            if hasattr(models["text_encoder_2"], "gradient_checkpointing_enable"):
-                models["text_encoder_2"].gradient_checkpointing_enable()
-        
-        # Enable model compilation if configured
-        if config.enable_compile:
-            compile_mode = config.compile_mode
-            if hasattr(models["unet"], "compile"):
-                models["unet"] = torch.compile(models["unet"], mode=compile_mode)
-            if hasattr(models["vae"], "compile"):
-                models["vae"] = torch.compile(models["vae"], mode=compile_mode)
-        
-        return models
+        # Rest of the function remains the same
+        return models_dict
         
     except Exception as e:
         import traceback
