@@ -61,10 +61,14 @@ def create_sdxl_models(
             torch_dtype=dtype
         )
         
-        # Load scheduler
-        models["scheduler"] = EulerDiscreteScheduler.from_pretrained(
-            os.path.join(pretrained_model_path, "scheduler")
-        )
+        # Create scheduler with default settings
+        models["scheduler"] = EulerDiscreteScheduler.from_config({
+            "num_train_timesteps": 1000,
+            "beta_start": 0.00085,
+            "beta_end": 0.012,
+            "beta_schedule": "scaled_linear",
+            "steps_offset": 1,
+        })
         
         # Create pipeline with loaded components
         pipeline = StableDiffusionXLPipeline(
