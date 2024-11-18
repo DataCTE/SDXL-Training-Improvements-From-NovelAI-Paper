@@ -20,8 +20,13 @@ from pathlib import Path
 import os
 from .memory import MemoryCache, MemoryManager
 import random
+import multiprocessing
 
 logger = logging.getLogger(__name__)
+
+if torch.cuda.is_available():
+    # Set start method to 'spawn' for CUDA multiprocessing
+    multiprocessing.set_start_method('spawn', force=True)
 
 class TextEmbeddingCache:
     """Ultra-optimized text embedding cache with parallel processing."""
