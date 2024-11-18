@@ -30,7 +30,8 @@ def create_sdxl_models(
         # Load VAE
         vae_path = vae_path or os.path.join(pretrained_model_path, "vae")
         models["vae"] = AutoencoderKL.from_pretrained(
-            vae_path,
+            pretrained_model_path,
+            subfolder="vae",
             torch_dtype=dtype
         )
         
