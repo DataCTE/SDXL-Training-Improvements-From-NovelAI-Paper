@@ -113,15 +113,14 @@ class ImageValidator:
                 if fmt is None:
                     raise ImageValidationError("Unknown format")
                     
-                # Get dimensions
+                # Get dimensions using format-specific parsing
+                width = height = None
                 if fmt == 'png':
-                    return struct.unpack('>II', header[16:24])
+                    width, height = struct.unpack('>II', header[16:24])
                 elif fmt == 'gif':
-                    return struct.unpack('<HH', header[6:10])
+                    width, height = struct.unpack('<HH', header[6:10])
                 elif fmt == 'jpeg':
                     # JPEG requires full header scan
-                    size = 2
-                    ftype = 0
                     idx = 2
                     while idx < len(header):
                         while header[idx] == 0xFF:
@@ -129,26 +128,33 @@ class ImageValidator:
                         ftype = header[idx]
                         if 0xC0 <= ftype <= 0xCF and ftype not in (0xC4, 0xC8, 0xCC):
                             height, width = struct.unpack('>HH', header[idx+3:idx+7])
-                            return width, height
+                            break
                         idx += 1
                 elif fmt == 'webp':
                     if header[12:16] == b'VP8 ':
                         width = struct.unpack('<H', header[26:28])[0] & 0x3FFF
                         height = struct.unpack('<H', header[28:30])[0] & 0x3FFF
-                        return width, height
                     elif header[12:16] == b'VP8L':
                         bits = header[21:25]
                         width = ((bits[1] & 0x3F) << 8) | bits[0]
                         height = ((bits[3] & 0xF) << 10) | (bits[2] << 2) | ((bits[1] & 0xC0) >> 6)
-                        return width + 1, height + 1
-                else:
-                    raise ImageValidationError("Unsupported format")
+                        width += 1
+                        height += 1
+                
+                if width is None or height is None:
+                    raise ImageValidationError("Failed to extract dimensions")
                 
                 # Run validations
                 size_valid = self._validate_size(height, width)
                 aspect_valid = self._validate_aspect(height, width)
-                content_valid = (not self.config.check_content or 
-                               self._check_content(image))
+                
+                # Only load full image if content check is needed
+                content_valid = True
+                if self.config.check_content:
+                    img = cv2.imread(image, cv2.IMREAD_COLOR)
+                    if img is None:
+                        raise ImageValidationError("Failed to load image")
+                    content_valid = self._check_content(img)
                 
                 # Update stats
                 is_valid = size_valid and aspect_valid and content_valid
@@ -158,7 +164,29 @@ class ImageValidator:
                 return is_valid, {
                     'size': size_valid,
                     'aspect': aspect_valid,
-                    'content': content_valid
+                    'content': content_valid,
+                    'width': width,
+                    'height': height,
+                    'format': fmt
+                }
+            
+            # For numpy arrays, validate content directly
+            if isinstance(image, np.ndarray):
+                height, width = image.shape[:2]
+                size_valid = self._validate_size(height, width)
+                aspect_valid = self._validate_aspect(height, width)
+                content_valid = not self.config.check_content or self._check_content(image)
+                
+                is_valid = size_valid and aspect_valid and content_valid
+                with self._lock:
+                    self._stats['valid' if is_valid else 'invalid'] += 1
+                    
+                return is_valid, {
+                    'size': size_valid,
+                    'aspect': aspect_valid,
+                    'content': content_valid,
+                    'width': width,
+                    'height': height
                 }
             
         except Exception as e:
@@ -166,7 +194,8 @@ class ImageValidator:
             return False, {
                 'size': False,
                 'aspect': False,
-                'content': False
+                'content': False,
+                'error': str(e)
             }
     
     def validate_batch(
@@ -207,3 +236,25 @@ class ImageValidator:
 class ImageValidationError(Exception):
     """Fast exception for image validation failures."""
     __slots__ = ()
+
+# Global validator instance for common use
+_default_validator = ImageValidator()
+
+def validate_image(
+    image: Union[np.ndarray, Image.Image, torch.Tensor, str],
+    config: Optional[ValidationConfig] = None
+) -> Tuple[bool, Dict[str, Union[bool, float, str, int]]]:
+    """
+    Validate an image using the default validator instance.
+    
+    Args:
+        image: Image to validate (numpy array, PIL Image, torch Tensor, or path)
+        config: Optional validation configuration
+        
+    Returns:
+        Tuple of (is_valid, validation_details)
+    """
+    global _default_validator
+    if config is not None:
+        _default_validator = ImageValidator(config)
+    return _default_validator.validate_image(image)

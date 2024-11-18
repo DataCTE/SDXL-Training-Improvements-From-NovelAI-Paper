@@ -25,7 +25,7 @@ class MultiAspectDataset(Dataset):
     
     __slots__ = ('image_paths', 'captions', 'bucket_manager', 'vae_cache',
                  'text_cache', '_lock', '_executor', '_stats', '_image_cache',
-                 '_transform_cache', '_batch_cache')
+                 '_transform_cache', '_batch_cache', 'num_workers')
     
     def __init__(
         self,
@@ -34,8 +34,7 @@ class MultiAspectDataset(Dataset):
         bucket_manager: BucketManager,
         vae_cache: Optional[VAECache] = None,
         text_cache: Optional[TextEmbeddingCache] = None,
-        num_workers: int = 4,
-        cache_size: int = 1000
+        num_workers: int = 4
     ):
         """Initialize with optimized caching and parallel processing."""
         self.image_paths = image_paths
@@ -44,6 +43,8 @@ class MultiAspectDataset(Dataset):
         self.vae_cache = vae_cache
         self.text_cache = text_cache
         
+        # Store number of workers for parallel processing
+        self.num_workers = num_workers
         self._lock = threading.RLock()
         self._executor = ThreadPoolExecutor(max_workers=num_workers)
         self._stats = defaultdict(int)
@@ -58,7 +59,7 @@ class MultiAspectDataset(Dataset):
     
     def _parallel_preprocess_images(self) -> None:
         """Pre-process images in parallel for faster access."""
-        chunk_size = max(1, len(self.image_paths) // (self._executor._max_workers * 4))
+        chunk_size = max(1, len(self.image_paths) // (self.num_workers * 4))
         chunks = [self.image_paths[i:i + chunk_size] 
                  for i in range(0, len(self.image_paths), chunk_size)]
         
