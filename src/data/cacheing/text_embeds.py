@@ -53,7 +53,7 @@ class TextEmbeddingCache:
         self._batch_size = batch_size
         self._max_cache_size = max_cache_size
         self._stats = {'hits': 0, 'misses': 0, 'evictions': 0}
-        self._scaler = amp.GradScaler(device_type='cuda')  # Updated for new API
+        self._scaler = amp.GradScaler()  # Fixed: removed device_type parameter
         
         # Initialize cache last
         self._cache_dir = Path(cache_dir) if cache_dir else None
