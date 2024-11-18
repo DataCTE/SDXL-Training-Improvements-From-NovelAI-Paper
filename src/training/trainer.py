@@ -28,6 +28,27 @@ class SDXLTrainer:
         self.device = torch.device(device)
         self.dtype = torch.float16 if config.mixed_precision == "fp16" else torch.float32
         
+        # Ensure DataLoader uses spawn method
+        if torch.cuda.is_available():
+            train_dataloader = torch.utils.data.DataLoader(
+                train_dataloader.dataset,
+                batch_size=train_dataloader.batch_size,
+                shuffle=train_dataloader.shuffle,
+                num_workers=train_dataloader.num_workers,
+                multiprocessing_context='spawn'
+            )
+            if val_dataloader is not None:
+                val_dataloader = torch.utils.data.DataLoader(
+                    val_dataloader.dataset,
+                    batch_size=val_dataloader.batch_size,
+                    shuffle=val_dataloader.shuffle,
+                    num_workers=val_dataloader.num_workers,
+                    multiprocessing_context='spawn'
+                )
+        
+        self.train_dataloader = train_dataloader
+        self.val_dataloader = val_dataloader
+        
         # Initialize components (optimizer, scheduler, etc.)
         self.components = initialize_training_components(config, models)
         self.metrics_manager = MetricsManager()

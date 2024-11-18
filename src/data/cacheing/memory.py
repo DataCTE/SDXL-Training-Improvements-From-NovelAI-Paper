@@ -110,7 +110,7 @@ class MemoryCache:
     def offload_to_disk(self) -> None:
         """Offload in-memory cache to disk to free memory."""
         try:
-            for key, value in self.in_memory_cache._cache.items():
+            for key, value in self.in_memory_cache.items():
                 cache_path = self._get_cache_path(key)
                 torch.save(value, cache_path)
                 self.cached_files.add(str(hash(key)))
@@ -143,13 +143,14 @@ class MemoryCache:
 class MemoryManager:
     """Ultra-optimized memory manager for cache system."""
     
-    __slots__ = ('_cache', '_lock', '_max_memory_gb', '_executor', 
-                 '_memory_threshold', '_eviction_trigger', '_stats')
+    __slots__ = ('_cache', '_local', '_max_memory_gb', '_executor', 
+                 '_memory_threshold', '_eviction_trigger', '_stats', '_lock')
     
     def __init__(self, max_memory_gb: float = 32.0):
         """Initialize memory manager with pre-allocated resources."""
         self._cache = OrderedDict()  # LRU cache
-        self._lock = threading.RLock()  # Reentrant lock for thread safety
+        self._local = threading.local()
+        self._lock = threading.RLock()  # Create the lock directly
         self._max_memory_gb = max_memory_gb
         self._executor = ThreadPoolExecutor(max_workers=4)  # Background tasks
         self._memory_threshold = 0.8  # 80% memory threshold
@@ -264,3 +265,8 @@ class MemoryManager:
         """Clean shutdown of resources."""
         self.clear()
         self._executor.shutdown(wait=False)
+    
+    def items(self) -> Dict[str, Any]:
+        """Get all items in the cache as a dictionary."""
+        with self._lock:
+            return dict(self._cache)
