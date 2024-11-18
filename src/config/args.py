@@ -94,8 +94,8 @@ class CachingConfig:
 @dataclass
 class TrainingConfig:
     # Required parameters
-    model_path: str
-    data_dir: str
+    pretrained_model_path: str  # Changed from model_path
+    train_data_dir: str  
     
     # Output configuration
     output_dir: str = DEFAULTS["training"]["output_dir"]
@@ -151,8 +151,10 @@ def parse_args() -> TrainingConfig:
     parser = argparse.ArgumentParser(description="Train a Stable Diffusion XL model")
     
     # Required arguments
-    parser.add_argument("--model_path", type=str, required=True, help="Path to pretrained model")
-    parser.add_argument("--data_dir", type=str, required=True, help="Training data directory")
+    parser.add_argument("--pretrained_model_path", type=str, required=True, 
+                       help="Path to pretrained model")
+    parser.add_argument("--train_data_dir", type=str, required=True, 
+                       help="Training data directory")
     parser.add_argument("--warmup_steps", type=int, default=DEFAULTS["training"]["warmup_steps"],
                        help="Number of warmup steps")
     parser.add_argument("--save_checkpoints", action="store_true",
@@ -227,8 +229,8 @@ def parse_args() -> TrainingConfig:
     
     # Convert to config
     config = TrainingConfig(
-        model_path=args.model_path,
-        data_dir=args.data_dir,
+        pretrained_model_path=args.pretrained_model_path,
+        train_data_dir=args.train_data_dir,
         output_dir=args.output_dir,
         batch_size=args.batch_size,
         num_epochs=args.num_epochs,

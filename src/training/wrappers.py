@@ -52,8 +52,8 @@ def train_sdxl(
         
         # Setup configuration - Update this part
         config = TrainingConfig(
-            model_path=str(pretrained_model_path) if pretrained_model_path else "",
-            data_dir=str(train_data_dir),
+            pretrained_model_path=str(pretrained_model_path) if pretrained_model_path else "",
+            train_data_dir=str(train_data_dir),
             output_dir=str(output_dir),
             **{k: v for k, v in kwargs.items() if k in TrainingConfig.__dataclass_fields__}
         )
