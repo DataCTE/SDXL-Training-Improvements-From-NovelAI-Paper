@@ -5,7 +5,8 @@ from pathlib import Path
 from dataclasses import asdict
 from PIL import Image
 
-from src.training.trainer import SDXLTrainer, TrainingConfig
+from src.config.args import TrainingConfig, VAEConfig
+from src.training.trainer import SDXLTrainer
 from src.training.vae_finetuner import VAEFinetuner
 from src.data.multiaspect.dataset import create_train_dataloader, create_validation_dataloader
 from src.models.model_loader import create_sdxl_models, create_vae_model
@@ -49,11 +50,12 @@ def train_sdxl(
         # Remove validation_config from kwargs if present
         kwargs.pop('validation_config', None)
         
-        # Setup configuration
+        # Setup configuration - Update this part
         config = TrainingConfig(
-            model_path=pretrained_model_path,
+            model_path=str(pretrained_model_path) if pretrained_model_path else "",
             data_dir=str(train_data_dir),
-            **kwargs
+            output_dir=str(output_dir),
+            **{k: v for k, v in kwargs.items() if k in TrainingConfig.__dataclass_fields__}
         )
         
         # Create output directory
