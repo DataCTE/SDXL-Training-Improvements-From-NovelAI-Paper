@@ -48,9 +48,10 @@ class SDXLTrainer:
         self.components = initialize_training_components(config, models)
         self.metrics_manager = MetricsManager()
         
-        # Move models to device
-        for model in self.models.values():
-            model.to(self.device)
+        # Move only torch.nn.Module models to device
+        for name, model in self.models.items():
+            if isinstance(model, torch.nn.Module):
+                model.to(self.device)
             
     def train(self, save_dir: str):
         """Execute training loop with validation."""

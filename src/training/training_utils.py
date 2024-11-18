@@ -5,12 +5,9 @@ from functools import lru_cache
 from src.data.prompt.caption_processor import CaptionProcessor
 from src.training.optimizers.setup_optimizers import setup_optimizer
 from src.training.ema import setup_ema_model
-from src.training.vae_finetuner import setup_vae_finetuner
 from src.training.loss_functions import get_cosine_schedule_with_warmup
 import warnings
 from torch.cuda.amp import GradScaler
-from torch.optim import Optimizer
-from torch.optim.lr_scheduler import LRScheduler
 
 # Suppress the specific deprecation warning
 warnings.filterwarnings("ignore", category=FutureWarning, 
