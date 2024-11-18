@@ -26,6 +26,7 @@ def train_sdxl(
     pretrained_model_path: Optional[str] = None,
     resume_from_checkpoint: Optional[str] = None,
     models: Optional[Dict[str, Any]] = None,
+    validation_config: Optional[Dict[str, Any]] = None,
     **kwargs
 ) -> SDXLTrainer:
     """
@@ -38,18 +39,26 @@ def train_sdxl(
         pretrained_model_path: Optional path to pretrained model weights
         resume_from_checkpoint: Optional path to resume training from checkpoint
         models: Optional pre-loaded model dictionary
+        validation_config: Optional validation configuration parameters
         **kwargs: Additional training configuration parameters
         
     Returns:
         Trained SDXLTrainer instance
     """
     try:
+        # Remove validation_config from kwargs if present
+        kwargs.pop('validation_config', None)
+        
+        # Setup configuration
+        config = TrainingConfig(
+            model_path=pretrained_model_path,
+            data_dir=str(train_data_dir),
+            **kwargs
+        )
+        
         # Create output directory
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Setup configuration
-        config = TrainingConfig(**kwargs)
         
         # Use provided models or create new ones
         if models is None:
