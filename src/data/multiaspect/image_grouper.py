@@ -1,14 +1,9 @@
 """Ultra-optimized image grouping for multi-aspect ratio training."""
 
-import numpy as np
 from typing import Dict, List, Tuple, Set, Optional, Any
-import torch
-from collections import defaultdict
-import logging
 from multiprocessing import Pool, Manager
 from dataclasses import dataclass
-from torch.cuda import amp
-
+import logging
 from .bucket_manager import Bucket, BucketManager
 
 logger = logging.getLogger(__name__)
@@ -97,8 +92,7 @@ class ImageGrouper:
         })
         self._cache = manager.dict()
         self._num_workers = num_workers
-        
-        # Bind the memory estimation method
+        self._estimate_memory = None
         self._estimate_memory = self._create_memory_estimator()
     
     def _create_memory_estimator(self):
@@ -118,6 +112,10 @@ class ImageGrouper:
             return base_memory + overhead
             
         return estimate_memory
+    
+    def _estimate_memory(self, bucket: Bucket, num_images: int) -> int:
+        """Placeholder method that will be replaced by _create_memory_estimator."""
+        raise NotImplementedError
     
     def create_groups(self, image_paths: List[str]) -> List[ImageGroup]:
         """Create optimal image groups using parallel processing."""
@@ -188,7 +186,9 @@ class ImageGrouper:
                         optimized.append(new_group)
                         self._stats['groups_split'] = \
                             self._stats.get('groups_split', 0) + 1
-                break
+                        break
+                    else:
+                        break
         
         return optimized
     
