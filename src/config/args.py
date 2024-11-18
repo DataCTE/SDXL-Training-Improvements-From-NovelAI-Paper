@@ -88,6 +88,7 @@ class TrainingConfig:
     
     # Output configuration
     output_dir: str = "output"
+    cache_dir: Optional[str] = None 
     
     # Training hyperparameters
     batch_size: int = 1
