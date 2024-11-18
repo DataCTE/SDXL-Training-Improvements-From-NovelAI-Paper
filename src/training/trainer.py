@@ -127,7 +127,7 @@ class SDXLTrainer:
             logger.error(f"Error setting up dataloader: {e}")
             raise
     
-    def train(self, save_dir: str):
+    def train(self):
         """Execute training loop with validation."""
         try:
             progress = ProgressTracker(
@@ -168,7 +168,7 @@ class SDXLTrainer:
                     # Save in diffusers format
                     save_diffusers_format(
                         pipeline=pipeline,
-                        output_dir=os.path.join(save_dir, f"epoch_{epoch}"),
+                        output_dir=os.path.join(self.config.output_dir, f"epoch_{epoch}"),
                         save_vae=getattr(self.config, "save_vae", True),
                         use_safetensors=getattr(self.config, "use_safetensors", True)
                     )
@@ -177,7 +177,7 @@ class SDXLTrainer:
                     if getattr(self.config, "save_checkpoint", False):
                         save_checkpoint(
                             pipeline=pipeline,
-                            checkpoint_path=os.path.join(save_dir, f"checkpoint_epoch_{epoch}.safetensors"),
+                            checkpoint_path=os.path.join(self.config.output_dir, f"checkpoint_epoch_{epoch}.safetensors"),
                             save_vae=getattr(self.config, "save_vae", True),
                             use_safetensors=getattr(self.config, "use_safetensors", True)
                         )

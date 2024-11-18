@@ -83,6 +83,7 @@ def main():
             models=models,
             validation_config=validation_config,
             config=config
+            sa
         )
         
         # Run SDXL training
