@@ -28,7 +28,8 @@ class TextEmbeddingCache:
     
     __slots__ = ('tokenizer1', 'tokenizer2', 'text_encoder1', 'text_encoder2',
                  '_memory_cache', '_lock', '_executor', '_batch_size',
-                 '_max_cache_size', '_stats', '_scaler', '_cache_dir')
+                 '_max_cache_size', '_stats', '_scaler', '_cache_dir',
+                 'dropout_rate')
     
     def __init__(
         self,
@@ -39,7 +40,8 @@ class TextEmbeddingCache:
         cache_dir: Optional[str] = None,
         max_cache_size: int = 10000,
         num_workers: int = 4,
-        batch_size: int = 32
+        batch_size: int = 32,
+        dropout_rate: float = 0.1
     ):
         """Initialize text embedding cache with optimized defaults."""
         # Initialize thread safety first
@@ -54,7 +56,8 @@ class TextEmbeddingCache:
         self._batch_size = batch_size
         self._max_cache_size = max_cache_size
         self._stats = {'hits': 0, 'misses': 0, 'evictions': 0}
-        self._scaler = amp.GradScaler()  # Fixed: removed device_type parameter
+        self._scaler = amp.GradScaler()
+        self.dropout_rate = dropout_rate
         
         # Initialize cache last
         self._cache_dir = Path(cache_dir) if cache_dir else None
