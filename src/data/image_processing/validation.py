@@ -237,15 +237,14 @@ class ImageValidationError(Exception):
     """Fast exception for image validation failures."""
     __slots__ = ()
 
-# Global validator instance for common use
-_default_validator = ImageValidator()
+
 
 def validate_image(
     image: Union[np.ndarray, Image.Image, torch.Tensor, str],
     config: Optional[ValidationConfig] = None
 ) -> Tuple[bool, Dict[str, Union[bool, float, str, int]]]:
     """
-    Validate an image using the default validator instance.
+    Validate an image using a thread-local validator instance.
     
     Args:
         image: Image to validate (numpy array, PIL Image, torch Tensor, or path)
@@ -254,7 +253,6 @@ def validate_image(
     Returns:
         Tuple of (is_valid, validation_details)
     """
-    global _default_validator
-    if config is not None:
-        _default_validator = ImageValidator(config)
-    return _default_validator.validate_image(image)
+    # Create a new validator instance for each call
+    validator = ImageValidator(config) if config is not None else ImageValidator()
+    return validator.validate_image(image)

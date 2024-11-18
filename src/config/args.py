@@ -88,7 +88,8 @@ class TrainingConfig:
     
     # Output configuration
     output_dir: str = "output"
-    cache_dir: Optional[str] = None 
+    cache_dir: Optional[str] = None
+    no_caching: bool = False
     
     # Training hyperparameters
     batch_size: int = 1
@@ -97,6 +98,8 @@ class TrainingConfig:
     learning_rate: float = 1e-5
     max_grad_norm: float = 1.0
     warmup_steps: int = 500
+    save_epochs: int = 1
+    validation_epochs: int = 5
     
     # Model and training mode configuration
     training_mode: str = "v_prediction"
@@ -104,6 +107,13 @@ class TrainingConfig:
     gradient_checkpointing: bool = False
     use_8bit_adam: bool = False
     use_ema: bool = True
+    train_text_encoder: bool = False
+    
+    # System configuration
+    enable_compile: bool = False
+    compile_mode: str = "default"
+    num_workers: int = 4
+    device: str = "cuda"
     
     # Component configurations
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
@@ -125,6 +135,8 @@ class TrainingConfig:
     scale_method: str = "karras"
     scale_factor: float = 0.7
     all_ar: bool = False
+    save_checkpoints: bool = False
+    use_tag_weighting: bool = False
 
 def parse_args() -> TrainingConfig:
     """
@@ -240,6 +252,7 @@ def parse_args() -> TrainingConfig:
     args = parser.parse_args()
     
     # Convert to config
+    # Convert to config
     config = TrainingConfig(
         model_path=args.model_path,
         data_dir=args.data_dir,
@@ -268,6 +281,8 @@ def parse_args() -> TrainingConfig:
         sigma_min=args.sigma_min,
         scale_method=args.scale_method,
         use_tag_weighting=args.use_tag_weighting,
+        use_ema=args.use_ema,
+        use_8bit_adam=args.use_8bit_adam,
     )
     
     # Update optimizer config
