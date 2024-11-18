@@ -106,14 +106,12 @@ def create_vae_model(
 def load_models(config: TrainingConfig) -> Dict[str, Any]:
     """Load all required models for SDXL training."""
     try:
-        # Update this line to use pretrained_model_path
-        models_dict = create_sdxl_models(
-            config.pretrained_model_path,  # Changed from model_path
-            device=config.device if hasattr(config, "device") else "cuda",
-            use_safetensors=True
+        # Remove use_safetensors parameter since it's not defined in create_sdxl_models
+        models_dict, pipeline = create_sdxl_models(
+            pretrained_model_path=config.pretrained_model_path,
+            device=config.device if hasattr(config, "device") else "cuda"
         )
         
-        # Rest of the function remains the same
         return models_dict
         
     except Exception as e:
