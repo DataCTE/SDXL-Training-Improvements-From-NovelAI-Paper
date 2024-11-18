@@ -34,14 +34,7 @@ def main():
             vae_trainer = train_vae(
                 train_data_dir=config.data_dir,
                 output_dir=config.output_dir,
-                pretrained_vae_path=config.vae_args.vae_path,
-                learning_rate=config.vae_args.learning_rate,
-                batch_size=config.batch_size,
-                num_epochs=config.num_epochs,
-                mixed_precision=config.mixed_precision,
-                use_8bit_adam=config.optimizer.use_8bit_adam,
-                gradient_checkpointing=config.gradient_checkpointing,
-                use_channel_scaling=config.vae_args.use_channel_scaling,
+                config=config.vae_args
             )
             models["vae"] = vae_trainer.vae
         
@@ -51,6 +44,7 @@ def main():
             train_data_dir=config.data_dir,
             output_dir=config.output_dir,
             pretrained_model_path=config.model_path,
+            models=models,
             batch_size=config.batch_size,
             num_epochs=config.num_epochs,
             learning_rate=config.optimizer.learning_rate,
@@ -59,8 +53,7 @@ def main():
             gradient_checkpointing=config.gradient_checkpointing,
             gradient_accumulation_steps=config.gradient_accumulation_steps,
             max_grad_norm=config.max_grad_norm,
-            save_epochs=config.save_epochs,
-            models=models
+            save_epochs=config.save_epochs
         )
         
         # Save final model

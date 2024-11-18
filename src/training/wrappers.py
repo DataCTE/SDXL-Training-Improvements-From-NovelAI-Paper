@@ -64,10 +64,10 @@ def train_sdxl(
             batch_size=8
         )
         text_embedding_cache = TextEmbeddingCache(
-            text_encoder1=models_dict['text_encoder_one'],
-            text_encoder2=models_dict['text_encoder_two'],
-            tokenizer1=models_dict['tokenizer_one'],
-            tokenizer2=models_dict['tokenizer_two'],
+            text_encoder1=models_dict['text_encoder'],
+            text_encoder2=models_dict['text_encoder_2'],
+            tokenizer1=models_dict['tokenizer'],
+            tokenizer2=models_dict['tokenizer_2'],
             cache_dir=str(output_dir / "text_embeds_cache"),
             max_cache_size=10000,
             num_workers=4,
