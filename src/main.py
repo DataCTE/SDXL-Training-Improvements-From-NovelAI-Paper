@@ -10,6 +10,7 @@ from utils.logging import setup_logging
 from models.model_loader import load_models
 from data.image_processing.validation import ValidationConfig
 from utils.progress import ProgressTracker
+import traceback
 
 logger = logging.getLogger(__name__)
 
