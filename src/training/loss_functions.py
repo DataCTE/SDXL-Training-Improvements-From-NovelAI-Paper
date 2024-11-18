@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 # Pre-allocated buffers for common operations
 _buffers = {}
 _sigma_cache = {}
+_scheduler_buffers = {}
 
 def _get_or_create_buffer(key: str, shape: tuple, device: torch.device) -> torch.Tensor:
     """Get or create a pre-allocated buffer."""
@@ -117,6 +118,81 @@ def training_loss_v_prediction(
     
     return loss
 
+@torch.jit.script
+def _compute_warmup_factor(current_step: int, num_warmup_steps: int) -> float:
+    """JIT-optimized warmup factor computation."""
+    return float(current_step) / float(max(1, num_warmup_steps))
+
+@torch.jit.script
+def _compute_cosine_decay(progress: float, num_cycles: float) -> float:
+    """JIT-optimized cosine decay computation."""
+    return max(0.0, 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)))
+
+@lru_cache(maxsize=16)
+def _get_scheduler_buffer(num_steps: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Cached computation of step tensors for scheduler."""
+    steps = torch.arange(num_steps, dtype=torch.float32, device=device)
+    progress = torch.where(
+        steps < num_steps,
+        steps / max(1, num_steps),
+        torch.ones_like(steps)
+    )
+    return steps, progress
+
+def get_cosine_schedule_with_warmup(
+    optimizer: torch.optim.Optimizer,
+    num_warmup_steps: int,
+    num_training_steps: int,
+    num_cycles: float = 0.5,
+    last_epoch: int = -1,
+    device: Optional[torch.device] = None,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """
+    Create an ultra-optimized cosine learning rate schedule with warmup.
+    
+    Optimizations:
+    - JIT-compiled core computations
+    - Pre-allocated and cached buffers
+    - Vectorized operations
+    - Memory-efficient implementation
+    
+    Args:
+        optimizer: The optimizer for which to schedule the learning rate
+        num_warmup_steps: The number of steps for the warmup phase
+        num_training_steps: The total number of training steps
+        num_cycles: Number of cycles for cosine decay (default: 0.5)
+        last_epoch: The index of the last epoch when resuming training
+        device: Optional device for tensor allocations
+    
+    Returns:
+        `torch.optim.lr_scheduler.LambdaLR` with the optimized schedule
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Get pre-computed tensors from buffer
+    steps, progress = _get_scheduler_buffer(num_training_steps, device)
+    
+    def lr_lambda(current_step: int) -> float:
+        if current_step < num_warmup_steps:
+            # Use pre-computed warmup factors if available
+            if "warmup_factors" in _scheduler_buffers:
+                return _scheduler_buffers["warmup_factors"][current_step].item()
+            return _compute_warmup_factor(current_step, num_warmup_steps)
+            
+        # Use pre-computed progress values
+        step_progress = progress[current_step].item()
+        return _compute_cosine_decay(step_progress, num_cycles)
+    
+    # Pre-compute warmup factors if not already cached
+    if "warmup_factors" not in _scheduler_buffers:
+        _scheduler_buffers["warmup_factors"] = torch.tensor(
+            [_compute_warmup_factor(i, num_warmup_steps) for i in range(num_warmup_steps)],
+            device=device
+        )
+    
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda, last_epoch)
+
 @autocast('cuda')
 def forward_pass(
     args: Any,
@@ -182,7 +258,9 @@ def forward_pass(
 
 def clear_caches() -> None:
     """Clear all caches and buffers."""
-    global _buffers, _sigma_cache
+    global _buffers, _sigma_cache, _scheduler_buffers
     _buffers.clear()
     _sigma_cache.clear()
+    _scheduler_buffers.clear()
+    _get_scheduler_buffer.cache_clear()
     _get_sigma_schedule.cache_clear()
