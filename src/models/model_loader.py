@@ -6,11 +6,9 @@ from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
 
 import torch
-from diffusers import AutoencoderKL, EulerDiscreteScheduler
-from transformers import CLIPTextModel, CLIPTokenizer, CLIPTextModelWithProjection
-from src.models.SDXL.pipeline import StableDiffusionXLPipeline
+from src.models.SDXL.pipeline import StableDiffusionXLPipeline, UNet2DConditionModel, AutoencoderKL, CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
 from src.config.args import TrainingConfig
-
+from diffusers import EulerDiscreteScheduler
 import logging
 logger = logging.getLogger(__name__)
 
