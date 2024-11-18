@@ -337,7 +337,7 @@ def create_dataloader(
     text_encoder: Optional[Any] = None,
     text_encoder_2: Optional[Any] = None,
     min_size: int = 512,
-    max_size: int = 4096,
+    max_size: int = 2048,
     bucket_step_size: int = 64,
     max_bucket_area: int = 1024*1024,
     token_dropout_rate: float = 0.1,

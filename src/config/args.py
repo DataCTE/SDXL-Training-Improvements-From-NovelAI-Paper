@@ -103,7 +103,14 @@ class TrainingConfig:
     gradient_checkpointing: bool = False
     use_8bit_adam: bool = False
     use_ema: bool = True
-    ema_decay: float = 0.9999
+    
+    # Component configurations
+    optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
+    scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
+    ema: EMAConfig = field(default_factory=EMAConfig)
+    vae_args: VAEConfig = field(default_factory=VAEConfig)
+    wandb: WandBConfig = field(default_factory=WandBConfig)
+    tag_weighting: TagWeightingConfig = field(default_factory=TagWeightingConfig)
     
     # SDXL specific parameters
     use_ztsnr: bool = False
@@ -117,39 +124,6 @@ class TrainingConfig:
     scale_method: str = "karras"
     scale_factor: float = 0.7
     all_ar: bool = False
-    
-    # Hardware and performance settings
-    device: str = "cuda"
-    enable_compile: bool = False
-    compile_mode: str = "default"
-    num_workers: int = 4
-    
-    # Validation settings
-    
-    # Checkpoint settings
-    save_epochs: int = 1
-    save_checkpoints: bool = False
-    
-    # Optimizer configuration
-    optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
-    scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
-    ema: EMAConfig = field(default_factory=EMAConfig)
-    vae_args: VAEConfig = field(default_factory=VAEConfig)
-    tag_weighting: TagWeightingConfig = field(default_factory=TagWeightingConfig)
-    wandb: WandBConfig = field(default_factory=WandBConfig)
-    
-    # Cache settings
-    cache_dir: str = "latents_cache"
-    no_caching: bool = False
-    
-    # Dataset settings
-    min_size: int = 512
-    max_size: int = 4096
-    bucket_step_size: int = 64
-    max_bucket_area: int = 1024*1024
-    
-    # Tag processing
-    use_tag_weighting: bool = False
 
 def parse_args() -> TrainingConfig:
     """

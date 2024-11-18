@@ -128,7 +128,7 @@ python src/main.py \
   
   # Resolution handling
   --min_size 512 \
-  --max_size 4096 \
+  --max_size 2048 \
   --bucket_step_size 64 \
   --max_bucket_area 4194304 \
   --all_ar
@@ -145,7 +145,7 @@ python src/main.py \
 
 ### Resolution Handling
 - `min_size`: Minimum dimension size (default: 512)
-- `max_size`: Maximum dimension size (default: 4096)
+- `max_size`: Maximum dimension size (default: 2048)
 - `bucket_step_size`: Resolution increment between buckets (default: 64)
 - `max_bucket_area`: Maximum area constraint (default: 4194304)
 - `all_ar`: Use aspect ratio for bucket assignment

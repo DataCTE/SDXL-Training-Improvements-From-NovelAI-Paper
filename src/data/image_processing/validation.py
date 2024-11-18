@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 class ValidationConfig:
     """Immutable validation configuration."""
     min_size: int = 512
-    max_size: int = 4096
+    max_size: int = 2048
     min_aspect: float = 0.4
     max_aspect: float = 2.5
     check_content: bool = True

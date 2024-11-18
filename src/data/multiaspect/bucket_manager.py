@@ -68,7 +68,7 @@ class BucketManager:
     
     def _precompute_buckets(self) -> None:
         """Pre-compute common bucket configurations."""
-        common_sizes = [512, 576, 640, 704, 768, 832, 896, 960, 1024]
+        common_sizes = [512, 576, 640, 704, 768, 832, 896, 960, 1024, 1088, 1152, 1216, 1280, 1344, 1408, 1472, 1536, 1600, 1664, 1728, 1792, 1856, 1920, 1984, 2048]
         for w in common_sizes:
             for h in common_sizes:
                 if w * h <= self._max_resolution:
