@@ -63,7 +63,7 @@ def main():
         )
         
         # Run SDXL training
-        trainer.train()
+        trainer.train(save_dir=config.output_dir)
         
         # Save final model
         trainer.save_checkpoint(config.output_dir, config.num_epochs)
