@@ -21,8 +21,7 @@ from src.data.image_processing.transforms import (
 )
 from src.data.image_processing.manipluations import converter
 from src.data.image_processing.validation import (
-    validate_image_comprehensive, validate_tensor_comprehensive,
-    validate_dimensions, check_image_corruption, ImageValidationError
+    validate_image, validate_tensor_comprehensive, validate_dimensions, check_image_corruption, ImageValidationError
 )
 from src.data.cacheing.vae import VAECache
 from src.data.cacheing.text_embeds import TextEmbeddingCache
@@ -177,30 +176,21 @@ class MultiAspectDataset(Dataset):
         """Validate a single image file.
         
         Args:
-            image_path: Path to image file
+            image_path: Path to image file to validate
             
         Raises:
-            Various validation errors if image is invalid
+            ImageValidationError: If image fails validation
+            FileNotFoundError: If image file not found
         """
-        # Check for corruption
-        if error := check_image_corruption(image_path):
-            raise ValueError(f"Corrupted image: {error}")
-            
-        # Load and validate image
-        image = load_and_verify_image(image_path)
-        validate_image_comprehensive(
-            image,
-            min_size=self.min_size,
-            max_size=self.max_size
-        )
+        # Validate image file
+        width, height = validate_image(image_path, min_size=self.min_size, max_size=self.max_size)
         
-        # Validate dimensions
-        width, height = image.size
-        validate_dimensions(
-            width, height,
-            min_size=self.min_size,
-            max_size=self.max_size
-        )
+        # Find appropriate bucket
+        bucket = self.bucket_manager._find_bucket(height, width)
+        if not bucket:
+            raise ImageValidationError(
+                f"No suitable bucket found for image dimensions {width}x{height}"
+            )
 
     def _init_caches(self):
         """Initialize VAE and text embedding caches."""
