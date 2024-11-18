@@ -5,16 +5,8 @@ from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
 
 import torch
-from diffusers import (
-    AutoencoderKL,
-    UNet2DConditionModel,
-    DDPMScheduler,
-)
-from transformers import (
-    CLIPTextModel,
-    CLIPTextModelWithProjection,
-    CLIPTokenizer,
-)
+from diffusers import AutoencoderKL
+
 import logging
 from src.models.SDXL.pipeline import StableDiffusionXLPipeline
 from src.config.args import TrainingConfig

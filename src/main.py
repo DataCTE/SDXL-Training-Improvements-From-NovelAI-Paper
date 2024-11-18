@@ -43,7 +43,7 @@ def main():
         if config.vae_args.enable_vae_finetuning:
             logger.info("Starting VAE finetuning...")
             vae_trainer = train_vae(
-                train_data_dir=config.data_dir,
+                train_data_dir=config.train_data_dir,
                 output_dir=config.output_dir,
                 config=config.vae_args,
                 validation_config=validation_config
@@ -53,9 +53,9 @@ def main():
         # Train SDXL
         logger.info("Starting SDXL training...")
         trainer = train_sdxl(
-            train_data_dir=config.data_dir,
+            train_data_dir=config.train_data_dir,
             output_dir=config.output_dir,
-            pretrained_model_path=config.model_path,
+            pretrained_model_path=config.pretrained_model_path,
             models=models,
             validation_config=validation_config,
             config=config  # Pass full config instead of individual params
