@@ -8,7 +8,7 @@ for storing and retrieving data during training.
 import os
 import mmap
 import numpy as np
-from typing import Dict, Any, Optional, Set
+from typing import Dict, Any, Optional, Set, Tuple
 import torch
 from concurrent.futures import ThreadPoolExecutor
 import threading
@@ -225,6 +225,19 @@ class MemoryManager:
                 
             self._cache[key] = value
             self._cache.move_to_end(key)  # Move to end for LRU
+    
+    def popitem(self, last: bool = True) -> Tuple[str, Any]:
+        """Remove and return a (key, value) pair from the cache.
+        
+        Args:
+            last: If True, remove the last item (most recently used),
+                 if False, remove the first item (least recently used)
+        
+        Returns:
+            Tuple of (key, value) removed from cache
+        """
+        with self._lock:
+            return self._cache.popitem(last=last)
     
     def clear(self) -> None:
         """Efficient cache clearing with CUDA optimization."""
