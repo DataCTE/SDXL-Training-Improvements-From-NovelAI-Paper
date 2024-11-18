@@ -12,12 +12,12 @@ from functools import lru_cache
 
 logger = logging.getLogger(__name__)
 
-# Pre-allocated buffers for common operations
-_buffers = {}
 
-def _get_or_create_buffer(key: str, shape: tuple, device: torch.device) -> torch.Tensor:
+# Pre-allocated buffers for common operations
+_buffers: Dict[str, torch.Tensor] = {}
+
+def _get_or_create_buffer(key: str, shape: Union[tuple, Tuple], device: torch.device) -> torch.Tensor:
     """Get or create a pre-allocated buffer."""
-    global _buffers
     buffer_key = f"{key}_{shape}_{device}"
     if buffer_key not in _buffers:
         _buffers[buffer_key] = torch.empty(shape, device=device)
@@ -79,7 +79,6 @@ def train_step(
     optimizers: Dict[str, torch.optim.Optimizer],
     schedulers: Dict[str, Any],
     batch: Dict[str, torch.Tensor],
-    batch_idx: int,
     metrics: MetricsManager,
     device: torch.device,
     dtype: torch.dtype = torch.float32,
@@ -103,7 +102,6 @@ def train_step(
             batch=batch,
             device=device,
             dtype=dtype,
-            components={"metrics": metrics}
         )
         
         # Scale loss for gradient accumulation if needed

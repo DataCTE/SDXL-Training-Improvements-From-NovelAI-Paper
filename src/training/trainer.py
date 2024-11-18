@@ -49,7 +49,7 @@ class SDXLTrainer:
         self.metrics_manager = MetricsManager()
         
         # Move only torch.nn.Module models to device
-        for name, model in self.models.items():
+        for _, model in self.models.items():
             if isinstance(model, torch.nn.Module):
                 model.to(self.device)
             
@@ -78,23 +78,22 @@ class SDXLTrainer:
                     for k, v in batch.items()}
             
             # Training step
-            loss_dict = train_step(
+            loss, metrics_dict = train_step(
                 self.config,
                 self.models,
                 self.components,
                 batch,
-                batch_idx,
+                self.metrics_manager,
                 self.device,
-                self.dtype,
-                self.metrics_manager
+                self.dtype
             )
             
-            total_loss += loss_dict["total_loss"]
+            total_loss += loss.item()  # Get scalar value from loss tensor
             
             # Log progress
             if batch_idx % 10 == 0:
                 logger.info(f"Epoch {epoch} [{batch_idx}/{num_batches}]: "
-                          f"Loss: {loss_dict['total_loss']:.4f}")
+                        f"Loss: {metrics_dict['loss']:.4f}")
                 
         avg_loss = total_loss / num_batches
         logger.info(f"Epoch {epoch} completed. Average loss: {avg_loss:.4f}")

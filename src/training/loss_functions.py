@@ -11,14 +11,13 @@ import math
 
 logger = logging.getLogger(__name__)
 
-# Pre-allocated buffers for common operations
-_buffers = {}
-_sigma_cache = {}
-_scheduler_buffers = {}
+# Pre-allocated buffers for common operations - properly typed and initialized
+_buffers: Dict[str, torch.Tensor] = {}
+_sigma_cache: Dict[str, torch.Tensor] = {}
+_scheduler_buffers: Dict[str, torch.Tensor] = {}
 
-def _get_or_create_buffer(key: str, shape: tuple, device: torch.device) -> torch.Tensor:
+def _get_or_create_buffer(key: str, shape: Union[tuple, Tuple], device: torch.device) -> torch.Tensor:
     """Get or create a pre-allocated buffer."""
-    global _buffers
     buffer_key = f"{key}_{shape}_{device}"
     if buffer_key not in _buffers:
         _buffers[buffer_key] = torch.empty(shape, device=device)
@@ -48,6 +47,28 @@ def _get_sigma_schedule(num_steps: int, sigma_min: float, sigma_max: float) -> t
     sigmas = torch.exp(-steps * inv_rho) * (sigma_max - sigma_min) + sigma_min
     return sigmas
 
+@torch.jit.script
+def _compute_resolution_scale(height: int, width: int, base_resolution: float = 1024.0) -> float:
+    """JIT-optimized resolution scale computation."""
+    return math.sqrt((float(height) * float(width)) / (base_resolution * base_resolution))
+
+@lru_cache(maxsize=32)
+def _get_resolution_scaled_sigma_schedule(
+    num_steps: int,
+    sigma_min: float,
+    sigma_max: float,
+    height: int,
+    width: int
+) -> torch.Tensor:
+    """Cached computation of resolution-scaled sigma schedule."""
+    scale = _compute_resolution_scale(height, width)
+    rho = 7.0  # Hardcoded for optimization
+    inv_rho = 1.0 / rho
+    steps = torch.arange(num_steps, dtype=torch.float32)
+    scaled_sigma_max = sigma_max * scale
+    sigmas = torch.exp(-steps * inv_rho) * (scaled_sigma_max - sigma_min) + sigma_min
+    return sigmas
+
 @autocast('cuda')
 def get_sigmas(
     num_inference_steps: int = 28,
@@ -56,13 +77,22 @@ def get_sigmas(
     width: int = 1024,
     device: Optional[torch.device] = None,
 ) -> torch.Tensor:
-    """Get optimized sigma schedule."""
+    """Get optimized sigma schedule with resolution scaling."""
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Use cached schedule
-    sigmas = _get_sigma_schedule(num_inference_steps, sigma_min, 14.614)
-    return sigmas.to(device)
+    # Use cached schedule with resolution scaling
+    cache_key = f"sigmas_{num_inference_steps}_{sigma_min}_{height}_{width}"
+    if cache_key not in _sigma_cache:
+        _sigma_cache[cache_key] = _get_resolution_scaled_sigma_schedule(
+            num_inference_steps,
+            sigma_min,
+            2000.0,  # Updated sigma_max based on paper
+            height,
+            width
+        )
+    
+    return _sigma_cache[cache_key].to(device)
 
 def apply_model(model: torch.nn.Module, x: torch.Tensor, t: torch.Tensor, text_embeddings: torch.Tensor, added_cond_kwargs: Optional[Dict[str, torch.Tensor]] = None) -> torch.Tensor:
     """Optimized model application."""
@@ -129,15 +159,9 @@ def _compute_cosine_decay(progress: float, num_cycles: float) -> float:
     return max(0.0, 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)))
 
 @lru_cache(maxsize=16)
-def _get_scheduler_buffer(num_steps: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Cached computation of step tensors for scheduler."""
-    steps = torch.arange(num_steps, dtype=torch.float32, device=device)
-    progress = torch.where(
-        steps < num_steps,
-        steps / max(1, num_steps),
-        torch.ones_like(steps)
-    )
-    return steps, progress
+def _get_scheduler_buffer(num_steps: int, device: torch.device) -> torch.Tensor:
+    """Cached computation of progress tensor for scheduler."""
+    return torch.arange(num_steps, dtype=torch.float32, device=device) / max(1, num_steps)
 
 def get_cosine_schedule_with_warmup(
     optimizer: torch.optim.Optimizer,
@@ -147,31 +171,12 @@ def get_cosine_schedule_with_warmup(
     last_epoch: int = -1,
     device: Optional[torch.device] = None,
 ) -> torch.optim.lr_scheduler.LambdaLR:
-    """
-    Create an ultra-optimized cosine learning rate schedule with warmup.
-    
-    Optimizations:
-    - JIT-compiled core computations
-    - Pre-allocated and cached buffers
-    - Vectorized operations
-    - Memory-efficient implementation
-    
-    Args:
-        optimizer: The optimizer for which to schedule the learning rate
-        num_warmup_steps: The number of steps for the warmup phase
-        num_training_steps: The total number of training steps
-        num_cycles: Number of cycles for cosine decay (default: 0.5)
-        last_epoch: The index of the last epoch when resuming training
-        device: Optional device for tensor allocations
-    
-    Returns:
-        `torch.optim.lr_scheduler.LambdaLR` with the optimized schedule
-    """
+    """Create an ultra-optimized cosine learning rate schedule with warmup."""
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Get pre-computed tensors from buffer
-    steps, progress = _get_scheduler_buffer(num_training_steps, device)
+    # Get pre-computed progress tensor from buffer
+    progress = _get_scheduler_buffer(num_training_steps, device)
     
     def lr_lambda(current_step: int) -> float:
         if current_step < num_warmup_steps:
@@ -200,7 +205,6 @@ def forward_pass(
     batch: Dict[str, torch.Tensor],
     device: torch.device,
     dtype: torch.dtype,
-    components: Dict[str, Any],
 ) -> torch.Tensor:
     """Execute forward pass with maximum GPU optimization."""
     try:
@@ -258,9 +262,9 @@ def forward_pass(
 
 def clear_caches() -> None:
     """Clear all caches and buffers."""
-    global _buffers, _sigma_cache, _scheduler_buffers
     _buffers.clear()
     _sigma_cache.clear()
     _scheduler_buffers.clear()
     _get_scheduler_buffer.cache_clear()
     _get_sigma_schedule.cache_clear()
+    _get_resolution_scaled_sigma_schedule.cache_clear()  # Added for completeness
