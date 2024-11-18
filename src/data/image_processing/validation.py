@@ -3,7 +3,7 @@
 import torch
 import numpy as np
 from PIL import Image
-import cv2
+import cv2.cv2 as cv2
 from typing import Tuple, Union, Optional, Dict
 from dataclasses import dataclass
 import threading
@@ -17,7 +17,7 @@ from pathlib import Path
 import imghdr
 import struct
 from functools import lru_cache
-import array
+import cv2
 
 logger = logging.getLogger(__name__)
 
@@ -151,7 +151,7 @@ class ImageValidator:
                 # Only load full image if content check is needed
                 content_valid = True
                 if self.config.check_content:
-                    img = cv2.imread(image, cv2.IMREAD_COLOR)
+                    img = cv2.cv2.imread(image, cv2.cv2.IMREAD_COLOR)
                     if img is None:
                         raise ImageValidationError("Failed to load image")
                     content_valid = self._check_content(img)
