@@ -56,7 +56,7 @@ def main():
                         output_dir=config.output_dir,
                         config=config.vae_args,
                         validation_config=validation_config,
-                        wandb_run=config.use_wandb
+                        wandb_run=config.wandb.use_wandb
                     )
                     
                     vae_progress.update(1, {"status": "Running VAE training"})
@@ -73,7 +73,7 @@ def main():
                     models=models,
                     validation_config=validation_config,
                     config=config,
-                    wandb_run=config.use_wandb
+                    wandb_run=config.wandb.use_wandb
                 )
                 
                 sdxl_progress.update(1, {"status": "Running SDXL training"})

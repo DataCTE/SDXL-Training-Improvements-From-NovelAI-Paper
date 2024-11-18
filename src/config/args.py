@@ -146,6 +146,16 @@ class TrainingConfig:
     validation_image_width: int = DEFAULTS["validation"]["width"]
     validation_num_images_per_prompt: int = DEFAULTS["validation"]["num_images_per_prompt"]
 
+    @property
+    def use_wandb(self) -> bool:
+        """Helper property to access wandb.use_wandb directly."""
+        return self.wandb.use_wandb
+
+    @property
+    def wandb_enabled(self) -> bool:
+        """Helper property to check if wandb is properly configured."""
+        return self.wandb.use_wandb and self.wandb.wandb_project is not None
+
 def parse_args() -> TrainingConfig:
     """Parse command line arguments and convert them into a structured config."""
     parser = argparse.ArgumentParser(description="Train a Stable Diffusion XL model")
