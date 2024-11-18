@@ -33,22 +33,24 @@ class VAECache:
             num_workers: Number of worker threads for parallel processing
             batch_size: Batch size for parallel processing
         """
-        self.vae = vae.eval()  # Ensure eval mode
-        self._cache_dir = Path(cache_dir) if cache_dir else None
+        # Initialize thread safety first
+        self._lock = threading.RLock()
+        self._executor = ThreadPoolExecutor(max_workers=num_workers)
         
-        # Initialize memory management
+        # Initialize model and parameters
+        self.vae = vae.eval()  # Ensure eval mode
+        self._batch_size = batch_size
+        self._max_cache_size = max_cache_size
+        self._stats = {'hits': 0, 'misses': 0, 'evictions': 0}
+        self._scaler = amp.GradScaler(device_type='cuda')  # Updated for new API
+        
+        # Initialize cache last
+        self._cache_dir = Path(cache_dir) if cache_dir else None
         if self._cache_dir:
             os.makedirs(self._cache_dir, exist_ok=True)
             self._memory_cache = MemoryCache(str(self._cache_dir))
         else:
             self._memory_cache = MemoryManager()
-            
-        self._lock = threading.RLock()
-        self._executor = ThreadPoolExecutor(max_workers=num_workers)
-        self._batch_size = batch_size
-        self._max_cache_size = max_cache_size
-        self._stats = {'hits': 0, 'misses': 0, 'evictions': 0}
-        self._scaler = amp.GradScaler()
         
         # Pre-warm CUDA
         if torch.cuda.is_available():

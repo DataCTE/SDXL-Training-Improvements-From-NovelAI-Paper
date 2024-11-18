@@ -15,6 +15,7 @@ import threading
 from collections import OrderedDict
 import logging
 import psutil
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +28,6 @@ class MemoryCache:
         cache_dir: Directory for storing cached data
         in_memory_cache: Dictionary storing cached items in memory
         cached_files: Set of cached file hashes
-        cache_lock: Thread lock for safe concurrent access
     """
     
     def __init__(self, cache_dir: str = "cache") -> None:
@@ -36,7 +36,8 @@ class MemoryCache:
         Args:
             cache_dir: Directory for storing cached data
         """
-        self.cache_dir = cache_dir
+        self.cache_dir = Path(cache_dir)
+        os.makedirs(self.cache_dir, exist_ok=True)
         self.in_memory_cache = MemoryManager(max_memory_gb=32.0)
         self.cached_files: Set[str] = set()
         
@@ -45,21 +46,28 @@ class MemoryCache:
         
     def _load_cached_files(self) -> None:
         """Load list of already cached files."""
-        self.cached_files = {f.stem for f in os.listdir(self.cache_dir)}
-        logger.info("Found %d existing cached items", len(self.cached_files))
+        if self.cache_dir.exists():
+            self.cached_files = {f.stem for f in self.cache_dir.iterdir() if f.is_file()}
+            logger.info("Found %d existing cached items", len(self.cached_files))
         
     def _get_cache_path(self, key: str) -> str:
-        """Get the cache file path for a key."""
-        return os.path.join(self.cache_dir, f"{hash(key)}.pt")
+        """Get cache file path for key."""
+        return str(self.cache_dir / f"{hash(key)}.pt")
         
-    def is_cached(self, key: str) -> bool:
-        """Check if an item is already cached."""
-        return str(hash(key)) in self.cached_files
+    def get(self, key: str, default: Any = None) -> Any:
+        """Get item from cache.
         
-    def get(self, key: str) -> Optional[torch.Tensor]:
-        """Get item from cache."""
+        Checks memory cache first, then disk cache if item not found in memory.
+        
+        Args:
+            key: Cache key to look up
+            default: Value to return if key not found
+            
+        Returns:
+            Cached value or default if not found
+        """
         # Check memory cache first
-        value = self.in_memory_cache.get(key)
+        value = self.in_memory_cache.get(key, None)
         if value is not None:
             return value
             
@@ -67,16 +75,24 @@ class MemoryCache:
         cache_path = self._get_cache_path(key)
         if os.path.exists(cache_path):
             try:
-                return torch.load(cache_path)
+                value = torch.load(cache_path)
+                # Cache in memory for faster future access
+                self.in_memory_cache.put(key, value)
+                return value
             except Exception as error:
                 logger.error(
                     "Failed to load cached item for %s: %s",
                     key, str(error)
                 )
-        return None
+        return default
         
-    def put(self, key: str, value: torch.Tensor) -> None:
-        """Store item in cache."""
+    def put(self, key: str, value: Any) -> None:
+        """Store item in both memory and disk cache.
+        
+        Args:
+            key: Cache key
+            value: Value to cache
+        """
         # Cache in memory
         self.in_memory_cache.put(key, value)
             
@@ -92,20 +108,36 @@ class MemoryCache:
             )
             
     def offload_to_disk(self) -> None:
-        """Offload in-memory cache to disk."""
+        """Offload in-memory cache to disk to free memory."""
         try:
-            for key, value in self.in_memory_cache.get_stats().items():
+            for key, value in self.in_memory_cache._cache.items():
                 cache_path = self._get_cache_path(key)
                 torch.save(value, cache_path)
                 self.cached_files.add(str(hash(key)))
                 
-                # Clear memory cache
-                self.in_memory_cache.clear()
-                torch.cuda.empty_cache()
+            # Clear memory cache
+            self.clear()
             
         except Exception as error:
             logger.error("Failed to offload cache to disk: %s", str(error))
             raise
+            
+    def clear(self) -> None:
+        """Clear both memory and disk cache."""
+        self.in_memory_cache.clear()
+        self.cached_files.clear()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+    def get_stats(self) -> Dict[str, int]:
+        """Get cache statistics including memory and disk usage."""
+        stats = self.in_memory_cache.get_stats()
+        stats['disk_items'] = len(self.cached_files)
+        return stats
+        
+    def __len__(self) -> int:
+        """Get total number of cached items (memory + disk)."""
+        return len(self.in_memory_cache) + len(self.cached_files)
 
 
 class MemoryManager:

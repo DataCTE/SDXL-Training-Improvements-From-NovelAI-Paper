@@ -31,36 +31,37 @@ class TextEmbeddingCache:
     
     def __init__(
         self,
-        tokenizer1: CLIPTokenizer,
-        tokenizer2: CLIPTokenizer,
         text_encoder1: CLIPTextModel,
         text_encoder2: CLIPTextModel,
+        tokenizer1: CLIPTokenizer,
+        tokenizer2: CLIPTokenizer,
         cache_dir: Optional[str] = None,
         max_cache_size: int = 10000,
         num_workers: int = 4,
         batch_size: int = 32
     ):
         """Initialize text embedding cache with optimized defaults."""
-        self.tokenizer1 = tokenizer1
-        self.tokenizer2 = tokenizer2
+        # Initialize thread safety first
+        self._lock = threading.RLock()
+        self._executor = ThreadPoolExecutor(max_workers=num_workers)
+        
+        # Initialize models and parameters
         self.text_encoder1 = text_encoder1.eval()
         self.text_encoder2 = text_encoder2.eval()
+        self.tokenizer1 = tokenizer1
+        self.tokenizer2 = tokenizer2
+        self._batch_size = batch_size
+        self._max_cache_size = max_cache_size
+        self._stats = {'hits': 0, 'misses': 0, 'evictions': 0}
+        self._scaler = amp.GradScaler(device_type='cuda')  # Updated for new API
         
+        # Initialize cache last
         self._cache_dir = Path(cache_dir) if cache_dir else None
-        
-        # Initialize memory management
         if self._cache_dir:
             os.makedirs(self._cache_dir, exist_ok=True)
             self._memory_cache = MemoryCache(str(self._cache_dir))
         else:
             self._memory_cache = MemoryManager()
-            
-        self._lock = threading.RLock()
-        self._executor = ThreadPoolExecutor(max_workers=num_workers)
-        self._batch_size = batch_size
-        self._max_cache_size = max_cache_size
-        self._stats = {'hits': 0, 'misses': 0, 'evictions': 0}
-        self._scaler = amp.GradScaler()
         
         # Pre-warm CUDA
         if torch.cuda.is_available():

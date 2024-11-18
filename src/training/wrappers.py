@@ -54,13 +54,19 @@ def train_sdxl(
         vae_cache = VAECache(
             vae=models_dict['vae'],
             cache_dir=str(output_dir / "vae_cache"),
-            max_cache_size=10000,  # Reasonable default
-            num_workers=4,  # Reasonable default for parallel processing
-            batch_size=8  # Optimal batch size for most GPUs
+            max_cache_size=10000,
+            num_workers=4,
+            batch_size=8
         )
         text_embedding_cache = TextEmbeddingCache(
+            text_encoder1=models_dict['text_encoder1'],
+            text_encoder2=models_dict['text_encoder2'],
+            tokenizer1=models_dict['tokenizer1'],
+            tokenizer2=models_dict['tokenizer2'],
             cache_dir=str(output_dir / "text_embeds_cache"),
-            text_encoder=models_dict['text_encoder']
+            max_cache_size=10000,
+            num_workers=4,
+            batch_size=32
         )
         
         # Create dataloaders
