@@ -214,7 +214,42 @@ def parse_args() -> TrainingConfig:
     parser.add_argument("--all_ar", action="store_true", help="Use all aspect ratios for training")
     
     # VAE arguments
-    parser.add_argument("--vae_use_channel_scaling", action="store_true", help="Use channel scaling for VAE")
+    vae_group = parser.add_argument_group('VAE training arguments')
+    vae_group.add_argument("--enable_vae_finetuning", action="store_true",
+                        help="Enable VAE finetuning")
+    vae_group.add_argument("--vae_path", type=str,
+                        help="Path to pretrained VAE model")
+    vae_group.add_argument("--vae_learning_rate", type=float, default=1e-6,
+                        help="Learning rate for VAE training")
+    vae_group.add_argument("--vae_batch_size", type=int, default=1,
+                        help="Batch size for VAE training")
+    vae_group.add_argument("--vae_num_epochs", type=int, default=1,
+                        help="Number of epochs for VAE training")
+    vae_group.add_argument("--vae_mixed_precision", type=str, default="fp16",
+                        choices=["no", "fp16", "bf16"],
+                        help="Mixed precision mode for VAE training")
+    vae_group.add_argument("--vae_use_8bit_adam", action="store_true",
+                        help="Use 8-bit Adam optimizer for VAE")
+    vae_group.add_argument("--vae_gradient_checkpointing", action="store_true",
+                        help="Enable gradient checkpointing for VAE")
+    vae_group.add_argument("--vae_max_grad_norm", type=float, default=1.0,
+                        help="Maximum gradient norm for VAE training")
+    vae_group.add_argument("--vae_use_channel_scaling", action="store_true",
+                        help="Enable channel scaling for VAE")
+    vae_group.add_argument("--vae_enable_cuda_graphs", action="store_true",
+                        help="Enable CUDA graphs for VAE")
+    vae_group.add_argument("--vae_cache_size", type=int, default=10000,
+                        help="Cache size for VAE training")
+    vae_group.add_argument("--vae_num_warmup_steps", type=int, default=100,
+                        help="Number of warmup steps for VAE training")
+    vae_group.add_argument("--vae_train_freq", type=int, default=10,
+                        help="Frequency of VAE training steps")
+    vae_group.add_argument("--vae_kl_weight", type=float, default=0.0,
+                        help="Weight for KL divergence loss")
+    vae_group.add_argument("--vae_perceptual_weight", type=float, default=0.0,
+                        help="Weight for perceptual loss")
+    vae_group.add_argument("--vae_initial_scale_factor", type=float, default=1.0,
+                        help="Initial scale factor for VAE training")
     
     # Add sampling parameters
     parser.add_argument("--sigma_min", type=float, default=0.029,
@@ -226,35 +261,6 @@ def parse_args() -> TrainingConfig:
     # Add tag processing arguments
     parser.add_argument("--use_tag_weighting", action="store_true",
                       help="Enable tag weighting based on frequency and emphasis")
-    
-    # VAE Training Arguments
-    parser.add_argument("--enable_vae_finetuning", action="store_true",
-                      help="Enable VAE finetuning")
-    parser.add_argument("--vae_path", type=str,
-                      help="Path to pretrained VAE model")
-    parser.add_argument("--vae_learning_rate", type=float, default=1e-6,
-                      help="Learning rate for VAE training")
-    parser.add_argument("--vae_batch_size", type=int, default=1,
-                      help="Batch size for VAE training")
-    parser.add_argument("--vae_num_epochs", type=int, default=1,
-                      help="Number of epochs for VAE training")
-    parser.add_argument("--vae_mixed_precision", type=str, default="fp16",
-                      choices=["no", "fp16", "bf16"],
-                      help="Mixed precision mode for VAE training")
-    parser.add_argument("--vae_use_8bit_adam", action="store_true",
-                      help="Use 8-bit Adam optimizer for VAE")
-    parser.add_argument("--vae_gradient_checkpointing", action="store_true",
-                      help="Enable gradient checkpointing for VAE")
-    parser.add_argument("--vae_max_grad_norm", type=float, default=1.0,
-                      help="Maximum gradient norm for VAE training")
-    parser.add_argument("--vae_use_channel_scaling", action="store_true",
-                      help="Enable channel scaling for VAE")
-    parser.add_argument("--vae_enable_cuda_graphs", action="store_true",
-                      help="Enable CUDA graphs for VAE")
-    parser.add_argument("--vae_cache_size", type=int, default=10000,
-                      help="Cache size for VAE training")
-    parser.add_argument("--vae_num_warmup_steps", type=int, default=100,
-                      help="Number of warmup steps for VAE training")
     
     args = parser.parse_args()
     
