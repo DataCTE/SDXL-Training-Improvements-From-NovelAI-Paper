@@ -19,17 +19,7 @@ def create_sdxl_models(
     dtype: torch.dtype = torch.float32,
     device: Optional[torch.device] = None,
 ) -> Tuple[Dict[str, Any], StableDiffusionXLPipeline]:
-    """Create SDXL models from pretrained weights.
-    
-    Args:
-        pretrained_model_path: Path to pretrained SDXL model
-        vae_path: Optional path to custom VAE model
-        dtype: Model dtype to use
-        device: Device to load models on
-        
-    Returns:
-        Tuple of (models dict, pipeline)
-    """
+    """Create SDXL models from pretrained weights."""
     try:
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -38,6 +28,8 @@ def create_sdxl_models(
         pipeline = StableDiffusionXLPipeline.from_pretrained(
             pretrained_model_path,
             torch_dtype=dtype,
+            use_safetensors=True,  # Use safetensors for better memory handling
+            device_map=None  # Don't use device map to avoid auto-optimization
         )
         
         # Extract components
@@ -55,17 +47,16 @@ def create_sdxl_models(
         if vae_path:
             models["vae"] = create_vae_model(vae_path, dtype)
         
-        # Move models to device
+        # Move models to device explicitly
         for name, model in models.items():
             if hasattr(model, "to"):
-                models[name] = model.to(device)
+                model.to(device=device, dtype=dtype)
                 
         return models, pipeline
         
     except Exception as e:
-        import traceback
-        logger.error("SDXL model creation failed with error: %s", str(e))
-        logger.error("Full traceback:\n%s", traceback.format_exc())
+        logger.error(f"SDXL model creation failed with error: {str(e)}")
+        logger.error(f"Full traceback:\n{traceback.format_exc()}")
         raise
 
 

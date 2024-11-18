@@ -17,7 +17,6 @@ def generate_validation_images(
     prompts: List[str],
     save_dir: str,
     device: torch.device,
-    caption_processor: Optional[CaptionProcessor] = None,
     num_inference_steps: int = 28,
     guidance_scale: float = 5.0,
     height: int = 1024,
@@ -29,22 +28,10 @@ def generate_validation_images(
     os.makedirs(save_dir, exist_ok=True)
     generated_paths = []
     
-    # Move pipeline to specified device
-    pipeline = pipeline.to(device)
+    # Pipeline should already be on device from trainer
     
     for idx, prompt in enumerate(prompts):
         try:
-            # Process prompt if caption processor is provided
-            if caption_processor is not None:
-                tags, weights = caption_processor.process_caption(prompt, training=False)
-                if tags:
-                    prompt = ", ".join(
-                        f"{{{tag}}}" if weight > 1.5 else 
-                        f"{{{{{tag}}}}}" if weight > 2.0 else 
-                        tag 
-                        for tag, weight in zip(tags, weights)
-                    )
-            
             with torch.no_grad():
                 output = pipeline(
                     prompt=prompt,
@@ -71,10 +58,6 @@ def generate_validation_images(
         except Exception as e:
             logger.error(f"Failed to generate validation image for prompt {prompt}: {str(e)}")
             continue
-            
-    # Move pipeline back to CPU to free up GPU memory
-    pipeline = pipeline.to("cpu")
-    torch.cuda.empty_cache()
             
     return generated_paths
 
@@ -160,7 +143,6 @@ def run_validation(
                     prompts=args.validation_prompts,
                     save_dir=save_dir,
                     device=device,
-                    caption_processor=caption_processor,
                     num_inference_steps=getattr(args, "validation_num_inference_steps", 28),
                     guidance_scale=getattr(args, "validation_guidance_scale", 5.5),
                     height=getattr(args, "validation_image_height", 1024),

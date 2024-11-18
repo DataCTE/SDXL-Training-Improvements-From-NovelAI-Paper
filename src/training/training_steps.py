@@ -9,6 +9,7 @@ from src.training.metrics import MetricsManager
 from src.training.loss_functions import forward_pass
 import weakref
 from functools import lru_cache
+from src.models.StateTracker import StateTracker
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +78,7 @@ def train_step(
     dtype: torch.dtype = torch.float32,
     grad_accumulator: Optional[GradientAccumulator] = None,
     scaler: Optional[GradScaler] = None,
+    state_tracker: Optional[StateTracker] = None
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Execute optimized training step with GPU acceleration."""
     try:

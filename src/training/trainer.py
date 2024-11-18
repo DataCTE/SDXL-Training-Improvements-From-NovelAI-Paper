@@ -4,11 +4,16 @@ from typing import Dict, Any, Optional
 from src.config.args import TrainingConfig
 from src.training.training_steps import train_step
 from src.training.training_utils import initialize_training_components
-from src.training.validation import run_validation
+from src.training.validation import generate_validation_images
 from src.training.metrics import MetricsManager
 from src.training.ema import setup_ema_model
 from src.utils.progress import ProgressTracker
+from src.models.StateTracker import StateTracker
 import wandb
+import os
+from src.models.SDXL.pipeline import StableDiffusionXLPipeline
+from src.models.model_saver import ModelSaver
+
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +47,16 @@ class SDXLTrainer:
             if isinstance(model, torch.nn.Module):
                 model.to(self.device)
                 model.train()
-    
+        
+        # Setup EMA models if enabled
+        self.ema_models = {}
+        if config.use_ema:
+            for name, model in self.models.items():
+                if isinstance(model, torch.nn.Module) and name in ['unet', 'text_encoder', 'text_encoder_2']:
+                    ema_model = setup_ema_model(model, self.device)
+                    if ema_model is not None:
+                        self.ema_models[name] = ema_model
+        
         # Initialize wandb
         self.wandb_run = None
         if hasattr(config, 'use_wandb') and config.use_wandb:
@@ -51,93 +65,100 @@ class SDXLTrainer:
                 name=config.wandb_run_name,
                 config=config.__dict__
             )
-    
+        
+        # Initialize state tracker
+        self.state_tracker = StateTracker()
+        
+        # Add state tracker to pipeline components
+        if 'unet' in self.models:
+            self.models['unet'].add_callback(self.state_tracker)
+        
         # Initialize cleanup handlers
         self._cleanup_handlers = []
         self._setup_cleanup_handlers()
-                
-    def __del__(self):
-        """Cleanup resources when trainer is destroyed."""
-        try:
-            # Run all cleanup handlers
-            for cleanup_handler in self._cleanup_handlers:
-                try:
-                    cleanup_handler()
-                except Exception as e:
-                    logger.error(f"Error during cleanup: {str(e)}")
-            
-            # Clear components
-            self.components.clear()
-            
-            # Clear models
-            self.models.clear()
-            
-            # Force garbage collection
-            import gc
-            gc.collect()
-            
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                
-        except Exception as e:
-            logger.error(f"Error during trainer cleanup: {str(e)}")
-            
+    
     def _setup_dataloader(self, dataloader):
         """Setup and validate the dataloader."""
         if not dataloader:
             return None
             
         try:
-            if torch.cuda.is_available():
-                # Get existing settings
-                batch_size = dataloader.batch_size
-                dataset = dataloader.dataset
-                
-                
-                # Create new dataloader with single process if there are pickling issues
-                return torch.utils.data.DataLoader(
-                    dataset,
-                    batch_size=batch_size,
-                    shuffle=isinstance(dataloader.sampler, torch.utils.data.RandomSampler),
-                    num_workers=0,  # Force single process to avoid pickling issues
-                    pin_memory=True,
-                    collate_fn=getattr(dataloader, 'collate_fn', None)
-                )
-            return dataloader
+            # Get existing settings
+            batch_size = dataloader.batch_size
+            dataset = dataloader.dataset
+            shuffle = isinstance(dataloader.sampler, torch.utils.data.RandomSampler)
+            
+            # Create new dataloader with optimized settings
+            return torch.utils.data.DataLoader(
+                dataset,
+                batch_size=batch_size,
+                shuffle=shuffle,
+                num_workers=0,  # Disable multiprocessing to avoid pickling issues
+                pin_memory=True,
+                collate_fn=getattr(dataloader, 'collate_fn', None)
+            )
         except Exception as e:
             logger.error(f"Error setting up dataloader: {e}")
             raise
-        
+    
     def train(self, save_dir: str):
         """Execute training loop with validation."""
-        with ProgressTracker(
-            "SDXL Training",
-            total=self.config.num_epochs,
-            wandb_run=self.wandb_run
-        ) as progress:
-            for epoch in range(self.config.num_epochs):
-                # Training epoch
-                epoch_metrics = self.train_epoch(epoch)
-                
-                # Update progress with epoch metrics
-                progress.update(1, epoch_metrics)
-                
-                # Validation
-                if self.val_dataloader and epoch % self.config.validation_epochs == 0:
-                    self.validate(epoch)
+        try:
+            with ProgressTracker(
+                "SDXL Training",
+                total=self.config.num_epochs,
+                wandb_run=self.wandb_run
+            ) as progress:
+                for epoch in range(self.config.num_epochs):
+                    # Training epoch
+                    epoch_metrics = self.train_epoch(epoch)
                     
-                # Save checkpoint
-                if epoch % self.config.save_epochs == 0:
-                    self.save_checkpoint(save_dir, epoch)
-                
+                    # Update EMA models
+                    if self.ema_models:
+                        for ema_model in self.ema_models.values():
+                            ema_model.step(epoch)
+                    
+                    # Update progress with epoch metrics
+                    progress.update(1, epoch_metrics)
+                    
+                    # Generate validation images
+                    if epoch % self.config.validation_epochs == 0:
+                        self.validate(epoch)
+                        
+                    # Save checkpoint
+                    if epoch % self.config.save_epochs == 0:
+                        ModelSaver.save_diffusers_checkpoint(
+                            pipeline=StableDiffusionXLPipeline(
+                                vae=self.models["vae"],
+                                text_encoder=self.models["text_encoder"],
+                                text_encoder_2=self.models["text_encoder_2"],
+                                tokenizer=self.models["tokenizer"],
+                                tokenizer_2=self.models["tokenizer_2"],
+                                unet=self.models["unet"],
+                                scheduler=self.models["scheduler"]
+                            ),
+                            save_dir=save_dir,
+                            models=self.models,
+                            epoch=epoch,
+                            push_to_hub=getattr(self.config, 'push_to_hub', False),
+                            repo_id=getattr(self.config, 'hub_repo_id', None)
+                        )
+                        
+        except Exception as e:
+            logger.error(f"Training failed with error: {str(e)}")
+            raise
+    
     def train_epoch(self, epoch: int):
         """Execute single training epoch."""
         try:
             total_loss = 0
             num_batches = len(self.train_dataloader)
             
+            # Reset state tracker at start of epoch
+            self.state_tracker.reset()
+            
             # Set models to training mode
-            for name, model in self.models.items():
+            for model in self.models.values():
                 if isinstance(model, torch.nn.Module):
                     model.train()
             
@@ -149,9 +170,18 @@ class SDXLTrainer:
             ) as progress:
                 for batch_idx, batch in enumerate(self.train_dataloader):
                     try:
-                        # Move batch to device and handle text embeddings
+                        # Move batch to device
                         batch = {k: v.to(self.device) if torch.is_tensor(v) else v 
                                 for k, v in batch.items()}
+                        
+                        # Store text encoder outputs in state tracker
+                        if 'text_encoder_hidden_states' in batch:
+                            self.state_tracker.store_text_encoder_outputs(
+                                text_encoder_hidden_states=batch.get('text_encoder_hidden_states'),
+                                text_encoder_2_hidden_states=batch.get('text_encoder_2_hidden_states'),
+                                prompt_embeds=batch.get('prompt_embeds'),
+                                pooled_prompt_embeds=batch.get('pooled_prompt_embeds')
+                            )
                         
                         # Training step
                         loss, metrics_dict = train_step(
@@ -166,6 +196,15 @@ class SDXLTrainer:
                             self.components['scaler']
                         )
                         
+                        # Get state from tracker and add to metrics
+                        state = self.state_tracker.get_state()
+                        if state['latents'] is not None:
+                            metrics_dict.update({
+                                'current_timestep': state['current_timestep'],
+                                'latents_mean': state['latents'].mean().item(),
+                                'latents_std': state['latents'].std().item(),
+                            })
+                        
                         total_loss += loss.item()
                         
                         # Update metrics and progress
@@ -175,7 +214,7 @@ class SDXLTrainer:
                         
                     except Exception as batch_error:
                         logger.error(f"Error processing batch {batch_idx}: {str(batch_error)}")
-                        continue  # Skip to next batch on error
+                        continue
             
             avg_loss = total_loss / num_batches
             return {'epoch': epoch, 'avg_loss': avg_loss, **metrics_dict}
@@ -183,109 +222,136 @@ class SDXLTrainer:
         except Exception as e:
             logger.error(f"Error in epoch {epoch}: {str(e)}")
             raise
+    
+    def __del__(self):
+        """Cleanup resources when trainer is destroyed."""
+        try:
+            # Reset state tracker
+            if hasattr(self, 'state_tracker'):
+                self.state_tracker.reset()
+            
+            # Clear EMA models
+            self.ema_models.clear()
+            
+            # Run cleanup handlers
+            for cleanup_handler in self._cleanup_handlers:
+                try:
+                    cleanup_handler()
+                except Exception as e:
+                    logger.error(f"Error during cleanup: {str(e)}")
+            
+            # Clear components and models
+            self.components.clear()
+            self.models.clear()
+            
+            # Force garbage collection
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+            
+        except Exception as e:
+            logger.error(f"Error during trainer cleanup: {str(e)}")
         
+    def _setup_cleanup_handlers(self):
+        """Setup cleanup handlers for various components."""
+        try:
+            # Add model cleanup handlers
+            for name, model in self.models.items():
+                if hasattr(model, 'cleanup'):
+                    self._cleanup_handlers.append(model.cleanup)
+            
+            # Add EMA cleanup handlers
+            for ema_model in self.ema_models.values():
+                if hasattr(ema_model, 'cleanup'):
+                    self._cleanup_handlers.append(ema_model.cleanup)
+            
+            # Add component cleanup handlers
+            for component in self.components.values():
+                if hasattr(component, 'cleanup'):
+                    self._cleanup_handlers.append(component.cleanup)
+                
+            # Add dataloader cleanup if needed
+            if hasattr(self.train_dataloader, 'cleanup'):
+                self._cleanup_handlers.append(self.train_dataloader.cleanup)
+            if hasattr(self.val_dataloader, 'cleanup'):
+                self._cleanup_handlers.append(self.val_dataloader.cleanup)
+            
+            # Add metrics manager cleanup
+            if hasattr(self.metrics_manager, 'cleanup'):
+                self._cleanup_handlers.append(self.metrics_manager.cleanup)
+            
+            # Add wandb cleanup if active
+            if self.wandb_run is not None:
+                self._cleanup_handlers.append(self.wandb_run.finish)
+            
+        except Exception as e:
+            logger.error(f"Error setting up cleanup handlers: {str(e)}")
+            raise
+    
     def validate(self, epoch: int):
-        """Run validation loop."""
-        # Set models to eval mode
-        for name, model in self.models.items():
-            if isinstance(model, torch.nn.Module):
-                model.eval()
-
-        with ProgressTracker(
-            f"Validation Epoch {epoch}",
-            total=len(self.val_dataloader) if self.val_dataloader else 0,
-            wandb_run=self.wandb_run
-        ) as progress:
-            metrics = run_validation(
-                self.config,
-                self.models,
-                self.components,
-                self.device,
-                self.dtype,
-                epoch,
-                self.metrics_manager,
-                progress_callback=progress.update
+        """Generate sample images using current model state."""
+        try:
+            # Create pipeline instance
+            pipeline = StableDiffusionXLPipeline(
+                vae=self.models["vae"],
+                text_encoder=self.models["text_encoder"],
+                text_encoder_2=self.models["text_encoder_2"],
+                tokenizer=self.models["tokenizer"],
+                tokenizer_2=self.models["tokenizer_2"],
+                unet=self.models["unet"],
+                scheduler=self.models["scheduler"]
             )
             
-            if self.wandb_run:
-                # Log validation metrics to wandb and images
-                self.wandb_run.log(metrics)
-                self.wandb_run.log({
-                    'validation_images': [wandb.Image(image_path) for image_path in metrics['validation_images']]
-                })
-        
-    def save_checkpoint(self, save_dir: str, epoch: int):
-        """Save training checkpoint."""
-        with ProgressTracker(
-            f"Saving checkpoint for epoch {epoch}",
-            total=1,
-            wandb_run=self.wandb_run
-        ) as progress:
-            checkpoint = {
-                'epoch': epoch,
-                'model_state': {name: model.state_dict() 
-                              for name, model in self.models.items()},
-                'optimizer_state': self.components['optimizer'].state_dict(),
-                'config': self.config,
-            }
+            # Set models to eval mode
+            for model in self.models.values():
+                if isinstance(model, torch.nn.Module):
+                    model.eval()
             
-            if 'ema_model' in self.components:
-                checkpoint['ema_state'] = self.components['ema_model'].state_dict()
-                
-            save_path = f"{save_dir}/checkpoint_epoch_{epoch}.pt"
-            torch.save(checkpoint, save_path)
+            # Setup validation directory
+            val_dir = os.path.join(self.config.output_dir, f"validation_images/epoch_{epoch}")
+            os.makedirs(val_dir, exist_ok=True)
             
-            if self.wandb_run:
-                artifact = wandb.Artifact(
-                    name=f"checkpoint-epoch-{epoch}",
-                    type="model"
+            # Get validation prompts
+            validation_prompts = getattr(self.config, "validation_prompts", [
+                "a beautiful sunset over mountains",
+                "a cute cat playing with yarn",
+                "an astronaut riding a horse on mars"
+            ])
+            
+            with ProgressTracker(
+                f"Generating Validation Images - Epoch {epoch}",
+                total=len(validation_prompts),
+                wandb_run=self.wandb_run
+            ) as progress:
+                generated_paths = generate_validation_images(
+                    pipeline=pipeline,
+                    prompts=validation_prompts,
+                    save_dir=val_dir,
+                    device=self.device,
+                    num_inference_steps=getattr(self.config, "validation_num_inference_steps", 28),
+                    guidance_scale=getattr(self.config, "validation_guidance_scale", 5.0),
+                    height=getattr(self.config, "validation_image_height", 1024),
+                    width=getattr(self.config, "validation_image_width", 1024),
+                    num_images_per_prompt=1,
+                    progress_callback=progress.update
                 )
-                artifact.add_file(save_path)
-                self.wandb_run.log_artifact(artifact)
-            
-            progress.update(1, {
-                'status': 'Checkpoint saved',
-                'path': save_path
-            })
-        
-    @classmethod
-    def load_checkpoint(cls, checkpoint_path: str, train_dataloader, val_dataloader=None):
-        """Load training checkpoint and reconstruct trainer."""
-        checkpoint = torch.load(checkpoint_path)
-        
-        # Reconstruct trainer
-        trainer = cls(
-            config=checkpoint['config'],
-            models={name: type(model)() for name, model in checkpoint['model_state'].items()},
-            train_dataloader=train_dataloader,
-            val_dataloader=val_dataloader
-        )
-        
-        # Load states
-        for name, state in checkpoint['model_state'].items():
-            trainer.models[name].load_state_dict(state)
-        trainer.components['optimizer'].load_state_dict(checkpoint['optimizer_state'])
-        
-        if 'ema_state' in checkpoint and 'ema_model' in trainer.components:
-            trainer.components['ema_model'].load_state_dict(checkpoint['ema_state'])
-            
-        return trainer
-        
-    def _setup_ema_model(self, model):
-        """Properly set up EMA model."""
-        try:
-            if not isinstance(model, torch.nn.Module):
-                raise ValueError("Model must be a torch.nn.Module instance")
-            
-            # Create a deep copy on the same device
-            ema_model = type(model)().to(model.device)
-            ema_model.load_state_dict(model.state_dict())
-            
-            # Ensure no gradients are computed for EMA model
-            for param in ema_model.parameters():
-                param.requires_grad_(False)
-            
-            return ema_model
+                
+                # Log images to wandb
+                if self.wandb_run is not None:
+                    for path in generated_paths:
+                        self.wandb_run.log({
+                            f"validation/image_{os.path.basename(path)}": wandb.Image(path)
+                        }, step=epoch)
+                
+                logger.info(f"Generated {len(generated_paths)} validation images for epoch {epoch}")
+                
+                # Set models back to train mode
+                for model in self.models.values():
+                    if isinstance(model, torch.nn.Module):
+                        model.train()
+                    
         except Exception as e:
-            logger.error(f"Failed to set up EMA model: {str(e)}")
-            return None
+            logger.error(f"Failed to generate validation images at epoch {epoch}: {str(e)}")
+            raise
+    
+    

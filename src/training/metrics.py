@@ -50,6 +50,7 @@ class MetricsManager:
     def __init__(self):
         self._manager = Manager()
         self._metrics = self._manager.dict()
+        self._lock = Lock()
         
     def get_metric(self, name: str) -> AverageMeter:
         """Get or create a metric by name."""
@@ -57,11 +58,29 @@ class MetricsManager:
             self._metrics[name] = AverageMeter(name)
         return self._metrics[name]
         
+    def update_metrics(self, metrics_dict: Dict[str, float], n: int = 1):
+        """Update multiple metrics at once."""
+        with self._lock:
+            for name, value in metrics_dict.items():
+                if isinstance(value, (int, float)):
+                    self.update_metric(name, value, n)
+    
     def update_metric(self, name: str, value: float, n: int = 1):
         """Update a metric with a new value."""
-        metric = self.get_metric(name)
-        metric.update(value, n)
-        
-    def get_all_metrics(self) -> Dict[str, float]:
-        """Get all metrics as a dictionary of averages."""
-        return {name: metric.avg for name, metric in self._metrics.items()}
+        with self._lock:
+            metric = self.get_metric(name)
+            metric.update(value, n)
+    
+    def reset_metrics(self):
+        """Reset all metrics."""
+        with self._lock:
+            for metric in self._metrics.values():
+                metric.reset()
+    
+    def cleanup(self):
+        """Cleanup manager resources."""
+        try:
+            self._metrics.clear()
+            self._manager.shutdown()
+        except Exception as e:
+            logger.error(f"Error during metrics cleanup: {e}")

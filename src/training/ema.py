@@ -174,18 +174,33 @@ class EMAModel:
         """Get reference to original model."""
         return self._model()
 
-def setup_ema_model(self, model):
-    """Properly set up EMA model."""
-    if not isinstance(model, torch.nn.Module):
-        logger.error("Model must be an instance of torch.nn.Module")
-        return None
+def setup_ema_model(model: torch.nn.Module, device: torch.device) -> Optional[EMAModel]:
+    """Properly set up EMA model.
+    
+    Args:
+        model: Base model to create EMA from
+        device: Device to place EMA model on
         
+    Returns:
+        EMAModel instance or None if setup fails
+    """
     try:
-        ema_model = type(model)().to(self.device)  # Create new instance
-        ema_model.load_state_dict(model.state_dict())  # Copy parameters
-        for param in ema_model.parameters():
-            param.requires_grad_(False)  # No gradient needed
+        if not isinstance(model, torch.nn.Module):
+            raise ValueError("Model must be an instance of torch.nn.Module")
+            
+        # Create EMA model instance with optimized settings
+        ema_model = EMAModel(
+            model=model,
+            power=0.75,  # Standard EMA power
+            max_value=0.9999,
+            update_after_step=100,
+            device=device,
+            jit_compile=False,  # Disable JIT to avoid serialization issues
+            use_cuda_graph=False  # Disable CUDA graphs for stability
+        )
+        
         return ema_model
+        
     except Exception as e:
         logger.error(f"Failed to set up EMA model: {str(e)}")
         return None
