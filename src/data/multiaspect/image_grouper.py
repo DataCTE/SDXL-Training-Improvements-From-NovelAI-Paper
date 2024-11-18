@@ -71,7 +71,7 @@ class ImageGrouper:
     """Ultra-optimized image grouper for multi-aspect ratio training."""
     
     __slots__ = ('bucket_manager', '_groups', '_max_memory', 
-                 '_stats', '_cache', '_num_workers', '_estimate_memory')
+                 '_stats', '_cache', '_num_workers', '_memory_estimator')
     
     def __init__(
         self,
@@ -92,8 +92,7 @@ class ImageGrouper:
         })
         self._cache = manager.dict()
         self._num_workers = num_workers
-        self._estimate_memory = None
-        self._estimate_memory = self._create_memory_estimator()
+        self._memory_estimator = self._create_memory_estimator()
     
     def _create_memory_estimator(self):
         """Create memory estimation function."""
@@ -114,8 +113,8 @@ class ImageGrouper:
         return estimate_memory
     
     def _estimate_memory(self, bucket: Bucket, num_images: int) -> int:
-        """Placeholder method that will be replaced by _create_memory_estimator."""
-        raise NotImplementedError
+        """Wrapper method to call the memory estimator."""
+        return self._memory_estimator(bucket, num_images)
     
     def create_groups(self, image_paths: List[str]) -> List[ImageGroup]:
         """Create optimal image groups using parallel processing."""

@@ -225,6 +225,59 @@ class MultiAspectDataset(Dataset):
         self._transform_cache.clear()
         self._batch_cache.clear()
         self._stats.clear()
+    
+    def _initialize_resources(self) -> None:
+        """Initialize/reinitialize resources after unpickling."""
+        # Create new Manager instance
+        manager = Manager()
+        
+        # Reinitialize shared dictionaries
+        self._stats = manager.dict()
+        self._image_cache = manager.dict()
+        self._transform_cache = manager.dict()
+        self._batch_cache = manager.dict()
+        
+        # Initialize stats
+        self._stats.update({
+            'processed': 0,
+            'errors': 0,
+            'cache_hits': 0,
+            'cache_misses': 0
+        })
+        
+        # Reinitialize caption processor if needed
+        if not hasattr(self, 'caption_processor'):
+            self.caption_processor = CaptionProcessor(
+                token_dropout_rate=0.1,  # Default values
+                caption_dropout_rate=0.1
+            )
+    
+    def __getstate__(self):
+        """Control pickling behavior."""
+        state = {
+            'image_paths': self.image_paths,
+            'captions': self.captions,
+            'bucket_manager': self.bucket_manager,
+            'vae_cache': self.vae_cache,
+            'text_cache': self.text_cache,
+            'num_workers': self.num_workers,
+            'caption_processor': self.caption_processor
+        }
+        return state
+    
+    def __setstate__(self, state):
+        """Control unpickling behavior."""
+        # Restore basic attributes
+        self.image_paths = state['image_paths']
+        self.captions = state['captions']
+        self.bucket_manager = state['bucket_manager']
+        self.vae_cache = state['vae_cache']
+        self.text_cache = state['text_cache']
+        self.num_workers = state['num_workers']
+        self.caption_processor = state['caption_processor']
+        
+        # Initialize shared resources
+        self._initialize_resources()
 
 
 def create_train_dataloader(

@@ -6,6 +6,7 @@ from src.training.training_steps import train_step
 from src.training.training_utils import initialize_training_components
 from src.training.validation import generate_validation_images
 from src.training.metrics import MetricsManager
+from src.training.ema import setup_ema_model
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,18 @@ class SDXLTrainer:
                 model.to(self.device)
                 model.train()  # Ensure training mode
             
+        # Setup EMA if enabled in config
+        if hasattr(config, 'use_ema') and config.use_ema:
+            self.ema_model = setup_ema_model(
+                model=self.models['unet'],  # Usually EMA is applied to UNet
+                device=self.device,
+                power=getattr(config, 'ema_power', 0.75),
+                max_value=getattr(config, 'ema_max_value', 0.9999),
+                update_after_step=getattr(config, 'ema_update_after_step', 0)
+            )
+        else:
+            self.ema_model = None
+        
     def _setup_dataloader(self, dataloader):
         """Setup and validate the dataloader."""
         if not dataloader:
@@ -175,3 +188,11 @@ class SDXLTrainer:
             trainer.components['ema_model'].load_state_dict(checkpoint['ema_state'])
             
         return trainer
+        
+    def _setup_ema_model(self, model):
+        """Properly set up EMA model."""
+        import copy
+        ema_model = copy.deepcopy(model)
+        for param in ema_model.parameters():
+            param.detach_()
+        return ema_model
