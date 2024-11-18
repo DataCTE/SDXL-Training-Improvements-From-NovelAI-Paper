@@ -11,7 +11,6 @@ from models.model_loader import load_models, save_diffusers_format, save_checkpo
 from data.image_processing.validation import ValidationConfig
 from models.SDXL.pipeline import StableDiffusionXLPipeline
 import traceback
-
 logger = logging.getLogger(__name__)
 
 def main():
@@ -83,7 +82,6 @@ def main():
             models=models,
             validation_config=validation_config,
             config=config
-            sa
         )
         
         # Run SDXL training
