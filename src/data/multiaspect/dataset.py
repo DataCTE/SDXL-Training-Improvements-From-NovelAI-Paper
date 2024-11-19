@@ -77,17 +77,24 @@ class MultiAspectDataset(Dataset):
             'cache_misses': 0
         })
         
-        chunk_size = max(1, len(self.image_paths) // (self.num_workers * 4))
-        chunks = [self.image_paths[i:i + chunk_size] 
-                 for i in range(0, len(self.image_paths), chunk_size)]
-        
-        # Process chunks in parallel
-        with Pool(processes=self.num_workers) as pool:
-            results = pool.map(
-                _process_chunk,
-                [(chunk, self.bucket_manager) for chunk in chunks]
-            )
+        # Handle case when num_workers is 0
+        if self.num_workers == 0:
+            # Process images sequentially
+            results = [_process_chunk(([path], self.bucket_manager)) 
+                      for path in self.image_paths]
+        else:
+            # Process in parallel with chunks
+            chunk_size = max(1, len(self.image_paths) // (self.num_workers * 4))
+            chunks = [self.image_paths[i:i + chunk_size] 
+                     for i in range(0, len(self.image_paths), chunk_size)]
             
+            # Process chunks in parallel
+            with Pool(processes=self.num_workers) as pool:
+                results = pool.map(
+                    _process_chunk,
+                    [(chunk, self.bucket_manager) for chunk in chunks]
+                )
+                
         # Aggregate results
         total_processed = sum(r['processed'] for r in results)
         total_errors = sum(r['errors'] for r in results)
