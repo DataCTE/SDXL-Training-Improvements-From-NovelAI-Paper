@@ -3,6 +3,12 @@
 import logging
 import sys
 from pathlib import Path
+import warnings
+
+# Filter out setuptools/distutils warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="_distutils_hack")
+warnings.filterwarnings("ignore", message="Setuptools is replacing distutils")
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 from config.args import parse_args
 from training.wrappers import train_sdxl, train_vae
@@ -11,6 +17,7 @@ from models.model_loader import load_models, save_diffusers_format, save_checkpo
 from data.image_processing.validation import ValidationConfig
 from models.SDXL.pipeline import StableDiffusionXLPipeline
 import traceback
+
 logger = logging.getLogger(__name__)
 
 def main():
