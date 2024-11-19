@@ -1,26 +1,32 @@
 # SDXL Training with ZTSNR and NovelAI V3 Improvements
 
+> **⚠️ IMPORTANT NOTE**: This repository is in early experimental stages. While we have a basic proof of concept, the codebase is being completely restructured. Not recommended for production use.
+
+
 Most SDXL implementations use a maximum noise deviation (σ_max) of 14.6 [meaning that only 14.6% of the noise is removed at maximum] inherited from SD1.5/1.4, without accounting for SDXL's larger scale. Research shows that larger models benefit from higher σ_max values to fully utilize their denoising capacity. This repository implements an increased σ_max ≈ 20000.0 (as recommended by NovelAI research arXiv:2409.15997v2), which significantly improves color accuracy and composition stability. Combined with Zero Terminal SNR (ZTSNR) and VAE finetuning.
 
 ### Current Status
 
-- [x] Core ZTSNR implementation
-- [x] v-prediction loss
-- [x] perceptual loss
-- [x] Sigma max 20000.0
-- [x] High-resolution coherence enhancements
-- [x] VAE improvements
-- [x] Tag-based weighting system
-- [x] Bucket-based batching
-- [x] Dynamic resolution handling
-- [x] Memory-efficient training
+- [x] Core ZTSNR implementation (proof of concept)
+- [x] Initial v-prediction loss implementation
+- [x] Basic wandb logging
+- [x] Memory-efficient training (needs optimization)
 - [x] Automatic mixed precision (AMP)
-- [x] Functional detailed wandb logging
 
-- [x] 10k dataset proof of concept (completed) [link](https://huggingface.co/dataautogpt3/ProteusSigma)
-- [ ] 200k+ dataset finetune (in progress)
+### Proof of Concept Results
+- ✅ 10k Dataset Test: [ProteusSigma](https://huggingface.co/dataautogpt3/ProteusSigma)
+  - Initial test of concepts
+  - Limited dataset size
+  - Basic implementation
+  - Demonstrates potential of approach
+
+### Work in Progress
+- [ ] Framework Restructuring (current focus)
+- [ ] 200k+ dataset finetune (planned)
 - [ ] 12M dataset finetune (planned)
 - [ ] LoRA support (planned)
+- [ ] Comprehensive testing suite
+- [ ] Production-ready optimizations
 
 ## Technical Implementation
 
@@ -75,126 +81,45 @@ pip install -r requirements.txt
 ### Basic Training
 ```bash
 python src/main.py \
-  --model_path /path/to/sdxl/model \
-  --data_dir /path/to/training/data \
-  --output_dir ./output \
-  --learning_rate 1e-6 \
-  --batch_size 1 \
-  --enable_compile \
-  --use_tag_weighting
+--pretrained_model_path stabilityai/stable-diffusion-xl-base-1.0 \
+--train_data_dir /path/to/data \
+--batch_size 4 \
+--gradient_accumulation_steps 8 \
+--learning_rate 3e-5
 ```
 
-### Advanced Configuration
-```bash
-python src/main.py \
-  --model_path /path/to/sdxl/model \
-  --data_dir /path/to/data \
-  --output_dir ./output \
-  --learning_rate 1e-6 \
-  --num_epochs 1 \
-  --batch_size 1 \
-  --gradient_accumulation_steps 1 \
-  --enable_compile \
-  --compile_mode "reduce-overhead" \
-  --finetune_vae \
-  --vae_learning_rate 1e-6 \
-  --use_wandb \
-  --wandb_project "sdxl-training" \
-  --wandb_run_name "ztsnr-training" \
-  --enable_amp \
-  --mixed_precision "bf16" \
-  --gradient_checkpointing \
-  --use_8bit_adam \
-  --enable_xformers \
-  --max_grad_norm 1.0 \
-  --adaptive_loss_scale \
-  --kl_weight 0.1 \
-  --perceptual_weight 0.1
-```
+## Development Roadmap
 
-## Tag Weighting System
+1. Core Framework (Current Focus)
+   - Stable training loop
+   - Memory management
+   - Proper error handling
+   - Testing infrastructure
 
-### Configuration
-```bash
-python src/main.py \
-  # Tag weighting parameters
-  --use_tag_weighting \
-  --min_tag_weight 0.1 \
-  --max_tag_weight 3.0 \
-  
-  # Caption processing
-  --token_dropout_rate 0.1 \
-  --caption_dropout_rate 0.1 \
-  
-  # Resolution handling
-  --min_size 512 \
-  --max_size 2048 \
-  --bucket_step_size 64 \
-  --max_bucket_area 4194304 \
-  --all_ar
-```
+2. ZTSNR Implementation (Planned)
+   - Noise scheduling
+   - V-prediction
+   - Resolution handling
 
-### Weight Configuration
-- `use_tag_weighting`: Enable tag-based loss weighting
-- `min_tag_weight`: Minimum weight for any tag (default: 0.1)
-- `max_tag_weight`: Maximum weight for any tag (default: 3.0)
+3. Optimizations (Planned)
+   - Memory efficiency
+   - Training speed
+   - Validation pipeline
 
-### Caption Processing
-- `token_dropout_rate`: Rate at which individual tokens are dropped (default: 0.1)
-- `caption_dropout_rate`: Rate at which entire captions are dropped (default: 0.1)
+## Contributing
 
-### Resolution Handling
-- `min_size`: Minimum dimension size (default: 512)
-- `max_size`: Maximum dimension size (default: 2048)
-- `bucket_step_size`: Resolution increment between buckets (default: 64)
-- `max_bucket_area`: Maximum area constraint (default: 4194304)
-- `all_ar`: Use aspect ratio for bucket assignment
-
-## Dataset Format
-
-### Directory Structure
-```
-data_dir/
-├── image1.png
-├── image1.txt
-├── image2.jpg
-├── image2.txt
-...
-```
-
-### Caption Format
-Text files should contain comma-separated tags:
-```plain
-tag1, tag2, tag3, tag4
-```
-Example: `1girl, white hair, outdoor, high quality`
+Currently focused on:
+1. Core stability improvements
+2. Memory optimization
+3. Testing infrastructure
+4. Documentation accuracy
 
 ## Project Structure
 See [Project Structure Documentation](src/filestruc.md) for detailed component descriptions.
 
-## Memory Management
-
-### Bucket-Based Batching
-- Dynamic resolution grouping
-- Aspect ratio preservation
-- Memory-efficient processing
-- Consistent tensor sizes
-
-### Latent Caching
-- VAE latent precomputation
-- Disk-based caching
-- Memory-mapped storage
-- Efficient batch processing
-
-### Resolution Handling
-- Dynamic bucket generation
-- Area-constrained scaling
-- Adaptive aspect ratios
-- Progressive resizing
-
 ## ComfyUI Integration
 
-This repository includes custom ComfyUI nodes that implement the ZTSNR and NovelAI V3 improvements. The nodes can be found in `src/inference/Comfyui-zsnrnode/`.
+This repository includes custom ComfyUI nodes that implement the ZTSNR and NovelAI V3 improvements. The nodes can be found in `/Comfyui-zsnrnode/`.
 
 ### Available Nodes
 
@@ -219,9 +144,9 @@ This repository includes custom ComfyUI nodes that implement the ZTSNR and Novel
 
 ### Installation
 
-1. Copy the `src/inference/Comfyui-zsnrnode` directory to your ComfyUI custom nodes folder:
+1. Copy the `/Comfyui-zsnrnode` directory to your ComfyUI custom nodes folder:
 ```bash
-cp -r src/inference/Comfyui-zsnrnode /path/to/ComfyUI/custom_nodes/
+cp -r /Comfyui-zsnrnode /path/to/ComfyUI/custom_nodes/
 ```
 
 2. Restart ComfyUI to load the new nodes
@@ -243,7 +168,6 @@ Contributions are welcome! Please feel free to submit issues or pull requests fo
 
 ## License
 Apache 2.0
-
 ## Citation
 ```bibtex
 @article{ossa2024improvements,
@@ -252,3 +176,4 @@ Apache 2.0
   journal={arXiv preprint arXiv:2409.15997v2},
   year={2024}
 }
+

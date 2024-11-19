@@ -1,143 +1,129 @@
 # Project Structure Documentation
 
-## Overview
-This project implements a Stable Diffusion XL training pipeline with Zero Terminal SNR (ZTSNR), high-resolution coherence enhancements, and VAE improvements from NovelAI research. The codebase is organized for maximum efficiency, modularity, and extensibility.
+> **Note**: This documentation reflects the current development state. Many features are planned but not yet implemented.
 
-## Directory Structure
+## Current Directory Structure
 
 ```
 src/
 ├── config/
 │   ├── __init__.py
-│   └── args.py            # Centralized configuration management
+│   ├── args.py            # Training configuration and CLI args
+│   └── defaults.json      # Default configuration values
 │
 ├── data/
-│   ├── __init__.py
-│   ├── caption_processor.py # Tag processing and weighting
-│   ├── image_processor.py  # Image loading and transformation
-│   ├── latent_cache.py    # VAE latent caching system
-│   ├── dataset/
+│   ├── cacheing/
 │   │   ├── __init__.py
-│   │   ├── base.py        # Base dataset class
-│   │   ├── bucket_manager.py # Resolution bucket management
-│   │   ├── dataset.py     # Main dataset implementation
-│   │   ├── dataset_initializer.py # Dataset setup
-│   │   ├── image_grouper.py # Image resolution grouping
-│   │   └── dataloader.py  # Custom data loading
-│   └── utils.py          # Data processing utilities
+│   │   ├── memory.py      # Memory management
+│   │   ├── text_embeds.py # Text embedding cache
+│   │   └── vae.py        # VAE cache handling
+│   │
+│   ├── core/
+│   │   ├── __init__.py
+│   │   ├── base.py       # Base dataset classes
+│   │   ├── dataloader.py # Custom dataloader
+│   │   ├── dataset_initializer.py
+│   │   └── sampler.py    # Custom sampling
+│   │
+│   ├── image_processing/
+│   │   ├── __init__.py
+│   │   ├── loading.py    # Image loading utilities
+│   │   ├── manipulations.py
+│   │   ├── transforms.py # Image transformations
+│   │   └── validation.py # Validation utilities
+│   │
+│   ├── multiaspect/
+│   │   ├── __init__.py
+│   │   ├── bucket_manager.py
+│   │   ├── dataset.py    # Multi-aspect dataset
+│   │   └── image_grouper.py
+│   │
+│   └── prompt/
+│       ├── __init__.py
+│       └── caption_processor.py
 │
 ├── models/
-│   ├── __init__.py
-│   ├── architecture.py   # Model architecture definitions
-│   ├── attention.py      # Memory-efficient attention
-│   └── vae.py           # Enhanced VAE components
+│   ├── SDXL/
+│   │   ├── __init__.py
+│   │   ├── pipeline.py   # SDXL pipeline
+│   │   └── model_loader.py
+│   └── StateTracker.py   # Training state management
 │
 ├── training/
+│   ├── optimizers/
+│   │   ├── adafactor/
+│   │   ├── adamw_bfloat16/
+│   │   ├── adamw8bit/
+│   │   ├── soap/
+│   │   └── setup_optimizers.py
+│   │
 │   ├── __init__.py
-│   ├── ema.py           # Enhanced EMA with scheduling
-│   ├── loss.py          # ZTSNR loss implementations
-│   ├── trainer.py       # Memory-efficient training loop
-│   └── vae_finetuner.py # VAE fine-tuning
+│   ├── trainer.py        # Training loop
+│   ├── training_steps.py # Training steps
+│   ├── loss_functions.py # Loss computation
+│   └── metrics.py        # Training metrics
 │
 ├── utils/
 │   ├── __init__.py
-│   ├── checkpoint.py    # Model state management
-│   ├── device.py       # Memory and device optimization
-│   ├── hub.py          # HuggingFace integration
-│   ├── logging.py      # Training monitoring
-│   └── validation.py   # Model validation
+│   ├── logging.py        # WandB and file logging
+│   └── progress.py       # Progress tracking
 │
-└── main.py             # Entry point with CLI
+└── main.py               # Entry point
 ```
 
-## Component Details
+## Implemented Components
 
 ### Config Module
-- `args.py`: Centralized configuration
-  - Training parameters
-  - Dataset configuration
-  - Model architecture settings
-  - Tag weighting parameters
-  - Optimization settings
-  - Validation configuration
+- Basic configuration system
+- CLI argument parsing
+- Default configuration handling
 
 ### Data Module
-- `caption_processor.py`: Tag processing system
-  - Tag extraction and normalization
-  - Weight computation
-  - Tag statistics tracking
-  - Dynamic weight adjustment
-  - Cache management
+- Basic image loading
+- Text embedding caching
+- Multi-aspect dataset support
+- Bucket management
 
-- `dataset/`: Advanced dataset implementation
-  - `bucket_manager.py`: Resolution bucket system
-    - Dynamic bucket generation
-    - Aspect ratio preservation
-    - Area constraints
-    - Adaptive bucketing
-  - `dataset.py`: Main dataset
-    - Multi-resolution handling
-    - Latent caching
-    - Tag weighting
-    - Memory optimization
-  - `image_grouper.py`: Resolution grouping
-    - Efficient bucket assignment
-    - Parallel processing
-    - Memory management
-
+### Models Module
+- SDXL model loading
+- Basic pipeline implementation
+- State tracking
 
 ### Training Module
-- `loss.py`: ZTSNR loss system
-  - V-prediction loss
-  - Dynamic weighting
-  - Tag-weighted loss
-  - Gradient scaling
-
-- `trainer.py`: Advanced training loop
-  - Mixed precision training
-  - Dynamic batch sizing
-  - Memory optimization
-  - Progress tracking
+- Basic training loop
+- Mixed precision support
+- Multiple optimizer options
+- Gradient accumulation
 
 ### Utils Module
-- `checkpoint.py`: State management
-  - Safe state saving/loading
-  - Version control
-  - Metadata tracking
+- Basic wandb logging
+- Progress tracking
+- File logging
 
-- `device.py`: Resource optimization
-  - Memory tracking
-  - CUDA optimization
-  - Cache management
+## Under Development
 
-## Implementation Notes
+### Core Features
+- Memory optimization
+- Advanced caching
+- Proper validation
+- Testing infrastructure
 
-### Memory Management
-- Bucket-based batching
-- Efficient latent caching
-- Dynamic resolution handling
-- Memory-mapped data
-- Streaming processing
+### Planned Features
+- ZTSNR implementation
+- Advanced noise scheduling
+- Resolution handling
+- Production optimizations
 
-### Training Features
-- Multi-resolution support
-- Dynamic tag weighting
-- Adaptive bucket selection
-- Progressive training
-- Automated logging
+## Development Guidelines
 
-### Performance Optimizations
-- Mixed precision training
-- Memory-efficient attention
-- Bucket-based batching
-- Efficient data loading
-- Caching strategies
+### Current Focus
+1. Core stability
+2. Memory management
+3. Testing infrastructure
+4. Documentation accuracy
 
-## Usage Guidelines
-
-Refer to main README.md for:
-- Installation steps
-- Training configurations
-- Performance optimization
-- Troubleshooting guide
-- Best practices
+### Contributing
+- Focus on core functionality
+- Add tests for new features
+- Update documentation
+- Follow existing patterns
