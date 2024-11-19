@@ -86,8 +86,8 @@ class SDXLTrainer:
         self.logger = SDXLTrainingLogger(
             log_dir=config.output_dir,
             use_wandb=config.wandb.use_wandb,
-            log_frequency=config.logging_steps,
-            window_size=100
+            log_frequency=config.wandb.logging_steps,
+            window_size=config.wandb.window_size
         )
         
         # Setup progress tracking
@@ -100,10 +100,8 @@ class SDXLTrainer:
         )
 
         # Initialize wandb if enabled
-        self.wandb_run = None
-        if config.wandb.use_wandb:
-            self._setup_wandb(config)
-            
+        self.wandb_run = self.logger.wandb_run if config.wandb.use_wandb else None
+        
         # Initialize EMA models if enabled
         self.ema_models = {}
         if getattr(config, "use_ema", False):
@@ -206,56 +204,55 @@ class SDXLTrainer:
         """Execute single training epoch with enhanced logging."""
         try:
             total_loss = 0
-            num_batches = len(self.train_dataloader)
             self.state_tracker.reset()
             
-            # Training loop with detailed metrics
             for batch_idx, batch in enumerate(self.train_dataloader):
-                try:
-                    # Process batch
-                    loss, batch_metrics = train_step(
-                        self.config,
-                        self.models,
-                        self.optimizers,
-                        self.schedulers,
-                        batch,
-                        self.device,
-                        dtype=self.dtype,
-                        grad_accumulator=self.grad_accumulator,
-                        scaler=self.scaler,
-                        state_tracker=self.state_tracker
-                    )
-                    
-                    # Update running metrics
-                    total_loss += loss.item()
-                    
-                    # Log detailed metrics
-                    self.logger.log_training_step(
-                        loss=loss,
-                        metrics=batch_metrics,
-                        learning_rate=batch_metrics["learning_rate"],
-                        step=self.state_tracker.global_step,
+                # Process batch and get metrics
+                loss, batch_metrics = train_step(
+                    self.config,
+                    self.models,
+                    self.optimizers,
+                    self.schedulers,
+                    batch,
+                    self.device,
+                    dtype=self.dtype,
+                    grad_accumulator=self.grad_accumulator,
+                    scaler=self.scaler,
+                    state_tracker=self.state_tracker
+                )
+                
+                # Update metrics
+                total_loss += loss.item()
+                
+                # Enhanced logging with detailed metrics
+                self.logger.log_training_step(
+                    loss=loss,
+                    metrics=batch_metrics,
+                    learning_rate=self.schedulers["unet"].get_last_lr()[0],
+                    step=self.state_tracker.global_step,
+                    epoch=epoch,
+                    batch_idx=batch_idx,
+                    step_time=batch_metrics.get("step_time", 0.0),
+                    v_pred_loss=batch_metrics.get("v_pred_loss"),
+                    v_pred_values=batch_metrics.get("v_pred_values"),
+                    v_pred_targets=batch_metrics.get("v_pred_targets"),
+                    grad_norm=batch_metrics.get("grad_norm/total"),
+                    parameter_metrics=batch_metrics.get("parameter_stats", {})
+                )
+                
+                # Log model state periodically
+                if self.state_tracker.global_step % self.config.wandb.logging_steps == 0:
+                    self.logger.log_model_state(
+                        model=self.models["unet"],
                         epoch=epoch,
-                        batch_idx=batch_idx,
-                        step_time=batch_metrics.get("step_time", 0.0),
-                        v_pred_loss=batch_metrics.get("loss/v_pred", None),
-                        v_pred_values=batch_metrics.get("v_pred/pred_mean", None),
-                        v_pred_targets=batch_metrics.get("v_pred/target_mean", None)
+                        step=self.state_tracker.global_step
                     )
-                    
-                except Exception as batch_error:
-                    logger.error(f"Error processing batch {batch_idx}: {str(batch_error)}")
-                    continue
             
-            # Compute epoch metrics
-            avg_loss = total_loss / num_batches
+            # Log epoch summary
             epoch_metrics = self.state_tracker.get_epoch_metrics()
+            self.logger.log_epoch_summary(epoch, epoch_metrics)
             
-            return {
-                'epoch': epoch,
-                'avg_loss': avg_loss,
-                **epoch_metrics
-            }
+            return epoch_metrics
             
         except Exception as e:
             logger.error(f"Error in epoch {epoch}: {str(e)}")
@@ -383,38 +380,5 @@ class SDXLTrainer:
         except Exception as e:
             logger.error(f"Failed to generate validation images at epoch {epoch}: {str(e)}")
             raise
-    
-    def _setup_wandb(self, config: TrainingConfig) -> None:
-        """Initialize wandb logging."""
-        try:
-            if not config.wandb_enabled:
-                return
-            
-            # Initialize wandb
-            wandb.init(
-                project=config.wandb.wandb_project,
-                name=config.wandb.run_name,
-                config=asdict(config),
-                dir=config.output_dir,
-                resume="allow"
-            )
-            
-            self.wandb_run = wandb.run
-            
-            # Setup custom logging
-            wandb.define_metric("loss", summary="min")
-            wandb.define_metric("learning_rate", summary="last")
-            wandb.define_metric("epoch", summary="max")
-            
-            # Create custom panels
-            wandb.run.log({
-                "training_progress": wandb.Table(
-                    columns=["epoch", "step", "loss", "lr"]
-                )
-            })
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize wandb: {e}")
-            self.wandb_run = None
     
     

@@ -10,6 +10,7 @@ from src.training.loss_functions import forward_pass
 import weakref
 from functools import lru_cache
 from src.models.StateTracker import StateTracker
+from src.utils.logging import SDXLTrainingLogger
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +81,7 @@ def train_step(
     scaler: Optional[GradScaler] = None,
     state_tracker: Optional[StateTracker] = None
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """Execute optimized training step with enhanced metrics."""
+    """Execute optimized training step with enhanced metrics and logging."""
     try:
         # Forward pass with detailed metrics
         loss, forward_metrics = forward_pass(
@@ -91,23 +92,39 @@ def train_step(
             dtype=dtype,
         )
         
+        # Initialize metrics dictionary
+        metrics_dict = {
+            "loss/total": loss.item(),
+            "batch_size": batch["pixel_values"].shape[0],
+            **forward_metrics
+        }
+        
         # Scale loss for gradient accumulation
         if grad_accumulator is not None:
             loss = loss / grad_accumulator.accumulation_steps
         
-        # Backward pass with gradient tracking
-        grad_metrics = {}
+        # Backward pass with enhanced gradient tracking
         if scaler is not None:
             scaler.scale(loss).backward()
             
-            # Track gradient norms before clipping
+            # Collect detailed gradient statistics
+            grad_metrics = {}
             if hasattr(args, 'log_gradients') and args.log_gradients:
                 for name, param in model_dict["unet"].named_parameters():
                     if param.grad is not None:
                         grad_metrics[f"grad_norm/{name}"] = param.grad.norm().item()
                         grad_metrics[f"weight_norm/{name}"] = param.norm().item()
+                        
+                        # Add detailed parameter statistics
+                        if logger and logger.log_frequency > 0:
+                            grad_metrics[f"param_stats/{name}"] = {
+                                "grad_mean": param.grad.mean().item(),
+                                "grad_std": param.grad.std().item(),
+                                "param_mean": param.mean().item(),
+                                "param_std": param.std().item()
+                            }
             
-            # Unscale and clip gradients
+            # Gradient clipping with logging
             if args.max_grad_norm is not None:
                 scaler.unscale_(optimizers["unet"])
                 grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -115,16 +132,12 @@ def train_step(
                     args.max_grad_norm
                 )
                 grad_metrics["grad_norm/total"] = grad_norm.item()
+                grad_metrics["grad_norm/clipped"] = min(grad_norm.item(), args.max_grad_norm)
+            
+            metrics_dict.update(grad_metrics)
         
-        # Gather comprehensive metrics
-        metrics_dict = {
-            "loss/total": loss.item(),
-            "loss/v_pred": forward_metrics.get("v_pred_loss", 0.0),
-            "learning_rate": schedulers["unet"].get_last_lr()[0],
-            "batch_size": batch["pixel_values"].shape[0],
-            **grad_metrics,
-            **forward_metrics
-        }
+        # Add learning rate to metrics
+        metrics_dict["learning_rate"] = schedulers["unet"].get_last_lr()[0]
         
         # Update state tracker
         if state_tracker is not None:

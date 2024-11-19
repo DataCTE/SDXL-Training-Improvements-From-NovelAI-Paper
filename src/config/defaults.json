@@ -74,7 +74,11 @@
     },
     "wandb": {
       "use_wandb": false,
-      "logging_steps": 50
+      "project": "",
+      "run_name": "",
+      "logging_steps": 50,
+      "log_model": false,
+      "window_size": 100
     },
     "caching": {
       "vae_cache": {

@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 def load_defaults():
     """Load default configuration values from defaults.json"""
     defaults_path = Path(__file__).parent / "defaults.json"
-    with open(defaults_path) as f:
+    with open(defaults_path, 'r', encoding='utf-8') as f:
         return json.load(f)
 
 DEFAULTS = load_defaults()
@@ -77,10 +77,13 @@ class TagWeightingConfig:
 
 @dataclass
 class WandBConfig:
+    """WandB configuration settings."""
     use_wandb: bool = DEFAULTS["wandb"]["use_wandb"]
-    wandb_project: Optional[str] = None
-    wandb_run_name: Optional[str] = None
+    project: str = DEFAULTS["wandb"].get("project", "")
+    run_name: str = DEFAULTS["wandb"].get("run_name", "")
     logging_steps: int = DEFAULTS["wandb"]["logging_steps"]
+    log_model: bool = DEFAULTS["wandb"].get("log_model", False)
+    window_size: int = DEFAULTS["wandb"].get("window_size", 100)
 
 @dataclass
 class CachingConfig:
@@ -198,7 +201,6 @@ def parse_args() -> TrainingConfig:
     parser.add_argument("--output_dir", type=str, default=DEFAULTS["training"]["output_dir"])
     parser.add_argument("--batch_size", type=int, default=DEFAULTS["training"]["batch_size"])
     parser.add_argument("--num_epochs", type=int, default=DEFAULTS["training"]["num_epochs"])
-    parser.add_argument("--learning_rate", type=float, default=DEFAULTS["optimizer"]["learning_rate"])
     parser.add_argument("--gradient_accumulation_steps", type=int, 
                        default=DEFAULTS["training"]["gradient_accumulation_steps"])
     parser.add_argument("--mixed_precision", type=str, default=DEFAULTS["training"]["mixed_precision"],
@@ -226,9 +228,21 @@ def parse_args() -> TrainingConfig:
                        default=DEFAULTS["training"]["gradient_checkpointing"])
     
     # Optimizer arguments
-    parser.add_argument("--optimizer_type", type=str, default=DEFAULTS["optimizer"]["optimizer_type"],
+    parser.add_argument("--optimizer_type", type=str, 
+                       default=DEFAULTS["optimizer"]["optimizer_type"],
                        choices=["adamw", "adamw8bit"])
-    parser.add_argument("--weight_decay", type=float, default=DEFAULTS["optimizer"]["weight_decay"])
+    parser.add_argument("--learning_rate", type=float,
+                       default=DEFAULTS["optimizer"]["learning_rate"])
+    parser.add_argument("--min_learning_rate", type=float,
+                       default=DEFAULTS["optimizer"].get("min_learning_rate", 1e-6))
+    parser.add_argument("--weight_decay", type=float,
+                       default=DEFAULTS["optimizer"]["weight_decay"])
+    parser.add_argument("--adam_beta1", type=float,
+                       default=DEFAULTS["optimizer"]["adam_beta1"])
+    parser.add_argument("--adam_beta2", type=float,
+                       default=DEFAULTS["optimizer"]["adam_beta2"])
+    parser.add_argument("--adam_epsilon", type=float,
+                       default=DEFAULTS["optimizer"]["adam_epsilon"])
     parser.add_argument("--use_8bit_adam", action="store_true",
                        default=DEFAULTS["optimizer"]["use_8bit_adam"])
     
@@ -245,10 +259,23 @@ def parse_args() -> TrainingConfig:
     parser.add_argument("--num_workers", type=int, default=DEFAULTS["training"]["num_workers"])
     
     # Wandb arguments
-    parser.add_argument("--use_wandb", action="store_true", default=DEFAULTS["wandb"]["use_wandb"])
-    parser.add_argument("--wandb_project", type=str)
-    parser.add_argument("--wandb_run_name", type=str)
-    parser.add_argument("--logging_steps", type=int, default=DEFAULTS["wandb"]["logging_steps"])
+    wandb_group = parser.add_argument_group("WandB Configuration")
+    wandb_group.add_argument("--use_wandb", action="store_true",
+                            default=DEFAULTS["wandb"]["use_wandb"],
+                            help="Enable WandB logging")
+    wandb_group.add_argument("--wandb_project", type=str,
+                            help="WandB project name")
+    wandb_group.add_argument("--wandb_run_name", type=str,
+                            help="WandB run name")
+    wandb_group.add_argument("--logging_steps", type=int,
+                            default=DEFAULTS["wandb"]["logging_steps"],
+                            help="Log every N steps")
+    wandb_group.add_argument("--wandb_log_model", action="store_true",
+                            default=DEFAULTS["wandb"].get("log_model", False),
+                            help="Log model checkpoints to WandB")
+    wandb_group.add_argument("--wandb_window_size", type=int,
+                            default=DEFAULTS["wandb"].get("window_size", 100),
+                            help="Window size for moving averages")
     
     # VAE arguments
     vae_group = parser.add_argument_group('VAE training arguments')
@@ -296,28 +323,7 @@ def parse_args() -> TrainingConfig:
                            default=DEFAULTS["caching"]["text_cache"]["num_workers"])
     cache_group.add_argument("--text_cache_batch_size", type=int,
                            default=DEFAULTS["caching"]["text_cache"]["batch_size"])
-    
-    # Add optimizer beta parameters
-    parser.add_argument("--adam_beta1", type=float, 
-                       default=DEFAULTS["optimizer"]["adam_beta1"])
-    parser.add_argument("--adam_beta2", type=float,
-                       default=DEFAULTS["optimizer"]["adam_beta2"])
-    parser.add_argument("--adam_epsilon", type=float,
-                       default=DEFAULTS["optimizer"]["adam_epsilon"])
-    
-    # Add learning rate arguments
-    parser.add_argument("--learning_rate", type=float,
-                       default=DEFAULTS["optimizer"]["learning_rate"])
-    parser.add_argument("--min_learning_rate", type=float,
-                       default=DEFAULTS["optimizer"].get("min_learning_rate", 1e-6))
-    parser.add_argument("--adam_beta1", type=float,
-                       default=DEFAULTS["optimizer"]["adam_beta1"])
-    parser.add_argument("--adam_beta2", type=float,
-                       default=DEFAULTS["optimizer"]["adam_beta2"])
-    parser.add_argument("--adam_epsilon", type=float,
-                       default=DEFAULTS["optimizer"]["adam_epsilon"])
-    parser.add_argument("--adam_weight_decay", type=float,
-                       default=DEFAULTS["optimizer"]["weight_decay"])
+
     
     # Add scheduler arguments
     parser.add_argument("--scheduler_type", type=str,
@@ -370,6 +376,8 @@ def parse_args() -> TrainingConfig:
     config.wandb.wandb_project = args.wandb_project
     config.wandb.wandb_run_name = args.wandb_run_name
     config.wandb.logging_steps = args.logging_steps
+    config.wandb.log_model = args.wandb_log_model
+    config.wandb.window_size = args.wandb_window_size
     
     # Update VAE config
     config.vae_args.enable_vae_finetuning = args.enable_vae_finetuning

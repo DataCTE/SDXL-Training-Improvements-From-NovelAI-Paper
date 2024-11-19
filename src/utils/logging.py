@@ -452,39 +452,30 @@ class SDXLTrainingLogger(DetailedLogger):
     ):
         super().__init__(log_dir, use_wandb, log_frequency)
         self.window_size = window_size
-        self.metrics_history = {
-            'loss': {
-                'total': [],
-                'v_pred': [],
-                'simple': [],
-                'moving_avg': [],
-            },
-            'v_pred': {
-                'values': [],
-                'targets': [],
-                'errors': [],
-                'moving_avg': []
-            },
-            'learning_rate': [],
-            'grad_norms': [],
-            'step_times': []
-        }
+        self.metrics_history = defaultdict(lambda: defaultdict(list))
         
+        # Initialize wandb run
+        self.wandb_run = None
         if use_wandb:
             self._setup_wandb_logging()
+            
+        # Initialize log files
+        self._initialize_log_files()
+    
+    def _initialize_log_files(self):
+        """Initialize log files with proper headers."""
+        log_files = {
+            "metrics": self.metrics_file,
+            "gradients": self.gradients_file,
+            "model_states": self.model_states_file,
+            "training_steps": self.training_steps_file
+        }
         
-        # Initialize log files with proper encoding
-        self.metrics_file = self.log_dir / "metrics.jsonl"
-        self.gradients_file = self.log_dir / "gradients.jsonl"
-        self.model_states_file = self.log_dir / "model_states.jsonl"
-        self.training_steps_file = self.log_dir / "training_steps.jsonl"
-        
-        # Create files with headers if they don't exist
-        for file_path in [self.metrics_file, self.gradients_file, 
-                         self.model_states_file, self.training_steps_file]:
+        for name, file_path in log_files.items():
             if not file_path.exists():
                 with open(file_path, "w", encoding="utf-8") as f:
-                    f.write("")
+                    f.write(f"# {name} log file\n")
+                    f.write("# Created at: " + datetime.now().isoformat() + "\n")
 
     def _setup_wandb_logging(self):
         """Configure wandb logging with custom panels."""
@@ -639,3 +630,76 @@ class SDXLTrainingLogger(DetailedLogger):
             'step_time': np.mean(self.metrics_history['step_times'][-window:])
                         if self.metrics_history['step_times'] else 0.0
         }
+
+    def log_epoch_summary(self, epoch: int, metrics: Dict[str, Any]) -> None:
+        """Log summary metrics for the epoch."""
+        summary_metrics = {
+            "epoch": epoch,
+            "loss/epoch_avg": np.mean(self.metrics_history['loss']['total'][-self.window_size:]),
+            "learning_rate/epoch_avg": np.mean(self.metrics_history['learning_rate'][-self.window_size:]),
+            **metrics
+        }
+        
+        # Log to file
+        with open(self.metrics_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "timestamp": datetime.now().isoformat(),
+                "type": "epoch_summary",
+                **summary_metrics
+            }) + "\n")
+        
+        # Log to wandb
+        if self.wandb_run is not None:
+            self.wandb_run.log({
+                "epoch": epoch,
+                "epoch_summary": summary_metrics
+            })
+            
+        logger.info(f"Epoch {epoch} Summary:")
+        for key, value in summary_metrics.items():
+            if isinstance(value, (int, float)):
+                logger.info(f"  {key}: {value:.6f}")
+            else:
+                logger.info(f"  {key}: {value}")
+
+def initialize_logging(config: Any) -> SDXLTrainingLogger:
+    """Initialize logging with both file and WandB support.
+    
+    Args:
+        config: Training configuration object
+        
+    Returns:
+        Configured SDXLTrainingLogger instance
+    """
+    # Setup basic logging
+    setup_logging(
+        log_dir=config.output_dir / "logs",
+        log_level=logging.INFO,
+        enable_console=True
+    )
+    
+    # Initialize WandB if enabled
+    if config.wandb.use_wandb:
+        try:
+            wandb.init(
+                project=config.wandb.project,
+                name=config.wandb.run_name,
+                config=vars(config),
+                dir=str(config.output_dir / "wandb"),
+            )
+            
+            # Log code files to WandB
+            if config.wandb.log_model:
+                wandb.run.log_code(".")
+                
+        except Exception as e:
+            logging.warning(f"Failed to initialize WandB: {str(e)}")
+            config.wandb.use_wandb = False
+    
+    # Create and return logger instance
+    return SDXLTrainingLogger(
+        log_dir=config.output_dir / "logs",
+        use_wandb=config.wandb.use_wandb,
+        log_frequency=config.wandb.logging_steps,
+        window_size=config.wandb.window_size
+    )
