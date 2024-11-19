@@ -35,7 +35,7 @@ class MultiAspectDataset(Dataset):
         bucket_manager: BucketManager,
         vae_cache: Optional[VAECache] = None,
         text_cache: Optional[TextEmbeddingCache] = None,
-        num_workers: int = 4,
+        num_workers: int = 0,
         token_dropout: float = 0.1,
         caption_dropout: float = 0.1,
         rarity_factor: float = 0.9,
@@ -58,12 +58,11 @@ class MultiAspectDataset(Dataset):
             num_workers=num_workers
         )
         
-        # Use multiprocessing Manager for shared state
-        manager = Manager()
-        self._stats = manager.dict()
-        self._image_cache = manager.dict()
-        self._transform_cache = manager.dict()
-        self._batch_cache = manager.dict()
+        # Use regular dictionaries instead of Manager
+        self._stats = {}
+        self._image_cache = {}
+        self._transform_cache = {}
+        self._batch_cache = {}
         
         # Process images
         self._preprocess_images()
@@ -347,7 +346,7 @@ def create_train_dataloader(
         bucket_manager=bucket_manager,
         vae_cache=vae_cache,
         text_cache=text_cache,
-        num_workers=config.num_workers,
+        num_workers=0,  # Force single worker
         token_dropout=config.tag_weighting.token_dropout_rate,
         caption_dropout=config.tag_weighting.caption_dropout_rate,
         rarity_factor=config.tag_weighting.rarity_factor,
@@ -358,10 +357,10 @@ def create_train_dataloader(
         dataset,
         batch_size=config.batch_size,
         shuffle=True,
-        num_workers=config.num_workers,
+        num_workers=0,  # Disable multiprocessing
         pin_memory=True,
         drop_last=True,
-        collate_fn=collate_fn  # Add custom collate function
+        collate_fn=collate_fn
     )
 
 def create_validation_dataloader(

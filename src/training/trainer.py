@@ -141,22 +141,15 @@ class SDXLTrainer:
             dataset = dataloader.dataset
             shuffle = isinstance(dataloader.sampler, torch.utils.data.RandomSampler)
             
-            # Check if data is already on GPU
-            sample = next(iter(dataloader))
-            is_on_cpu = all(
-                tensor.device.type == 'cpu' 
-                for tensor in sample.values() 
-                if torch.is_tensor(tensor)
-            )
-            
             # Create new dataloader with optimized settings
             return torch.utils.data.DataLoader(
                 dataset,
                 batch_size=batch_size,
                 shuffle=shuffle,
                 num_workers=0,  # Disable multiprocessing to avoid pickling issues
-                pin_memory=is_on_cpu,  # Only pin memory if tensors are on CPU
-                collate_fn=getattr(dataloader, 'collate_fn', None)
+                pin_memory=True,  # Always enable pin_memory since we're not using multiprocessing
+                collate_fn=getattr(dataloader, 'collate_fn', None),
+                persistent_workers=False  # Disable persistent workers
             )
         except Exception as e:
             logger.error(f"Error setting up dataloader: {e}")
