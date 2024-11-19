@@ -106,16 +106,10 @@ class MultiAspectDataset(Dataset):
             logger.error(f"Error loading {path}: {e}")
             raise
     
-    def _transform_image(
-        self,
-        image: Image.Image,
-        bucket: Bucket
-    ) -> torch.Tensor:
+    def _transform_image(self, image: Image.Image, bucket: Bucket) -> torch.Tensor:
         """Transform image with caching and mixed precision."""
-        # Resize to bucket dimensions
-        if image.size != (bucket.width, bucket.height):
-            image = image.resize((bucket.width, bucket.height),
-                               Image.Resampling.LANCZOS)
+        # Always resize to bucket dimensions, regardless of current size
+        image = image.resize((bucket.width, bucket.height), Image.Resampling.LANCZOS)
         
         # Convert to tensor with mixed precision
         with torch.amp.autocast('cuda'):
@@ -309,6 +303,25 @@ def create_train_dataloader(
     Returns:
         DataLoader configured for training
     """
+    def collate_fn(batch):
+        """Custom collate function to ensure consistent sizes within batches."""
+        # Group by size
+        size_groups = {}
+        for item in batch:
+            size = item['pixel_values'].shape
+            if size not in size_groups:
+                size_groups[size] = []
+            size_groups[size].append(item)
+        
+        # Use largest group
+        largest_group = max(size_groups.values(), key=len)
+        
+        # Stack tensors from the same size group
+        return {
+            'pixel_values': torch.stack([x['pixel_values'] for x in largest_group]),
+            'encoder_hidden_states': torch.stack([x['encoder_hidden_states'] for x in largest_group]),
+            'pooled_outputs': torch.stack([x['pooled_outputs'] for x in largest_group])
+        }
     # Create bucket manager if not provided
     if bucket_manager is None:
         bucket_manager = BucketManager(
@@ -347,7 +360,8 @@ def create_train_dataloader(
         shuffle=True,
         num_workers=config.num_workers,
         pin_memory=True,
-        drop_last=True
+        drop_last=True,
+        collate_fn=collate_fn  # Add custom collate function
     )
 
 def create_validation_dataloader(
