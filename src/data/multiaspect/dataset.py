@@ -219,8 +219,8 @@ class MultiAspectDataset(Dataset):
         
         return {
             'pixel_values': pixel_values,
-            'encoder_hidden_states': text_embeds[0],
-            'pooled_outputs': text_embeds[1]
+            'text_embeddings': text_embeds[0],
+            'pooled_text_embeddings': text_embeds[1]
         }
     
     def get_stats(self) -> Dict[str, int]:
@@ -325,8 +325,8 @@ def create_train_dataloader(
         # Stack tensors from the same size group
         return {
             'pixel_values': torch.stack([x['pixel_values'] for x in largest_group]),
-            'encoder_hidden_states': torch.stack([x['encoder_hidden_states'] for x in largest_group]),
-            'pooled_outputs': torch.stack([x['pooled_outputs'] for x in largest_group])
+            'text_embeddings': torch.stack([x['text_embeddings'] for x in largest_group]),
+            'pooled_text_embeddings': torch.stack([x['pooled_text_embeddings'] for x in largest_group])
         }
     # Create bucket manager if not provided
     if bucket_manager is None:
