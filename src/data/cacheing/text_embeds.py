@@ -92,18 +92,23 @@ class TextEmbeddingCache:
     @torch.no_grad()
     def _encode_batch(self, texts: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
         """Optimized batch encoding with mixed precision."""
-        # Tokenize texts
+        # Tokenize texts (keep on CPU initially)
         tokens1 = self.tokenizer1(texts, padding=True, truncation=True,
                                 return_tensors="pt")
         tokens2 = self.tokenizer2(texts, padding=True, truncation=True,
                                 return_tensors="pt")
         
+        # Pin memory before CUDA transfer
         if torch.cuda.is_available():
+            tokens1 = {k: v.pin_memory() for k, v in tokens1.items()}
+            tokens2 = {k: v.pin_memory() for k, v in tokens2.items()}
+            
+            # Now transfer to CUDA
             tokens1 = {k: v.cuda() for k, v in tokens1.items()}
             tokens2 = {k: v.cuda() for k, v in tokens2.items()}
             
         # Use mixed precision for faster encoding
-        with amp.autocast():
+        with amp.autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu'):
             # Encode with both text encoders
             embed1 = self.text_encoder1(**tokens1)[0]
             embed2 = self.text_encoder2(**tokens2)[0]
@@ -152,6 +157,10 @@ class TextEmbeddingCache:
             
             if cached is not None:
                 embed1, embed2 = cached
+                # Ensure tensors are on CPU for pinning
+                if torch.cuda.is_available():
+                    embed1 = embed1.cpu()
+                    embed2 = embed2.cpu()
                 embed1_list.append(embed1)
                 embed2_list.append(embed2)
                 self._stats['hits'] += 1
@@ -167,12 +176,20 @@ class TextEmbeddingCache:
             # Cache new embeddings
             for i, (embed1, embed2) in enumerate(zip(embed1_batch, embed2_batch)):
                 key = self._get_cache_key(texts[uncached_indices[i]])
-                self._memory_cache.put(key, (embed1.detach(), embed2.detach()))
-                embed1_list.append(embed1)
-                embed2_list.append(embed2)
+                # Store on CPU in cache
+                self._memory_cache.put(key, (embed1.cpu(), embed2.cpu()))
+                embed1_list.append(embed1.cpu())
+                embed2_list.append(embed2.cpu())
                 
-        # Combine results maintaining order
-        return torch.stack(embed1_list), torch.stack(embed2_list)
+        # Stack results and pin memory
+        result1 = torch.stack(embed1_list)
+        result2 = torch.stack(embed2_list)
+        
+        if torch.cuda.is_available():
+            result1 = result1.pin_memory()
+            result2 = result2.pin_memory()
+            
+        return result1, result2
         
     def clear(self) -> None:
         """Efficient cache clearing."""

@@ -43,11 +43,13 @@ class VAECache:
         
         # Initialize model and parameters
         self.vae = vae.eval()  # Ensure eval mode
+        if torch.cuda.is_available():
+            self.vae = self.vae.cuda()
         self._batch_size = batch_size
         self._max_cache_size = max_cache_size
-        self._scaler = amp.GradScaler()  # Fixed: removed device_type parameter
+        self._scaler = amp.GradScaler()
         
-        # Initialize cache last
+        # Initialize cache
         self._cache_dir = Path(cache_dir) if cache_dir else None
         if self._cache_dir:
             os.makedirs(self._cache_dir, exist_ok=True)
@@ -88,13 +90,24 @@ class VAECache:
     @torch.no_grad()
     def _encode_batch(self, images: torch.Tensor) -> torch.Tensor:
         """Optimized batch encoding with mixed precision."""
-        if not torch.cuda.is_available():
-            return self.vae.encode(images)[0].sample()
-            
+        # Ensure images start on CPU
+        if images.device.type == 'cuda':
+            images = images.cpu()
+        
+        # Pin memory if using CUDA
+        if torch.cuda.is_available():
+            images = images.pin_memory()
+            images = images.cuda()
+        
         # Use mixed precision for faster encoding
-        with amp.autocast():
+        with amp.autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu'):
             encoded = self.vae.encode(images)[0]
-            return self._scaler.scale(encoded).sample()
+            if torch.cuda.is_available():
+                encoded = self._scaler.scale(encoded)
+            encoded = encoded.sample()
+        
+        # Return tensor on CPU for caching
+        return encoded.cpu()
     
     def _parallel_encode(self, images: torch.Tensor) -> torch.Tensor:
         """Parallel batch processing with optimal batch size."""
@@ -120,6 +133,10 @@ class VAECache:
         if images.ndim == 3:
             images = images.unsqueeze(0)
             
+        # Ensure input is on CPU
+        if images.device.type == 'cuda':
+            images = images.cpu()
+            
         # Check cache for each image
         encoded_list = []
         uncached_indices = []
@@ -130,7 +147,9 @@ class VAECache:
             cached = self._memory_cache.get(key)
             
             if cached is not None:
-                encoded_list.append(cached)
+                # Get cached tensor and ensure it's on CPU
+                encoded = cached.cpu() if cached.device.type == 'cuda' else cached
+                encoded_list.append(encoded)
                 self._stats['hits'] += 1
             else:
                 uncached_indices.append(i)
@@ -142,16 +161,22 @@ class VAECache:
             uncached_batch = torch.stack(uncached_images)
             encoded_batch = self._parallel_encode(uncached_batch)
             
-            # Cache new encodings
+            # Cache new encodings (ensure on CPU)
             for i, encoded in zip(uncached_indices, encoded_batch):
                 key = self._get_cache_key(images[i])
                 if self._should_evict():
                     self._evict_items()
-                self._memory_cache.put(key, encoded.detach())
-                encoded_list.append(encoded)
+                # Store in cache on CPU
+                encoded_cpu = encoded.cpu() if encoded.device.type == 'cuda' else encoded
+                self._memory_cache.put(key, encoded_cpu)
+                encoded_list.append(encoded_cpu)
         
-        # Combine results maintaining order
-        return torch.stack(encoded_list)
+        # Stack results and pin memory if using CUDA
+        result = torch.stack(encoded_list)
+        if torch.cuda.is_available():
+            result = result.pin_memory()
+        
+        return result
     
     def clear(self) -> None:
         """Efficient cache clearing."""

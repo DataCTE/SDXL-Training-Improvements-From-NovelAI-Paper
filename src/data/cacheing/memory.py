@@ -21,7 +21,7 @@ class MemoryManager:
         """Initialize memory manager with pre-allocated resources."""
         manager = Manager()
         self._manager = manager
-        self._cache = manager.dict()  # Use Manager dict instead of OrderedDict
+        self._cache = manager.dict()
         self._max_memory_gb = max_memory_gb
         self._stats = manager.dict({'hits': 0, 'misses': 0, 'evictions': 0})
         
@@ -56,6 +56,9 @@ class MemoryManager:
         try:
             value = self._cache.get(key, default)
             if value is not None:
+                # Handle tensor device placement
+                if isinstance(value, torch.Tensor):
+                    value = value.cpu()  # Ensure tensor is on CPU
                 self._stats['hits'] = self._stats.get('hits', 0) + 1
                 return value
             self._stats['misses'] = self._stats.get('misses', 0) + 1
@@ -69,7 +72,10 @@ class MemoryManager:
             self._evict_items()
             
         if isinstance(value, torch.Tensor):
+            # Ensure tensor is on CPU and detached
             value = value.detach()
+            if value.device.type == 'cuda':
+                value = value.cpu()
                 
         self._cache[key] = value
     
@@ -114,8 +120,12 @@ class MemoryCache(MemoryManager):
     def _load_cached_files(self) -> None:
         """Load list of cached files."""
         if self.cache_dir.exists():
-            existing_files = set(f.stem for f in self.cache_dir.iterdir() if f.is_file())
-            self.cached_files.extend(list(existing_files))
+            try:
+                existing_files = set(f.stem for f in self.cache_dir.iterdir() 
+                                   if f.is_file() and f.suffix == '.pt')
+                self.cached_files.extend(list(existing_files))
+            except Exception as e:
+                logger.error(f"Failed to load cached files: {e}")
     
     def _get_cache_path(self, key: str) -> str:
         """Get cache file path for key."""
@@ -123,6 +133,12 @@ class MemoryCache(MemoryManager):
     
     def put(self, key: str, value: Any) -> None:
         """Store item in cache with disk persistence."""
+        # Ensure tensor is on CPU before storing
+        if isinstance(value, torch.Tensor):
+            value = value.detach()
+            if value.device.type == 'cuda':
+                value = value.cpu()
+                
         super().put(key, value)
         if key not in self.cached_files:
             self.cached_files.append(key)
@@ -130,6 +146,7 @@ class MemoryCache(MemoryManager):
         if self.cache_dir:
             try:
                 cache_path = self._get_cache_path(key)
+                # Save tensor to disk in CPU format
                 torch.save(value, cache_path)
             except Exception as e:
                 logger.error(f"Failed to save to disk cache: {e}")
@@ -141,7 +158,8 @@ class MemoryCache(MemoryManager):
             try:
                 cache_path = self._get_cache_path(key)
                 if os.path.exists(cache_path):
-                    value = torch.load(cache_path)
+                    # Load tensor on CPU
+                    value = torch.load(cache_path, map_location='cpu')
                     super().put(key, value)  # Load into memory cache
                     return value
             except Exception as e:
