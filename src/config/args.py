@@ -111,7 +111,8 @@ class TrainingConfig:
     batch_size: int = DEFAULTS["training"]["batch_size"]
     num_epochs: int = DEFAULTS["training"]["num_epochs"]
     gradient_accumulation_steps: int = DEFAULTS["training"]["gradient_accumulation_steps"]
-    learning_rate: float = DEFAULTS["training"]["learning_rate"]
+    learning_rate: float = DEFAULTS["optimizer"]["learning_rate"]
+    min_learning_rate: float = DEFAULTS["optimizer"].get("min_learning_rate", 1e-6)
     max_grad_norm: float = DEFAULTS["training"]["max_grad_norm"]
     warmup_steps: int = DEFAULTS["training"]["warmup_steps"]
     save_checkpoints: bool = False
@@ -155,6 +156,13 @@ class TrainingConfig:
     adam_beta1: float = DEFAULTS["optimizer"]["adam_beta1"]
     adam_beta2: float = DEFAULTS["optimizer"]["adam_beta2"]
     adam_epsilon: float = DEFAULTS["optimizer"]["adam_epsilon"]
+    adam_weight_decay: float = DEFAULTS["optimizer"]["weight_decay"]
+    
+    # Add scheduler parameters
+    scheduler_type: str = DEFAULTS["scheduler"].get("scheduler_type", "cosine")
+    num_warmup_steps: int = DEFAULTS["scheduler"]["num_warmup_steps"]
+    num_training_steps: int = DEFAULTS["scheduler"]["num_training_steps"]
+    num_cycles: float = DEFAULTS["scheduler"]["num_cycles"]
 
     @property
     def use_wandb(self) -> bool:
@@ -190,7 +198,7 @@ def parse_args() -> TrainingConfig:
     parser.add_argument("--output_dir", type=str, default=DEFAULTS["training"]["output_dir"])
     parser.add_argument("--batch_size", type=int, default=DEFAULTS["training"]["batch_size"])
     parser.add_argument("--num_epochs", type=int, default=DEFAULTS["training"]["num_epochs"])
-    parser.add_argument("--learning_rate", type=float, default=DEFAULTS["training"]["learning_rate"])
+    parser.add_argument("--learning_rate", type=float, default=DEFAULTS["optimizer"]["learning_rate"])
     parser.add_argument("--gradient_accumulation_steps", type=int, 
                        default=DEFAULTS["training"]["gradient_accumulation_steps"])
     parser.add_argument("--mixed_precision", type=str, default=DEFAULTS["training"]["mixed_precision"],
@@ -296,6 +304,30 @@ def parse_args() -> TrainingConfig:
                        default=DEFAULTS["optimizer"]["adam_beta2"])
     parser.add_argument("--adam_epsilon", type=float,
                        default=DEFAULTS["optimizer"]["adam_epsilon"])
+    
+    # Add learning rate arguments
+    parser.add_argument("--learning_rate", type=float,
+                       default=DEFAULTS["optimizer"]["learning_rate"])
+    parser.add_argument("--min_learning_rate", type=float,
+                       default=DEFAULTS["optimizer"].get("min_learning_rate", 1e-6))
+    parser.add_argument("--adam_beta1", type=float,
+                       default=DEFAULTS["optimizer"]["adam_beta1"])
+    parser.add_argument("--adam_beta2", type=float,
+                       default=DEFAULTS["optimizer"]["adam_beta2"])
+    parser.add_argument("--adam_epsilon", type=float,
+                       default=DEFAULTS["optimizer"]["adam_epsilon"])
+    parser.add_argument("--adam_weight_decay", type=float,
+                       default=DEFAULTS["optimizer"]["weight_decay"])
+    
+    # Add scheduler arguments
+    parser.add_argument("--scheduler_type", type=str,
+                       default=DEFAULTS["scheduler"].get("scheduler_type", "cosine"))
+    parser.add_argument("--num_warmup_steps", type=int,
+                       default=DEFAULTS["scheduler"]["num_warmup_steps"])
+    parser.add_argument("--num_training_steps", type=int,
+                       default=DEFAULTS["scheduler"]["num_training_steps"])
+    parser.add_argument("--num_cycles", type=float,
+                       default=DEFAULTS["scheduler"]["num_cycles"])
     
     args = parser.parse_args()
     
