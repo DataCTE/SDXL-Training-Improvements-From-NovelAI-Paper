@@ -117,10 +117,10 @@ def training_loss_v_prediction(
     batch_size = x_0.shape[0]
     device = x_0.device
     
-    # Reuse noise tensor if possible
+    # Generate noise efficiently
     if noise is None:
         noise_buffer = _get_or_create_buffer("noise", x_0.shape, device)
-        torch.randn_like(x_0, out=noise_buffer)
+        noise_buffer.normal_()  # In-place normal distribution
         noise = noise_buffer
     
     # Optimize timesteps computation
