@@ -150,6 +150,11 @@ class TrainingConfig:
     validation_image_height: int = DEFAULTS["validation"]["height"]
     validation_image_width: int = DEFAULTS["validation"]["width"]
     validation_num_images_per_prompt: int = DEFAULTS["validation"]["num_images_per_prompt"]
+    
+    # Add optimizer parameters
+    adam_beta1: float = DEFAULTS["optimizer"]["adam_beta1"]
+    adam_beta2: float = DEFAULTS["optimizer"]["adam_beta2"]
+    adam_epsilon: float = DEFAULTS["optimizer"]["adam_epsilon"]
 
     @property
     def use_wandb(self) -> bool:
@@ -283,6 +288,14 @@ def parse_args() -> TrainingConfig:
                            default=DEFAULTS["caching"]["text_cache"]["num_workers"])
     cache_group.add_argument("--text_cache_batch_size", type=int,
                            default=DEFAULTS["caching"]["text_cache"]["batch_size"])
+    
+    # Add optimizer beta parameters
+    parser.add_argument("--adam_beta1", type=float, 
+                       default=DEFAULTS["optimizer"]["adam_beta1"])
+    parser.add_argument("--adam_beta2", type=float,
+                       default=DEFAULTS["optimizer"]["adam_beta2"])
+    parser.add_argument("--adam_epsilon", type=float,
+                       default=DEFAULTS["optimizer"]["adam_epsilon"])
     
     args = parser.parse_args()
     
