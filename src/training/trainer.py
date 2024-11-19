@@ -83,12 +83,26 @@ class SDXLTrainer:
         # Setup metrics and logging
         self.metrics_manager = MetricsManager()
         self.state_tracker = StateTracker()
+        
+        # Create wandb config dictionary
+        wandb_config = {
+            "project": config.wandb.project,
+            "run_name": config.wandb.run_name,
+            "config": asdict(config),  # Convert config to dict
+            "log_model": config.wandb.log_model
+        }
+        
+        # Update logger initialization with wandb config
         self.logger = SDXLTrainingLogger(
             log_dir=config.output_dir,
             use_wandb=config.wandb.use_wandb,
             log_frequency=config.wandb.logging_steps,
-            window_size=config.wandb.window_size
+            window_size=config.wandb.window_size,
+            wandb_config=wandb_config
         )
+        
+        # Remove duplicate WandB setup since it's handled by SDXLTrainingLogger
+        self.wandb_run = self.logger.wandb_run if config.wandb.use_wandb else None
         
         # Setup progress tracking
         self.progress = ProgressTracker(
@@ -98,9 +112,6 @@ class SDXLTrainer:
             save_steps=1000,
             eval_steps=1000
         )
-
-        # Initialize wandb if enabled
-        self.wandb_run = self.logger.wandb_run if config.wandb.use_wandb else None
         
         # Initialize EMA models if enabled
         self.ema_models = {}

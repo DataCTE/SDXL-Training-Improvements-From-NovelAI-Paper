@@ -14,6 +14,9 @@ import torch
 import wandb
 import numpy as np
 from collections import defaultdict
+import logging
+
+logger = logging.getLogger(__name__)
 
 class ColoredFormatter(logging.Formatter):
     """Custom formatter adding colors to log levels."""
@@ -448,7 +451,8 @@ class SDXLTrainingLogger(DetailedLogger):
         log_dir: Union[str, Path],
         use_wandb: bool = False,
         log_frequency: int = 1,
-        window_size: int = 100
+        window_size: int = 100,
+        wandb_config: Optional[Dict] = None
     ):
         super().__init__(log_dir, use_wandb, log_frequency)
         self.window_size = window_size
@@ -457,7 +461,7 @@ class SDXLTrainingLogger(DetailedLogger):
         # Initialize wandb run
         self.wandb_run = None
         if use_wandb:
-            self._setup_wandb_logging()
+            self._setup_wandb_logging(wandb_config)
             
         # Initialize log files
         self._initialize_log_files()
@@ -477,21 +481,40 @@ class SDXLTrainingLogger(DetailedLogger):
                     f.write(f"# {name} log file\n")
                     f.write("# Created at: " + datetime.now().isoformat() + "\n")
 
-    def _setup_wandb_logging(self):
+    def _setup_wandb_logging(self, wandb_config: Optional[Dict] = None):
         """Configure wandb logging with custom panels."""
         if not self.use_wandb:
             return
             
-        wandb.define_metric("loss/total", summary="min")
-        wandb.define_metric("loss/v_pred", summary="min")
-        wandb.define_metric("loss/moving_avg", summary="min")
-        
-        # Create custom wandb panels
-        wandb.run.log({
-            "training_progress": wandb.Table(
-                columns=["epoch", "step", "loss", "v_pred_loss", "lr"]
-            )
-        })
+        try:
+            # Initialize wandb if not already initialized
+            if wandb.run is None:
+                self.wandb_run = wandb.init(
+                    project=wandb_config.get("project", "sdxl-training"),
+                    name=wandb_config.get("run_name"),
+                    config=wandb_config,
+                    dir=str(self.log_dir / "wandb"),
+                    resume="allow"
+                )
+            else:
+                self.wandb_run = wandb.run
+            
+            # Define metrics after initialization
+            wandb.define_metric("loss/total", summary="min")
+            wandb.define_metric("loss/v_pred", summary="min")
+            wandb.define_metric("loss/moving_avg", summary="min")
+            
+            # Create custom wandb panels
+            wandb.run.log({
+                "training_progress": wandb.Table(
+                    columns=["epoch", "step", "loss", "v_pred_loss", "lr"]
+                )
+            })
+            
+        except Exception as e:
+            logger.warning(f"Failed to initialize WandB: {str(e)}")
+            self.use_wandb = False
+            self.wandb_run = None
     
     def log_training_step(
         self,
