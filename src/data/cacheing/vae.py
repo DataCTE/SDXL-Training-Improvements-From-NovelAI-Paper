@@ -101,7 +101,7 @@ class VAECache:
         
         # Use mixed precision for faster encoding
         if torch.cuda.is_available():
-            with amp.autocast('cuda'):
+            with torch.cuda.amp.autocast():  # Simplest form
                 encoded = self.vae.encode(images)[0]
                 encoded = self._scaler.scale(encoded)
                 encoded = encoded.sample()

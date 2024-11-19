@@ -109,7 +109,7 @@ class TextEmbeddingCache:
             
         # Use mixed precision for faster encoding
         if torch.cuda.is_available():
-            with amp.autocast('cuda'):
+            with torch.cuda.amp.autocast():
                 # Encode with both text encoders
                 embed1 = self.text_encoder1(**tokens1)[0]
                 embed2 = self.text_encoder2(**tokens2)[0]
