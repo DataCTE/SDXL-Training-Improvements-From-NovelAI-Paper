@@ -224,14 +224,31 @@ def forward_pass(
     dtype: torch.dtype,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Execute forward pass with detailed metrics."""
-    try:
-        # Get models
-        unet = model_dict["unet"]
-        text_encoder = model_dict.get("text_encoder")
-        text_encoder_2 = model_dict.get("text_encoder_2")
+    # Get models
+    unet = model_dict["unet"]
+    text_encoder = model_dict.get("text_encoder")
+    text_encoder_2 = model_dict.get("text_encoder_2")
+    
+    # Validate batch contents
+    required_keys = ["pixel_values"]
+    missing_keys = [key for key in required_keys if key not in batch]
+    if missing_keys:
+        raise ValueError(f"Missing required keys in batch: {missing_keys}")
         
-        # Move batch to device efficiently
-        pixel_values = batch["pixel_values"].to(device=device, dtype=dtype, non_blocking=True)
+    # Move batch to device efficiently
+    pixel_values = batch["pixel_values"].to(device=device, dtype=dtype, non_blocking=True)
+    
+    # Handle text embeddings if present in batch
+    if "text_embeddings" in batch and "pooled_text_embeddings" in batch:
+        # Use pre-computed embeddings
+        text_embeddings = batch["text_embeddings"].to(device=device, non_blocking=True)
+        pooled_text_embeddings = batch["pooled_text_embeddings"].to(device=device, non_blocking=True)
+    else:
+        # Check for input IDs
+        if "input_ids" not in batch:
+            raise KeyError("Batch must contain either 'text_embeddings' or 'input_ids'")
+            
+        # Get input IDs
         input_ids = batch["input_ids"].to(device=device, non_blocking=True)
         input_ids_2 = batch.get("input_ids_2", input_ids).to(device=device, non_blocking=True)
         
@@ -246,48 +263,44 @@ def forward_pass(
             _buffers[cache_key] = (text_embeddings, pooled_text_embeddings)
         else:
             text_embeddings, pooled_text_embeddings = _buffers[cache_key]
-        
-        # Prepare added conditions
-        added_cond_kwargs = {"text_embeds": pooled_text_embeddings}
-        
-        # Get sigmas efficiently
-        height, width = pixel_values.shape[-2:]
-        sigmas = get_sigmas(
-            height=height,
-            width=width,
-            device=device
-        )
-        sigma = sigmas[0]
-        
-        # Compute loss with detailed metrics
-        loss, v_pred_metrics = training_loss_v_prediction(
-            model=unet,
-            x_0=pixel_values,
-            sigma=sigma,
-            text_embeddings=text_embeddings,
-            use_snr_weighting=getattr(args, "use_snr_weighting", True),
-            min_snr_gamma=getattr(args, "min_snr_gamma", 5.0),
-            scale_factor=getattr(args, "scale_factor", 1.0),
-            added_cond_kwargs=added_cond_kwargs,
-            return_metrics=True
-        )
-        
-        # Gather forward pass metrics
-        metrics = {
-            "v_pred/target_mean": v_pred_metrics["target_mean"],
-            "v_pred/target_std": v_pred_metrics["target_std"],
-            "v_pred/pred_mean": v_pred_metrics["pred_mean"],
-            "v_pred/pred_std": v_pred_metrics["pred_std"],
-            "v_pred/error": v_pred_metrics["error"],
-            "sigma/value": sigma.mean().item(),
-            "embeddings/norm": text_embeddings.norm().item(),
-        }
-        
-        return loss, metrics
-        
-    except Exception as e:
-        logger.error(f"Forward pass failed: {e}")
-        raise
+    
+    # Prepare added conditions
+    added_cond_kwargs = {"text_embeds": pooled_text_embeddings}
+    
+    # Get sigmas efficiently
+    height, width = pixel_values.shape[-2:]
+    sigmas = get_sigmas(
+        height=height,
+        width=width,
+        device=device
+    )
+    sigma = sigmas[0]
+    
+    # Compute loss with detailed metrics
+    loss, v_pred_metrics = training_loss_v_prediction(
+        model=unet,
+        x_0=pixel_values,
+        sigma=sigma,
+        text_embeddings=text_embeddings,
+        use_snr_weighting=getattr(args, "use_snr_weighting", True),
+        min_snr_gamma=getattr(args, "min_snr_gamma", 5.0),
+        scale_factor=getattr(args, "scale_factor", 1.0),
+        added_cond_kwargs=added_cond_kwargs,
+        return_metrics=True
+    )
+    
+    # Gather forward pass metrics
+    metrics = {
+        "v_pred/target_mean": v_pred_metrics["target_mean"],
+        "v_pred/target_std": v_pred_metrics["target_std"],
+        "v_pred/pred_mean": v_pred_metrics["pred_mean"],
+        "v_pred/pred_std": v_pred_metrics["pred_std"],
+        "v_pred/error": v_pred_metrics["error"],
+        "sigma/value": sigma.mean().item(),
+        "embeddings/norm": text_embeddings.norm().item(),
+    }
+    
+    return loss, metrics
 
 def clear_caches() -> None:
     """Clear all caches and buffers."""
