@@ -116,7 +116,7 @@ class SDXLTrainer:
         # Initialize EMA models if enabled
         self.ema_models = {}
         if getattr(config, "use_ema", False):
-            self.ema_models = setup_ema_model(
+            ema_model = setup_ema_model(
                 model=models["unet"],
                 device=self.device,
                 power=0.75,  # Default power value
@@ -124,7 +124,9 @@ class SDXLTrainer:
                 update_after_step=getattr(config, "ema_update_after_step", 0),
                 inv_gamma=1.0
             )
-            
+            if ema_model is not None:
+                self.ema_models["unet"] = ema_model
+        
         # Register cleanup handlers
         self._setup_cleanup_handlers()
     
