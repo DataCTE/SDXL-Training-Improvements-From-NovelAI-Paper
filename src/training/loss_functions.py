@@ -266,19 +266,20 @@ def forward_pass(
     
     # Prepare added conditions with time_ids
     batch_size = pixel_values.shape[0]
+    height, width = pixel_values.shape[-2:]
+    
     added_cond_kwargs = {
         "text_embeds": pooled_text_embeddings,
         "time_ids": _get_add_time_ids(
             batch_size=batch_size,
-            height=pixel_values.shape[-2],
-            width=pixel_values.shape[-1],
-            dtype=pixel_values.dtype,
+            height=height,
+            width=width,
+            dtype=dtype,
             device=device
         )
     }
     
     # Get sigmas efficiently
-    height, width = pixel_values.shape[-2:]
     sigmas = get_sigmas(
         height=height,
         width=width,
@@ -329,7 +330,16 @@ def _get_add_time_ids(
     device: torch.device
 ) -> torch.Tensor:
     """Generate time_ids tensor for SDXL conditioning."""
-    add_time_ids = torch.tensor([height, width, 0, 0, height, width])
-    add_time_ids = add_time_ids.to(device=device, dtype=dtype)
-    add_time_ids = add_time_ids.repeat(batch_size, 1)
-    return add_time_ids
+    # Create original size, crop coordinates and target size
+    original_size = (height, width)
+    crops_coords_top_left = (0, 0)  # No cropping during training
+    target_size = (height, width)  # Same as original during training
+    
+    # Combine all values into a single list
+    add_time_ids = list(original_size + crops_coords_top_left + target_size)
+    
+    # Create tensor with correct shape [batch_size, 1, n_dims]
+    time_ids = torch.tensor([add_time_ids], dtype=dtype, device=device)
+    time_ids = time_ids.repeat(batch_size, 1, 1)  # Shape: [batch_size, 1, 6]
+    
+    return time_ids
