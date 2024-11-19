@@ -1,7 +1,9 @@
 import torch
 import logging
 from typing import Dict, Any, Optional
+from torch.cuda.amp import GradScaler
 from src.config.args import TrainingConfig
+from src.training.training_steps import GradientAccumulator  # Add this import
 from src.training.training_steps import train_step
 from src.training.training_utils import initialize_training_components
 from src.training.validation import generate_validation_images
@@ -13,7 +15,14 @@ import wandb
 import os
 from src.models.model_loader import save_diffusers_format, save_checkpoint
 from src.models.SDXL.pipeline import StableDiffusionXLPipeline
+import warnings
+from src.utils.logging import SDXLTrainingLogger
+from dataclasses import asdict
 
+# Filter out deprecation warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="_distutils_hack")
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", message=".*Setuptools is replacing distutils.*")
 
 logger = logging.getLogger(__name__)
 
@@ -29,16 +38,7 @@ class SDXLTrainer:
         val_dataloader: Optional[torch.utils.data.DataLoader] = None,
         device: str = "cuda",
     ):
-        """Initialize SDXL trainer.
-        
-        Args:
-            config: Training configuration
-            models: Dictionary of model components
-            train_dataloader: Training data loader
-            val_dataloader: Optional validation data loader
-            device: Target device for training
-        """
-        # Initialize cleanup handlers first
+        """Initialize SDXL trainer."""
         self._cleanup_handlers = []
         
         self.config = config
@@ -46,13 +46,49 @@ class SDXLTrainer:
         self.device = torch.device(device)
         self.dtype = torch.float16 if config.mixed_precision == "fp16" else torch.float32
         
-        # Initialize with single process dataloader
+        # Initialize dataloaders
         self.train_dataloader = self._setup_dataloader(train_dataloader)
         self.val_dataloader = self._setup_dataloader(val_dataloader) if val_dataloader else None
         
-        # Initialize components with updated config
+        # Initialize components
         self.components = initialize_training_components(config, models)
+        
+        # Setup optimizers and schedulers
+        self.optimizers = {
+            "unet": torch.optim.AdamW(
+                self.models["unet"].parameters(),
+                lr=config.learning_rate,
+                betas=(config.adam_beta1, config.adam_beta2),
+                weight_decay=config.adam_weight_decay,
+                eps=config.adam_epsilon
+            )
+        }
+        
+        self.schedulers = {
+            "unet": torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizers["unet"],
+                T_max=config.num_epochs * len(self.train_dataloader),
+                eta_min=config.min_learning_rate
+            )
+        }
+        
+        # Setup gradient accumulation
+        self.grad_accumulator = GradientAccumulator(
+            accumulation_steps=config.gradient_accumulation_steps
+        ) if config.gradient_accumulation_steps > 1 else None
+        
+        # Setup mixed precision training
+        self.scaler = GradScaler() if config.mixed_precision == "fp16" else None
+        
+        # Setup metrics and logging
         self.metrics_manager = MetricsManager()
+        self.state_tracker = StateTracker()
+        self.logger = SDXLTrainingLogger(
+            log_dir=config.output_dir,
+            use_wandb=config.wandb.use_wandb,
+            log_frequency=config.logging_steps,
+            window_size=100
+        )
         
         # Setup progress tracking
         self.progress = ProgressTracker(
@@ -62,45 +98,25 @@ class SDXLTrainer:
             save_steps=1000,
             eval_steps=1000
         )
-        
-        # Move models to device
-        for name, model in self.models.items():
-            if isinstance(model, torch.nn.Module):
-                model.to(self.device)
-                if config.gradient_checkpointing and hasattr(model, 'enable_gradient_checkpointing'):
-                    model.enable_gradient_checkpointing()
-                model.train()
-        
-        # Setup EMA models if enabled
-        self.ema_models = {}
-        if config.use_ema:
-            for name, model in self.models.items():
-                if isinstance(model, torch.nn.Module) and name in ['unet', 'text_encoder', 'text_encoder_2']:
-                    ema_model = setup_ema_model(
-                        model=model,
-                        device=self.device,
-                        power=0.75,
-                        update_after_step=config.ema.update_after_step,
-                        max_value=0.9999,
-                        min_value=0,
-                        inv_gamma=1
-                    )
-                    if ema_model is not None:
-                        self.ema_models[name] = ema_model
-        
-        # Initialize wandb
+
+        # Initialize wandb if enabled
         self.wandb_run = None
         if config.wandb.use_wandb:
-            self.wandb_run = wandb.init(
-                project=config.wandb.wandb_project,
-                name=config.wandb.wandb_run_name,
-                config=vars(config)
+            self._setup_wandb(config)
+            
+        # Initialize EMA models if enabled
+        self.ema_models = {}
+        if getattr(config, "use_ema", False):
+            self.ema_models = setup_ema_model(
+                model=models["unet"],
+                device=self.device,
+                power=0.75,  # Default power value
+                max_value=getattr(config, "ema_decay", 0.9999),
+                update_after_step=getattr(config, "ema_update_after_step", 0),
+                inv_gamma=1.0
             )
-        
-        # Initialize state tracker without adding callback
-        self.state_tracker = StateTracker()
-        
-        # Setup cleanup handlers
+            
+        # Register cleanup handlers
         self._setup_cleanup_handlers()
     
     def _setup_dataloader(self, dataloader):
@@ -187,77 +203,59 @@ class SDXLTrainer:
             raise
     
     def train_epoch(self, epoch: int):
-        """Execute single training epoch."""
+        """Execute single training epoch with enhanced logging."""
         try:
             total_loss = 0
             num_batches = len(self.train_dataloader)
-            
-            # Reset state tracker at start of epoch
             self.state_tracker.reset()
             
-            # Set models to training mode
-            for model in self.models.values():
-                if isinstance(model, torch.nn.Module):
-                    model.train()
-            
-            progress = ProgressTracker(
-                f"Epoch {epoch}",
-                total=num_batches,
-                wandb_run=self.wandb_run,
-                log_interval=0.1
-            )
-            
+            # Training loop with detailed metrics
             for batch_idx, batch in enumerate(self.train_dataloader):
                 try:
-                    # Move batch to device
-                    batch = {k: v.to(self.device) if torch.is_tensor(v) else v 
-                            for k, v in batch.items()}
-                    
-                    # Store text encoder outputs in state tracker
-                    if 'text_encoder_hidden_states' in batch:
-                        self.state_tracker.store_text_encoder_outputs(
-                            text_encoder_hidden_states=batch.get('text_encoder_hidden_states'),
-                            text_encoder_2_hidden_states=batch.get('text_encoder_2_hidden_states'),
-                            prompt_embeds=batch.get('prompt_embeds'),
-                            pooled_prompt_embeds=batch.get('pooled_prompt_embeds')
-                        )
-                    
-                    # Training step
-                    loss, metrics_dict = train_step(
+                    # Process batch
+                    loss, batch_metrics = train_step(
                         self.config,
                         self.models,
-                        self.components['optimizer'],
-                        self.components['scheduler'],
+                        self.optimizers,
+                        self.schedulers,
                         batch,
                         self.device,
-                        self.dtype,
-                        self.components['grad_accumulator'],
-                        self.components['scaler'],
+                        dtype=self.dtype,
+                        grad_accumulator=self.grad_accumulator,
+                        scaler=self.scaler,
                         state_tracker=self.state_tracker
                     )
                     
-                    # Get state from tracker and add to metrics
-                    state = self.state_tracker.get_state()
-                    if state['latents'] is not None:
-                        metrics_dict.update({
-                            'current_timestep': state['current_timestep'],
-                            'latents_mean': state['latents'].mean().item(),
-                            'latents_std': state['latents'].std().item(),
-                        })
-                    
+                    # Update running metrics
                     total_loss += loss.item()
                     
-                    # Update metrics and progress
-                    metrics_dict['loss'] = loss.item()
-                    metrics_dict['learning_rate'] = self.components['scheduler'].get_last_lr()[0]
-                    progress.update(1, metrics_dict)
+                    # Log detailed metrics
+                    self.logger.log_training_step(
+                        loss=loss,
+                        metrics=batch_metrics,
+                        learning_rate=batch_metrics["learning_rate"],
+                        step=self.state_tracker.global_step,
+                        epoch=epoch,
+                        batch_idx=batch_idx,
+                        step_time=batch_metrics.get("step_time", 0.0),
+                        v_pred_loss=batch_metrics.get("loss/v_pred", None),
+                        v_pred_values=batch_metrics.get("v_pred/pred_mean", None),
+                        v_pred_targets=batch_metrics.get("v_pred/target_mean", None)
+                    )
                     
                 except Exception as batch_error:
                     logger.error(f"Error processing batch {batch_idx}: {str(batch_error)}")
                     continue
             
+            # Compute epoch metrics
             avg_loss = total_loss / num_batches
-            return {'epoch': epoch, 'avg_loss': avg_loss, **metrics_dict}
+            epoch_metrics = self.state_tracker.get_epoch_metrics()
+            
+            return {
+                'epoch': epoch,
+                'avg_loss': avg_loss,
+                **epoch_metrics
+            }
             
         except Exception as e:
             logger.error(f"Error in epoch {epoch}: {str(e)}")
@@ -299,11 +297,12 @@ class SDXLTrainer:
             for name, model in self.models.items():
                 if hasattr(model, 'cleanup'):
                     self._cleanup_handlers.append(model.cleanup)
-            
-            # Add EMA cleanup handlers
-            for ema_model in self.ema_models.values():
-                if hasattr(ema_model, 'cleanup'):
-                    self._cleanup_handlers.append(ema_model.cleanup)
+        
+            # Add EMA cleanup handlers if EMA is enabled
+            if hasattr(self, 'ema_models'):
+                for ema_model in self.ema_models.values():
+                    if hasattr(ema_model, 'cleanup'):
+                        self._cleanup_handlers.append(ema_model.cleanup)
             
             # Add component cleanup handlers
             for component in self.components.values():
@@ -313,17 +312,7 @@ class SDXLTrainer:
             # Add dataloader cleanup if needed
             if hasattr(self.train_dataloader, 'cleanup'):
                 self._cleanup_handlers.append(self.train_dataloader.cleanup)
-            if hasattr(self.val_dataloader, 'cleanup'):
-                self._cleanup_handlers.append(self.val_dataloader.cleanup)
-            
-            # Add metrics manager cleanup
-            if hasattr(self.metrics_manager, 'cleanup'):
-                self._cleanup_handlers.append(self.metrics_manager.cleanup)
-            
-            # Add wandb cleanup if active
-            if self.wandb_run is not None:
-                self._cleanup_handlers.append(self.wandb_run.finish)
-            
+                
         except Exception as e:
             logger.error(f"Error setting up cleanup handlers: {str(e)}")
             raise
@@ -394,5 +383,38 @@ class SDXLTrainer:
         except Exception as e:
             logger.error(f"Failed to generate validation images at epoch {epoch}: {str(e)}")
             raise
+    
+    def _setup_wandb(self, config: TrainingConfig) -> None:
+        """Initialize wandb logging."""
+        try:
+            if not config.wandb_enabled:
+                return
+            
+            # Initialize wandb
+            wandb.init(
+                project=config.wandb.wandb_project,
+                name=config.wandb.run_name,
+                config=asdict(config),
+                dir=config.output_dir,
+                resume="allow"
+            )
+            
+            self.wandb_run = wandb.run
+            
+            # Setup custom logging
+            wandb.define_metric("loss", summary="min")
+            wandb.define_metric("learning_rate", summary="last")
+            wandb.define_metric("epoch", summary="max")
+            
+            # Create custom panels
+            wandb.run.log({
+                "training_progress": wandb.Table(
+                    columns=["epoch", "step", "loss", "lr"]
+                )
+            })
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize wandb: {e}")
+            self.wandb_run = None
     
     

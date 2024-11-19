@@ -80,18 +80,10 @@ def train_step(
     scaler: Optional[GradScaler] = None,
     state_tracker: Optional[StateTracker] = None
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """Execute optimized training step with GPU acceleration."""
+    """Execute optimized training step with enhanced metrics."""
     try:
-        # Determine precision context
-        if args.mixed_precision == "fp16":
-            dtype = torch.float16
-        elif args.mixed_precision == "bf16":
-            dtype = torch.bfloat16
-        else:
-            dtype = torch.float32
-        
-        # Forward pass with mixed precision
-        loss = forward_pass(
+        # Forward pass with detailed metrics
+        loss, forward_metrics = forward_pass(
             args=args,
             model_dict=model_dict,
             batch=batch,
@@ -99,59 +91,44 @@ def train_step(
             dtype=dtype,
         )
         
-        # Scale loss for gradient accumulation if needed
+        # Scale loss for gradient accumulation
         if grad_accumulator is not None:
             loss = loss / grad_accumulator.accumulation_steps
         
-        # Backward pass with mixed precision
+        # Backward pass with gradient tracking
+        grad_metrics = {}
         if scaler is not None:
             scaler.scale(loss).backward()
             
-            # Unscale gradients and clip if needed
+            # Track gradient norms before clipping
+            if hasattr(args, 'log_gradients') and args.log_gradients:
+                for name, param in model_dict["unet"].named_parameters():
+                    if param.grad is not None:
+                        grad_metrics[f"grad_norm/{name}"] = param.grad.norm().item()
+                        grad_metrics[f"weight_norm/{name}"] = param.norm().item()
+            
+            # Unscale and clip gradients
             if args.max_grad_norm is not None:
                 scaler.unscale_(optimizers["unet"])
-                torch.nn.utils.clip_grad_norm_(
+                grad_norm = torch.nn.utils.clip_grad_norm_(
                     model_dict["unet"].parameters(),
                     args.max_grad_norm
                 )
-            
-            # Step optimizer with gradient scaling
-            if grad_accumulator is None or grad_accumulator.apply_accumulated_grads():
-                scaler.step(optimizers["unet"])
-                scaler.update()
-                optimizers["unet"].zero_grad(set_to_none=True)
-        else:
-            loss.backward()
-            
-            # Clip gradients if needed
-            if args.max_grad_norm is not None:
-                torch.nn.utils.clip_grad_norm_(
-                    model_dict["unet"].parameters(),
-                    args.max_grad_norm
-                )
-            
-            # Step optimizer
-            if grad_accumulator is None or grad_accumulator.apply_accumulated_grads():
-                optimizers["unet"].step()
-                optimizers["unet"].zero_grad(set_to_none=True)
+                grad_metrics["grad_norm/total"] = grad_norm.item()
         
-        # Update EMA model if present
-        if "ema_unet" in model_dict:
-            update_ema_model(
-                model_dict["ema_unet"],
-                model_dict["unet"],
-                getattr(args, "ema_decay", 0.9999)
-            )
-        
-        # Update learning rate
-        for scheduler in schedulers.values():
-            scheduler.step()
-        
-        # Gather metrics
+        # Gather comprehensive metrics
         metrics_dict = {
-            "loss": loss.item(),
-            "lr": schedulers["unet"].get_last_lr()[0]
+            "loss/total": loss.item(),
+            "loss/v_pred": forward_metrics.get("v_pred_loss", 0.0),
+            "learning_rate": schedulers["unet"].get_last_lr()[0],
+            "batch_size": batch["pixel_values"].shape[0],
+            **grad_metrics,
+            **forward_metrics
         }
+        
+        # Update state tracker
+        if state_tracker is not None:
+            state_tracker.update_metrics(metrics_dict)
         
         return loss, metrics_dict
         

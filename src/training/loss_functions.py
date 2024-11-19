@@ -111,7 +111,8 @@ def training_loss_v_prediction(
     min_snr_gamma: float = 5.0,
     scale_factor: float = 1.0,
     added_cond_kwargs: Optional[Dict[str, torch.Tensor]] = None,
-) -> torch.Tensor:
+    return_metrics: bool = False,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Compute v-prediction loss with maximum optimization."""
     batch_size = x_0.shape[0]
     device = x_0.device
@@ -145,6 +146,22 @@ def training_loss_v_prediction(
     
     # Compute loss efficiently
     loss = torch.sum((v_pred - v_target) ** 2 * weights) / batch_size
+    
+    if return_metrics:
+        # Compute metrics
+        target_mean = v_target.mean().item()
+        target_std = v_target.std().item()
+        pred_mean = v_pred.mean().item()
+        pred_std = v_pred.std().item()
+        error = torch.abs(v_pred - v_target).mean().item()
+        
+        return loss, {
+            "target_mean": target_mean,
+            "target_std": target_std,
+            "pred_mean": pred_mean,
+            "pred_std": pred_std,
+            "error": error,
+        }
     
     return loss
 
@@ -205,8 +222,8 @@ def forward_pass(
     batch: Dict[str, torch.Tensor],
     device: torch.device,
     dtype: torch.dtype,
-) -> torch.Tensor:
-    """Execute forward pass with maximum GPU optimization."""
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Execute forward pass with detailed metrics."""
     try:
         # Get models
         unet = model_dict["unet"]
@@ -242,8 +259,8 @@ def forward_pass(
         )
         sigma = sigmas[0]
         
-        # Compute loss with all optimizations
-        loss = training_loss_v_prediction(
+        # Compute loss with detailed metrics
+        loss, v_pred_metrics = training_loss_v_prediction(
             model=unet,
             x_0=pixel_values,
             sigma=sigma,
@@ -252,9 +269,21 @@ def forward_pass(
             min_snr_gamma=getattr(args, "min_snr_gamma", 5.0),
             scale_factor=getattr(args, "scale_factor", 1.0),
             added_cond_kwargs=added_cond_kwargs,
+            return_metrics=True
         )
         
-        return loss
+        # Gather forward pass metrics
+        metrics = {
+            "v_pred/target_mean": v_pred_metrics["target_mean"],
+            "v_pred/target_std": v_pred_metrics["target_std"],
+            "v_pred/pred_mean": v_pred_metrics["pred_mean"],
+            "v_pred/pred_std": v_pred_metrics["pred_std"],
+            "v_pred/error": v_pred_metrics["error"],
+            "sigma/value": sigma.mean().item(),
+            "embeddings/norm": text_embeddings.norm().item(),
+        }
+        
+        return loss, metrics
         
     except Exception as e:
         logger.error(f"Forward pass failed: {e}")
