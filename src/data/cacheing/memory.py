@@ -51,6 +51,12 @@ class MemoryManager:
         """Check if memory pressure requires eviction."""
         return self._get_memory_usage() > 0.9
     
+    def _prepare_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Prepare tensor for caching by ensuring it's on CPU and detached."""
+        if tensor.device.type == 'cuda':
+            tensor = tensor.cpu()
+        return tensor.detach()
+    
     def get(self, key: str, default: Any = None) -> Optional[Any]:
         """Get item from cache."""
         try:
@@ -58,7 +64,9 @@ class MemoryManager:
             if value is not None:
                 # Handle tensor device placement
                 if isinstance(value, torch.Tensor):
-                    value = value.cpu()  # Ensure tensor is on CPU
+                    value = self._prepare_tensor(value)
+                elif isinstance(value, tuple) and all(isinstance(v, torch.Tensor) for v in value):
+                    value = tuple(self._prepare_tensor(v) for v in value)
                 self._stats['hits'] = self._stats.get('hits', 0) + 1
                 return value
             self._stats['misses'] = self._stats.get('misses', 0) + 1
@@ -72,11 +80,10 @@ class MemoryManager:
             self._evict_items()
             
         if isinstance(value, torch.Tensor):
-            # Ensure tensor is on CPU and detached
-            value = value.detach()
-            if value.device.type == 'cuda':
-                value = value.cpu()
-                
+            value = self._prepare_tensor(value)
+        elif isinstance(value, tuple) and all(isinstance(v, torch.Tensor) for v in value):
+            value = tuple(self._prepare_tensor(v) for v in value)
+            
         self._cache[key] = value
     
     def _evict_items(self) -> None:

@@ -100,10 +100,14 @@ class VAECache:
             images = images.cuda()
         
         # Use mixed precision for faster encoding
-        with amp.autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu'):
-            encoded = self.vae.encode(images)[0]
-            if torch.cuda.is_available():
+        if torch.cuda.is_available():
+            with amp.autocast('cuda'):
+                encoded = self.vae.encode(images)[0]
                 encoded = self._scaler.scale(encoded)
+                encoded = encoded.sample()
+        else:
+            # CPU fallback without mixed precision
+            encoded = self.vae.encode(images)[0]
             encoded = encoded.sample()
         
         # Return tensor on CPU for caching

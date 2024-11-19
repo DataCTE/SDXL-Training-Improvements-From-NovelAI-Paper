@@ -108,14 +108,17 @@ class TextEmbeddingCache:
             tokens2 = {k: v.cuda() for k, v in tokens2.items()}
             
         # Use mixed precision for faster encoding
-        with amp.autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu'):
-            # Encode with both text encoders
-            embed1 = self.text_encoder1(**tokens1)[0]
-            embed2 = self.text_encoder2(**tokens2)[0]
-            
-            if torch.cuda.is_available():
+        if torch.cuda.is_available():
+            with amp.autocast('cuda'):
+                # Encode with both text encoders
+                embed1 = self.text_encoder1(**tokens1)[0]
+                embed2 = self.text_encoder2(**tokens2)[0]
                 embed1 = self._scaler.scale(embed1)
                 embed2 = self._scaler.scale(embed2)
+        else:
+            # CPU fallback without mixed precision
+            embed1 = self.text_encoder1(**tokens1)[0]
+            embed2 = self.text_encoder2(**tokens2)[0]
                 
         return embed1, embed2
         
