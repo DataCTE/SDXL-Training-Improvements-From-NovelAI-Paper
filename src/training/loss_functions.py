@@ -338,8 +338,8 @@ def _get_add_time_ids(
     # Combine all values into a single list
     add_time_ids = list(original_size + crops_coords_top_left + target_size)
     
-    # Create tensor with correct shape [batch_size, 1, n_dims]
+    # Create tensor with correct shape [batch_size, n_dims]
     time_ids = torch.tensor([add_time_ids], dtype=dtype, device=device)
-    time_ids = time_ids.repeat(batch_size, 1, 1)  # Shape: [batch_size, 1, 6]
+    time_ids = time_ids.repeat(batch_size, 1)  # Shape: [batch_size, 6]
     
     return time_ids
