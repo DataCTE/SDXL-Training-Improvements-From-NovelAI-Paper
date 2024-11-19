@@ -264,8 +264,18 @@ def forward_pass(
         else:
             text_embeddings, pooled_text_embeddings = _buffers[cache_key]
     
-    # Prepare added conditions
-    added_cond_kwargs = {"text_embeds": pooled_text_embeddings}
+    # Prepare added conditions with time_ids
+    batch_size = pixel_values.shape[0]
+    added_cond_kwargs = {
+        "text_embeds": pooled_text_embeddings,
+        "time_ids": _get_add_time_ids(
+            batch_size=batch_size,
+            height=pixel_values.shape[-2],
+            width=pixel_values.shape[-1],
+            dtype=pixel_values.dtype,
+            device=device
+        )
+    }
     
     # Get sigmas efficiently
     height, width = pixel_values.shape[-2:]
@@ -310,3 +320,16 @@ def clear_caches() -> None:
     _get_scheduler_buffer.cache_clear()
     _get_sigma_schedule.cache_clear()
     _get_resolution_scaled_sigma_schedule.cache_clear()  # Added for completeness
+
+def _get_add_time_ids(
+    batch_size: int,
+    height: int,
+    width: int,
+    dtype: torch.dtype,
+    device: torch.device
+) -> torch.Tensor:
+    """Generate time_ids tensor for SDXL conditioning."""
+    add_time_ids = torch.tensor([height, width, 0, 0, height, width])
+    add_time_ids = add_time_ids.to(device=device, dtype=dtype)
+    add_time_ids = add_time_ids.repeat(batch_size, 1)
+    return add_time_ids
