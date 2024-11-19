@@ -162,12 +162,10 @@ Recommended workflow:
 2. Configure CFG rescaling if using high CFG values
 3. Optionally use the Laplace scheduler for improved noise distribution
 
-## Contributing
-
-Contributions are welcome! Please feel free to submit issues or pull requests for improvements.
 
 ## License
 Apache 2.0
+
 ## Citation
 ```bibtex
 @article{ossa2024improvements,
