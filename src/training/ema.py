@@ -68,10 +68,8 @@ class EMAModel:
         """Register and optimize model parameters."""
         for name, param in self._model().named_parameters():
             if param.requires_grad:
-                # Create shadow parameter
+                # Create shadow parameter without JIT compilation
                 shadow = param.detach().clone()
-                if self.jit_compile:
-                    shadow = torch.jit.script(shadow)
                 self._shadow_params[name] = shadow.to(device=self.device)
     
     def _init_cuda_graph(self) -> None:

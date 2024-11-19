@@ -47,6 +47,7 @@ class CaptionProcessor:
     
     MIN_WEIGHT: float = 0.1
     MAX_WEIGHT: float = 3.0
+    MAX_LENGTH: int = 77  # SDXL's max token length
     
     def __init__(self, 
                  token_dropout_rate: float = 0.1,
@@ -63,25 +64,36 @@ class CaptionProcessor:
         self.weight_cache: Dict[str, float] = {}
         
     def process_caption(self, caption: str, training: bool = True) -> Tuple[List[str], List[float]]:
-        """Process caption into tags and weights."""
+        """Process caption into tags and weights with length normalization."""
         tags = self.parse_tags(caption)
         if not tags or (training and random.random() < self.caption_dropout_rate):
-            return [], []
+            # Return padded empty tags
+            return [''] * self.MAX_LENGTH, [0.0] * self.MAX_LENGTH
             
         # Apply token dropout during training
         if training and self.token_dropout_rate > 0:
             tags = [tag for tag in tags if random.random() > self.token_dropout_rate]
-            
-        # Update statistics for each tag
+        
+        # Update statistics
         for tag in tags:
             self.tag_stats.update(tag)
-            
-        # Update co-occurrence for all tag pairs
+        
         for i, tag1 in enumerate(tags):
             for tag2 in tags[i+1:]:
                 self.tag_stats.update_cooccurrence(tag1, tag2)
-                
+        
+        # Get weights
         weights = [self.get_tag_weight(tag) for tag in tags]
+        
+        # Pad or truncate to MAX_LENGTH
+        if len(tags) < self.MAX_LENGTH:
+            padding_length = self.MAX_LENGTH - len(tags)
+            tags.extend([''] * padding_length)
+            weights.extend([0.0] * padding_length)
+        else:
+            tags = tags[:self.MAX_LENGTH]
+            weights = weights[:self.MAX_LENGTH]
+            
         return tags, weights
     
     def parse_tags(self, caption: str) -> List[str]:
