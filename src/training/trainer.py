@@ -57,9 +57,9 @@ class SDXLTrainer:
         self.optimizers = {
             "unet": torch.optim.AdamW(
                 self.models["unet"].parameters(),
-                lr=config.learning_rate,
+                lr=config.optimizer.learning_rate,
                 betas=(config.adam_beta1, config.adam_beta2),
-                weight_decay=config.adam_weight_decay,
+                weight_decay=config.optimizer.weight_decay,
                 eps=config.adam_epsilon
             )
         }
