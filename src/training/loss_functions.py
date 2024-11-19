@@ -116,6 +116,7 @@ def training_loss_v_prediction(
     """Compute v-prediction loss with maximum optimization."""
     batch_size = x_0.shape[0]
     device = x_0.device
+    height, width = x_0.shape[-2:]
     
     # Generate noise efficiently
     if noise is None:
@@ -130,11 +131,39 @@ def training_loss_v_prediction(
     # Compute noisy samples efficiently
     noisy_samples = x_0 + noise * sigma.view(-1, 1, 1, 1)
     
+    # Generate time embeddings for SDXL
+    if added_cond_kwargs is None:
+        added_cond_kwargs = {}
+    
+    if "time_ids" not in added_cond_kwargs:
+        time_ids = _get_add_time_ids(
+            batch_size=batch_size,
+            height=height,
+            width=width,
+            dtype=text_embeddings.dtype,
+            device=device,
+            text_encoder_projection_dim=text_embeddings.shape[-1]
+        )
+        added_cond_kwargs["time_ids"] = time_ids
+    
+    # Debug prints for tensor shapes
+    logger.info(f"Text embeddings shape: {text_embeddings.shape}")
+    logger.info(f"Timesteps buffer shape: {timesteps_buffer.shape}")
+    logger.info(f"Time ids shape: {added_cond_kwargs['time_ids'].shape}")
+    logger.info(f"Added cond kwargs shapes: {[(k, v.shape) for k, v in added_cond_kwargs.items()]}")
+    
+    # Ensure timesteps have correct shape for UNet
+    timesteps_buffer = timesteps_buffer.view(batch_size, 1)
+    
     # Forward pass with optimization
     v_pred = apply_model(model, noisy_samples, timesteps_buffer, text_embeddings, added_cond_kwargs)
     
     # Compute target
     v_target = _compute_v_target(noise, sigma)
+    
+    # Debug prints for prediction shapes
+    logger.info(f"v_pred shape: {v_pred.shape}")
+    logger.info(f"v_target shape: {v_target.shape}")
     
     # Compute weights if needed
     if use_snr_weighting:
@@ -327,19 +356,38 @@ def _get_add_time_ids(
     height: int,
     width: int,
     dtype: torch.dtype,
-    device: torch.device
+    device: torch.device,
+    original_size: Optional[Tuple[int, int]] = None,
+    crops_coords_top_left: Tuple[int, int] = (0, 0),
+    target_size: Optional[Tuple[int, int]] = None,
+    aesthetic_score: float = 6.0,
+    negative_aesthetic_score: float = 2.5,
+    text_encoder_projection_dim: int = 1280,
 ) -> torch.Tensor:
-    """Generate time_ids tensor for SDXL conditioning."""
-    # Create original size, crop coordinates and target size
-    original_size = (height, width)
-    crops_coords_top_left = (0, 0)  # No cropping during training
-    target_size = (height, width)  # Same as original during training
+    """Generate time_ids tensor for SDXL conditioning following the official implementation."""
+    if original_size is None:
+        original_size = (height, width)
+    if target_size is None:
+        target_size = (height, width)
+
+    # SDXL expects the following additional time ids:
+    # 1-2. Original image size (h, w)
+    # 3-4. Crop coordinates (top, left)
+    # 5-6. Target size (h, w)
+    # 7. Aesthetic score
+    add_time_ids = list(original_size) + list(crops_coords_top_left) + list(target_size) + [aesthetic_score]
     
-    # Combine all values into a single list
-    add_time_ids = list(original_size + crops_coords_top_left + target_size)
-    
-    # Create tensor with correct shape [batch_size, n_dims]
-    time_ids = torch.tensor([add_time_ids], dtype=dtype, device=device)
-    time_ids = time_ids.repeat(batch_size, 1)  # Shape: [batch_size, 6]
-    
-    return time_ids
+    # Create tensor with correct shape [batch_size, dim]
+    add_time_ids = torch.tensor([add_time_ids], dtype=dtype, device=device)
+    add_time_ids = add_time_ids.repeat(batch_size, 1)
+
+    # Pad or truncate to match text encoder projection dim
+    if add_time_ids.shape[1] < text_encoder_projection_dim:
+        # Pad with zeros if needed
+        padding = torch.zeros(batch_size, text_encoder_projection_dim - add_time_ids.shape[1], dtype=dtype, device=device)
+        add_time_ids = torch.cat([add_time_ids, padding], dim=1)
+    else:
+        # Truncate if needed
+        add_time_ids = add_time_ids[:, :text_encoder_projection_dim]
+
+    return add_time_ids
