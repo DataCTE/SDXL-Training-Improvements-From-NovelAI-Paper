@@ -179,34 +179,30 @@ def training_loss_v_prediction(
     scale_factor: float = 1.0,
     added_cond_kwargs: Optional[Dict[str, torch.Tensor]] = None,
     return_metrics: bool = False,
-    optimizer_type: str = "lion"  # Add optimizer type parameter
+    optimizer_type: str = "lion"
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Compute v-prediction loss with NAI improvements and Lion support.
-    
-    Args:
-        model: The diffusion model
-        x_0: Input tensor
-        sigma: Noise levels
-        text_embeddings: Text condition embeddings
-        noise: Optional pre-generated noise
-        use_snr_weighting: Whether to use MinSNR weighting
-        min_snr_gamma: SNR clamping value
-        scale_factor: Additional scaling factor
-        added_cond_kwargs: Additional conditioning inputs
-        return_metrics: Whether to return additional metrics
-        optimizer_type: Type of optimizer being used ("adamw" or "lion")
     """
     # Scale sigma based on resolution
     height, width = x_0.shape[-2:]
     sigma = sigma * _compute_resolution_scale(height, width)
     
-    # Generate noise if not provided (using input tensor's device)
+    # Generate noise if not provided
     if noise is None:
-        noise = torch.randn_like(x_0)  # Inherits device from x_0
+        noise = torch.randn_like(x_0)
     
-    # Add noise to input (NAI section 2.2 - ZTSNR support)
+    # Add noise to input
     noised = x_0 + sigma.view(-1, 1, 1, 1) * noise
+    
+    # Process added conditioning
+    if added_cond_kwargs is not None:
+        # Ensure time_ids has correct shape [B, 1280] for SDXL
+        if "time_ids" in added_cond_kwargs:
+            time_ids = added_cond_kwargs["time_ids"]  # [B, 6]
+            # Project to higher dimension using learned embedding
+            time_embeds = model.time_embedding(time_ids.float())  # [B, 1280]
+            added_cond_kwargs["time_ids"] = time_embeds
     
     # Forward pass with proper conditioning
     v_pred = model(
@@ -219,18 +215,18 @@ def training_loss_v_prediction(
     # Compute v-target with NAI's formulation
     v_target = _compute_v_target(noise, sigma)
     
-    # Compute MinSNR loss weights (NAI section 2.4)
+    # Compute MinSNR loss weights
     if use_snr_weighting:
         weights = _compute_min_snr_weights(
             sigma,
-            sigma_data=1.0,  # NAI uses unit variance
+            sigma_data=1.0,
             min_snr_gamma=min_snr_gamma,
             scale=scale_factor
         )
     else:
         weights = torch.ones_like(sigma.view(-1, 1, 1, 1))
     
-    # Compute weighted MSE loss with improved stability
+    # Compute weighted MSE loss
     loss = F.mse_loss(
         v_pred * weights.sqrt(),
         v_target * weights.sqrt(),
@@ -239,7 +235,7 @@ def training_loss_v_prediction(
 
     # Lion-specific loss scaling
     if optimizer_type == "lion":
-        loss = loss * 0.5  # Lion typically needs smaller loss scaling
+        loss = loss * 0.5
 
     if return_metrics:
         with torch.no_grad():
