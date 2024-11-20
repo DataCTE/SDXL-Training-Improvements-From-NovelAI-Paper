@@ -127,11 +127,14 @@ def training_loss_v_prediction(
     # Optimize timesteps computation - now ensuring it's 1D
     timesteps_buffer = _get_or_create_buffer("timesteps", (batch_size,), device)
     timesteps_buffer.copy_(sigma)
-    # Ensure timesteps is 1D for the UNet
     timesteps_buffer = timesteps_buffer.squeeze()  # Remove any extra dimensions
     
     # Compute noisy samples efficiently
     noisy_samples = x_0 + noise * sigma.view(-1, 1, 1, 1)
+    
+    # Reshape text embeddings if needed
+    if len(text_embeddings.shape) == 4:  # [batch, 1, seq_len, dim]
+        text_embeddings = text_embeddings.squeeze(1)  # Remove the extra dimension
     
     # Generate time embeddings for SDXL
     if added_cond_kwargs is None:
@@ -144,7 +147,7 @@ def training_loss_v_prediction(
             width=width,
             dtype=text_embeddings.dtype,
             device=device,
-            text_encoder_projection_dim=text_embeddings.shape[-1]
+            text_encoder_projection_dim=1280  # SDXL uses fixed 1280 dim
         )
         added_cond_kwargs["time_ids"] = time_ids
     
@@ -182,19 +185,12 @@ def training_loss_v_prediction(
     loss = torch.sum((v_pred - v_target) ** 2 * weights) / batch_size
     
     if return_metrics:
-        # Compute metrics
-        target_mean = v_target.mean().item()
-        target_std = v_target.std().item()
-        pred_mean = v_pred.mean().item()
-        pred_std = v_pred.std().item()
-        error = torch.abs(v_pred - v_target).mean().item()
-        
         return loss, {
-            "target_mean": target_mean,
-            "target_std": target_std,
-            "pred_mean": pred_mean,
-            "pred_std": pred_std,
-            "error": error,
+            "target_mean": v_target.mean().item(),
+            "target_std": v_target.std().item(),
+            "pred_mean": v_pred.mean().item(),
+            "pred_std": v_pred.std().item(),
+            "error": torch.abs(v_pred - v_target).mean().item(),
         }
     
     return loss
