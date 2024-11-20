@@ -70,7 +70,8 @@ def train_sdxl(
             cache_dir=str(vae_cache_dir.absolute()),
             max_cache_size=config.caching.vae_cache_size,
             num_workers=config.caching.vae_cache_num_workers,
-            batch_size=config.caching.vae_cache_batch_size
+            batch_size=config.caching.vae_cache_batch_size,
+            max_memory_gb=config.caching.vae_cache_memory_gb
         )
         
         text_embedding_cache = TextEmbeddingCache(
@@ -81,7 +82,8 @@ def train_sdxl(
             cache_dir=str(text_cache_dir.absolute()),
             max_cache_size=config.caching.text_cache_size,
             num_workers=config.caching.text_cache_num_workers,
-            batch_size=config.caching.text_cache_batch_size
+            batch_size=config.caching.text_cache_batch_size,
+            max_memory_gb=config.caching.text_cache_memory_gb
         )
         
         # Get image paths and captions

@@ -90,7 +90,15 @@
         "max_cache_size": 10000,
         "num_workers": 4,
         "batch_size": 32
-      }
+      },
+      "vae_cache_size": 10000,
+      "vae_cache_num_workers": 4,
+      "vae_cache_batch_size": 16,
+      "vae_cache_memory_gb": 32.0,
+      "text_cache_size": 10000,
+      "text_cache_num_workers": 4,
+      "text_cache_batch_size": 16,
+      "text_cache_memory_gb": 32.0
     },
     "validation": {
       "validation_epochs": 1,

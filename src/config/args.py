@@ -87,12 +87,18 @@ class WandBConfig:
 
 @dataclass
 class CachingConfig:
-    vae_cache_size: int = DEFAULTS["caching"]["vae_cache"]["max_cache_size"]
-    vae_cache_num_workers: int = DEFAULTS["caching"]["vae_cache"]["num_workers"]
-    vae_cache_batch_size: int = DEFAULTS["caching"]["vae_cache"]["batch_size"]
-    text_cache_size: int = DEFAULTS["caching"]["text_cache"]["max_cache_size"]
-    text_cache_num_workers: int = DEFAULTS["caching"]["text_cache"]["num_workers"]
-    text_cache_batch_size: int = DEFAULTS["caching"]["text_cache"]["batch_size"]
+    """Configuration for VAE and text embedding caches."""
+    # VAE cache settings
+    vae_cache_size: int = DEFAULTS["caching"]["vae_cache_size"]
+    vae_cache_num_workers: int = DEFAULTS["caching"]["vae_cache_num_workers"]
+    vae_cache_batch_size: int = DEFAULTS["caching"]["vae_cache_batch_size"]
+    vae_cache_memory_gb: float = DEFAULTS["caching"]["vae_cache_memory_gb"]
+    
+    # Text embedding cache settings
+    text_cache_size: int = DEFAULTS["caching"]["text_cache_size"]
+    text_cache_num_workers: int = DEFAULTS["caching"]["text_cache_num_workers"]
+    text_cache_batch_size: int = DEFAULTS["caching"]["text_cache_batch_size"]
+    text_cache_memory_gb: float = DEFAULTS["caching"]["text_cache_memory_gb"]
 
 @dataclass
 class TrainingConfig:
@@ -175,7 +181,7 @@ class TrainingConfig:
     @property
     def wandb_enabled(self) -> bool:
         """Helper property to check if wandb is properly configured."""
-        return self.wandb.use_wandb and self.wandb.wandb_project is not None
+        return self.wandb.use_wandb and self.wandb.project is not None
 
 def parse_args() -> TrainingConfig:
     """Parse command line arguments and convert them into a structured config."""
@@ -373,8 +379,8 @@ def parse_args() -> TrainingConfig:
     
     # Update WandB config
     config.wandb.use_wandb = args.use_wandb
-    config.wandb.wandb_project = args.wandb_project
-    config.wandb.wandb_run_name = args.wandb_run_name
+    config.wandb.project = args.wandb_project
+    config.wandb.run_name = args.wandb_run_name
     config.wandb.logging_steps = args.logging_steps
     config.wandb.log_model = args.wandb_log_model
     config.wandb.window_size = args.wandb_window_size
