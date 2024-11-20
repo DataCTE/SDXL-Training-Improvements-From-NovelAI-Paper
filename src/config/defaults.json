@@ -61,7 +61,16 @@
       "train_freq": 10,
       "kl_weight": 0.0,
       "perceptual_weight": 0.0,
-      "initial_scale_factor": 1.0
+      "initial_scale_factor": 1.0,
+      "max_resolution": 1024,
+      "min_resolution": 512,
+      "resolution_type": "pixel",
+      "bucket_resolution_steps": 64,
+      "bucket_no_upscale": false,
+      "random_crop": true,
+      "random_flip": true,
+      "shuffle_tags": false,
+      "keep_tokens": 1
     },
     "tag_weighting": {
       "token_dropout_rate": 0.1,

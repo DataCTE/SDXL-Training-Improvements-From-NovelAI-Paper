@@ -65,6 +65,17 @@ class VAEConfig:
     kl_weight: float = DEFAULTS["vae"]["kl_weight"]
     perceptual_weight: float = DEFAULTS["vae"]["perceptual_weight"]
     initial_scale_factor: float = DEFAULTS["vae"]["initial_scale_factor"]
+    max_resolution: int = DEFAULTS["vae"]["max_resolution"]
+    min_resolution: int = DEFAULTS["vae"]["min_resolution"]
+    resolution_type: str = DEFAULTS["vae"]["resolution_type"]
+    bucket_resolution_steps: int = DEFAULTS["vae"]["bucket_resolution_steps"]
+    bucket_no_upscale: bool = DEFAULTS["vae"]["bucket_no_upscale"]
+    random_crop: bool = DEFAULTS["vae"]["random_crop"]
+    random_flip: bool = DEFAULTS["vae"]["random_flip"]
+    shuffle_tags: bool = DEFAULTS["vae"]["shuffle_tags"]
+    keep_tokens: int = 1
+    caption_dropout_probability: float = 0.0
+    caption_tag_dropout_probability: float = 0.0
 
 @dataclass
 class TagWeightingConfig:

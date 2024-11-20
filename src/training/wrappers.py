@@ -221,12 +221,12 @@ def train_vae(
         # Create empty captions dict (VAE training doesn't need captions)
         train_captions = {path: "" for path in train_image_paths}
         
-        # Create dataloader
+        # Create dataloader with proper config parameters
         logger.info("Creating training dataloader...")
         train_dataloader = create_train_dataloader(
             image_paths=train_image_paths,
             captions=train_captions,
-            config=config,
+            config=config,  # Now config will have all required attributes
             vae_cache=vae_cache,
             text_cache=None
         )
