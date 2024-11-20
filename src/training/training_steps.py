@@ -82,17 +82,13 @@ def train_step(
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Execute optimized training step with enhanced metrics and logging."""
     try:
-        # Get optimizer type
-        optimizer_type = "lion" if isinstance(optimizers["unet"], Lion) else "adamw"
-        
-        # Forward pass with optimizer type
+        # Forward pass without optimizer type
         loss, forward_metrics = forward_pass(
             args=args,
             model_dict=model_dict,
             batch=batch,
             device=device,
-            dtype=dtype,
-            optimizer_type=optimizer_type
+            dtype=dtype
         )
         
         # Initialize metrics dictionary
@@ -168,12 +164,9 @@ def train_step(
             "effective_batch_size": batch["pixel_values"].shape[0] * (grad_accumulator.accumulation_steps if grad_accumulator else 1)
         })
         
-        # Lion-specific gradient handling
+        # Add optimizer-specific metrics
+        optimizer_type = "lion" if isinstance(optimizers["unet"], Lion) else "adamw"
         if optimizer_type == "lion":
-            # Lion works better with smaller gradient clipping
-            args.max_grad_norm = args.max_grad_norm * 0.5 if args.max_grad_norm else None
-            
-            # Lion-specific metrics
             metrics_dict.update({
                 "optimizer/type": "lion",
                 "optimizer/beta1": optimizers["unet"].param_groups[0]["betas"][0],
