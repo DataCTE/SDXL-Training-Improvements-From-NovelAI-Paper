@@ -60,6 +60,7 @@ class VAEConfig:
     use_channel_scaling: bool = DEFAULTS["vae"]["use_channel_scaling"]
     enable_cuda_graphs: bool = DEFAULTS["vae"]["enable_cuda_graphs"]
     cache_size: int = DEFAULTS["vae"]["cache_size"]
+    num_workers: int = DEFAULTS["vae"]["num_workers"]
     num_warmup_steps: int = DEFAULTS["vae"]["num_warmup_steps"]
     train_freq: int = DEFAULTS["vae"]["train_freq"]
     kl_weight: float = DEFAULTS["vae"]["kl_weight"]
@@ -73,7 +74,7 @@ class VAEConfig:
     random_crop: bool = DEFAULTS["vae"]["random_crop"]
     random_flip: bool = DEFAULTS["vae"]["random_flip"]
     shuffle_tags: bool = DEFAULTS["vae"]["shuffle_tags"]
-    keep_tokens: int = 1
+    keep_tokens: int = DEFAULTS["vae"]["keep_tokens"]
     caption_dropout_probability: float = 0.0
     caption_tag_dropout_probability: float = 0.0
 
@@ -404,6 +405,7 @@ def parse_args() -> TrainingConfig:
     config.vae_args.batch_size = args.vae_batch_size
     config.vae_args.num_epochs = args.vae_num_epochs
     config.vae_args.mixed_precision = args.vae_mixed_precision
+    config.vae_args.num_workers = args.num_workers
     
     # Update Tag Weighting config
     config.tag_weighting.token_dropout_rate = args.token_dropout_rate

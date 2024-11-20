@@ -57,6 +57,7 @@
       "use_channel_scaling": true,
       "enable_cuda_graphs": false,
       "cache_size": 10000,
+      "num_workers": 1,
       "num_warmup_steps": 100,
       "train_freq": 10,
       "kl_weight": 0.0,
