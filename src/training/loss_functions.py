@@ -343,50 +343,61 @@ def _get_add_time_ids(
     dtype: torch.dtype,
     device: torch.device,
     hidden_dim: int,
-    text_encoder_projection_dim: int = None,  # Marked optional since unused
+    # Remove unused parameters:
+    # text_encoder_projection_dim and target_size are not used in SDXL paper
     crop_coords: Optional[torch.Tensor] = None,
-    target_size: Optional[torch.Tensor] = None,  # Marked optional since unused
 ) -> torch.Tensor:
     """
     Get additional time embeddings per SDXL paper section 2.2 and 2.3.
-    Implements size, crop and aspect ratio conditioning with Fourier features.
+    Implements original size, crop and aspect ratio conditioning with Fourier features.
+    
+    The SDXL paper describes conditioning on:
+    1. Original image size before any rescaling (section 2.2)
+    2. Crop coordinates (section 2.2) 
+    3. Aspect ratio (section 2.3)
     """
     # Original image size conditioning (SDXL section 2.2)
+    # Paper: "condition the UNet model on the original image resolution"
     c_size = torch.tensor([height, width], device=device, dtype=torch.long)
     c_size = c_size.unsqueeze(0).expand(batch_size, -1)
     
     # Crop conditioning (SDXL section 2.2)
+    # Paper: "feed them into the model as conditioning parameters via Fourier feature embeddings"
     if crop_coords is None:
-        # Default to center crop for inference (NAI.txt line 23-24)
+        # Default to no cropping for inference
+        # NAI.txt: "we set (ctop, cleft) = (0, 0) during inference"
         c_crop = torch.zeros((batch_size, 2), device=device, dtype=torch.long)
     else:
         c_crop = crop_coords.to(device=device, dtype=torch.long)
     
     # Aspect ratio conditioning (SDXL section 2.3)
-    aspect_ratio = torch.tensor([width / height], device=device, dtype=torch.float32)  # Changed to float32
+    # Paper discusses multi-aspect training and conditioning
+    aspect_ratio = torch.tensor([width / height], device=device, dtype=torch.float32)
     c_ar = aspect_ratio.unsqueeze(0).expand(batch_size, -1)
     
     # Get Fourier embeddings for each conditioning
+    # Paper: "Each component is independently embedded using a Fourier feature encoding"
     c_size_emb = _get_fourier_embedding(c_size)  # [B, 2*D]
-    c_crop_emb = _get_fourier_embedding(c_crop)  # [B, 2*D]
+    c_crop_emb = _get_fourier_embedding(c_crop)  # [B, 2*D] 
     c_ar_emb = _get_fourier_embedding(c_ar)      # [B, D]
     
-    # Concatenate all embeddings (SDXL Figure 16 and NAI.txt lines 635-639)
+    # Concatenate all embeddings
+    # Paper: "these encodings are concatenated into a single vector"
     time_ids = torch.cat([
-        c_size_emb,  # Size conditioning
-        c_crop_emb,  # Crop conditioning
+        c_size_emb,  # Original size conditioning
+        c_crop_emb,  # Crop coordinate conditioning
         c_ar_emb,    # Aspect ratio conditioning
     ], dim=1)
     
-    # Project to hidden dimension using linear layer
+    # Project to hidden dimension
+    # Paper: "we feed into the model by adding it to the timestep embedding"
     projection = torch.randn(
         time_ids.shape[1],  # in_features
         hidden_dim,         # out_features 
         device=device,
         dtype=dtype
-    ) / math.sqrt(time_ids.shape[1])  # Xavier init
+    ) / math.sqrt(time_ids.shape[1])  # Xavier initialization
     
-    # Use linear projection properly (following NAI.txt line 636)
     time_ids = torch.matmul(time_ids, projection)
     
     return time_ids
@@ -464,8 +475,7 @@ def forward_pass(
         dtype=dtype,
         device=device,
         hidden_dim=unet.config.cross_attention_dim,
-        text_encoder_projection_dim=text_encoder_2.config.projection_dim
-    )  # [B, D]
+    )  # [B, D] 
     
     # Add sequence dimension to match text embeddings
     time_embeddings = time_embeddings.unsqueeze(1)  # [B, 1, D]
