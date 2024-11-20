@@ -164,12 +164,22 @@ class SDXLTrainer:
             shuffle = isinstance(dataloader.sampler, torch.utils.data.RandomSampler)
             
             # Create new dataloader with optimized settings
+            # Disable pin_memory if data is already on CUDA
+            pin_memory = not any(
+                isinstance(item, torch.cuda.FloatTensor) 
+                for item in next(iter(dataloader)).values()
+                if isinstance(item, torch.Tensor)
+            )
+            
+            # Reset iterator
+            dataloader._iterator = None
+            
             return torch.utils.data.DataLoader(
                 dataset,
                 batch_size=batch_size,
                 shuffle=shuffle,
                 num_workers=0,  # Disable multiprocessing to avoid pickling issues
-                pin_memory=True,  # Always enable pin_memory since we're not using multiprocessing
+                pin_memory=pin_memory,  # Only pin memory for CPU tensors
                 collate_fn=getattr(dataloader, 'collate_fn', None),
                 persistent_workers=False  # Disable persistent workers
             )
