@@ -94,7 +94,13 @@ class TextEmbeddingCache:
         
     @torch.no_grad()
     def _encode_text(self, text: Union[str, List[str]]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Encode text with both encoders."""
+        """Encode text with both encoders.
+        
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: 
+                - Combined hidden states [batch_size, seq_len, hidden_size]
+                - Pooled output from second encoder [batch_size, hidden_size]
+        """
         if isinstance(text, str):
             text = [text]
             
@@ -120,21 +126,22 @@ class TextEmbeddingCache:
             tokens2 = {k: v.cuda() for k,v in tokens2.items()}
             
         # Get embeddings from both encoders
-        with torch.cuda.amp.autocast():
-            embed1 = self.text_encoder1(**tokens1)[0]
-            embed2 = self.text_encoder2(**tokens2)[0]
-            
-            # Concatenate along channel dimension
-            embed = torch.cat([embed1, embed2], dim=-1)
+        with torch.amp.autocast('cuda'):  # Updated autocast syntax
+            # Get hidden states from both encoders
+            hidden_states1 = self.text_encoder1(**tokens1)[0]  # [batch, seq_len, hidden_size]
+            hidden_states2 = self.text_encoder2(**tokens2)[0]  # [batch, seq_len, hidden_size]
             
             # Get pooled output from second encoder
-            pooled = self.text_encoder2(**tokens2)[1]
+            pooled_output = self.text_encoder2(**tokens2)[1]  # [batch, hidden_size]
             
+            # Concatenate hidden states along hidden dimension
+            combined_hidden = torch.cat([hidden_states1, hidden_states2], dim=-1)
+                
         # Move back to CPU for caching
-        embed = embed.cpu()
-        pooled = pooled.cpu()
+        combined_hidden = combined_hidden.cpu()
+        pooled_output = pooled_output.cpu()
         
-        return embed, pooled
+        return combined_hidden, pooled_output
         
     def _parallel_encode(self, texts: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
         """Parallel batch processing with optimal batch size."""
