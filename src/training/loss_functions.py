@@ -469,25 +469,36 @@ def forward_pass(
             # Concatenate to 2048-dim per paper
             text_embeddings = torch.cat([text_embeds_1, text_embeds_2], dim=-1)  # [B, S, 2048]
     
-    # Get time embeddings with sequence dimension matched
-    time_embeddings = _get_add_time_ids(
+    # Get time embeddings with proper shape handling
+    time_ids = _get_add_time_ids(
         batch_size=batch_size,
         height=height,
         width=width,
         dtype=dtype,
         device=device,
         hidden_dim=unet.config.cross_attention_dim,
-    )  # [B, D] 
+    )  # [B, 1, D]
     
-    # Add sequence dimension to match text embeddings
-    time_embeddings = time_embeddings.unsqueeze(1)  # [B, 1, D]
-    time_embeddings = time_embeddings.expand(-1, text_embeddings.shape[1], -1)  # [B, S, D]
+    # Ensure time_ids has correct shape [B, S, D]
+    if time_ids.ndim == 4:  # If shape is [B, 1, 1, D]
+        time_ids = time_ids.squeeze(2)  # Remove extra dimension -> [B, 1, D]
+    
+    # Expand to match sequence length of text embeddings
+    time_embeddings = time_ids.expand(-1, text_embeddings.shape[1], -1)  # [B, S, D]
     
     added_cond_kwargs = {
         "text_embeds": pooled_embeddings,  # [B, 1280]
         "time_ids": time_embeddings        # [B, S, D]
     }
-    sigma=get_sigmas(height, width, device)[0]
+    
+    # Get sigmas for current step
+    sigma = get_sigmas(
+        num_inference_steps=args.num_inference_steps,
+        height=height,
+        width=width,
+        device=device
+    )[0]
+    
     # Get loss with NAI improvements
     loss, metrics = training_loss_v_prediction(
         model=unet,
