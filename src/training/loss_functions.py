@@ -356,48 +356,36 @@ def _get_add_time_ids(
 ) -> torch.Tensor:
     """
     Get additional time embeddings per SDXL paper section 2.2 and 2.3.
-    Returns embeddings with shape [batch_size, sequence_length, hidden_dim]
-    to match text embeddings shape.
+    Returns embeddings with shape [batch_size, hidden_dim]
     """
     # Original image size conditioning
-    c_size = torch.tensor([height, width], device=device, dtype=torch.long)
-    c_size = c_size.unsqueeze(0).expand(batch_size, -1)
+    original_size = torch.tensor([height, width], device=device, dtype=torch.long)
+    original_size = original_size.unsqueeze(0).expand(batch_size, -1)
     
     # Crop conditioning 
     if crop_coords is None:
-        c_crop = torch.zeros((batch_size, 2), device=device, dtype=torch.long)
+        crops_coords_top_left = torch.zeros((batch_size, 2), device=device, dtype=torch.long)
     else:
-        c_crop = crop_coords.to(device=device, dtype=torch.long)
+        crops_coords_top_left = crop_coords.to(device=device, dtype=torch.long)
     
-    # Aspect ratio conditioning
-    aspect_ratio = torch.tensor([width / height], device=device, dtype=torch.float32)
-    c_ar = aspect_ratio.unsqueeze(0).expand(batch_size, -1)
+    # Target size is same as original for training
+    target_size = original_size.clone()
+    
+    # Concatenate all time embeddings
+    add_time_ids = torch.cat([
+        original_size,
+        crops_coords_top_left,
+        target_size
+    ], dim=1)  # [batch_size, 6]
     
     # Get Fourier embeddings
-    c_size_emb = _get_fourier_embedding(c_size)  # [B, 2*D]
-    c_crop_emb = _get_fourier_embedding(c_crop)  # [B, 2*D]
-    c_ar_emb = _get_fourier_embedding(c_ar)      # [B, D]
+    time_embeddings = _get_fourier_embedding(
+        add_time_ids,
+        dim=hidden_dim // 6,  # Divide by number of time embedding components
+        max_period=10000
+    )  # [batch_size, hidden_dim]
     
-    # Concatenate embeddings
-    time_ids = torch.cat([
-        c_size_emb,
-        c_crop_emb,
-        c_ar_emb,
-    ], dim=1)  # [B, 5*D]
-    
-    # Project to hidden dimension
-    projection = torch.randn(
-        time_ids.shape[1],
-        hidden_dim,
-        device=device,
-        dtype=dtype
-    ) / math.sqrt(time_ids.shape[1])
-    
-    # Project and add sequence dimension to match text embeddings shape
-    time_ids = torch.matmul(time_ids, projection)  # [B, hidden_dim]
-    time_ids = time_ids.unsqueeze(1)  # [B, 1, hidden_dim]
-    
-    return time_ids
+    return time_embeddings
 
 def _get_fourier_embedding(
     x: torch.Tensor,
