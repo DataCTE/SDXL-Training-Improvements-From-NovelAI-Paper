@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from torch.amp import autocast
 import logging
 from typing import Dict, Any, Optional, Tuple, Union
-import weakref
+import torch.nn as nn
 from functools import lru_cache
 import math
 
@@ -260,8 +260,8 @@ def apply_model(
         
     # Per paper section 2.2: Additional micro-conditioning requires matching dims
     if "time_ids" in added_cond_kwargs:
-        time_ids = added_cond_kwargs["time_ids"]  # Shape: [B, D_time]
-        # Add sequence dimension to match text embeddings
+        time_ids = added_cond_kwargs["time_ids"]  # Shape: [B, D_time] or [B, S, D_time]
+        # Ensure time_ids matches text_embeddings dimensions
         if time_ids.ndim == 2 and text_embeddings.ndim == 3:
             # Expand to [B, S, D_time] to match text embedding sequence length
             time_ids = time_ids.unsqueeze(1).expand(-1, text_embeddings.shape[1], -1)
@@ -270,43 +270,57 @@ def apply_model(
     # Text embeddings from second encoder need same treatment
     if "text_embeds" in added_cond_kwargs:
         text_embeds = added_cond_kwargs["text_embeds"]  # Shape: [B, D_pooled]
+        # Ensure text_embeds matches text_embeddings dimensions
         if text_embeds.ndim == 2 and text_embeddings.ndim == 3:
             # Expand to [B, S, D_pooled]
             text_embeds = text_embeds.unsqueeze(1).expand(-1, text_embeddings.shape[1], -1)
         added_cond_kwargs["text_embeds"] = text_embeds
+
+    # Ensure all tensors have matching dimensions before model forward pass
+    if hasattr(model, "get_aug_embed"):
+        # Handle UNet2DConditionModel case
+        for key, value in added_cond_kwargs.items():
+            if value.ndim != text_embeddings.ndim:
+                if value.ndim == 2:
+                    added_cond_kwargs[key] = value.unsqueeze(1).expand(-1, text_embeddings.shape[1], -1)
+                elif value.ndim == 3:
+                    added_cond_kwargs[key] = value.squeeze(1)
     
     return model(x, t, text_embeddings, added_cond_kwargs=added_cond_kwargs).sample
 
 def _get_add_time_ids(
     batch_size: int,
-    height: int, 
+    height: int,
     width: int,
     dtype: torch.dtype,
     device: torch.device,
-    hidden_dim: int,  # 2048 per paper section 2.1
+    hidden_dim: int,
     text_encoder_projection_dim: Optional[int] = None
-) -> torch.Tensor:
-    """
-    From section 2.2: Micro-conditioning includes original size, crop coordinates,
-    and target size, projected to match embedding dimension.
-    """
-    # Per paper: Condition on original and target image dimensions
-    add_time_ids = torch.tensor([
-        [height, width,  # original size
-         0, 0,          # crop coordinates (default to 0,0)
-         height, width] # target size
-    ], dtype=dtype, device=device)  # Shape: [1, 6]
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Generate time embeddings with correct dimensions per SDXL paper section 2.2"""
     
-    # Repeat for batch
-    add_time_ids = add_time_ids.repeat(batch_size, 1)  # Shape: [B, 6]
+    # Original size conditioning [B, 2]
+    original_size = torch.tensor([[height, width]], dtype=dtype, device=device)
+    original_size = original_size.repeat(batch_size, 1)
     
-    # Project to embedding space
-    total_dim = text_encoder_projection_dim or hidden_dim
-    time_embed = torch.nn.Linear(add_time_ids.shape[1], total_dim, device=device, dtype=dtype)
-    # Final shape: [B, D_time] where D_time = total_dim
-    return time_embed(add_time_ids)
+    # Crop conditioning [B, 2]
+    crops = torch.tensor([[0, 0]], dtype=dtype, device=device)  # Default center crop
+    crops = crops.repeat(batch_size, 1)
+    
+    # Target size conditioning [B, 2]
+    target_size = torch.tensor([[height, width]], dtype=dtype, device=device)
+    target_size = target_size.repeat(batch_size, 1)
+    
+    # Concatenate all micro-conditionings [B, 6]
+    add_time_ids = torch.cat([original_size, crops, target_size], dim=1)
+    
+    # Project to embedding dimension specified by text encoder or hidden dim
+    embed_dim = text_encoder_projection_dim or hidden_dim
+    time_embed = nn.Linear(6, embed_dim, device=device, dtype=dtype)
+    projected = time_embed(add_time_ids)  # [B, D]
+    
+    return projected
 
-@autocast('cuda')
 def forward_pass(
     args: Any,
     model_dict: Dict[str, torch.nn.Module],
@@ -314,64 +328,64 @@ def forward_pass(
     device: torch.device,
     dtype: torch.dtype,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """Main forward pass implementing architecture from SDXL paper section 2.1"""
+    """Forward pass with corrected tensor dimensions per paper sections 2.1-2.2"""
+    
     unet = model_dict["unet"]
-    text_encoder = model_dict.get("text_encoder")     # CLIP ViT-L
-    text_encoder_2 = model_dict.get("text_encoder_2") # OpenCLIP ViT-bigG
+    text_encoder = model_dict.get("text_encoder")      # CLIP ViT-L 
+    text_encoder_2 = model_dict.get("text_encoder_2")  # OpenCLIP ViT-bigG
     
-    # 2048-dim cross attention per paper
-    hidden_dim = unet.config.cross_attention_dim
+    pixel_values = batch["pixel_values"].to(device=device, dtype=dtype)  # [B, C, H, W]
+    batch_size, _, height, width = pixel_values.shape
     
-    pixel_values = batch["pixel_values"].to(device=device, dtype=dtype, non_blocking=True)
-    batch_size = pixel_values.shape[0]
-    height, width = pixel_values.shape[-2:]
-    
-    # Handle text embeddings - concatenate both encoder outputs
-    if "text_embeddings" in batch and "pooled_text_embeddings" in batch:
-        text_embeddings = batch["text_embeddings"].to(device=device, non_blocking=True)
-        pooled_text_embeddings = batch["pooled_text_embeddings"].to(device=device, non_blocking=True)
+    # Text embeddings with proper shapes
+    if "text_embeddings" in batch:
+        text_embeddings = batch["text_embeddings"].to(device=device)  # [B, S, D]
+        pooled_embeddings = batch["pooled_text_embeddings"].to(device=device)  # [B, D]
     else:
         with torch.no_grad():
-            # Get embeddings from both encoders
-            text_embeddings = text_encoder(batch["input_ids"].to(device))[0]      # [B, S, 768]
-            text_embeddings_2 = text_encoder_2(batch["input_ids_2"].to(device))[0] # [B, S, 1280] 
-            pooled_text_embeddings = text_embeddings_2[:, -1]  # [B, 1280]
-            # Concatenate to 2048 dim per paper
-            text_embeddings = torch.cat([text_embeddings, text_embeddings_2], dim=-1)
-
-    # Get time embeddings with proper dimensions
-    time_ids = _get_add_time_ids(
+            # Get embeddings from CLIP ViT-L (768-dim)
+            encoder_output = text_encoder(batch["input_ids"].to(device))
+            text_embeds_1 = encoder_output[0]  # [B, S, 768]
+            
+            # Get embeddings from OpenCLIP ViT-bigG (1280-dim)
+            encoder_output_2 = text_encoder_2(batch["input_ids"].to(device))
+            text_embeds_2 = encoder_output_2[0]  # [B, S, 1280]
+            pooled_embeddings = encoder_output_2[1]  # [B, 1280]
+            
+            # Concatenate to 2048-dim per paper
+            text_embeddings = torch.cat([text_embeds_1, text_embeds_2], dim=-1)  # [B, S, 2048]
+    
+    # Get time embeddings with sequence dimension matched
+    time_embeddings = _get_add_time_ids(
         batch_size=batch_size,
         height=height,
-        width=width, 
+        width=width,
         dtype=dtype,
         device=device,
-        hidden_dim=hidden_dim,
+        hidden_dim=unet.config.cross_attention_dim,
         text_encoder_projection_dim=text_encoder_2.config.projection_dim
-    )
-
-    # Match sequence dimension for concatenation 
-    if time_ids.ndim == 2 and text_embeddings.ndim == 3:
-        time_ids = time_ids.unsqueeze(1).expand(-1, text_embeddings.shape[1], -1)
-
-    # Prepare all conditioning inputs
+    )  # [B, D]
+    
+    # Add sequence dimension to match text embeddings
+    time_embeddings = time_embeddings.unsqueeze(1)  # [B, 1, D]
+    time_embeddings = time_embeddings.expand(-1, text_embeddings.shape[1], -1)  # [B, S, D]
+    
     added_cond_kwargs = {
-        "text_embeds": pooled_text_embeddings,  # [B, 1280]
-        "time_ids": time_ids                    # [B, S, D_time]
+        "text_embeds": pooled_embeddings,  # [B, 1280]
+        "time_ids": time_embeddings        # [B, S, D]
     }
-
-    # Get sigmas and compute loss
+    
+    # Get loss with matched dimensions
     sigmas = get_sigmas(height=height, width=width, device=device)
-    sigma = sigmas[0]
-
+    
     return training_loss_v_prediction(
         model=unet,
         x_0=pixel_values,
-        sigma=sigma,
+        sigma=sigmas[0],
         text_embeddings=text_embeddings,
+        added_cond_kwargs=added_cond_kwargs,
         use_snr_weighting=getattr(args, "use_snr_weighting", True),
         min_snr_gamma=getattr(args, "min_snr_gamma", 5.0),
         scale_factor=getattr(args, "scale_factor", 1.0),
-        added_cond_kwargs=added_cond_kwargs,
         return_metrics=True
     )
