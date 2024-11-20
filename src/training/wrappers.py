@@ -175,6 +175,7 @@ def train_vae(
     train_data_dir: Union[str, Path],
     output_dir: Union[str, Path],
     config: VAEConfig,
+    pretrained_model_path: Optional[str] = None,
     **kwargs
 ) -> VAEFinetuner:
     """High-level wrapper for VAE finetuning."""
@@ -188,19 +189,25 @@ def train_vae(
         
         logger.info("Initializing VAE finetuning...")
         
-        # Create VAE model
+        # Create VAE model with proper fallback
         vae = create_vae_model(
-            vae_path=config.vae_path,
-            device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            vae_path=config.vae_path if hasattr(config, 'vae_path') else None,
+            pretrained_model_path=pretrained_model_path,
+            device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
+            dtype=torch.float32,
+            force_upcast=True
         )
+        
+        logger.info(f"VAE loaded from: {config.vae_path if hasattr(config, 'vae_path') else pretrained_model_path}")
         
         # Setup VAE cache with proper config
         vae_cache = VAECache(
             vae=vae,
             cache_dir=str(output_dir / "vae_cache"),
-            max_cache_size=config.cache_size,
+            max_cache_size=config.cache_size if hasattr(config, 'cache_size') else 10000,
             num_workers=config.num_workers if hasattr(config, 'num_workers') else 4,
-            batch_size=config.batch_size
+            batch_size=config.batch_size if hasattr(config, 'batch_size') else 1,
+            max_memory_gb=config.max_memory_gb if hasattr(config, 'max_memory_gb') else 4
         )
         
         # Get and validate image paths
