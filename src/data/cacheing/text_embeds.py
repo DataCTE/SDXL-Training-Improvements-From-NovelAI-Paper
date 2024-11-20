@@ -82,12 +82,9 @@ class TextEmbeddingCache:
                 return_dict=True
             )
             
-            # Get pooled output (2D) and last hidden state (3D)
-            pooled = encoder_output.pooler_output  # [batch, hidden_dim]
-            hidden = encoder_output.last_hidden_state  # [batch, seq_len, hidden_dim]
-            
-            # Add sequence dimension to pooled output to match hidden states
-            pooled = pooled.unsqueeze(1)  # [batch, 1, hidden_dim]
+            # Get last hidden state and use first token ([CLS]) as pooled output
+            hidden = encoder_output.hidden_states[-2]  # Use penultimate layer as per SDXL paper
+            pooled = hidden[:, 0:1, :]  # Take [CLS] token embedding as pooled output
             
         return pooled, hidden
 
