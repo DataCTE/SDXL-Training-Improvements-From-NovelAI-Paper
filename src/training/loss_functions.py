@@ -353,24 +353,30 @@ def _get_add_time_ids(
     width: int,
     dtype: torch.dtype,
     device: torch.device,
-    original_size: Optional[Tuple[int, int]] = None,
-    crops_coords_top_left: Tuple[int, int] = (0, 0),
-    target_size: Optional[Tuple[int, int]] = None,
+    hidden_dim: int,
+    text_encoder_projection_dim: Optional[int] = None
 ) -> torch.Tensor:
-    """Generate time_ids tensor for SDXL conditioning following the official implementation."""
-    if original_size is None:
-        original_size = (height, width)
-    if target_size is None:
-        target_size = (height, width)
-
-    # SDXL base expects 6 time_ids:
-    # 1-2. Original image size (h, w)
-    # 3-4. Crop coordinates (top, left)
-    # 5-6. Target size (h, w)
-    add_time_ids = list(original_size) + list(crops_coords_top_left) + list(target_size)
+    """Generate properly shaped time embeddings for SDXL conditioning."""
+    # Get original size and target size
+    original_size = (height, width)
+    target_size = (height, width)
+    crops_coords_top_left = (0, 0)
     
-    # Create tensor with correct shape [batch_size, 6]
-    add_time_ids = torch.tensor([add_time_ids], dtype=dtype, device=device)
-    add_time_ids = add_time_ids.repeat(batch_size, 1)
-
-    return add_time_ids
+    # Create time ID list
+    add_time_ids = list(original_size + crops_coords_top_left + target_size)
+    
+    # Calculate expected embedding dimension
+    if text_encoder_projection_dim is not None:
+        expected_dim = hidden_dim + text_encoder_projection_dim
+    else:
+        expected_dim = hidden_dim
+        
+    # Create tensor and expand to match sequence length
+    time_ids = torch.tensor([add_time_ids], dtype=dtype, device=device)
+    time_ids = time_ids.repeat(batch_size, 1)  # [batch_size, num_time_tokens]
+    
+    # Project to higher dimension to match text embeddings
+    time_embeddings = torch.nn.Linear(len(add_time_ids), expected_dim, device=device)(time_ids)
+    time_embeddings = time_embeddings.unsqueeze(1)  # [batch_size, 1, hidden_dim]
+    
+    return time_embeddings
