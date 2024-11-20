@@ -1,6 +1,6 @@
 import torch
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 from torch.cuda.amp import GradScaler
 from src.config.args import TrainingConfig
 from src.training.training_steps import GradientAccumulator  # Add this import
@@ -18,8 +18,9 @@ from src.models.SDXL.pipeline import StableDiffusionXLPipeline
 import warnings
 from src.utils.logging import SDXLTrainingLogger
 from dataclasses import asdict
+#D:\SDXL-Training-Improvements-From-NovelAI-Paper\src\models\SDXL\scheduler.py
 from src.models.SDXL.scheduler import EDMEulerScheduler
-
+from src.training.optimizers.lion.__init__ import Lion
 # Filter out deprecation warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="_distutils_hack")
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -54,24 +55,44 @@ class SDXLTrainer:
         # Initialize components
         self.components = initialize_training_components(config, models)
         
-        # Setup optimizers and schedulers
-        self.optimizers = {
-            "unet": torch.optim.AdamW(
-                self.models["unet"].parameters(),
-                lr=config.optimizer.learning_rate,
-                betas=(config.adam_beta1, config.adam_beta2),
-                weight_decay=config.optimizer.weight_decay,
-                eps=config.adam_epsilon
-            )
-        }
+        # Setup optimizers based on config type
+        if config.optimizer.optimizer_type == "lion":
+            self.optimizers = {
+                "unet": Lion(
+                    self.models["unet"].parameters(),
+                    lr=config.optimizer.learning_rate,
+                    weight_decay=config.optimizer.weight_decay,
+                    betas=config.optimizer.lion_betas  # NAI recommended (0.95, 0.98)
+                )
+            }
+        else:
+            self.optimizers = {
+                "unet": torch.optim.AdamW(
+                    self.models["unet"].parameters(),
+                    lr=config.optimizer.learning_rate,
+                    betas=(config.optimizer.adam_beta1, config.optimizer.adam_beta2),
+                    weight_decay=config.optimizer.weight_decay,
+                    eps=config.optimizer.adam_epsilon
+                )
+            }
         
-        self.schedulers = {
-            "unet": torch.optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizers["unet"],
-                T_max=config.num_epochs * len(self.train_dataloader),
-                eta_min=config.min_learning_rate
-            )
-        }
+        if isinstance(self.optimizers["unet"], Lion):
+            self.schedulers = {
+                "unet": torch.optim.lr_scheduler.LinearLR(
+                    self.optimizers["unet"],
+                    start_factor=1.0,
+                    end_factor=0.1,
+                    total_iters=config.num_epochs * len(train_dataloader)
+                )
+            }
+        else:
+            self.schedulers = {
+                "unet": torch.optim.lr_scheduler.CosineAnnealingLR(
+                    self.optimizers["unet"],
+                    T_max=config.num_epochs * len(self.train_dataloader),
+                    eta_min=config.min_learning_rate
+                )
+            }
         
         # Setup gradient accumulation
         self.grad_accumulator = GradientAccumulator(

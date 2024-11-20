@@ -179,10 +179,10 @@ def training_loss_v_prediction(
     scale_factor: float = 1.0,
     added_cond_kwargs: Optional[Dict[str, torch.Tensor]] = None,
     return_metrics: bool = False,
+    optimizer_type: str = "lion"  # Add optimizer type parameter
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
-    Compute v-prediction loss with NAI improvements.
-    Implements v-prediction parameterization and MinSNR weighting.
+    Compute v-prediction loss with NAI improvements and Lion support.
     
     Args:
         model: The diffusion model
@@ -195,6 +195,7 @@ def training_loss_v_prediction(
         scale_factor: Additional scaling factor
         added_cond_kwargs: Additional conditioning inputs
         return_metrics: Whether to return additional metrics
+        optimizer_type: Type of optimizer being used ("adamw" or "lion")
     """
     # Scale sigma based on resolution
     height, width = x_0.shape[-2:]
@@ -236,9 +237,13 @@ def training_loss_v_prediction(
         reduction='none'
     ).mean()
 
+    # Lion-specific loss scaling
+    if optimizer_type == "lion":
+        loss = loss * 0.5  # Lion typically needs smaller loss scaling
+
     if return_metrics:
         with torch.no_grad():
-            return loss, {
+            metrics = {
                 "target_mean": v_target.mean().item(),
                 "target_std": v_target.std().item(),
                 "pred_mean": v_pred.mean().item(),
@@ -250,6 +255,7 @@ def training_loss_v_prediction(
                 "sigma_std": sigma.std().item(),
                 "v_pred_loss": loss.item(),
             }
+            return loss, metrics
     
     return loss
 
