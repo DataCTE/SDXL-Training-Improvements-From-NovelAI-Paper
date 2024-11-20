@@ -189,6 +189,10 @@ def train_vae(
         
         logger.info("Initializing VAE finetuning...")
         
+        # Ensure we have either vae_path or pretrained_model_path
+        if not hasattr(config, 'vae_path') and pretrained_model_path is None:
+            raise ValueError("Either config.vae_path or pretrained_model_path must be provided")
+            
         # Create VAE model with proper fallback
         vae = create_vae_model(
             vae_path=config.vae_path if hasattr(config, 'vae_path') else None,
