@@ -183,19 +183,11 @@ def train_vae(
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Setup logging directory
-        log_dir = output_dir / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        
         logger.info("Initializing VAE finetuning...")
         
-        # Ensure we have either vae_path or pretrained_model_path
-        if not hasattr(config, 'vae_path') and pretrained_model_path is None:
-            raise ValueError("Either config.vae_path or pretrained_model_path must be provided")
-            
         # Create VAE model with proper fallback
         vae = create_vae_model(
-            vae_path=config.vae_path if hasattr(config, 'vae_path') else None,
+            vae_path=getattr(config, 'vae_path', None),
             pretrained_model_path=pretrained_model_path,
             device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
             dtype=torch.float32,

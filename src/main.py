@@ -57,6 +57,7 @@ def main():
                 train_data_dir=config.train_data_dir,
                 output_dir=str(output_dir / "vae"),
                 config=config.vae_args,
+                pretrained_model_path=config.pretrained_model_path,
                 validation_config=validation_config
             )
             # Run VAE training
