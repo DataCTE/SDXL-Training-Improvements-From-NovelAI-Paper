@@ -351,12 +351,11 @@ def _get_add_time_ids(
     width: int,
     dtype: torch.dtype,
     device: torch.device,
-    hidden_dim: int,
     crop_coords: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Get additional time embeddings per SDXL paper section 2.2 and 2.3.
-    Returns embeddings with shape [batch_size, hidden_dim]
+    Returns embeddings with shape [batch_size, 6]
     """
     # Original image size conditioning
     original_size = torch.tensor([height, width], device=device, dtype=torch.long)
@@ -378,14 +377,7 @@ def _get_add_time_ids(
         target_size
     ], dim=1)  # [batch_size, 6]
     
-    # Get Fourier embeddings
-    time_embeddings = _get_fourier_embedding(
-        add_time_ids,
-        dim=hidden_dim // 6,  # Divide by number of time embedding components
-        max_period=10000
-    )  # [batch_size, hidden_dim]
-    
-    return time_embeddings
+    return add_time_ids.to(dtype=dtype)
 
 def _get_fourier_embedding(
     x: torch.Tensor,
@@ -433,53 +425,42 @@ def forward_pass(
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Forward pass with NAI improvements"""
     unet = model_dict["unet"]
-    text_encoder = model_dict.get("text_encoder")      # CLIP ViT-L 
-    text_encoder_2 = model_dict.get("text_encoder_2")  # OpenCLIP ViT-bigG
+    text_encoder = model_dict.get("text_encoder")
+    text_encoder_2 = model_dict.get("text_encoder_2")
     
-    pixel_values = batch["pixel_values"].to(device=device, dtype=dtype)  # [B, C, H, W]
+    pixel_values = batch["pixel_values"].to(device=device, dtype=dtype)
     batch_size, _, height, width = pixel_values.shape
     
-    # Text embeddings with proper shapes
+    # Get text embeddings
     if "text_embeddings" in batch:
-        text_embeddings = batch["text_embeddings"].to(device=device)  # [B, S, D]
-        pooled_embeddings = batch["pooled_text_embeddings"].to(device=device)  # [B, D]
+        text_embeddings = batch["text_embeddings"].to(device=device)
+        pooled_embeddings = batch["pooled_text_embeddings"].to(device=device)
     else:
         with torch.no_grad():
-            # Get embeddings from CLIP ViT-L (768-dim)
             encoder_output = text_encoder(batch["input_ids"].to(device))
-            text_embeds_1 = encoder_output[0]  # [B, S, 768]
+            text_embeds_1 = encoder_output[0]
             
-            # Get embeddings from OpenCLIP ViT-bigG (1280-dim)
             encoder_output_2 = text_encoder_2(batch["input_ids"].to(device))
-            text_embeds_2 = encoder_output_2[0]  # [B, S, 1280]
-            pooled_embeddings = encoder_output_2[1]  # [B, 1280]
+            text_embeds_2 = encoder_output_2[0]
+            pooled_embeddings = encoder_output_2[1]
             
-            # Concatenate to 2048-dim per paper
-            text_embeddings = torch.cat([text_embeds_1, text_embeds_2], dim=-1)  # [B, S, 2048]
+            text_embeddings = torch.cat([text_embeds_1, text_embeds_2], dim=-1)
     
-    # Get time embeddings with proper shape handling
-    time_ids = _get_add_time_ids(
+    # Get time embeddings
+    add_time_ids = _get_add_time_ids(
         batch_size=batch_size,
         height=height,
         width=width,
         dtype=dtype,
-        device=device,
-        hidden_dim=unet.config.cross_attention_dim,
-    )  # [B, 1, D]
-    
-    # Ensure time_ids has correct shape [B, S, D]
-    if time_ids.ndim == 4:  # If shape is [B, 1, 1, D]
-        time_ids = time_ids.squeeze(2)  # Remove extra dimension -> [B, 1, D]
-    
-    # Expand to match sequence length of text embeddings
-    time_embeddings = time_ids.expand(-1, text_embeddings.shape[1], -1)  # [B, S, D]
+        device=device
+    )
     
     added_cond_kwargs = {
-        "text_embeds": pooled_embeddings,  # [B, 1280]
-        "time_ids": time_embeddings        # [B, S, D]
+        "text_embeds": pooled_embeddings,
+        "time_ids": add_time_ids
     }
     
-    # Get sigmas for current step
+    # Get sigmas and compute loss
     sigma = get_sigmas(
         num_inference_steps=args.num_inference_steps,
         height=height,
@@ -487,7 +468,6 @@ def forward_pass(
         device=device
     )[0]
     
-    # Get loss with NAI improvements
     loss, metrics = training_loss_v_prediction(
         model=unet,
         x_0=pixel_values,
