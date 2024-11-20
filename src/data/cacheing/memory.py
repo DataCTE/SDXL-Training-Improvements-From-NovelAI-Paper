@@ -32,7 +32,7 @@ class MemoryCache:
         self.cache_dir = Path(cache_dir) if cache_dir else None
         if self.cache_dir:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
-            self.cached_files = manager.set()
+            self.cached_files = manager.list()
         
         # Pre-warm the cache
         self._prewarm_cache()
@@ -72,7 +72,7 @@ class MemoryCache:
                     # Try to save to disk before evicting
                     if self.cache_dir:
                         self._save_to_disk(key, self._cache[key])
-                        self.cached_files.add(key)
+                        self.cached_files.append(key)
                     
                     del self._cache[key]
                     self._stats['evictions'] = self._stats.get('evictions', 0) + 1
@@ -86,6 +86,17 @@ class MemoryCache:
     def _get_cache_path(self, key: str) -> Path:
         """Get path for disk cache file."""
         return self.cache_dir / f"{key}.pt"
+
+    def _save_to_disk(self, key: str, value: Any) -> None:
+        """Save value to disk cache."""
+        if self.cache_dir:
+            try:
+                cache_path = self._get_cache_path(key)
+                torch.save(value, cache_path)
+                if key not in self.cached_files:
+                    self.cached_files.append(key)
+            except Exception as e:
+                logger.error(f"Failed to save to disk cache: {e}")
 
     def put(self, key: str, value: Tuple[torch.Tensor, torch.Tensor]) -> None:
         """Store embeddings tuple in cache with disk fallback."""
@@ -104,7 +115,6 @@ class MemoryCache:
             # Backup to disk if enabled
             if self.cache_dir:
                 self._save_to_disk(key, value)
-                self.cached_files.add(key)
 
     def get(self, key: str, default: Any = None) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """Get embeddings from cache with disk fallback."""

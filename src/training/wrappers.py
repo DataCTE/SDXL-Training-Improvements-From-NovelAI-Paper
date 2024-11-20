@@ -61,10 +61,13 @@ def train_sdxl(
             logger.info("Using provided models...")
             models_dict = models
             
-        # Setup caches with proper config
+        # Setup caches with proper config and absolute paths
+        vae_cache_dir = output_dir / "vae_cache"
+        text_cache_dir = output_dir / "text_embeds_cache"
+        
         vae_cache = VAECache(
             vae=models_dict['vae'],
-            cache_dir=str(output_dir / "vae_cache"),
+            cache_dir=str(vae_cache_dir.absolute()),
             max_cache_size=config.caching.vae_cache_size,
             num_workers=config.caching.vae_cache_num_workers,
             batch_size=config.caching.vae_cache_batch_size
@@ -75,7 +78,7 @@ def train_sdxl(
             text_encoder2=models_dict['text_encoder_2'],
             tokenizer1=models_dict['tokenizer'],
             tokenizer2=models_dict['tokenizer_2'],
-            cache_dir=str(output_dir / "text_embeds_cache"),
+            cache_dir=str(text_cache_dir.absolute()),
             max_cache_size=config.caching.text_cache_size,
             num_workers=config.caching.text_cache_num_workers,
             batch_size=config.caching.text_cache_batch_size
