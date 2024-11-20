@@ -5,3 +5,4 @@ final.zip
 final
 __pycache__
 *.txt
+train_dreambooth_lora_sdxl.py

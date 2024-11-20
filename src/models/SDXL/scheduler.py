@@ -53,19 +53,41 @@ class EDMEulerScheduler(SchedulerMixin):
         return steps
 
     def _generate_sigmas(self) -> torch.Tensor:
-        """Generate noise levels (sigmas) with NAI's practical infinity."""
-        # Generate log-linear spacing from sigma_min to sigma_max
-        rho = 7.0  # EDM's recommended value
+        """
+        Generate noise levels (sigmas) with NAI's practical infinity using EDM's rho formulation.
+        Reference: https://arxiv.org/abs/2206.00364 equation 6
+        """
+        # EDM's recommended value for optimal noise schedule
+        rho = 7.0
+        
         sigma_min = self.config.sigma_min
         sigma_max = self.config.sigma_max
         
+        # Implement EDM's rho-space interpolation
         sigmas = []
         for i in range(self.config.num_train_timesteps):
             t = i / (self.config.num_train_timesteps - 1)
-            log_sigma = math.log(sigma_max) + t * (math.log(sigma_min) - math.log(sigma_max))
-            sigmas.append(math.exp(log_sigma))
+            
+            # Convert to/from rho space for better interpolation
+            rho_min = self._sigma_to_rho(sigma_min, rho)
+            rho_max = self._sigma_to_rho(sigma_max, rho)
+            
+            # Interpolate in rho space
+            rho_t = rho_max + t * (rho_min - rho_max)
+            
+            # Convert back to sigma space
+            sigma = self._rho_to_sigma(rho_t, rho)
+            sigmas.append(sigma)
             
         return torch.tensor(sigmas, dtype=torch.float32)
+
+    def _sigma_to_rho(self, sigma: float, rho: float) -> float:
+        """Convert sigma to rho space."""
+        return -rho * math.log(sigma)
+
+    def _rho_to_sigma(self, rho: float, rho_param: float) -> float:
+        """Convert rho back to sigma space."""
+        return math.exp(-rho / rho_param)
 
     def scale_model_input(self, sample: torch.Tensor, timestep: Optional[int] = None) -> torch.Tensor:
         """
