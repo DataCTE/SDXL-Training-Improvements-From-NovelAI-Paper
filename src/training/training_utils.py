@@ -8,7 +8,7 @@ from src.training.ema import setup_ema_model
 from src.training.loss_functions import get_cosine_schedule_with_warmup
 import warnings
 from torch.cuda.amp import GradScaler
-from torch.optim import Lion
+from src.training.optimizers.lion.__init__ import Lion
 
 # Suppress the specific deprecation warning
 warnings.filterwarnings("ignore", category=FutureWarning, 
@@ -61,13 +61,25 @@ def initialize_training_components(
     """Initialize training components with NAI recommendations"""
     components = {}
     
-    # Use Lion optimizer with NAI's settings
-    components["optimizer"] = Lion(
-        models["unet"].parameters(),
-        lr=config.optimizer.learning_rate,
-        weight_decay=config.optimizer.weight_decay,
-        betas=(0.95, 0.98)  # NAI recommended values
-    )
+    # Setup optimizer based on type
+    if config.optimizer.optimizer_type == "lion":
+        components["optimizer"] = Lion(
+            models["unet"].parameters(),
+            lr=config.optimizer.learning_rate,
+            weight_decay=config.optimizer.weight_decay,
+            betas=config.optimizer.lion_betas  # Use NAI's recommended values
+        )
+    else:
+        components["optimizer"] = setup_optimizer(
+            model=models["unet"],
+            optimizer_type=config.optimizer.optimizer_type,
+            learning_rate=config.optimizer.learning_rate,
+            weight_decay=config.optimizer.weight_decay,
+            adam_beta1=config.optimizer.adam_beta1,
+            adam_beta2=config.optimizer.adam_beta2,
+            adam_epsilon=config.optimizer.adam_epsilon,
+            use_8bit_optimizer=config.optimizer.use_8bit_adam
+        )
     
     # NAI-style warmup scheduler
     components["scheduler"] = get_cosine_schedule_with_warmup(

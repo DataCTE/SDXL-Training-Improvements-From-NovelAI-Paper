@@ -30,6 +30,7 @@ class OptimizerConfig:
     adam_beta2: float = DEFAULTS["optimizer"]["adam_beta2"]
     adam_epsilon: float = DEFAULTS["optimizer"]["adam_epsilon"]
     use_8bit_adam: bool = DEFAULTS["optimizer"]["use_8bit_adam"]
+    lion_betas: tuple = (0.95, 0.98)  # NAI recommended values
 
 @dataclass
 class SchedulerConfig:
@@ -236,7 +237,7 @@ def parse_args() -> TrainingConfig:
     # Optimizer arguments
     parser.add_argument("--optimizer_type", type=str, 
                        default=DEFAULTS["optimizer"]["optimizer_type"],
-                       choices=["adamw", "adamw8bit"])
+                       choices=["adamw", "adamw8bit", "lion"])
     parser.add_argument("--learning_rate", type=float,
                        default=DEFAULTS["optimizer"]["learning_rate"])
     parser.add_argument("--min_learning_rate", type=float,

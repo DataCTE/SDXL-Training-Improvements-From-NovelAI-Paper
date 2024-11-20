@@ -2,7 +2,7 @@ from typing import Dict, Any, List, Optional, Union
 import torch
 import logging
 from src.training.optimizers.adamw8bit import setup_adamw_optimizer
-from src.training.optimizers.soap import SOAP
+from bitsandbytes.optim import Lion
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +15,7 @@ def create_optimizer(
     adam_beta2: float = 0.999,
     adam_epsilon: float = 1e-8,
     use_8bit_optimizer: bool = False,
+    lion_betas: tuple = (0.95, 0.98),
 ) -> torch.optim.Optimizer:
     """
     Create an optimizer for model training.
@@ -28,6 +29,7 @@ def create_optimizer(
         adam_beta2: Beta2 factor for Adam
         adam_epsilon: Epsilon for Adam
         use_8bit_optimizer: Whether to use 8-bit optimization when available
+        lion_betas: Beta1 and Beta2 factors for Lion optimizer
         
     Returns:
         Configured optimizer instance
@@ -49,6 +51,13 @@ def create_optimizer(
             adam_beta2=adam_beta2,
             adam_epsilon=adam_epsilon,
             use_8bit=use_8bit_optimizer
+        )
+    elif optimizer_type == "lion":
+        return Lion(
+            model_params,
+            lr=learning_rate,
+            weight_decay=weight_decay,
+            betas=lion_betas
         )
     else:
         raise ValueError(f"Unsupported optimizer type: {optimizer_type}")
