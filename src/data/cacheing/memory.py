@@ -3,7 +3,7 @@
 import os
 import mmap
 import numpy as np
-from typing import Dict, Any, Optional, Set, Tuple
+from typing import Dict, Any, Optional, Set, Tuple, Union
 import torch
 from multiprocessing import Pool, Manager, RLock
 import logging
@@ -18,21 +18,26 @@ class MemoryCache:
     
     __slots__ = ('_cache', '_max_memory_gb', '_max_cache_size', '_stats', '_manager', '_lock', 'cache_dir', 'cached_files')
     
-    def __init__(self, max_memory_gb: float = 32.0, max_cache_size: int = 100000, cache_dir: Optional[Path] = None):
+    def __init__(self, max_memory_gb: float = 32.0, max_cache_size: int = 100000, cache_dir: Optional[Union[str, Path]] = None):
         """Initialize memory manager with pre-allocated resources."""
         manager = Manager()
         self._manager = manager
         self._cache = manager.dict()
-        self._max_memory_gb = max_memory_gb
-        self._max_cache_size = max_cache_size
+        self._max_memory_gb = float(max_memory_gb)
+        self._max_cache_size = int(max_cache_size)
         self._stats = manager.dict({'hits': 0, 'misses': 0, 'evictions': 0})
         self._lock = RLock()
         
         # Disk cache setup
-        self.cache_dir = Path(cache_dir) if cache_dir else None
-        if self.cache_dir:
+        if cache_dir is not None:
+            self.cache_dir = Path(cache_dir).resolve()
             self.cache_dir.mkdir(parents=True, exist_ok=True)
             self.cached_files = manager.list()
+            logger.info(f"Initialized disk cache at: {self.cache_dir}")
+        else:
+            self.cache_dir = None
+            self.cached_files = manager.list()
+            logger.info("Running without disk cache")
         
         # Pre-warm the cache
         self._prewarm_cache()
@@ -40,12 +45,17 @@ class MemoryCache:
     def _prewarm_cache(self) -> None:
         """Pre-warm cache for better initial performance."""
         try:
-            # Reserve memory for cache
-            reserved_mem = int(self._max_memory_gb * 1024 * 1024 * 1024)  # Convert GB to bytes
-            torch.empty(reserved_mem // 4, dtype=torch.float32)  # Reserve 1/4 for cache
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                # Reserve memory for cache (in bytes)
+                reserved_mem = int(self._max_memory_gb * 1024 * 1024 * 1024)  # Convert GB to bytes
+                # Reserve 1/4 for cache, create empty tensor of appropriate size
+                torch.empty(reserved_mem // (4 * 4), dtype=torch.float32)  # Divide by 4 for float32 bytes
+                torch.cuda.empty_cache()
+                logger.info(f"Pre-warmed cache with {self._max_memory_gb}GB memory reservation")
         except Exception as e:
             logger.warning(f"Cache pre-warming failed: {e}")
+            # Continue without pre-warming
+            pass
 
     def _get_cache_key(self, text: str) -> str:
         """Generate consistent cache key for text."""
