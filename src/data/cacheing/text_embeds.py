@@ -74,13 +74,16 @@ class TextEmbeddingCache:
         )
         
         # Move tokens to device only when needed
-        tokens = {k: v.to(device) for k, v in tokens.items()}
+        device_tokens = {
+            'input_ids': tokens['input_ids'].to(device),
+            'attention_mask': tokens['attention_mask'].to(device)
+        }
         
         # Get embeddings from text encoder
         with torch.no_grad():
             encoder_output = text_encoder(
-                input_ids=tokens.input_ids,
-                attention_mask=tokens.attention_mask,
+                input_ids=device_tokens['input_ids'],
+                attention_mask=device_tokens['attention_mask'],
                 output_hidden_states=True,
                 return_dict=True
             )
