@@ -64,14 +64,17 @@ class TextEmbeddingCache:
 
     def _process_embeddings(self, text_encoder, tokenizer, text_input, device) -> Tuple[torch.Tensor, torch.Tensor]:
         """Process text through encoder and handle dimensionality."""
-        # Tokenize and encode text
+        # Tokenize text (keep on CPU initially)
         tokens = tokenizer(
             text_input,
             padding="max_length",
             max_length=tokenizer.model_max_length,
             truncation=True,
             return_tensors="pt"
-        ).to(device)
+        )
+        
+        # Move tokens to device only when needed
+        tokens = {k: v.to(device) for k, v in tokens.items()}
         
         # Get embeddings from text encoder
         with torch.no_grad():
@@ -86,18 +89,14 @@ class TextEmbeddingCache:
             hidden = encoder_output.hidden_states[-2]  # Use penultimate layer as per SDXL paper
             pooled = hidden[:, 0:1, :]  # Take [CLS] token embedding as pooled output
             
+            # Move results back to CPU for caching
+            hidden = hidden.cpu()
+            pooled = pooled.cpu()
+            
         return pooled, hidden
 
     def encode(self, text_input: str) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Encode text input to embeddings.
-        
-        Args:
-            text_input: Text to encode
-            
-        Returns:
-            Tuple of (pooled_embeddings, hidden_state_embeddings)
-            Both with shape (batch, sequence_length, hidden_dim)
-        """
+        """Encode text input to embeddings."""
         # Check cache first
         key = self._get_cache_key(text_input)
         cached = self._memory_cache.get(key)
@@ -123,7 +122,7 @@ class TextEmbeddingCache:
             self.device
         )
 
-        # Concatenate embeddings
+        # Concatenate embeddings (on CPU)
         result = (
             torch.cat([pooled1, pooled2], dim=-1),  # Concatenate pooled embeddings
             torch.cat([hidden1, hidden2], dim=-1)   # Concatenate hidden states
