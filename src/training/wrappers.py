@@ -261,3 +261,29 @@ def train_vae(
         logger.error("Full traceback:\n%s", traceback.format_exc())
         raise
 
+def create_text_encoders(pretrained_model_path: str):
+    """Create text encoders and tokenizers from pretrained model."""
+    from transformers import CLIPTextModel, CLIPTokenizer
+    
+    # Load text encoder 1
+    text_encoder1 = CLIPTextModel.from_pretrained(
+        pretrained_model_path,
+        subfolder="text_encoder"
+    )
+    tokenizer1 = CLIPTokenizer.from_pretrained(
+        pretrained_model_path,
+        subfolder="tokenizer"
+    )
+    
+    # Load text encoder 2
+    text_encoder2 = CLIPTextModel.from_pretrained(
+        pretrained_model_path,
+        subfolder="text_encoder_2"
+    )
+    tokenizer2 = CLIPTokenizer.from_pretrained(
+        pretrained_model_path,
+        subfolder="tokenizer_2"
+    )
+    
+    return text_encoder1, text_encoder2, tokenizer1, tokenizer2
+
