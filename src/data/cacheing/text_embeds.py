@@ -83,7 +83,7 @@ class TextEmbeddingCache:
             )
             
             # Get pooled output (2D) and last hidden state (3D)
-            pooled = encoder_output.pooled_output  # [batch, hidden_dim]
+            pooled = encoder_output.pooler_output  # [batch, hidden_dim]
             hidden = encoder_output.last_hidden_state  # [batch, seq_len, hidden_dim]
             
             # Add sequence dimension to pooled output to match hidden states
