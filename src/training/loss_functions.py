@@ -16,22 +16,31 @@ _buffers: Dict[str, torch.Tensor] = {}
 _sigma_cache: Dict[str, torch.Tensor] = {}
 _scheduler_buffers: Dict[str, torch.Tensor] = {}
 
-def _get_or_create_buffer(key: str, shape: Union[tuple, Tuple], device: torch.device) -> torch.Tensor:
-    """Get or create a pre-allocated buffer."""
-    buffer_key = f"{key}_{shape}_{device}"
-    if buffer_key not in _buffers:
-        _buffers[buffer_key] = torch.empty(shape, device=device)
-    return _buffers[buffer_key]
 
 @torch.jit.script
 def _compute_v_target(noise: torch.Tensor, sigma: torch.Tensor, sigma_data: float = 1.0) -> torch.Tensor:
-    """JIT-optimized v-prediction target computation."""
+    """
+    Compute v-prediction target per NAI paper section 2.1.
+    Transitions from ε-prediction to x0-prediction as SNR changes.
+    """
+    # v = ε * σ_data / sqrt(σ² + σ_data²)
     return noise * sigma_data / (sigma ** 2 + sigma_data ** 2) ** 0.5
 
 @torch.jit.script
-def _compute_snr(timesteps: torch.Tensor, sigma_data: float) -> torch.Tensor:
-    """JIT-optimized SNR computation."""
-    return (sigma_data ** 2) / (timesteps ** 2)
+def _compute_snr(sigma: torch.Tensor, sigma_data: float = 1.0) -> torch.Tensor:
+    """
+    Compute Signal-to-Noise Ratio (SNR) with support for Zero Terminal SNR.
+    
+    Args:
+        sigma: Noise levels
+        sigma_data: Data standard deviation (typically 1.0)
+    Returns:
+        SNR tensor
+    """
+    # SNR = (σ_data/σ)^2
+    # Handle potential numerical instability at very high sigmas
+    snr = (sigma_data**2) / (sigma**2 + 1e-8)  # Add small epsilon for stability
+    return snr
 
 @torch.jit.script
 def _compute_min_snr_weights(
@@ -64,14 +73,6 @@ def _compute_min_snr_weights(
         
     return weights.view(-1, 1, 1, 1)  # Add dims for broadcasting
 
-@lru_cache(maxsize=32)
-def _get_sigma_schedule(num_steps: int, sigma_min: float, sigma_max: float) -> torch.Tensor:
-    """Cached computation of sigma schedule."""
-    rho = 7.0  # Hardcoded for optimization
-    inv_rho = 1.0 / rho
-    steps = torch.arange(num_steps, dtype=torch.float32)
-    sigmas = torch.exp(-steps * inv_rho) * (sigma_max - sigma_min) + sigma_min
-    return sigmas
 
 @torch.jit.script
 def _compute_resolution_scale(height: int, width: int, base_resolution: float = 1024.0) -> float:
@@ -81,30 +82,52 @@ def _compute_resolution_scale(height: int, width: int, base_resolution: float = 
 @lru_cache(maxsize=32)
 def _get_resolution_scaled_sigma_schedule(
     num_steps: int,
-    sigma_min: float,
-    sigma_max: float,
+    sigma_min: float, 
+    sigma_max: float = None,  # Made optional since ZTSNR uses fixed value
     height: int,
     width: int,
-    rho: float = 7.0,  # Configurable rho parameter
+    rho: float = 7.0,  # Karras schedule parameter
     min_snr_gamma: float = 5.0,
+    use_ztsnr: bool = True,  # Added flag to toggle ZTSNR
+    ztsnr_sigma: float = 20000.0,  # NAI practical ZTSNR approximation
 ) -> torch.Tensor:
-    """Compute sigma schedule with NAI3's resolution-based scaling."""
-    # Resolution-based scaling (NAI3 improvement)
+    """
+    Compute sigma schedule with NAI's resolution-based scaling and ZTSNR support.
+    
+    Args:
+        num_steps: Number of diffusion steps
+        sigma_min: Minimum noise level
+        sigma_max: Maximum noise level (used when ZTSNR is disabled)
+        height: Image height
+        width: Image width
+        rho: Karras schedule parameter
+        min_snr_gamma: SNR clamping value
+        use_ztsnr: Whether to use Zero Terminal SNR (NAI section 2.2)
+        ztsnr_sigma: Sigma value for ZTSNR approximation
+    Returns:
+        Tensor of sigma values
+    """
+    # Resolution-based scaling (NAI section 2.3)
     scale = _compute_resolution_scale(height, width)
     
-    # Apply NAI3's adaptive sigma scaling
-    scaled_sigma_max = sigma_max * scale
+    # Apply NAI's adaptive sigma scaling
     scaled_sigma_min = sigma_min * math.sqrt(scale)  # Square root scaling for min sigma
+    
+    # Choose max sigma based on ZTSNR setting (NAI section 2.2)
+    if use_ztsnr:
+        scaled_sigma_max = ztsnr_sigma  # Use fixed ZTSNR value
+    else:
+        scaled_sigma_max = sigma_max * scale if sigma_max else ztsnr_sigma
     
     # Generate timesteps with improved spacing
     steps = torch.linspace(0, num_steps - 1, num_steps, dtype=torch.float32)
     inv_rho = 1.0 / rho
     
-    # Compute sigmas with NAI3's improvements
+    # Compute sigmas with NAI's improvements
     sigmas = torch.exp(-steps * inv_rho)
     sigmas = sigmas * (scaled_sigma_max - scaled_sigma_min) + scaled_sigma_min
     
-    # Apply dynamic SNR clamping (NAI3 improvement)
+    # Apply dynamic SNR clamping (NAI improvement)
     snr = _compute_snr(sigmas, 1.0)
     sigmas = torch.where(
         snr > min_snr_gamma,
@@ -118,26 +141,28 @@ def _get_resolution_scaled_sigma_schedule(
 def get_sigmas(
     num_inference_steps: int = 28,
     sigma_min: float = 0.0292,
-    sigma_max: float = 14.614,  # SDXL default
+    sigma_max: float = 20000.0,  # Changed to NAI's ZTSNR value
     height: int = 1024,
     width: int = 1024,
     device: Optional[torch.device] = None,
     min_snr_gamma: float = 5.0,
+    use_ztsnr: bool = True,  # Added ZTSNR flag
 ) -> torch.Tensor:
     """Get optimized sigma schedule with SDXL defaults and NovelAI improvements."""
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # Use cached schedule with resolution scaling
-    cache_key = f"sigmas_{num_inference_steps}_{sigma_min}_{sigma_max}_{height}_{width}_{min_snr_gamma}"
+    cache_key = f"sigmas_{num_inference_steps}_{sigma_min}_{sigma_max}_{height}_{width}_{min_snr_gamma}_{use_ztsnr}"
     if cache_key not in _sigma_cache:
         _sigma_cache[cache_key] = _get_resolution_scaled_sigma_schedule(
             num_inference_steps,
             sigma_min,
-            sigma_max,
             height,
             width,
-            min_snr_gamma=min_snr_gamma
+            sigma_max=sigma_max,
+            min_snr_gamma=min_snr_gamma,
+            use_ztsnr=use_ztsnr
         )
     
     return _sigma_cache[cache_key].to(device)
@@ -155,54 +180,73 @@ def training_loss_v_prediction(
     added_cond_kwargs: Optional[Dict[str, torch.Tensor]] = None,
     return_metrics: bool = False,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """Compute v-prediction loss with SDXL and NovelAI improvements."""
+    """
+    Compute v-prediction loss with NAI improvements.
+    Implements v-prediction parameterization and MinSNR weighting.
+    
+    Args:
+        model: The diffusion model
+        x_0: Input tensor
+        sigma: Noise levels
+        text_embeddings: Text condition embeddings
+        noise: Optional pre-generated noise
+        use_snr_weighting: Whether to use MinSNR weighting
+        min_snr_gamma: SNR clamping value
+        scale_factor: Additional scaling factor
+        added_cond_kwargs: Additional conditioning inputs
+        return_metrics: Whether to return additional metrics
+    """
     batch_size = x_0.shape[0]
-    device = x_0.device
     
-    # Generate noise if not provided
+    # Generate noise if not provided (using input tensor's device)
     if noise is None:
-        noise_buffer = _get_or_create_buffer("noise", x_0.shape, device)
-        noise_buffer.normal_()
-        noise = noise_buffer
+        noise = torch.randn_like(x_0)  # Inherits device from x_0
     
-    # Compute timesteps with improved precision
-    timesteps = sigma.squeeze()
-    
-    # Compute v-target with improved numerical stability
+    # Compute v-target with improved numerical stability (NAI section 2.1)
     v_target = _compute_v_target(noise, sigma)
     
-    # Add noise to input
+    # Add noise to input (NAI section 2.2 - ZTSNR support)
     noisy_samples = x_0 + noise * sigma.view(-1, 1, 1, 1)
     
-    # Forward pass
-    v_pred = apply_model(model, noisy_samples, timesteps, text_embeddings, added_cond_kwargs)
+    # Forward pass with proper conditioning
+    v_pred = model(
+        noisy_samples,
+        sigma.squeeze(),
+        text_embeddings,
+        added_cond_kwargs=added_cond_kwargs
+    ).sample
     
-    # Compute MinSNR loss weights per NAI paper
+    # Compute MinSNR loss weights (NAI section 2.4)
     if use_snr_weighting:
         weights = _compute_min_snr_weights(
             sigma,
-            sigma_data=1.0,
+            sigma_data=1.0,  # NAI uses unit variance
             min_snr_gamma=min_snr_gamma,
             scale=scale_factor
         )
     else:
         weights = torch.ones_like(sigma.view(-1, 1, 1, 1))
     
-    # Compute loss with improved numerical stability
-    loss = F.mse_loss(v_pred * weights.sqrt(), v_target * weights.sqrt(), reduction='sum') / batch_size
+    # Compute weighted MSE loss with improved stability
+    loss = F.mse_loss(
+        v_pred * weights.sqrt(),
+        v_target * weights.sqrt(),
+        reduction='sum'
+    ) / batch_size
 
     if return_metrics:
-        return loss, {
-            "target_mean": v_target.mean().item(),
-            "target_std": v_target.std().item(),
-            "pred_mean": v_pred.mean().item(),
-            "pred_std": v_pred.std().item(),
-            "error": torch.abs(v_pred - v_target).mean().item(),
-            "snr": weights.mean().item(),
-            "weight_mean": weights.mean().item(),
-            "weight_std": weights.std().item(),  # Added for monitoring
-            "effective_loss": (weights * (v_pred - v_target) ** 2).mean().item(),  # Added for monitoring
-        }
+        with torch.no_grad():
+            return loss, {
+                "target_mean": v_target.mean().item(),
+                "target_std": v_target.std().item(),
+                "pred_mean": v_pred.mean().item(),
+                "pred_std": v_pred.std().item(),
+                "error": torch.abs(v_pred - v_target).mean().item(),
+                "snr": _compute_snr(sigma).mean().item(),
+                "weight_mean": weights.mean().item(),
+                # Add NAI-specific metrics
+                "effective_loss": (weights * (v_pred - v_target) ** 2).mean().item(),
+            }
     
     return loss
 
@@ -262,53 +306,35 @@ def clear_caches() -> None:
     _sigma_cache.clear()
     _scheduler_buffers.clear()
     _get_scheduler_buffer.cache_clear()
-    _get_sigma_schedule.cache_clear()
     _get_resolution_scaled_sigma_schedule.cache_clear()  # Added for completeness
 
 def apply_model(
     model: torch.nn.Module,
-    x: torch.Tensor,          # Shape: [B, C, H, W]
-    t: torch.Tensor,          # Shape: [B]
-    text_embeddings: torch.Tensor,  # Shape: [B, S, D] where S=sequence length, D=embedding dim
+    x: torch.Tensor,
+    t: torch.Tensor, 
+    text_embeddings: torch.Tensor,
     added_cond_kwargs: Optional[Dict[str, torch.Tensor]] = None
 ) -> torch.Tensor:
     """
-    From SDXL paper section 2.1: UNet receives concatenated text embeddings from 
-    CLIP ViT-L (768-dim) and OpenCLIP ViT-bigG (1280-dim) for 2048 total dim.
-    Additionally conditions on pooled embeddings and time_ids.
+    Apply model with proper conditioning handling.
+    Supports SDXL's dual text encoder and additional conditionings.
     """
+    # Handle added conditioning kwargs
     if added_cond_kwargs is None:
         added_cond_kwargs = {}
         
-    # Per paper section 2.2: Additional micro-conditioning requires matching dims
-    if "time_ids" in added_cond_kwargs:
-        time_ids = added_cond_kwargs["time_ids"]  # Shape: [B, D_time] or [B, S, D_time]
-        # Ensure time_ids matches text_embeddings dimensions
-        if time_ids.ndim == 2 and text_embeddings.ndim == 3:
-            # Expand to [B, S, D_time] to match text embedding sequence length
-            time_ids = time_ids.unsqueeze(1).expand(-1, text_embeddings.shape[1], -1)
-        added_cond_kwargs["time_ids"] = time_ids
+    # Ensure all tensors are on same device
+    device = x.device
+    for k, v in added_cond_kwargs.items():
+        added_cond_kwargs[k] = v.to(device)
         
-    # Text embeddings from second encoder need same treatment
-    if "text_embeds" in added_cond_kwargs:
-        text_embeds = added_cond_kwargs["text_embeds"]  # Shape: [B, D_pooled]
-        # Ensure text_embeds matches text_embeddings dimensions
-        if text_embeds.ndim == 2 and text_embeddings.ndim == 3:
-            # Expand to [B, S, D_pooled]
-            text_embeds = text_embeds.unsqueeze(1).expand(-1, text_embeddings.shape[1], -1)
-        added_cond_kwargs["text_embeds"] = text_embeds
-
-    # Ensure all tensors have matching dimensions before model forward pass
-    if hasattr(model, "get_aug_embed"):
-        # Handle UNet2DConditionModel case
-        for key, value in added_cond_kwargs.items():
-            if value.ndim != text_embeddings.ndim:
-                if value.ndim == 2:
-                    added_cond_kwargs[key] = value.unsqueeze(1).expand(-1, text_embeddings.shape[1], -1)
-                elif value.ndim == 3:
-                    added_cond_kwargs[key] = value.squeeze(1)
-    
-    return model(x, t, text_embeddings, added_cond_kwargs=added_cond_kwargs).sample
+    # Forward pass with all conditionings
+    return model(
+        x,
+        t,
+        text_embeddings,
+        added_cond_kwargs=added_cond_kwargs
+    ).sample
 
 def _get_add_time_ids(
     batch_size: int,
@@ -317,31 +343,84 @@ def _get_add_time_ids(
     dtype: torch.dtype,
     device: torch.device,
     hidden_dim: int,
-    text_encoder_projection_dim: Optional[int] = None
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Generate time embeddings with correct dimensions per SDXL paper section 2.2"""
+    text_encoder_projection_dim: int = None,  # Marked optional since unused
+    crop_coords: Optional[torch.Tensor] = None,
+    target_size: Optional[torch.Tensor] = None,  # Marked optional since unused
+) -> torch.Tensor:
+    """
+    Get additional time embeddings per SDXL paper section 2.2 and 2.3.
+    Implements size, crop and aspect ratio conditioning with Fourier features.
+    """
+    # Original image size conditioning (SDXL section 2.2)
+    c_size = torch.tensor([height, width], device=device, dtype=torch.long)
+    c_size = c_size.unsqueeze(0).expand(batch_size, -1)
     
-    # Original size conditioning [B, 2]
-    original_size = torch.tensor([[height, width]], dtype=dtype, device=device)
-    original_size = original_size.repeat(batch_size, 1)
+    # Crop conditioning (SDXL section 2.2)
+    if crop_coords is None:
+        # Default to center crop for inference (NAI.txt line 23-24)
+        c_crop = torch.zeros((batch_size, 2), device=device, dtype=torch.long)
+    else:
+        c_crop = crop_coords.to(device=device, dtype=torch.long)
     
-    # Crop conditioning [B, 2]
-    crops = torch.tensor([[0, 0]], dtype=dtype, device=device)  # Default center crop
-    crops = crops.repeat(batch_size, 1)
+    # Aspect ratio conditioning (SDXL section 2.3)
+    aspect_ratio = torch.tensor([width / height], device=device, dtype=torch.float32)  # Changed to float32
+    c_ar = aspect_ratio.unsqueeze(0).expand(batch_size, -1)
     
-    # Target size conditioning [B, 2]
-    target_size = torch.tensor([[height, width]], dtype=dtype, device=device)
-    target_size = target_size.repeat(batch_size, 1)
+    # Get Fourier embeddings for each conditioning
+    c_size_emb = _get_fourier_embedding(c_size)  # [B, 2*D]
+    c_crop_emb = _get_fourier_embedding(c_crop)  # [B, 2*D]
+    c_ar_emb = _get_fourier_embedding(c_ar)      # [B, D]
     
-    # Concatenate all micro-conditionings [B, 6]
-    add_time_ids = torch.cat([original_size, crops, target_size], dim=1)
+    # Concatenate all embeddings (SDXL Figure 16 and NAI.txt lines 635-639)
+    time_ids = torch.cat([
+        c_size_emb,  # Size conditioning
+        c_crop_emb,  # Crop conditioning
+        c_ar_emb,    # Aspect ratio conditioning
+    ], dim=1)
     
-    # Project to embedding dimension specified by text encoder or hidden dim
-    embed_dim = text_encoder_projection_dim or hidden_dim
-    time_embed = nn.Linear(6, embed_dim, device=device, dtype=dtype)
-    projected = time_embed(add_time_ids)  # [B, D]
+    # Project to hidden dimension using linear layer
+    projection = torch.randn(
+        time_ids.shape[1],  # in_features
+        hidden_dim,         # out_features 
+        device=device,
+        dtype=dtype
+    ) / math.sqrt(time_ids.shape[1])  # Xavier init
     
-    return projected
+    # Use linear projection properly (following NAI.txt line 636)
+    time_ids = torch.matmul(time_ids, projection)
+    
+    return time_ids
+
+def _get_fourier_embedding(
+    x: torch.Tensor,
+    dim: int = 256,
+    max_period: int = 10000
+) -> torch.Tensor:
+    """
+    Fourier feature embedding as used in SDXL.
+    See SDXL paper Figure 16 for reference implementation.
+    """
+    # Reshape if needed
+    if x.ndim == 1:
+        x = x.unsqueeze(-1)
+    assert x.ndim == 2
+    
+    batch_size = x.shape[0]  # Only use batch_size from shape
+    
+    # Compute frequencies
+    half_dim = dim // 2
+    frequencies = torch.exp(
+        -math.log(max_period) * torch.arange(0, half_dim, device=x.device) / half_dim
+    )
+    
+    # Compute angles
+    angles = x.unsqueeze(-1) * frequencies.unsqueeze(0).unsqueeze(0)
+    
+    # Get embeddings
+    embeddings = torch.cat([angles.sin(), angles.cos()], dim=-1)
+    
+    # Reshape to match SDXL's implementation
+    return embeddings.reshape(batch_size, -1)
 
 def forward_pass(
     args: Any,
@@ -411,3 +490,19 @@ def forward_pass(
         scale_factor=getattr(args, "scale_factor", 1.0),
         return_metrics=True
     )
+
+def normalize_vae_latents(latents: torch.Tensor) -> torch.Tensor:
+    """
+    Normalize VAE latents using NAI's statistics (section B.2).
+    Makes each channel a standard Gaussian.
+    """
+    # NAI statistics from paper figure 9
+    means = torch.tensor([4.8119, 0.1607, 1.3538, -1.7753], device=latents.device)
+    stds = torch.tensor([9.9181, 6.2753, 7.5978, 5.9956], device=latents.device)
+    
+    # Reshape for broadcasting
+    means = means.view(1, -1, 1, 1)
+    stds = stds.view(1, -1, 1, 1)
+    
+    # Normalize to standard Gaussian
+    return (latents - means) / stds
