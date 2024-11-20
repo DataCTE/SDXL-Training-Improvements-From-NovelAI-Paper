@@ -5,12 +5,9 @@ import logging
 from typing import Dict, Any, Optional, Tuple
 from torch.amp import autocast, GradScaler
 import torch.distributed as dist
-from src.training.metrics import MetricsManager
 from src.training.loss_functions import forward_pass
 import weakref
-from functools import lru_cache
 from src.models.StateTracker import StateTracker
-from src.utils.logging import SDXLTrainingLogger
 from src.training.loss_functions import _compute_resolution_scale
 from src.training.optimizers.lion.__init__ import Lion
 
