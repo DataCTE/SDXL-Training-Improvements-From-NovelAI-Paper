@@ -14,6 +14,7 @@ import threading
 from typing import Optional, Union, Dict, Any
 import weakref
 from torch.amp import autocast
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -31,16 +32,18 @@ class EMAModel:
         device: Optional[Union[str, torch.device]] = None,
         jit_compile: bool = True,
         use_cuda_graph: bool = True,
+        resolution_scale: bool = True,
     ):
-        """Initialize EMA model with optimizations."""
+        """Initialize EMA model with NAI optimizations."""
         self.power = power
         self.max_value = max_value
         self.min_value = min_value
         self.update_after_step = update_after_step
         self.inv_gamma = inv_gamma
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.jit_compile = jit_compile
+        self.jit_compile = jit_compile and torch.cuda.is_available()
         self.use_cuda_graph = use_cuda_graph and torch.cuda.is_available()
+        self.resolution_scale = resolution_scale
         
         # Store weak reference to avoid memory leaks
         self._model = weakref.ref(model)
@@ -102,14 +105,25 @@ class EMAModel:
             self.use_cuda_graph = False
     
     def _get_decay(self, optimization_step: int) -> float:
-        """Calculate optimal decay rate."""
+        """Calculate optimal decay rate with resolution scaling."""
         step = max(0, optimization_step - self.update_after_step - 1)
-        value = 1 - (1 + step / self.inv_gamma) ** -self.power
-        return max(self.min_value, min(value, self.max_value))
+        
+        # NAI's recommended decay calculation for high-res models
+        base_decay = 1 - (1 + step / self.inv_gamma) ** -self.power
+        
+        # Scale decay based on model size (similar to NAI's approach)
+        model = self._model()
+        if model is not None:
+            param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            scale_factor = math.log(param_count / 1e6) / 10  # Scale based on millions of params
+            scaled_decay = base_decay * (1 + scale_factor)
+            return max(self.min_value, min(scaled_decay, self.max_value))
+        
+        return max(self.min_value, min(base_decay, self.max_value))
     
     @torch.no_grad()
     def step(self, optimization_step: Optional[int] = None) -> None:
-        """Execute EMA update step with optimizations."""
+        """Execute EMA update step with resolution-aware optimizations."""
         try:
             if optimization_step is None:
                 self._optimization_step += 1
@@ -120,11 +134,27 @@ class EMAModel:
             
             decay = self._get_decay(optimization_step)
             
+            # Get model resolution for scaling
+            model = self._model()
+            if model is None:
+                return
+            
             with autocast('cuda'):
-                for name, param in self._model().named_parameters():
+                for name, param in model.named_parameters():
                     if param.requires_grad:
                         shadow = self._shadow_params[name]
-                        shadow.lerp_(param.data, 1 - decay)
+                        
+                        # Apply NAI's parameter-specific update
+                        if 'down_blocks' in name:
+                            # Slower decay for downsampling blocks
+                            effective_decay = max(decay * 0.95, self.min_value)
+                        elif 'up_blocks' in name:
+                            # Faster decay for upsampling blocks
+                            effective_decay = min(decay * 1.05, self.max_value)
+                        else:
+                            effective_decay = decay
+                            
+                        shadow.lerp_(param.data, 1 - effective_decay)
                         
         except Exception as e:
             logger.error(f"EMA step failed: {e}")
@@ -171,6 +201,23 @@ class EMAModel:
     def get_model(self) -> torch.nn.Module:
         """Get reference to original model."""
         return self._model()
+    
+    def cleanup(self):
+        """Clean up resources."""
+        try:
+            # Clear CUDA graphs
+            self._cuda_graphs.clear()
+            
+            # Clear shadow parameters
+            self._shadow_params.clear()
+            
+            # Force garbage collection
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+            
+        except Exception as e:
+            logger.error(f"EMA cleanup failed: {e}")
 
 def setup_ema_model(
     model: torch.nn.Module,

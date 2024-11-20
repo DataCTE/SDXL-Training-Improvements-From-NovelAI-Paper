@@ -18,6 +18,7 @@ from src.models.SDXL.pipeline import StableDiffusionXLPipeline
 import warnings
 from src.utils.logging import SDXLTrainingLogger
 from dataclasses import asdict
+from src.models.SDXL.scheduler import EDMEulerScheduler
 
 # Filter out deprecation warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="_distutils_hack")
@@ -158,6 +159,18 @@ class SDXLTrainer:
     def train(self):
         """Execute training loop with validation."""
         try:
+            # Enable full model training
+            for model in self.models.values():
+                if isinstance(model, torch.nn.Module):
+                    model.requires_grad_(True)
+                    
+            # Enable gradient checkpointing for memory efficiency
+            if self.config.gradient_checkpointing:
+                self.models["unet"].enable_gradient_checkpointing()
+                if self.config.train_text_encoder:
+                    self.models["text_encoder"].gradient_checkpointing_enable()
+                    self.models["text_encoder_2"].gradient_checkpointing_enable()
+            
             progress = ProgressTracker(
                 "SDXL Training",
                 total=self.config.num_epochs,
@@ -332,6 +345,15 @@ class SDXLTrainer:
         """Generate sample images using current model state."""
         try:
             # Create pipeline instance
+            validation_scheduler = EDMEulerScheduler(
+                sigma_min=0.002,
+                sigma_max=20000.0,  # NAI's practical infinity
+                s_churn=0,
+                s_tmin=0,
+                s_tmax=float('inf'),
+                s_noise=1.0
+            )
+            
             pipeline = StableDiffusionXLPipeline(
                 vae=self.models["vae"],
                 text_encoder=self.models["text_encoder"],
@@ -339,7 +361,7 @@ class SDXLTrainer:
                 tokenizer=self.models["tokenizer"],
                 tokenizer_2=self.models["tokenizer_2"],
                 unet=self.models["unet"],
-                scheduler=self.models["scheduler"]
+                scheduler=validation_scheduler
             )
             
             # Set models to eval mode

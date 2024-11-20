@@ -79,7 +79,7 @@ def train_sdxl(
             text_encoder2=models_dict['text_encoder_2'],
             tokenizer1=models_dict['tokenizer'],
             tokenizer2=models_dict['tokenizer_2'],
-            cache_dir=str(text_cache_dir.absolute()),
+            text_cache_dir=str(text_cache_dir.absolute()),
             max_cache_size=config.caching.text_cache_size,
             num_workers=config.caching.text_cache_num_workers,
             batch_size=config.caching.text_cache_batch_size,

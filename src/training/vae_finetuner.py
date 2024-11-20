@@ -13,42 +13,44 @@ import weakref
 from pathlib import Path
 from src.utils.progress import ProgressTracker
 from src.config.args import VAEConfig
+from src.utils.vae_utils import normalize_vae_latents
 import torchvision.transforms as T
 
 logger = logging.getLogger(__name__)
 
 
 class PerceptualLoss(nn.Module):
-    """Perceptual loss using VGG16 features."""
+    """Enhanced perceptual loss with NAI improvements."""
     
     def __init__(self, resize=True):
         super().__init__()
         from torchvision.models import vgg16
-        from torchvision.transforms import Resize, InterpolationMode
         
         vgg = vgg16(pretrained=True).eval()
+        # Use more VGG layers for better feature matching
         self.slice1 = nn.Sequential(*vgg.features[:4]).eval()
         self.slice2 = nn.Sequential(*vgg.features[4:9]).eval()
         self.slice3 = nn.Sequential(*vgg.features[9:16]).eval()
+        self.slice4 = nn.Sequential(*vgg.features[16:23]).eval()  # Added deeper layer
         
         for param in self.parameters():
             param.requires_grad = False
             
-        self.resize = Resize(224, interpolation=InterpolationMode.BICUBIC) if resize else None
+        self.resize = T.Resize(224, interpolation=T.InterpolationMode.BICUBIC) if resize else None
         self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
     def forward(self, x: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Calculate perceptual loss between input and target images."""
+        """Calculate enhanced perceptual loss between input and target images."""
         if self.resize:
             x = self.resize(x)
             target = self.resize(target)
             
-        x = (x - self.mean) / self.std
-        target = (target - self.mean) / self.std
+        x = normalize_vae_latents(x)  # Use NAI normalization
+        target = normalize_vae_latents(target)
         
         loss = 0.0
-        for slice_model in [self.slice1, self.slice2, self.slice3]:
+        for slice_model in [self.slice1, self.slice2, self.slice3, self.slice4]:
             x_feat = slice_model(x)
             target_feat = slice_model(target)
             loss += F.mse_loss(x_feat, target_feat)
@@ -106,6 +108,11 @@ class VAEFinetuner:
         self.config = config
         self.train_dataloader = train_dataloader
         self.device = device
+        
+        # Initialize perceptual loss if configured
+        self.perceptual_loss = None
+        if config.perceptual_weight > 0:
+            self.perceptual_loss = PerceptualLoss(resize=True).to(device)
         
         # Initialize optimizer with config parameters
         self.optimizer = torch.optim.AdamW(
@@ -218,10 +225,13 @@ class VAEFinetuner:
                 if output is None:  # Fall back to regular forward
                     output = self.vae(batch["pixel_values"])
                 
-                # Calculate losses
+                # Apply NAI normalization to latents
+                normalized_latents = normalize_vae_latents(output.latent_dist.sample())
+                
+                # Calculate reconstruction loss on normalized latents
                 recon_loss = F.mse_loss(
-                    output.sample,
-                    batch["pixel_values"],
+                    normalized_latents,
+                    normalize_vae_latents(batch["pixel_values"]),
                     reduction="mean"
                 )
                 
@@ -234,12 +244,17 @@ class VAEFinetuner:
                     loss = recon_loss
                 
                 # Add perceptual loss if configured
-                if self.config.perceptual_weight > 0 and hasattr(self, 'perceptual_loss'):
-                    perceptual_loss = PerceptualLoss(
+                if self.config.perceptual_weight > 0:
+                    if not hasattr(self, 'perceptual_loss'):
+                        # Initialize perceptual loss module once
+                        self.perceptual_loss = PerceptualLoss(resize=True).to(self.device)
+                    
+                    # Calculate perceptual loss using forward method
+                    p_loss = self.perceptual_loss(
                         output.sample, 
                         batch["pixel_values"]
                     )
-                    loss = loss + self.config.perceptual_weight * perceptual_loss
+                    loss = loss + self.config.perceptual_weight * p_loss
             
             # Backward pass with automatic mixed precision
             if self.scaler is not None:

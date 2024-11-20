@@ -4,3 +4,4 @@ venv
 final.zip
 final
 __pycache__
+*.txt

@@ -11,6 +11,7 @@ import weakref
 from functools import lru_cache
 from src.models.StateTracker import StateTracker
 from src.utils.logging import SDXLTrainingLogger
+from src.training.loss_functions import _compute_resolution_scale
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +63,7 @@ def update_ema_model(
     model: torch.nn.Module,
     decay: float = 0.9999
 ) -> None:
-    """Update EMA model parameters efficiently."""
+    """Update EMA model parameters with NAI-recommended decay."""
     with torch.no_grad():
         for ema_param, model_param in zip(ema_model.parameters(), model.parameters()):
             if model_param.requires_grad:
@@ -105,7 +106,21 @@ def train_step(
         
         # Backward pass with enhanced gradient tracking
         if scaler is not None:
-            scaler.scale(loss).backward()
+            # Scale loss and compute gradients
+            scaled_loss = scaler.scale(loss)
+            scaled_loss.backward()
+            
+            # Unscale before gradient clipping
+            scaler.unscale_(optimizers["unet"])
+            
+            # NAI-recommended gradient clipping
+            if args.max_grad_norm is not None:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model_dict["unet"].parameters(),
+                    args.max_grad_norm
+                )
+                metrics_dict["grad_norm/total"] = grad_norm.item()
+                metrics_dict["grad_norm/clipped"] = min(grad_norm.item(), args.max_grad_norm)
             
             # Collect detailed gradient statistics
             grad_metrics = {}
@@ -124,16 +139,6 @@ def train_step(
                                 "param_std": param.std().item()
                             }
             
-            # Gradient clipping with logging
-            if args.max_grad_norm is not None:
-                scaler.unscale_(optimizers["unet"])
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    model_dict["unet"].parameters(),
-                    args.max_grad_norm
-                )
-                grad_metrics["grad_norm/total"] = grad_norm.item()
-                grad_metrics["grad_norm/clipped"] = min(grad_norm.item(), args.max_grad_norm)
-            
             metrics_dict.update(grad_metrics)
         
         # Add learning rate to metrics
@@ -141,7 +146,25 @@ def train_step(
         
         # Update state tracker
         if state_tracker is not None:
-            state_tracker.update_metrics(metrics_dict)
+            state_tracker.update_metrics({
+                **metrics_dict,
+                "sigma_max": 20000.0,  # NAI's practical infinity
+                "effective_batch_size": batch["pixel_values"].shape[0] * (grad_accumulator.accumulation_steps if grad_accumulator else 1),
+            })
+        
+        # Scale loss based on resolution
+        height, width = batch["pixel_values"].shape[-2:]
+        resolution_scale = _compute_resolution_scale(height, width)
+        
+        # Apply NAI's loss scaling
+        loss = loss * resolution_scale
+        
+        # Add NAI-specific metrics
+        metrics_dict.update({
+            "resolution_scale": resolution_scale,
+            "sigma_max": 20000.0,
+            "effective_batch_size": batch["pixel_values"].shape[0] * (grad_accumulator.accumulation_steps if grad_accumulator else 1)
+        })
         
         return loss, metrics_dict
         

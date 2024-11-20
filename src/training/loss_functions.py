@@ -196,25 +196,27 @@ def training_loss_v_prediction(
         added_cond_kwargs: Additional conditioning inputs
         return_metrics: Whether to return additional metrics
     """
-    batch_size = x_0.shape[0]
+    # Scale sigma based on resolution
+    height, width = x_0.shape[-2:]
+    sigma = sigma * _compute_resolution_scale(height, width)
     
     # Generate noise if not provided (using input tensor's device)
     if noise is None:
         noise = torch.randn_like(x_0)  # Inherits device from x_0
     
-    # Compute v-target with improved numerical stability (NAI section 2.1)
-    v_target = _compute_v_target(noise, sigma)
-    
     # Add noise to input (NAI section 2.2 - ZTSNR support)
-    noisy_samples = x_0 + noise * sigma.view(-1, 1, 1, 1)
+    noised = x_0 + sigma.view(-1, 1, 1, 1) * noise
     
     # Forward pass with proper conditioning
     v_pred = model(
-        noisy_samples,
-        sigma.squeeze(),
-        text_embeddings,
+        noised,
+        sigma,
+        encoder_hidden_states=text_embeddings,
         added_cond_kwargs=added_cond_kwargs
     ).sample
+    
+    # Compute v-target with NAI's formulation
+    v_target = _compute_v_target(noise, sigma)
     
     # Compute MinSNR loss weights (NAI section 2.4)
     if use_snr_weighting:
@@ -231,8 +233,8 @@ def training_loss_v_prediction(
     loss = F.mse_loss(
         v_pred * weights.sqrt(),
         v_target * weights.sqrt(),
-        reduction='sum'
-    ) / batch_size
+        reduction='none'
+    ).mean()
 
     if return_metrics:
         with torch.no_grad():
@@ -244,8 +246,9 @@ def training_loss_v_prediction(
                 "error": torch.abs(v_pred - v_target).mean().item(),
                 "snr": _compute_snr(sigma).mean().item(),
                 "weight_mean": weights.mean().item(),
-                # Add NAI-specific metrics
-                "effective_loss": (weights * (v_pred - v_target) ** 2).mean().item(),
+                "sigma_mean": sigma.mean().item(),
+                "sigma_std": sigma.std().item(),
+                "v_pred_loss": loss.item(),
             }
     
     return loss
@@ -421,6 +424,12 @@ def _get_fourier_embedding(
     # Reshape to match SDXL's implementation
     return embeddings.reshape(batch_size, -1)
 
+def compute_snr_weight(sigma: torch.Tensor, gamma: float = 5.0) -> torch.Tensor:
+    """Compute MinSNR weight from NAI section 2.4"""
+    snr = 1 / (sigma ** 2)
+    weight = torch.minimum(snr, torch.ones_like(snr) * gamma) / snr
+    return weight
+
 def forward_pass(
     args: Any,
     model_dict: Dict[str, torch.nn.Module],
@@ -428,8 +437,7 @@ def forward_pass(
     device: torch.device,
     dtype: torch.dtype,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """Forward pass with corrected tensor dimensions per paper sections 2.1-2.2"""
-    
+    """Forward pass with NAI improvements"""
     unet = model_dict["unet"]
     text_encoder = model_dict.get("text_encoder")      # CLIP ViT-L 
     text_encoder_2 = model_dict.get("text_encoder_2")  # OpenCLIP ViT-bigG
@@ -473,34 +481,20 @@ def forward_pass(
         "text_embeds": pooled_embeddings,  # [B, 1280]
         "time_ids": time_embeddings        # [B, S, D]
     }
-    
-    # Get loss with matched dimensions
-    sigmas = get_sigmas(height=height, width=width, device=device)
-    
-    return training_loss_v_prediction(
+    sigma=get_sigmas(height, width, device)[0]
+    # Get loss with NAI improvements
+    loss, metrics = training_loss_v_prediction(
         model=unet,
         x_0=pixel_values,
-        sigma=sigmas[0],
+        sigma=sigma,
         text_embeddings=text_embeddings,
         added_cond_kwargs=added_cond_kwargs,
-        use_snr_weighting=getattr(args, "use_snr_weighting", True),
-        min_snr_gamma=getattr(args, "min_snr_gamma", 5.0),
-        scale_factor=getattr(args, "scale_factor", 1.0),
         return_metrics=True
     )
+    
+    if args.use_min_snr:
+        weight = compute_snr_weight(sigma, gamma=args.min_snr_gamma)
+        loss = loss * weight
+    
+    return loss, metrics
 
-def normalize_vae_latents(latents: torch.Tensor) -> torch.Tensor:
-    """
-    Normalize VAE latents using NAI's statistics (section B.2).
-    Makes each channel a standard Gaussian.
-    """
-    # NAI statistics from paper figure 9
-    means = torch.tensor([4.8119, 0.1607, 1.3538, -1.7753], device=latents.device)
-    stds = torch.tensor([9.9181, 6.2753, 7.5978, 5.9956], device=latents.device)
-    
-    # Reshape for broadcasting
-    means = means.view(1, -1, 1, 1)
-    stds = stds.view(1, -1, 1, 1)
-    
-    # Normalize to standard Gaussian
-    return (latents - means) / stds

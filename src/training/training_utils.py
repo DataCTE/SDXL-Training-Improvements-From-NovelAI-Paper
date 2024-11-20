@@ -8,6 +8,7 @@ from src.training.ema import setup_ema_model
 from src.training.loss_functions import get_cosine_schedule_with_warmup
 import warnings
 from torch.cuda.amp import GradScaler
+from torch.optim import Lion
 
 # Suppress the specific deprecation warning
 warnings.filterwarnings("ignore", category=FutureWarning, 
@@ -57,31 +58,23 @@ def initialize_training_components(
     config: Any,
     models: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """Initialize all training components."""
+    """Initialize training components with NAI recommendations"""
     components = {}
     
-    # Setup optimizer
-    logger.info(f"Setting up {config.optimizer.optimizer_type} optimizer with learning rate {config.optimizer.learning_rate}")
-    components["optimizer"] = setup_optimizer(
-        model=models["unet"],
-        learning_rate=config.optimizer.learning_rate,
+    # Use Lion optimizer with NAI's settings
+    components["optimizer"] = Lion(
+        models["unet"].parameters(),
+        lr=config.optimizer.learning_rate,
         weight_decay=config.optimizer.weight_decay,
-        optimizer_type=config.optimizer.optimizer_type,
-        use_8bit_optimizer=config.optimizer.use_8bit_adam,
-        adam_beta1=config.optimizer.adam_beta1,
-        adam_beta2=config.optimizer.adam_beta2,
-        adam_epsilon=config.optimizer.adam_epsilon
+        betas=(0.95, 0.98)  # NAI recommended values
     )
     
-    # Setup scheduler using get_cosine_schedule_with_warmup instead of setup_scheduler
-    if config.scheduler.use_scheduler:
-        components["scheduler"] = get_cosine_schedule_with_warmup(
-            optimizer=components["optimizer"],
-            num_warmup_steps=config.scheduler.num_warmup_steps,
-            num_training_steps=config.scheduler.num_training_steps,
-            num_cycles=config.scheduler.num_cycles,
-            device=config.device if hasattr(config, "device") else "cuda"
-        )
+    # NAI-style warmup scheduler
+    components["scheduler"] = get_cosine_schedule_with_warmup(
+        optimizer=components["optimizer"],
+        num_warmup_steps=int(config.scheduler.num_training_steps * 0.02),  # 2% warmup
+        num_training_steps=config.scheduler.num_training_steps
+    )
     
     # Setup gradient scaler for mixed precision training
     if config.mixed_precision != "no":
