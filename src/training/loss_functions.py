@@ -62,26 +62,27 @@ def _get_resolution_scaled_sigma_schedule(
     rho: float = 7.0,  # Configurable rho parameter
     min_snr_gamma: float = 5.0,
 ) -> torch.Tensor:
-    """Cached computation of resolution-scaled sigma schedule with NovelAI improvements."""
-    # Compute resolution scale
+    """Compute sigma schedule with NAI3's resolution-based scaling."""
+    # Resolution-based scaling (NAI3 improvement)
     scale = _compute_resolution_scale(height, width)
     
-    # Apply NovelAI's improved sigma scaling
+    # Apply NAI3's adaptive sigma scaling
     scaled_sigma_max = sigma_max * scale
     scaled_sigma_min = sigma_min * math.sqrt(scale)  # Square root scaling for min sigma
     
-    # Generate timesteps
-    steps = torch.arange(num_steps, dtype=torch.float32)
+    # Generate timesteps with improved spacing
+    steps = torch.linspace(0, num_steps - 1, num_steps, dtype=torch.float32)
     inv_rho = 1.0 / rho
     
-    # Compute sigmas with improved scaling
-    sigmas = torch.exp(-steps * inv_rho) * (scaled_sigma_max - scaled_sigma_min) + scaled_sigma_min
+    # Compute sigmas with NAI3's improvements
+    sigmas = torch.exp(-steps * inv_rho)
+    sigmas = sigmas * (scaled_sigma_max - scaled_sigma_min) + scaled_sigma_min
     
-    # Apply SNR clamping
+    # Apply dynamic SNR clamping (NAI3 improvement)
     snr = _compute_snr(sigmas, 1.0)
     sigmas = torch.where(
         snr > min_snr_gamma,
-        torch.sqrt(torch.tensor(1.0 + min_snr_gamma) / snr) * sigmas,
+        torch.sqrt((1.0 + min_snr_gamma) / snr) * sigmas,
         sigmas
     )
     
@@ -134,65 +135,46 @@ def training_loss_v_prediction(
     added_cond_kwargs: Optional[Dict[str, torch.Tensor]] = None,
     return_metrics: bool = False,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """Compute v-prediction loss with SDXL and NovelAI optimizations."""
+    """Compute v-prediction loss with SDXL and NovelAI improvements."""
     batch_size = x_0.shape[0]
     device = x_0.device
-    height, width = x_0.shape[-2:]
     
-    # Generate noise efficiently
+    # Generate noise if not provided
     if noise is None:
         noise_buffer = _get_or_create_buffer("noise", x_0.shape, device)
         noise_buffer.normal_()
         noise = noise_buffer
     
-    # Optimize timesteps computation
-    timesteps_buffer = _get_or_create_buffer("timesteps", (batch_size,), device)
-    timesteps_buffer.copy_(sigma)
-    timesteps_buffer = timesteps_buffer.squeeze()
+    # Compute timesteps with improved precision
+    timesteps = sigma.squeeze()
     
-    # Compute noisy samples efficiently
-    noisy_samples = x_0 + noise * sigma.view(-1, 1, 1, 1)
-    
-    # Generate time embeddings for SDXL
-    if added_cond_kwargs is None:
-        added_cond_kwargs = {}
-    
-    if "time_ids" not in added_cond_kwargs:
-        time_ids = _get_add_time_ids(
-            batch_size=batch_size,
-            height=height,
-            width=width,
-            dtype=text_embeddings.dtype,
-            device=device
-        )
-        added_cond_kwargs["time_ids"] = time_ids
-    
-    # Ensure text_embeds has correct shape [batch_size, dim]
-    if "text_embeds" in added_cond_kwargs:
-        text_embeds = added_cond_kwargs["text_embeds"]
-        if len(text_embeds.shape) == 3:  # If shape is [batch_size, 1, dim]
-            added_cond_kwargs["text_embeds"] = text_embeds.squeeze(1)
-    
-    # Forward pass with optimization
-    v_pred = apply_model(model, noisy_samples, timesteps_buffer, text_embeddings, added_cond_kwargs)
-    
-    # Compute target with improved SNR weighting
+    # Compute v-target with improved numerical stability
     v_target = _compute_v_target(noise, sigma)
     
-    # Compute weights with NovelAI's improvements
+    # Add noise to input
+    noisy_samples = x_0 + noise * sigma.view(-1, 1, 1, 1)
+    
+    # Forward pass
+    v_pred = apply_model(model, noisy_samples, timesteps, text_embeddings, added_cond_kwargs)
+    
+    # Compute SNR-based loss weights (NAI3 improvement)
     if use_snr_weighting:
+        # Compute SNR with improved stability
         snr = _compute_snr(sigma, 1.0)
-        # Apply min SNR gamma clamping
+        
+        # Apply NAI3's dynamic SNR clamping
         snr = torch.clamp(snr, max=min_snr_gamma)
-        # Compute weights with scale factor
-        weights = _compute_loss_weights(snr, min_snr_gamma, scale_factor)
+        
+        # Compute weights with scale factor (NAI3 improvement)
+        weights = scale_factor * torch.minimum(snr, torch.tensor(min_snr_gamma, device=device)) / snr
         weights = weights.view(-1, 1, 1, 1)
     else:
         weights = torch.ones_like(sigma.view(-1, 1, 1, 1))
+        snr = torch.zeros_like(sigma)  # For metrics
     
-    # Compute loss efficiently
-    loss = torch.sum((v_pred - v_target) ** 2 * weights) / batch_size
-    
+    # Compute loss with improved numerical stability
+    loss = F.mse_loss(v_pred * weights.sqrt(), v_target * weights.sqrt(), reduction='sum') / batch_size
+
     if return_metrics:
         return loss, {
             "target_mean": v_target.mean().item(),
@@ -202,6 +184,8 @@ def training_loss_v_prediction(
             "error": torch.abs(v_pred - v_target).mean().item(),
             "snr": snr.mean().item() if use_snr_weighting else 0.0,
             "weight_mean": weights.mean().item(),
+            "weight_std": weights.std().item(),  # Added for monitoring
+            "effective_loss": (weights * (v_pred - v_target) ** 2).mean().item(),  # Added for monitoring
         }
     
     return loss

@@ -91,17 +91,11 @@ class VAECache:
         return len(self._memory_cache) >= self._max_cache_size
     
     def _evict_items(self) -> None:
-        """Efficient batch eviction."""
-        while self._should_evict() and self._memory_cache:
-            try:
-                key = next(iter(self._memory_cache))
-                del self._memory_cache[key]
-                self._stats['evictions'] = self._stats.get('evictions', 0) + 1
-            except (StopIteration, RuntimeError):
-                break
-            
-        if self._should_evict() and torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        """Evict items when cache is full."""
+        if len(self._memory_cache) > self._max_cache_size:
+            # Calculate number of items to evict (20% of cache)
+            evict_count = max(1, int(self._max_cache_size * 0.2))
+            self._memory_cache._evict_items(evict_count)
     
     @torch.no_grad()
     def _encode_batch(self, images: torch.Tensor) -> torch.Tensor:
@@ -232,3 +226,8 @@ class VAECache:
         if self._pool:
             self._pool.close()
             self._pool.join()
+    
+    def __delitem__(self, key: str) -> None:
+        """Support item deletion."""
+        if key in self._memory_cache:
+            del self._memory_cache[key]

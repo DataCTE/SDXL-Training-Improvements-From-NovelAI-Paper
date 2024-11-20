@@ -35,10 +35,13 @@ class MemoryCache:
             self.cached_files = manager.list()
 
     def __delitem__(self, key: str) -> None:
-        """Delete item from cache."""
+        """Delete item from cache with proper cleanup."""
         with self._lock:
             if key in self._cache:
+                # Remove from memory cache
                 del self._cache[key]
+                
+                # Clean up disk cache if enabled
                 if self.cache_dir and key in self.cached_files:
                     try:
                         cache_path = self._get_cache_path(key)
@@ -106,3 +109,16 @@ class MemoryCache:
     def __iter__(self):
         """Iterate over cache keys."""
         return iter(self._cache)
+
+    def get_stats(self) -> Dict[str, int]:
+        """Get cache statistics."""
+        with self._lock:
+            return dict(self._stats)  # Return a copy of stats dict
+
+    def _evict_items(self, count: int = 1) -> None:
+        """Evict oldest items from cache."""
+        with self._lock:
+            keys_to_evict = list(self._cache.keys())[:count]
+            for key in keys_to_evict:
+                self.__delitem__(key)
+                self._stats['evictions'] += 1
