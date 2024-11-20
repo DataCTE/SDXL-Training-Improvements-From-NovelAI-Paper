@@ -96,19 +96,22 @@ class TextEmbeddingCache:
     def _encode_text(self, text: Union[str, List[str]]) -> Tuple[torch.Tensor, torch.Tensor]:
         """Encode text with both encoders.
         
+        Args:
+            text: Single text string or list of strings
+            
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: 
-                - Combined hidden states [batch_size, seq_len, hidden_size]
-                - Pooled output from second encoder [batch_size, hidden_size]
+                - hidden_states: Combined text embeddings [batch_size, seq_len, hidden_size_combined]
+                - pooled: Second encoder pooled output [batch_size, hidden_size2]
         """
         if isinstance(text, str):
             text = [text]
             
-        # Tokenize
+        # Tokenize with both encoders
         tokens1 = self.tokenizer1(
             text,
             padding="max_length",
-            max_length=77,
+            max_length=77,  # SDXL's max token length
             truncation=True,
             return_tensors="pt"
         )
@@ -125,19 +128,29 @@ class TextEmbeddingCache:
             tokens1 = {k: v.cuda() for k,v in tokens1.items()}
             tokens2 = {k: v.cuda() for k,v in tokens2.items()}
             
-        # Get embeddings from both encoders
-        with torch.amp.autocast('cuda'):  # Updated autocast syntax
-            # Get hidden states from both encoders
-            hidden_states1 = self.text_encoder1(**tokens1)[0]  # [batch, seq_len, hidden_size]
-            hidden_states2 = self.text_encoder2(**tokens2)[0]  # [batch, seq_len, hidden_size]
+        with torch.amp.autocast('cuda'):
+            # Get outputs from both encoders
+            outputs1 = self.text_encoder1(**tokens1)
+            outputs2 = self.text_encoder2(**tokens2)
+            
+            # Extract hidden states (sequence embeddings)
+            # Both should be [batch_size, seq_len, hidden_size]
+            hidden_states1 = outputs1[0]  # CLIP-L hidden states
+            hidden_states2 = outputs2[0]  # CLIP-G hidden states
             
             # Get pooled output from second encoder
-            pooled_output = self.text_encoder2(**tokens2)[1]  # [batch, hidden_size]
+            pooled_output = outputs2[1]  # [batch_size, hidden_size]
             
-            # Concatenate hidden states along hidden dimension
+            # Verify shapes
+            assert hidden_states1.ndim == hidden_states2.ndim == 3, \
+                f"Hidden states must be 3D: got {hidden_states1.shape} and {hidden_states2.shape}"
+            
+            # Concatenate hidden states along hidden dimension (dim=-1)
+            # This combines CLIP-L (768) and CLIP-G (1280) features
             combined_hidden = torch.cat([hidden_states1, hidden_states2], dim=-1)
+            # Result: [batch_size, seq_len, 768+1280]
                 
-        # Move back to CPU for caching
+        # Move to CPU for caching
         combined_hidden = combined_hidden.cpu()
         pooled_output = pooled_output.cpu()
         
