@@ -14,8 +14,16 @@ import os
 from .memory import MemoryCache
 from multiprocessing import Manager
 from multiprocessing import Pool
+import multiprocessing
 
 logger = logging.getLogger(__name__)
+
+if torch.cuda.is_available():
+    # Set start method to 'spawn' for CUDA multiprocessing
+    try:
+        multiprocessing.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass  # Already set
 
 class VAECache:
     """Ultra-optimized VAE encoding cache with parallel processing."""
@@ -26,7 +34,7 @@ class VAECache:
     
     def __init__(self, vae: nn.Module, cache_dir: Optional[str] = None,
                  max_cache_size: int = 10000, num_workers: int = 4,
-                 batch_size: int = 8):
+                 batch_size: int = 8, max_memory_gb: float = 32.0):
         """Initialize VAE cache with optimized defaults.
         
         Args:
@@ -35,11 +43,15 @@ class VAECache:
             max_cache_size: Maximum number of items to keep in cache
             num_workers: Number of worker threads for parallel processing
             batch_size: Batch size for parallel processing
+            max_memory_gb: Maximum memory in GB for cache
         """
         # Initialize multiprocessing components
         self._manager = Manager()
         self._stats = self._manager.dict({'hits': 0, 'misses': 0, 'evictions': 0})
         self._num_workers = num_workers
+        
+        # Initialize process pool
+        self._pool = Pool(processes=num_workers) if num_workers > 0 else None
         
         # Initialize model and parameters
         self.vae = vae.eval()  # Ensure eval mode
@@ -53,14 +65,18 @@ class VAECache:
         self._cache_dir = Path(cache_dir) if cache_dir else None
         if self._cache_dir:
             os.makedirs(self._cache_dir, exist_ok=True)
-            self._memory_cache = MemoryCache(str(self._cache_dir))
+            self._memory_cache = MemoryCache(
+                max_memory_gb=max_memory_gb,
+                max_cache_size=max_cache_size,
+                cache_dir=str(self._cache_dir)
+            )
         else:
-            self._memory_cache = MemoryManager()
+            self._memory_cache = MemoryCache(
+                max_memory_gb=max_memory_gb,
+                max_cache_size=max_cache_size
+            )
         
-        # Initialize process pool
-        self._pool = Pool(processes=num_workers) if num_workers > 0 else None
-        
-        # Pre-warm CUDA
+        # Pre-warm CUDA if available
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.memory.empty_cache()

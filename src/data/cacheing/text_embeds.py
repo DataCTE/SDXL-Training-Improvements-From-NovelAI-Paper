@@ -50,7 +50,8 @@ class TextEmbeddingCache:
         batch_size: int = 16,
         cache_dir: Optional[Union[str, Path]] = None,
         dropout_rate: float = 0.0,
-        num_workers: int = 4
+        num_workers: int = 4,
+        max_memory_gb: float = 32.0
     ) -> None:
         """Initialize text embedding cache with dual encoders."""
         self.text_encoder1 = text_encoder1
@@ -60,7 +61,7 @@ class TextEmbeddingCache:
         
         # Initialize cache and stats
         self._memory_cache = MemoryCache(
-            max_memory_gb=32.0,
+            max_memory_gb=max_memory_gb,
             max_cache_size=max_cache_size,
             cache_dir=cache_dir
         )

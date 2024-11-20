@@ -29,108 +29,46 @@ class MemoryCache:
         self._lock = RLock()
         
         # Disk cache setup
-        if cache_dir is not None:
-            self.cache_dir = Path(cache_dir).resolve()
+        self.cache_dir = Path(cache_dir) if cache_dir else None
+        if self.cache_dir:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
             self.cached_files = manager.list()
-            logger.info(f"Initialized disk cache at: {self.cache_dir}")
-        else:
-            self.cache_dir = None
-            self.cached_files = manager.list()
-            logger.info("Running without disk cache")
-        
-        # Pre-warm the cache
-        self._prewarm_cache()
-    
-    def _prewarm_cache(self) -> None:
-        """Pre-warm cache for better initial performance."""
-        try:
-            if torch.cuda.is_available():
-                # Reserve memory for cache (in bytes)
-                reserved_mem = int(self._max_memory_gb * 1024 * 1024 * 1024)  # Convert GB to bytes
-                # Reserve 1/4 for cache, create empty tensor of appropriate size
-                torch.empty(reserved_mem // (4 * 4), dtype=torch.float32)  # Divide by 4 for float32 bytes
-                torch.cuda.empty_cache()
-                logger.info(f"Pre-warmed cache with {self._max_memory_gb}GB memory reservation")
-        except Exception as e:
-            logger.warning(f"Cache pre-warming failed: {e}")
-            # Continue without pre-warming
-            pass
 
-    def _get_cache_key(self, text: str) -> str:
-        """Generate consistent cache key for text."""
-        # Use SHA-256 for consistent hashing
-        return hashlib.sha256(text.encode()).hexdigest()
-
-    def _should_evict(self) -> bool:
-        """Check if cache needs eviction based on memory usage."""
-        if not torch.cuda.is_available():
-            return len(self._cache) >= self._max_cache_size
-            
-        # Check GPU memory usage
-        memory_used = torch.cuda.memory_allocated() / (1024 * 1024 * 1024)  # GB
-        return memory_used >= self._max_memory_gb * 0.9  # 90% threshold
-
-    def _evict_items(self) -> None:
-        """Efficient batch eviction with memory management."""
+    def __delitem__(self, key: str) -> None:
+        """Delete item from cache."""
         with self._lock:
-            while self._should_evict() and self._cache:
-                try:
-                    # Get oldest item
-                    key = next(iter(self._cache))
-                    
-                    # Try to save to disk before evicting
-                    if self.cache_dir:
-                        self._save_to_disk(key, self._cache[key])
-                        self.cached_files.append(key)
-                    
-                    del self._cache[key]
-                    self._stats['evictions'] = self._stats.get('evictions', 0) + 1
-                except (StopIteration, RuntimeError) as e:
-                    logger.error(f"Eviction error: {e}")
-                    break
-                    
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            if key in self._cache:
+                del self._cache[key]
+                if self.cache_dir and key in self.cached_files:
+                    try:
+                        cache_path = self._get_cache_path(key)
+                        if cache_path.exists():
+                            cache_path.unlink()
+                        self.cached_files.remove(key)
+                    except Exception as e:
+                        logger.error(f"Failed to delete cached file: {e}")
 
     def _get_cache_path(self, key: str) -> Path:
-        """Get path for disk cache file."""
+        """Get path for cached file."""
         return self.cache_dir / f"{key}.pt"
 
-    def _save_to_disk(self, key: str, value: Any) -> None:
-        """Save value to disk cache."""
-        if self.cache_dir:
-            try:
-                cache_path = self._get_cache_path(key)
-                torch.save(value, cache_path)
-                if key not in self.cached_files:
-                    self.cached_files.append(key)
-            except Exception as e:
-                logger.error(f"Failed to save to disk cache: {e}")
-
-    def put(self, key: str, value: Tuple[torch.Tensor, torch.Tensor]) -> None:
-        """Store embeddings tuple in cache with disk fallback."""
+    def put(self, key: str, value: Any) -> None:
+        """Store value in cache with disk fallback."""
         with self._lock:
-            if self._should_evict():
-                self._evict_items()
-            
-            # Store on CPU for memory efficiency
-            if isinstance(value, tuple):
-                value = tuple(t.cpu() for t in value)
-            else:
-                value = value.cpu()
-                
             self._cache[key] = value
-            
-            # Backup to disk if enabled
             if self.cache_dir:
-                self._save_to_disk(key, value)
+                try:
+                    cache_path = self._get_cache_path(key)
+                    torch.save(value, cache_path)
+                    if key not in self.cached_files:
+                        self.cached_files.append(key)
+                except Exception as e:
+                    logger.error(f"Failed to save to disk cache: {e}")
 
-    def get(self, key: str, default: Any = None) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        """Get embeddings from cache with disk fallback."""
+    def get(self, key: str, default: Any = None) -> Optional[Any]:
+        """Get value from cache with disk fallback."""
         with self._lock:
             value = self._cache.get(key)
-            
             if value is None and self.cache_dir and key in self.cached_files:
                 try:
                     cache_path = self._get_cache_path(key)
@@ -143,16 +81,10 @@ class MemoryCache:
                     logger.error(f"Failed to load from disk cache: {e}")
                     self._stats['misses'] += 1
                     return default
-            
-            if value is not None:
-                self._stats['hits'] += 1
-            else:
-                self._stats['misses'] += 1
-                
-            return value if value is not None else default
+            return value
 
     def clear(self) -> None:
-        """Clear both memory and disk cache."""
+        """Clear cache and remove cached files."""
         with self._lock:
             self._cache.clear()
             if self.cache_dir and self.cache_dir.exists():
@@ -167,21 +99,10 @@ class MemoryCache:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-    def get_stats(self) -> Dict[str, int]:
-        """Get cache performance statistics."""
-        with self._lock:
-            stats = dict(self._stats)  # Create a copy of stats
-            stats.update({
-                'size': len(self._cache),
-                'disk_cached': len(self.cached_files) if hasattr(self, 'cached_files') else 0,
-            })
-            
-            if torch.cuda.is_available():
-                stats['gpu_memory_used_gb'] = torch.cuda.memory_allocated() / (1024 * 1024 * 1024)
-                stats['gpu_memory_reserved_gb'] = torch.cuda.memory_reserved() / (1024 * 1024 * 1024)
-            
-            return stats
-
     def __len__(self) -> int:
         """Get current cache size."""
         return len(self._cache)
+
+    def __iter__(self):
+        """Iterate over cache keys."""
+        return iter(self._cache)
