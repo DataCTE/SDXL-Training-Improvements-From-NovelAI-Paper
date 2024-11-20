@@ -124,9 +124,11 @@ def training_loss_v_prediction(
         noise_buffer.normal_()  # In-place normal distribution
         noise = noise_buffer
     
-    # Optimize timesteps computation
+    # Optimize timesteps computation - now ensuring it's 1D
     timesteps_buffer = _get_or_create_buffer("timesteps", (batch_size,), device)
     timesteps_buffer.copy_(sigma)
+    # Ensure timesteps is 1D for the UNet
+    timesteps_buffer = timesteps_buffer.squeeze()  # Remove any extra dimensions
     
     # Compute noisy samples efficiently
     noisy_samples = x_0 + noise * sigma.view(-1, 1, 1, 1)
@@ -146,14 +148,17 @@ def training_loss_v_prediction(
         )
         added_cond_kwargs["time_ids"] = time_ids
     
+    # Ensure text_embeds has correct shape [batch_size, 1280]
+    if "text_embeds" in added_cond_kwargs:
+        text_embeds = added_cond_kwargs["text_embeds"]
+        if len(text_embeds.shape) == 3:  # If shape is [batch_size, 1, dim]
+            added_cond_kwargs["text_embeds"] = text_embeds.squeeze(1)
+    
     # Debug prints for tensor shapes
     logger.info(f"Text embeddings shape: {text_embeddings.shape}")
     logger.info(f"Timesteps buffer shape: {timesteps_buffer.shape}")
     logger.info(f"Time ids shape: {added_cond_kwargs['time_ids'].shape}")
     logger.info(f"Added cond kwargs shapes: {[(k, v.shape) for k, v in added_cond_kwargs.items()]}")
-    
-    # Ensure timesteps have correct shape for UNet
-    timesteps_buffer = timesteps_buffer.view(batch_size, 1)
     
     # Forward pass with optimization
     v_pred = apply_model(model, noisy_samples, timesteps_buffer, text_embeddings, added_cond_kwargs)
