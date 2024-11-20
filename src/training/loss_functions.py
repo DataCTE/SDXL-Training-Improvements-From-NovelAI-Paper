@@ -116,10 +116,25 @@ def get_sigmas(
     
     return _sigma_cache[cache_key].to(device)
 
-def apply_model(model: torch.nn.Module, x: torch.Tensor, t: torch.Tensor, text_embeddings: torch.Tensor, added_cond_kwargs: Optional[Dict[str, torch.Tensor]] = None) -> torch.Tensor:
-    """Optimized model application."""
+
+def apply_model(
+    model: torch.nn.Module,
+    x: torch.Tensor,
+    t: torch.Tensor,
+    text_embeddings: torch.Tensor,
+    added_cond_kwargs: Optional[Dict[str, torch.Tensor]] = None
+) -> torch.Tensor:
+    """Modified model application ensuring tensor shape compatibility."""
     if added_cond_kwargs is None:
         added_cond_kwargs = {}
+        
+    # Ensure time_ids have correct shape
+    if "time_ids" in added_cond_kwargs:
+        time_ids = added_cond_kwargs["time_ids"]
+        if time_ids.ndim != text_embeddings.ndim:
+            time_ids = time_ids.unsqueeze(1).expand(-1, text_embeddings.shape[1], -1)
+        added_cond_kwargs["time_ids"] = time_ids
+        
     return model(x, t, text_embeddings, added_cond_kwargs=added_cond_kwargs).sample
 
 @autocast('cuda')
@@ -340,27 +355,29 @@ def _get_add_time_ids(
     hidden_dim: int,
     text_encoder_projection_dim: Optional[int] = None
 ) -> torch.Tensor:
-    """Generate properly shaped time embeddings for SDXL conditioning."""
-    # Get original size and target size
+    """Generate time IDs for SDXL conditioning following NAI3 improvements."""
+    # SDXL's micro-conditioning values
     original_size = (height, width)
     target_size = (height, width)
     crops_coords_top_left = (0, 0)
     
-    # Create time ID list
-    add_time_ids = list(original_size + crops_coords_top_left + target_size)
-    
-    # Calculate expected embedding dimension
+    # Create raw tensor of micro-conditioning values
+    add_time_ids = torch.tensor([
+        list(original_size) +  
+        list(crops_coords_top_left) + 
+        list(target_size)
+    ], dtype=dtype, device=device)
+
+    # Repeat for batch size
+    add_time_ids = add_time_ids.repeat(batch_size, 1)
+
+    # Match projection dimension from text encoder
+    total_dim = hidden_dim
     if text_encoder_projection_dim is not None:
-        expected_dim = hidden_dim + text_encoder_projection_dim
-    else:
-        expected_dim = hidden_dim
-        
-    # Create tensor and expand to match sequence length
-    time_ids = torch.tensor([add_time_ids], dtype=dtype, device=device)
-    time_ids = time_ids.repeat(batch_size, 1)  # [batch_size, num_time_tokens]
-    
-    # Project to higher dimension to match text embeddings
-    time_embeddings = torch.nn.Linear(len(add_time_ids), expected_dim, device=device)(time_ids)
-    time_embeddings = time_embeddings.unsqueeze(1)  # [batch_size, 1, hidden_dim]
-    
+        total_dim = text_encoder_projection_dim
+
+    # Project to embedding space
+    time_embed = torch.nn.Linear(add_time_ids.shape[1], total_dim, device=device, dtype=dtype)
+    time_embeddings = time_embed(add_time_ids) 
+
     return time_embeddings
