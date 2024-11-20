@@ -121,13 +121,13 @@ def training_loss_v_prediction(
     # Generate noise efficiently
     if noise is None:
         noise_buffer = _get_or_create_buffer("noise", x_0.shape, device)
-        noise_buffer.normal_()  # In-place normal distribution
+        noise_buffer.normal_()
         noise = noise_buffer
     
-    # Optimize timesteps computation - now ensuring it's 1D
+    # Optimize timesteps computation
     timesteps_buffer = _get_or_create_buffer("timesteps", (batch_size,), device)
     timesteps_buffer.copy_(sigma)
-    timesteps_buffer = timesteps_buffer.squeeze()  # Remove any extra dimensions
+    timesteps_buffer = timesteps_buffer.squeeze()
     
     # Compute noisy samples efficiently
     noisy_samples = x_0 + noise * sigma.view(-1, 1, 1, 1)
@@ -145,6 +145,12 @@ def training_loss_v_prediction(
             device=device
         )
         added_cond_kwargs["time_ids"] = time_ids
+    
+    # Ensure text_embeds has correct shape [batch_size, dim]
+    if "text_embeds" in added_cond_kwargs:
+        text_embeds = added_cond_kwargs["text_embeds"]
+        if len(text_embeds.shape) == 3:  # If shape is [batch_size, 1, dim]
+            added_cond_kwargs["text_embeds"] = text_embeds.squeeze(1)
     
     # Debug prints for tensor shapes
     logger.info(f"Text embeddings shape: {text_embeddings.shape}")
