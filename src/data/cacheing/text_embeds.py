@@ -24,6 +24,8 @@ import multiprocessing
 from multiprocessing import Manager
 from multiprocessing import Pool
 
+
+
 logger = logging.getLogger(__name__)
 
 if torch.cuda.is_available():
@@ -44,43 +46,39 @@ class TextEmbeddingCache:
         text_encoder2: CLIPTextModel,
         tokenizer1: CLIPTokenizer,
         tokenizer2: CLIPTokenizer,
-        cache_dir: Optional[str] = None,
         max_cache_size: int = 10000,
-        num_workers: int = 4,
-        batch_size: int = 32,
-        dropout_rate: float = 0.1
-    ):
-        """Initialize text embedding cache with optimized defaults."""
-        # Initialize multiprocessing components
-        self._manager = Manager()
-        self._stats = self._manager.dict({'hits': 0, 'misses': 0, 'evictions': 0})
-        self._num_workers = num_workers
-        
-        # Initialize models and parameters
-        self.text_encoder1 = text_encoder1.eval()
-        self.text_encoder2 = text_encoder2.eval()
-        self.tokenizer1 = tokenizer1
+        batch_size: int = 16,
+        cache_dir: Optional[Union[str, Path]] = None,
+        dropout_rate: float = 0.0,
+        num_workers: int = 4
+    ) -> None:
+        """Initialize text embedding cache with dual encoders."""
+        self.text_encoder1 = text_encoder1
+        self.text_encoder2 = text_encoder2
+        self.tokenizer1 = tokenizer1 
         self.tokenizer2 = tokenizer2
+        
+        # Initialize cache and stats
+        self._memory_cache = MemoryCache(max_memory_gb=max_cache_size, cache_dir=cache_dir)
         self._batch_size = batch_size
         self._max_cache_size = max_cache_size
-        self._scaler = amp.GradScaler()
-        self.dropout_rate = dropout_rate
+        self._stats = {'hits': 0, 'misses': 0}
         
-        # Initialize cache
+        # Setup multiprocessing
+        self._manager = Manager()
+        self._num_workers = num_workers
+        self._pool = Pool(num_workers) if num_workers > 0 else None
+        
+        # Mixed precision
+        self._scaler = amp.GradScaler() if torch.cuda.is_available() else None
+        
+        # Cache directory
         self._cache_dir = Path(cache_dir) if cache_dir else None
         if self._cache_dir:
-            os.makedirs(self._cache_dir, exist_ok=True)
-            self._memory_cache = MemoryCache(str(self._cache_dir))
-        else:
-            self._memory_cache = MemoryManager()
+            self._cache_dir.mkdir(parents=True, exist_ok=True)
             
-        # Initialize process pool
-        self._pool = Pool(processes=num_workers) if num_workers > 0 else None
+        self.dropout_rate = dropout_rate
         
-        # Pre-warm CUDA
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            
     def _get_cache_key(self, text: str) -> str:
         """Generate deterministic cache key for text."""
         return hashlib.sha256(text.encode()).hexdigest()
@@ -90,37 +88,48 @@ class TextEmbeddingCache:
         return len(self._memory_cache) >= self._max_cache_size
         
     @torch.no_grad()
-    def _encode_batch(self, texts: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Optimized batch encoding with mixed precision."""
-        # Tokenize texts (keep on CPU initially)
-        tokens1 = self.tokenizer1(texts, padding=True, truncation=True,
-                                return_tensors="pt")
-        tokens2 = self.tokenizer2(texts, padding=True, truncation=True,
-                                return_tensors="pt")
-        
-        # Pin memory before CUDA transfer
-        if torch.cuda.is_available():
-            tokens1 = {k: v.pin_memory() for k, v in tokens1.items()}
-            tokens2 = {k: v.pin_memory() for k, v in tokens2.items()}
+    def _encode_text(self, text: Union[str, List[str]]) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Encode text with both encoders."""
+        if isinstance(text, str):
+            text = [text]
             
-            # Now transfer to CUDA
-            tokens1 = {k: v.cuda() for k, v in tokens1.items()}
-            tokens2 = {k: v.cuda() for k, v in tokens2.items()}
-            
-        # Use mixed precision for faster encoding
+        # Tokenize
+        tokens1 = self.tokenizer1(
+            text,
+            padding="max_length",
+            max_length=77,
+            truncation=True,
+            return_tensors="pt"
+        )
+        tokens2 = self.tokenizer2(
+            text, 
+            padding="max_length",
+            max_length=77,
+            truncation=True,
+            return_tensors="pt"
+        )
+
+        # Move to GPU if available
         if torch.cuda.is_available():
-            with torch.cuda.amp.autocast():
-                # Encode with both text encoders
-                embed1 = self.text_encoder1(**tokens1)[0]
-                embed2 = self.text_encoder2(**tokens2)[0]
-                embed1 = self._scaler.scale(embed1)
-                embed2 = self._scaler.scale(embed2)
-        else:
-            # CPU fallback without mixed precision
+            tokens1 = {k: v.cuda() for k,v in tokens1.items()}
+            tokens2 = {k: v.cuda() for k,v in tokens2.items()}
+            
+        # Get embeddings from both encoders
+        with torch.cuda.amp.autocast():
             embed1 = self.text_encoder1(**tokens1)[0]
             embed2 = self.text_encoder2(**tokens2)[0]
-                
-        return embed1, embed2
+            
+            # Concatenate along channel dimension
+            embed = torch.cat([embed1, embed2], dim=-1)
+            
+            # Get pooled output from second encoder
+            pooled = self.text_encoder2(**tokens2)[1]
+            
+        # Move back to CPU for caching
+        embed = embed.cpu()
+        pooled = pooled.cpu()
+        
+        return embed, pooled
         
     def _parallel_encode(self, texts: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
         """Parallel batch processing with optimal batch size."""
@@ -128,14 +137,14 @@ class TextEmbeddingCache:
         num_texts = len(texts)
         
         if num_texts <= batch_size or not self._pool:
-            return self._encode_batch(texts)
+            return self._encode_text(texts)
             
         # Split into optimal batches
         batches = [texts[i:i + batch_size] 
                   for i in range(0, num_texts, batch_size)]
         
         # Process batches in parallel
-        results = self._pool.map(self._encode_batch, batches)
+        results = self._pool.map(self._encode_text, batches)
         
         # Gather results efficiently
         embed1 = torch.cat([r[0] for r in results], dim=0)

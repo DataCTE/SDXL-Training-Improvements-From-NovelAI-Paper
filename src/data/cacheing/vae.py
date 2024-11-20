@@ -2,7 +2,7 @@
 
 import torch
 import torch.nn as nn
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Union
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 import threading
@@ -101,14 +101,28 @@ class VAECache:
         
         # Use mixed precision for faster encoding
         if torch.cuda.is_available():
-            with torch.cuda.amp.autocast():  # Simplest form
+            with torch.cuda.amp.autocast():
                 encoded = self.vae.encode(images)[0]
                 encoded = self._scaler.scale(encoded)
                 encoded = encoded.sample()
+                
+                # Expand from 3 to 4 channels if needed
+                if encoded.shape[1] == 3:
+                    # Add zero-filled 4th channel
+                    zero_channel = torch.zeros_like(encoded[:, :1, :, :])
+                    encoded = torch.cat([encoded, zero_channel], dim=1)
+                    
+                    # Log channel expansion
+                    logger.debug("Expanded VAE output from 3 to 4 channels")
         else:
             # CPU fallback without mixed precision
             encoded = self.vae.encode(images)[0]
             encoded = encoded.sample()
+            
+            # Expand channels if needed
+            if encoded.shape[1] == 3:
+                zero_channel = torch.zeros_like(encoded[:, :1, :, :])
+                encoded = torch.cat([encoded, zero_channel], dim=1)
         
         # Return tensor on CPU for caching
         return encoded.cpu()

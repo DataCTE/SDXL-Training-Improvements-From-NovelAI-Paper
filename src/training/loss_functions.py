@@ -58,38 +58,59 @@ def _get_resolution_scaled_sigma_schedule(
     sigma_min: float,
     sigma_max: float,
     height: int,
-    width: int
+    width: int,
+    rho: float = 7.0,  # Configurable rho parameter
+    min_snr_gamma: float = 5.0,
 ) -> torch.Tensor:
-    """Cached computation of resolution-scaled sigma schedule."""
+    """Cached computation of resolution-scaled sigma schedule with NovelAI improvements."""
+    # Compute resolution scale
     scale = _compute_resolution_scale(height, width)
-    rho = 7.0  # Hardcoded for optimization
-    inv_rho = 1.0 / rho
-    steps = torch.arange(num_steps, dtype=torch.float32)
+    
+    # Apply NovelAI's improved sigma scaling
     scaled_sigma_max = sigma_max * scale
-    sigmas = torch.exp(-steps * inv_rho) * (scaled_sigma_max - sigma_min) + sigma_min
+    scaled_sigma_min = sigma_min * math.sqrt(scale)  # Square root scaling for min sigma
+    
+    # Generate timesteps
+    steps = torch.arange(num_steps, dtype=torch.float32)
+    inv_rho = 1.0 / rho
+    
+    # Compute sigmas with improved scaling
+    sigmas = torch.exp(-steps * inv_rho) * (scaled_sigma_max - scaled_sigma_min) + scaled_sigma_min
+    
+    # Apply SNR clamping
+    snr = _compute_snr(sigmas, 1.0)
+    sigmas = torch.where(
+        snr > min_snr_gamma,
+        torch.sqrt(torch.tensor(1.0 + min_snr_gamma) / snr) * sigmas,
+        sigmas
+    )
+    
     return sigmas
 
 @autocast('cuda')
 def get_sigmas(
     num_inference_steps: int = 28,
     sigma_min: float = 0.0292,
+    sigma_max: float = 14.614,  # SDXL default
     height: int = 1024,
     width: int = 1024,
     device: Optional[torch.device] = None,
+    min_snr_gamma: float = 5.0,
 ) -> torch.Tensor:
-    """Get optimized sigma schedule with resolution scaling."""
+    """Get optimized sigma schedule with SDXL defaults and NovelAI improvements."""
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # Use cached schedule with resolution scaling
-    cache_key = f"sigmas_{num_inference_steps}_{sigma_min}_{height}_{width}"
+    cache_key = f"sigmas_{num_inference_steps}_{sigma_min}_{sigma_max}_{height}_{width}_{min_snr_gamma}"
     if cache_key not in _sigma_cache:
         _sigma_cache[cache_key] = _get_resolution_scaled_sigma_schedule(
             num_inference_steps,
             sigma_min,
-            2000.0,  # Updated sigma_max based on paper
+            sigma_max,
             height,
-            width
+            width,
+            min_snr_gamma=min_snr_gamma
         )
     
     return _sigma_cache[cache_key].to(device)
@@ -113,7 +134,7 @@ def training_loss_v_prediction(
     added_cond_kwargs: Optional[Dict[str, torch.Tensor]] = None,
     return_metrics: bool = False,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """Compute v-prediction loss with maximum optimization."""
+    """Compute v-prediction loss with SDXL and NovelAI optimizations."""
     batch_size = x_0.shape[0]
     device = x_0.device
     height, width = x_0.shape[-2:]
@@ -152,25 +173,18 @@ def training_loss_v_prediction(
         if len(text_embeds.shape) == 3:  # If shape is [batch_size, 1, dim]
             added_cond_kwargs["text_embeds"] = text_embeds.squeeze(1)
     
-    # Debug prints for tensor shapes
-    logger.info(f"Text embeddings shape: {text_embeddings.shape}")
-    logger.info(f"Timesteps buffer shape: {timesteps_buffer.shape}")
-    logger.info(f"Time ids shape: {added_cond_kwargs['time_ids'].shape}")
-    logger.info(f"Added cond kwargs shapes: {[(k, v.shape) for k, v in added_cond_kwargs.items()]}")
-    
     # Forward pass with optimization
     v_pred = apply_model(model, noisy_samples, timesteps_buffer, text_embeddings, added_cond_kwargs)
     
-    # Compute target
+    # Compute target with improved SNR weighting
     v_target = _compute_v_target(noise, sigma)
     
-    # Debug prints for prediction shapes
-    logger.info(f"v_pred shape: {v_pred.shape}")
-    logger.info(f"v_target shape: {v_target.shape}")
-    
-    # Compute weights if needed
+    # Compute weights with NovelAI's improvements
     if use_snr_weighting:
         snr = _compute_snr(sigma, 1.0)
+        # Apply min SNR gamma clamping
+        snr = torch.clamp(snr, max=min_snr_gamma)
+        # Compute weights with scale factor
         weights = _compute_loss_weights(snr, min_snr_gamma, scale_factor)
         weights = weights.view(-1, 1, 1, 1)
     else:
@@ -186,6 +200,8 @@ def training_loss_v_prediction(
             "pred_mean": v_pred.mean().item(),
             "pred_std": v_pred.std().item(),
             "error": torch.abs(v_pred - v_target).mean().item(),
+            "snr": snr.mean().item() if use_snr_weighting else 0.0,
+            "weight_mean": weights.mean().item(),
         }
     
     return loss
