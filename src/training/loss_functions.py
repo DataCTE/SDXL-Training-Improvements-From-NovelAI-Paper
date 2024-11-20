@@ -83,9 +83,9 @@ def _compute_resolution_scale(height: int, width: int, base_resolution: float = 
 def _get_resolution_scaled_sigma_schedule(
     num_steps: int,
     sigma_min: float, 
-    sigma_max: float = None,  # Made optional since ZTSNR uses fixed value
     height: int,
     width: int,
+    sigma_max: Optional[float] = None,  # Moved and made optional
     rho: float = 7.0,  # Karras schedule parameter
     min_snr_gamma: float = 5.0,
     use_ztsnr: bool = True,  # Added flag to toggle ZTSNR
