@@ -175,6 +175,10 @@ def train_vae(
     train_data_dir: Union[str, Path],
     output_dir: Union[str, Path],
     config: VAEConfig,
+    text_encoder1,
+    text_encoder2,
+    tokenizer1,
+    tokenizer2,
     pretrained_model_path: Optional[str] = None,
     **kwargs
 ) -> VAEFinetuner:
@@ -221,14 +225,24 @@ def train_vae(
         # Create empty captions dict (VAE training doesn't need captions)
         train_captions = {path: "" for path in train_image_paths}
         
-        # Create dataloader with proper config parameters
-        logger.info("Creating training dataloader...")
+        # Initialize text cache
+        text_cache = TextEmbeddingCache(
+            text_encoder1=text_encoder1,
+            text_encoder2=text_encoder2,
+            tokenizer1=tokenizer1,
+            tokenizer2=tokenizer2,
+            max_cache_size=config.cache_size,
+            num_workers=config.num_workers,
+            batch_size=config.batch_size
+        )
+        
+        # Create dataloader with text cache
         train_dataloader = create_train_dataloader(
             image_paths=train_image_paths,
             captions=train_captions,
-            config=config,  # Now config will have all required attributes
+            config=config,
             vae_cache=vae_cache,
-            text_cache=None
+            text_cache=text_cache
         )
         
         # Create trainer

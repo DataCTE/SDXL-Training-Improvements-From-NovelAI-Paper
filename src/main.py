@@ -13,7 +13,7 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 from config.args import parse_args
 from training.wrappers import train_sdxl, train_vae
 from utils.logging import setup_logging
-from models.model_loader import load_models, save_diffusers_format, save_checkpoint
+from models.model_loader import load_models, save_diffusers_format, save_checkpoint, create_text_encoders
 from data.image_processing.validation import ValidationConfig
 from models.SDXL.pipeline import StableDiffusionXLPipeline
 import traceback
@@ -53,13 +53,25 @@ def main():
         # Train VAE if enabled
         if config.vae_args.enable_vae_finetuning:
             logger.info("Starting VAE finetuning...")
+            
+            # Create text encoders and tokenizers for VAE training
+            logger.info("Initializing text encoders for VAE training...")
+            text_encoder1, text_encoder2, tokenizer1, tokenizer2 = create_text_encoders(
+                pretrained_model_path=config.pretrained_model_path
+            )
+            
             vae_trainer = train_vae(
                 train_data_dir=config.train_data_dir,
                 output_dir=str(output_dir / "vae"),
                 config=config.vae_args,
+                text_encoder1=text_encoder1,
+                text_encoder2=text_encoder2,
+                tokenizer1=tokenizer1,
+                tokenizer2=tokenizer2,
                 pretrained_model_path=config.pretrained_model_path,
                 validation_config=validation_config
             )
+            
             # Run VAE training
             vae_trainer.train()
             models["vae"] = vae_trainer.vae
