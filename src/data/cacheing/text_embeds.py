@@ -18,7 +18,7 @@ import hashlib
 from transformers import CLIPTextModel, CLIPTokenizer
 from pathlib import Path
 import os
-from .memory import MemoryCache, MemoryManager
+from .memory import MemoryCache
 import random
 import multiprocessing
 from multiprocessing import Manager
@@ -59,7 +59,11 @@ class TextEmbeddingCache:
         self.tokenizer2 = tokenizer2
         
         # Initialize cache and stats
-        self._memory_cache = MemoryCache(max_memory_gb=max_cache_size, cache_dir=cache_dir)
+        self._memory_cache = MemoryCache(
+            max_memory_gb=32.0,
+            max_cache_size=max_cache_size,
+            cache_dir=cache_dir
+        )
         self._batch_size = batch_size
         self._max_cache_size = max_cache_size
         self._stats = {'hits': 0, 'misses': 0}

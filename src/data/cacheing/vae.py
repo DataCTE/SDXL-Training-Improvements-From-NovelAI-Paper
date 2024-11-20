@@ -11,7 +11,7 @@ import logging
 from torch.cuda import amp
 from pathlib import Path
 import os
-from .memory import MemoryCache, MemoryManager
+from .memory import MemoryCache
 from multiprocessing import Manager
 from multiprocessing import Pool
 
