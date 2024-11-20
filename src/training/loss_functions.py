@@ -34,9 +34,35 @@ def _compute_snr(timesteps: torch.Tensor, sigma_data: float) -> torch.Tensor:
     return (sigma_data ** 2) / (timesteps ** 2)
 
 @torch.jit.script
-def _compute_loss_weights(snr: torch.Tensor, min_snr_gamma: float, scale: float) -> torch.Tensor:
-    """JIT-optimized loss weight computation."""
-    return torch.minimum(snr, torch.tensor(min_snr_gamma)).div(snr).mul(scale)
+def _compute_min_snr_weights(
+    sigma: torch.Tensor,
+    sigma_data: float = 1.0,
+    min_snr_gamma: float = 5.0,
+    scale: float = 1.0
+) -> torch.Tensor:
+    """
+    Compute MinSNR loss weights per NAI paper section 2.4.
+    Args:
+        sigma: Noise levels
+        sigma_data: Data standard deviation (typically 1.0)
+        min_snr_gamma: SNR clamping value (default 5.0 per paper)
+        scale: Optional scaling factor
+    Returns:
+        Loss weights tensor
+    """
+    # Compute SNR = (sigma_data/sigma)^2
+    snr = (sigma_data ** 2) / (sigma ** 2)
+    
+    # Clamp SNR and compute weights
+    # w(t) = min(SNR(t), γ) / SNR(t)
+    weights = torch.minimum(snr, torch.tensor(min_snr_gamma, device=sigma.device))
+    weights = weights / snr
+    
+    # Apply optional scaling
+    if scale != 1.0:
+        weights = weights * scale
+        
+    return weights.view(-1, 1, 1, 1)  # Add dims for broadcasting
 
 @lru_cache(maxsize=32)
 def _get_sigma_schedule(num_steps: int, sigma_min: float, sigma_max: float) -> torch.Tensor:
@@ -151,20 +177,16 @@ def training_loss_v_prediction(
     # Forward pass
     v_pred = apply_model(model, noisy_samples, timesteps, text_embeddings, added_cond_kwargs)
     
-    # Compute SNR-based loss weights (NAI3 improvement)
+    # Compute MinSNR loss weights per NAI paper
     if use_snr_weighting:
-        # Compute SNR with improved stability
-        snr = _compute_snr(sigma, 1.0)
-        
-        # Apply NAI3's dynamic SNR clamping
-        snr = torch.clamp(snr, max=min_snr_gamma)
-        
-        # Compute weights with scale factor (NAI3 improvement)
-        weights = scale_factor * torch.minimum(snr, torch.tensor(min_snr_gamma, device=device)) / snr
-        weights = weights.view(-1, 1, 1, 1)
+        weights = _compute_min_snr_weights(
+            sigma,
+            sigma_data=1.0,
+            min_snr_gamma=min_snr_gamma,
+            scale=scale_factor
+        )
     else:
         weights = torch.ones_like(sigma.view(-1, 1, 1, 1))
-        snr = torch.zeros_like(sigma)  # For metrics
     
     # Compute loss with improved numerical stability
     loss = F.mse_loss(v_pred * weights.sqrt(), v_target * weights.sqrt(), reduction='sum') / batch_size
@@ -176,7 +198,7 @@ def training_loss_v_prediction(
             "pred_mean": v_pred.mean().item(),
             "pred_std": v_pred.std().item(),
             "error": torch.abs(v_pred - v_target).mean().item(),
-            "snr": snr.mean().item() if use_snr_weighting else 0.0,
+            "snr": weights.mean().item(),
             "weight_mean": weights.mean().item(),
             "weight_std": weights.std().item(),  # Added for monitoring
             "effective_loss": (weights * (v_pred - v_target) ** 2).mean().item(),  # Added for monitoring
