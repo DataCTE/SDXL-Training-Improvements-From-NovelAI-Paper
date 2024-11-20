@@ -132,10 +132,6 @@ def training_loss_v_prediction(
     # Compute noisy samples efficiently
     noisy_samples = x_0 + noise * sigma.view(-1, 1, 1, 1)
     
-    # Reshape text embeddings if needed
-    if len(text_embeddings.shape) == 4:  # [batch, 1, seq_len, dim]
-        text_embeddings = text_embeddings.squeeze(1)  # Remove the extra dimension
-    
     # Generate time embeddings for SDXL
     if added_cond_kwargs is None:
         added_cond_kwargs = {}
@@ -146,16 +142,9 @@ def training_loss_v_prediction(
             height=height,
             width=width,
             dtype=text_embeddings.dtype,
-            device=device,
-            text_encoder_projection_dim=1280  # SDXL uses fixed 1280 dim
+            device=device
         )
         added_cond_kwargs["time_ids"] = time_ids
-    
-    # Ensure text_embeds has correct shape [batch_size, 1280]
-    if "text_embeds" in added_cond_kwargs:
-        text_embeds = added_cond_kwargs["text_embeds"]
-        if len(text_embeds.shape) == 3:  # If shape is [batch_size, 1, dim]
-            added_cond_kwargs["text_embeds"] = text_embeds.squeeze(1)
     
     # Debug prints for tensor shapes
     logger.info(f"Text embeddings shape: {text_embeddings.shape}")
@@ -361,9 +350,6 @@ def _get_add_time_ids(
     original_size: Optional[Tuple[int, int]] = None,
     crops_coords_top_left: Tuple[int, int] = (0, 0),
     target_size: Optional[Tuple[int, int]] = None,
-    aesthetic_score: float = 6.0,
-    negative_aesthetic_score: float = 2.5,
-    text_encoder_projection_dim: int = 1280,
 ) -> torch.Tensor:
     """Generate time_ids tensor for SDXL conditioning following the official implementation."""
     if original_size is None:
@@ -371,24 +357,14 @@ def _get_add_time_ids(
     if target_size is None:
         target_size = (height, width)
 
-    # SDXL expects the following additional time ids:
+    # SDXL base expects 6 time_ids:
     # 1-2. Original image size (h, w)
     # 3-4. Crop coordinates (top, left)
     # 5-6. Target size (h, w)
-    # 7. Aesthetic score
-    add_time_ids = list(original_size) + list(crops_coords_top_left) + list(target_size) + [aesthetic_score]
+    add_time_ids = list(original_size) + list(crops_coords_top_left) + list(target_size)
     
-    # Create tensor with correct shape [batch_size, dim]
+    # Create tensor with correct shape [batch_size, 6]
     add_time_ids = torch.tensor([add_time_ids], dtype=dtype, device=device)
     add_time_ids = add_time_ids.repeat(batch_size, 1)
-
-    # Pad or truncate to match text encoder projection dim
-    if add_time_ids.shape[1] < text_encoder_projection_dim:
-        # Pad with zeros if needed
-        padding = torch.zeros(batch_size, text_encoder_projection_dim - add_time_ids.shape[1], dtype=dtype, device=device)
-        add_time_ids = torch.cat([add_time_ids, padding], dim=1)
-    else:
-        # Truncate if needed
-        add_time_ids = add_time_ids[:, :text_encoder_projection_dim]
 
     return add_time_ids
