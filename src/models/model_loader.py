@@ -17,6 +17,7 @@ def create_sdxl_models(
     pretrained_model_path: str,
     dtype: torch.dtype = torch.float32,
     device: Optional[torch.device] = None,
+    vae_path: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], StableDiffusionXLPipeline]:
     """Create SDXL models from pretrained weights."""
     try:
@@ -27,10 +28,11 @@ def create_sdxl_models(
         models = {}
         
         # Load VAE
-        models["vae"] = AutoencoderKL.from_pretrained(
-            pretrained_model_path,
-            subfolder="vae",
-            torch_dtype=dtype
+        models["vae"] = create_vae_model(
+            vae_path=vae_path,
+            pretrained_model_path=pretrained_model_path,
+            dtype=dtype,
+            device=device
         )
         
         # Load text encoders and tokenizers
@@ -99,11 +101,14 @@ def load_models(config: TrainingConfig) -> Dict[str, Any]:
         device = getattr(config, "device", torch.device("cuda" if torch.cuda.is_available() else "cpu"))
         dtype = getattr(config, "dtype", torch.float32)
         
+        # Get VAE path from config if available
+        vae_path = getattr(config.vae_args, "vae_path", None) if hasattr(config, "vae_args") else None
+        
         models_dict, _ = create_sdxl_models(
             pretrained_model_path=config.pretrained_model_path,
-            vae_path=getattr(config, "vae_path", None),
             dtype=dtype,
-            device=device
+            device=device,
+            vae_path=vae_path
         )
         
         return models_dict
