@@ -96,6 +96,9 @@ class TextEmbeddingCache:
     def _encode_text(self, text: Union[str, List[str]]) -> Tuple[torch.Tensor, torch.Tensor]:
         """Encode text following SDXL's dual encoder architecture exactly.
         
+        Args:
+            text: Single text string or list of strings
+            
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: 
                 - hidden_states: Combined text embeddings [batch_size, seq_len, 768+1280]
@@ -108,10 +111,11 @@ class TextEmbeddingCache:
         tokens1 = self.tokenizer1(
             text,
             padding="max_length",
-            max_length=77,
+            max_length=77,  # SDXL's max token length
             truncation=True,
             return_tensors="pt"
-        )
+        )  # Returns dict with 'input_ids' and 'attention_mask'
+        
         tokens2 = self.tokenizer2(
             text, 
             padding="max_length",
@@ -120,6 +124,7 @@ class TextEmbeddingCache:
             return_tensors="pt"
         )
 
+        # Move to GPU if available
         if torch.cuda.is_available():
             tokens1 = {k: v.cuda() for k,v in tokens1.items()}
             tokens2 = {k: v.cuda() for k,v in tokens2.items()}
@@ -127,17 +132,13 @@ class TextEmbeddingCache:
         with torch.amp.autocast('cuda'):
             # First encoder (CLIP-L/14)
             outputs1 = self.text_encoder1(
-                input_ids=tokens1.input_ids,
-                attention_mask=tokens1.attention_mask,
-                return_dict=True
+                **tokens1  # Unpack dict properly
             )
             hidden_states1 = outputs1.last_hidden_state  # [batch, 77, 768]
             
             # Second encoder (CLIP-G/14)
             outputs2 = self.text_encoder2(
-                input_ids=tokens2.input_ids,
-                attention_mask=tokens2.attention_mask,
-                return_dict=True
+                **tokens2  # Unpack dict properly
             )
             hidden_states2 = outputs2.last_hidden_state  # [batch, 77, 1280]
             pooled_output = outputs2.pooled_output      # [batch, 1280]
@@ -146,7 +147,7 @@ class TextEmbeddingCache:
             assert hidden_states1.shape[-1] == 768, f"CLIP-L hidden size must be 768, got {hidden_states1.shape[-1]}"
             assert hidden_states2.shape[-1] == 1280, f"CLIP-G hidden size must be 1280, got {hidden_states2.shape[-1]}"
             assert hidden_states1.shape[1] == hidden_states2.shape[1] == 77, f"Sequence length must be 77"
-                
+                    
             # Concatenate along hidden dimension as per SDXL
             combined_hidden = torch.cat([hidden_states1, hidden_states2], dim=-1)
             
@@ -277,7 +278,7 @@ class TextEmbeddingCache:
         if len(self._memory_cache) > self._max_cache_size:
             # Calculate number of items to evict (20% of cache)
             evict_count = max(1, int(self._max_cache_size * 0.2))
-            self._memory_cache._evict_items(evict_count)
+            self._memory_cache.evict(evict_count)
 
     def __delitem__(self, key: str) -> None:
         """Support item deletion."""

@@ -115,10 +115,19 @@ class MemoryCache:
         with self._lock:
             return dict(self._stats)  # Return a copy of stats dict
 
-    def _evict_items(self, count: int = 1) -> None:
-        """Evict oldest items from cache."""
+    def evict(self, count: int = 1) -> None:
+        """Public method to evict items from cache.
+        
+        Args:
+            count: Number of items to evict
+        """
         with self._lock:
             keys_to_evict = list(self._cache.keys())[:count]
             for key in keys_to_evict:
                 self.__delitem__(key)
                 self._stats['evictions'] += 1
+
+    def _evict_items(self, count: int = 1) -> None:
+        """Deprecated: Use evict() instead."""
+        logger.warning("_evict_items is deprecated, use evict() instead")
+        self.evict(count)

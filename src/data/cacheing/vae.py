@@ -95,7 +95,7 @@ class VAECache:
         if len(self._memory_cache) > self._max_cache_size:
             # Calculate number of items to evict (20% of cache)
             evict_count = max(1, int(self._max_cache_size * 0.2))
-            self._memory_cache._evict_items(evict_count)
+            self._memory_cache.evict(evict_count)
     
     @torch.no_grad()
     def _encode_batch(self, images: torch.Tensor) -> torch.Tensor:
