@@ -47,6 +47,16 @@ class EMAConfig:
     warmup_steps: int = DEFAULTS["ema"]["warmup_steps"]
 
 @dataclass
+class TagWeightingConfig:
+    token_dropout_rate: float = DEFAULTS["tag_weighting"]["token_dropout_rate"]
+    caption_dropout_rate: float = DEFAULTS["tag_weighting"]["caption_dropout_rate"]
+    rarity_factor: float = DEFAULTS["tag_weighting"]["rarity_factor"]
+    emphasis_factor: float = DEFAULTS["tag_weighting"]["emphasis_factor"]
+    min_tag_freq: int = DEFAULTS["tag_weighting"]["min_tag_freq"]
+    min_cluster_size: int = DEFAULTS["tag_weighting"]["min_cluster_size"]
+    similarity_threshold: float = DEFAULTS["tag_weighting"]["similarity_threshold"]
+
+@dataclass
 class VAEConfig:
     enable_vae_finetuning: bool = DEFAULTS["vae"]["enable_vae_finetuning"]
     vae_path: Optional[str] = None
@@ -77,16 +87,9 @@ class VAEConfig:
     keep_tokens: int = DEFAULTS["vae"]["keep_tokens"]
     caption_dropout_probability: float = 0.0
     caption_tag_dropout_probability: float = 0.0
+    tag_weighting: TagWeightingConfig = field(default_factory=TagWeightingConfig)
 
-@dataclass
-class TagWeightingConfig:
-    token_dropout_rate: float = DEFAULTS["tag_weighting"]["token_dropout_rate"]
-    caption_dropout_rate: float = DEFAULTS["tag_weighting"]["caption_dropout_rate"]
-    rarity_factor: float = DEFAULTS["tag_weighting"]["rarity_factor"]
-    emphasis_factor: float = DEFAULTS["tag_weighting"]["emphasis_factor"]
-    min_tag_freq: int = DEFAULTS["tag_weighting"]["min_tag_freq"]
-    min_cluster_size: int = DEFAULTS["tag_weighting"]["min_cluster_size"]
-    similarity_threshold: float = DEFAULTS["tag_weighting"]["similarity_threshold"]
+
 
 @dataclass
 class WandBConfig:
@@ -407,14 +410,14 @@ def parse_args() -> TrainingConfig:
     config.vae_args.mixed_precision = args.vae_mixed_precision
     config.vae_args.num_workers = args.num_workers
     
-    # Update Tag Weighting config
-    config.tag_weighting.token_dropout_rate = args.token_dropout_rate
-    config.tag_weighting.caption_dropout_rate = args.caption_dropout_rate
-    config.tag_weighting.rarity_factor = args.rarity_factor
-    config.tag_weighting.emphasis_factor = args.emphasis_factor
-    config.tag_weighting.min_tag_freq = args.min_tag_freq
-    config.tag_weighting.min_cluster_size = args.min_cluster_size
-    config.tag_weighting.similarity_threshold = args.similarity_threshold
+    # Add tag weighting configuration to VAE config
+    config.vae_args.tag_weighting.token_dropout_rate = args.token_dropout_rate
+    config.vae_args.tag_weighting.caption_dropout_rate = args.caption_dropout_rate
+    config.vae_args.tag_weighting.rarity_factor = args.rarity_factor
+    config.vae_args.tag_weighting.emphasis_factor = args.emphasis_factor
+    config.vae_args.tag_weighting.min_tag_freq = args.min_tag_freq
+    config.vae_args.tag_weighting.min_cluster_size = args.min_cluster_size
+    config.vae_args.tag_weighting.similarity_threshold = args.similarity_threshold
     
     # Update caching config
     config.caching.vae_cache_size = args.vae_cache_size
