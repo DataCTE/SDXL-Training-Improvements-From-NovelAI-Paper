@@ -12,7 +12,7 @@ import logging
 from .memory import MemoryCache
 import multiprocessing
 from multiprocessing import Pool
-
+import hashlib
 
 
 logger = logging.getLogger(__name__)
