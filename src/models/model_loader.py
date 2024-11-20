@@ -15,7 +15,6 @@ logger = logging.getLogger(__name__)
 
 def create_sdxl_models(
     pretrained_model_path: str,
-    vae_path: Optional[str] = None,
     dtype: torch.dtype = torch.float32,
     device: Optional[torch.device] = None,
 ) -> Tuple[Dict[str, Any], StableDiffusionXLPipeline]:
@@ -201,7 +200,8 @@ def load_checkpoint(checkpoint_path: str, models: Dict[str, Any]) -> Dict[str, A
 
 
 def create_vae_model(
-    vae_path: str,
+    vae_path: Optional[str] = None,
+    pretrained_model_path: Optional[str] = None,
     dtype: torch.dtype = torch.float32,
     device: Optional[torch.device] = None,
     use_safetensors: bool = True,
@@ -210,7 +210,8 @@ def create_vae_model(
     """Create VAE model from pretrained weights.
     
     Args:
-        vae_path: Path to pretrained VAE weights
+        vae_path: Path to pretrained VAE weights (optional)
+        pretrained_model_path: Path to pretrained model containing VAE (optional)
         dtype: Data type for model parameters
         device: Device to load model on
         use_safetensors: Whether to use safetensors format
@@ -220,25 +221,30 @@ def create_vae_model(
         Initialized AutoencoderKL model
         
     Raises:
-        ValueError: If vae_path is invalid
         RuntimeError: If model loading fails
     """
     try:
-        if not vae_path:
-            raise ValueError("VAE path cannot be empty")
-            
-        # Set default device if none provided
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             
-        # Load VAE with configuration
-        vae = AutoencoderKL.from_pretrained(
-            vae_path,
-            torch_dtype=dtype,
-            use_safetensors=use_safetensors,
-            force_upcast=force_upcast
-        )
-        
+        # Try loading from VAE path first
+        if vae_path:
+            vae = AutoencoderKL.from_pretrained(
+                vae_path,
+                torch_dtype=dtype,
+                use_safetensors=use_safetensors,
+                force_upcast=force_upcast
+            )
+        # Fall back to pretrained model path
+        elif pretrained_model_path:
+            vae = AutoencoderKL.from_pretrained(
+                pretrained_model_path,
+                subfolder="vae",
+                torch_dtype=dtype
+            )
+        else:
+            raise ValueError("Either vae_path or pretrained_model_path must be provided")
+            
         # Move to device and set dtype
         if device:
             vae = vae.to(device=device, dtype=dtype)
@@ -247,11 +253,11 @@ def create_vae_model(
         if hasattr(vae, "enable_xformers_memory_efficient_attention"):
             vae.enable_xformers_memory_efficient_attention()
             
-        logger.info(f"Successfully loaded VAE from {vae_path}")
+        logger.info(f"Successfully loaded VAE from {'vae_path' if vae_path else 'pretrained model'}")
         return vae
         
     except Exception as e:
-        logger.error(f"Failed to load VAE from {vae_path}: {str(e)}")
+        logger.error(f"Failed to load VAE: {str(e)}")
         logger.error(f"Traceback:\n{traceback.format_exc()}")
         raise RuntimeError(f"VAE loading failed: {str(e)}")
 
