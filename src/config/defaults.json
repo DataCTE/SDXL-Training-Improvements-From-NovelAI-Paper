@@ -20,7 +20,14 @@
       "device": "cuda",
       "cache_size": 10000,
       "max_resolution": 2048,
-      "resolution_type": "pixel"
+      "resolution_type": "pixel",
+      "use_min_snr": true,
+      "min_snr_gamma": 5.0,
+      "use_ztsnr": true,
+      "ztsnr_sigma": 20000.0,
+      "sigma_min": 0.002,
+      "sigma_max": null,
+      "rho": 7.0
     },
     "optimizer": {
       "learning_rate": 1e-5,

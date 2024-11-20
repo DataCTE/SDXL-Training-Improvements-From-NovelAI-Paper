@@ -119,10 +119,10 @@ class CachingConfig:
 @dataclass
 class TrainingConfig:
     # Required parameters
-    pretrained_model_path: str  # Changed from model_path
+    pretrained_model_path: str  
     train_data_dir: str  
     
-    # Output configuration
+    # Training parameters
     output_dir: str = DEFAULTS["training"]["output_dir"]
     cache_dir: Optional[str] = None
     no_caching: bool = False
@@ -148,6 +148,8 @@ class TrainingConfig:
     # Model and training mode configuration
     training_mode: str = DEFAULTS["training"]["training_mode"]
     mixed_precision: str = DEFAULTS["training"]["mixed_precision"]
+    
+    # Model settings
     gradient_checkpointing: bool = DEFAULTS["training"]["gradient_checkpointing"]
     use_8bit_adam: bool = DEFAULTS["training"]["use_8bit_adam"]
     use_ema: bool = DEFAULTS["training"]["use_ema"]
@@ -158,6 +160,26 @@ class TrainingConfig:
     compile_mode: str = DEFAULTS["training"]["compile_mode"]
     num_workers: int = DEFAULTS["training"]["num_workers"]
     device: str = DEFAULTS["training"]["device"]
+    cache_size: int = DEFAULTS["training"]["cache_size"]
+    
+    # Resolution settings
+    max_resolution: int = DEFAULTS["training"]["max_resolution"]
+    resolution_type: str = DEFAULTS["training"]["resolution_type"]
+    
+    # Training improvements
+    use_min_snr: bool = DEFAULTS["training"]["use_min_snr"]
+    min_snr_gamma: float = DEFAULTS["training"]["min_snr_gamma"]
+    use_ztsnr: bool = DEFAULTS["training"]["use_ztsnr"]
+    ztsnr_sigma: float = DEFAULTS["training"]["ztsnr_sigma"]
+    
+    # EDM settings
+    sigma_min: float = DEFAULTS["training"]["sigma_min"]
+    sigma_max: Optional[float] = DEFAULTS["training"]["sigma_max"]
+    rho: float = DEFAULTS["training"]["rho"]
+    
+    # Inference settings
+    num_inference_steps: int = DEFAULTS["validation"]["num_inference_steps"]
+    guidance_scale: float = DEFAULTS["validation"]["guidance_scale"]
     
     # Component configurations
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
@@ -168,9 +190,11 @@ class TrainingConfig:
     tag_weighting: TagWeightingConfig = field(default_factory=TagWeightingConfig)
     caching: CachingConfig = field(default_factory=CachingConfig)
     
-    # Validation parameters
+    # Validation settings
     validation_epochs: int = DEFAULTS["validation"]["validation_epochs"]
-    validation_prompts: Optional[List[str]] = field(default_factory=lambda: DEFAULTS["validation"]["prompts"])
+    validation_prompts: List[str] = field(
+        default_factory=lambda: DEFAULTS["validation"]["prompts"]
+    )
     validation_num_inference_steps: int = DEFAULTS["validation"]["num_inference_steps"]
     validation_guidance_scale: float = DEFAULTS["validation"]["guidance_scale"]
     validation_image_height: int = DEFAULTS["validation"]["height"]
@@ -191,12 +215,10 @@ class TrainingConfig:
 
     @property
     def use_wandb(self) -> bool:
-        """Helper property to access wandb.use_wandb directly."""
         return self.wandb.use_wandb
 
     @property
     def wandb_enabled(self) -> bool:
-        """Helper property to check if wandb is properly configured."""
         return self.wandb.use_wandb and self.wandb.project is not None
 
 def parse_args() -> TrainingConfig:
