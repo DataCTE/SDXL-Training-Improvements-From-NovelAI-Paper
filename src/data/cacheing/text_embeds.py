@@ -8,20 +8,9 @@ mixed precision, and efficient memory management.
 import torch
 import torch.nn as nn
 from typing import Dict, List, Optional, Tuple, Union
-import numpy as np
-from concurrent.futures import ThreadPoolExecutor
-import threading
-from collections import OrderedDict
 import logging
-from torch.cuda import amp
-import hashlib
-from transformers import CLIPTextModel, CLIPTokenizer
-from pathlib import Path
-import os
 from .memory import MemoryCache
-import random
 import multiprocessing
-from multiprocessing import Manager
 from multiprocessing import Pool
 
 
@@ -102,74 +91,51 @@ class TextEmbeddingCache:
             
         return pooled, hidden
 
-    def encode_text(self, text_input: Union[str, List[str]]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Get text embeddings with matching dimensions.
+    def encode(self, text_input: str) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Encode text input to embeddings.
         
+        Args:
+            text_input: Text to encode
+            
         Returns:
             Tuple of (pooled_embeddings, hidden_state_embeddings)
             Both with shape (batch, sequence_length, hidden_dim)
         """
-        # Convert single string to list
-        if isinstance(text_input, str):
-            text_input = [text_input]
-            
-        # Check cache for each text
-        embed1_list = []
-        embed2_list = []
-        uncached_indices = []
-        uncached_texts = []
+        # Check cache first
+        key = self._get_cache_key(text_input)
+        cached = self._memory_cache.get(key)
         
-        for i, text in enumerate(text_input):
-            key = self._get_cache_key(text)
-            cached = self._memory_cache.get(key)
-            
-            if cached is not None:
-                embed1, embed2 = cached
-                embed1_list.append(embed1)
-                embed2_list.append(embed2)
-                self._stats['hits'] += 1
-            else:
-                uncached_indices.append(i)
-                uncached_texts.append(text)
-                self._stats['misses'] += 1
-                
-        # Process uncached texts
-        if uncached_texts:
-            for text in uncached_texts:
-                # Generate embeddings
-                pooled1, hidden1 = self._process_embeddings(
-                    self.text_encoder1, 
-                    self.tokenizer1,
-                    text,
-                    self.device
-                )
-                
-                pooled2, hidden2 = self._process_embeddings(
-                    self.text_encoder2,
-                    self.tokenizer2, 
-                    text,
-                    self.device
-                )
+        if cached is not None:
+            self._stats['hits'] += 1
+            return cached
+        
+        self._stats['misses'] += 1
+        
+        # Generate embeddings for uncached text
+        pooled1, hidden1 = self._process_embeddings(
+            self.text_encoder1,
+            self.tokenizer1,
+            text_input, 
+            self.device
+        )
+        
+        pooled2, hidden2 = self._process_embeddings(
+            self.text_encoder2,
+            self.tokenizer2,
+            text_input,
+            self.device
+        )
 
-                # Concatenate embeddings
-                result = (
-                    torch.cat([pooled1, pooled2], dim=-1),  # Concatenate pooled embeddings
-                    torch.cat([hidden1, hidden2], dim=-1)   # Concatenate hidden states
-                )
-                
-                # Store in cache
-                key = self._get_cache_key(text)
-                self._memory_cache.put(key, result)
-                
-                # Add to results
-                embed1_list.append(result[0])
-                embed2_list.append(result[1])
+        # Concatenate embeddings
+        result = (
+            torch.cat([pooled1, pooled2], dim=-1),  # Concatenate pooled embeddings
+            torch.cat([hidden1, hidden2], dim=-1)   # Concatenate hidden states
+        )
         
-        # Stack results
-        final_pooled = torch.cat(embed1_list, dim=0)
-        final_hidden = torch.cat(embed2_list, dim=0)
+        # Store in cache
+        self._memory_cache.put(key, result)
         
-        return final_pooled, final_hidden
+        return result
 
     def _get_cache_key(self, text: str) -> str:
         """Generate cache key for text input."""
