@@ -248,72 +248,59 @@ def forward_pass(
     device: torch.device,
     dtype: torch.dtype,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """Execute forward pass with detailed metrics."""
     # Get models
     unet = model_dict["unet"]
     text_encoder = model_dict.get("text_encoder")
     text_encoder_2 = model_dict.get("text_encoder_2")
     
-    # Validate batch contents
-    required_keys = ["pixel_values"]
-    missing_keys = [key for key in required_keys if key not in batch]
-    if missing_keys:
-        raise ValueError(f"Missing required keys in batch: {missing_keys}")
-        
-    # Move batch to device efficiently
+    # Get hidden dimension from UNet config
+    hidden_dim = unet.config.cross_attention_dim  # Should be 2048 for SDXL
+    
+    # Validate and process batch
     pixel_values = batch["pixel_values"].to(device=device, dtype=dtype, non_blocking=True)
     
-    # Handle text embeddings if present in batch
+    # Handle text embeddings
     if "text_embeddings" in batch and "pooled_text_embeddings" in batch:
-        # Use pre-computed embeddings
         text_embeddings = batch["text_embeddings"].to(device=device, non_blocking=True)
         pooled_text_embeddings = batch["pooled_text_embeddings"].to(device=device, non_blocking=True)
     else:
-        # Check for input IDs
         if "input_ids" not in batch:
             raise KeyError("Batch must contain either 'text_embeddings' or 'input_ids'")
-            
-        # Get input IDs
         input_ids = batch["input_ids"].to(device=device, non_blocking=True)
         input_ids_2 = batch.get("input_ids_2", input_ids).to(device=device, non_blocking=True)
         
-        # Compute text embeddings with caching
-        cache_key = f"{input_ids.shape}_{input_ids_2.shape}"
-        if cache_key not in _buffers:
-            with torch.no_grad():
-                text_embeddings = text_encoder(input_ids)[0]
-                text_embeddings_2 = text_encoder_2(input_ids_2)[0]
-                pooled_text_embeddings = text_embeddings_2[:, -1]
-                text_embeddings = torch.cat([text_embeddings, text_embeddings_2], dim=-1)
-            _buffers[cache_key] = (text_embeddings, pooled_text_embeddings)
-        else:
-            text_embeddings, pooled_text_embeddings = _buffers[cache_key]
-    
-    # Prepare added conditions with time_ids
+        with torch.no_grad():
+            text_embeddings = text_encoder(input_ids)[0]
+            text_embeddings_2 = text_encoder_2(input_ids_2)[0]
+            pooled_text_embeddings = text_embeddings_2[:, -1]
+            text_embeddings = torch.cat([text_embeddings, text_embeddings_2], dim=-1)
+
+    # Get batch size and dimensions
     batch_size = pixel_values.shape[0]
     height, width = pixel_values.shape[-2:]
     
-    added_cond_kwargs = {
-        "text_embeds": pooled_text_embeddings,
-        "time_ids": _get_add_time_ids(
-            batch_size=batch_size,
-            height=height,
-            width=width,
-            dtype=dtype,
-            device=device
-        )
-    }
-    
-    # Get sigmas efficiently
-    sigmas = get_sigmas(
+    # Get time IDs with proper hidden dimension
+    time_ids = _get_add_time_ids(
+        batch_size=batch_size,
         height=height,
         width=width,
-        device=device
+        dtype=dtype,
+        device=device,
+        hidden_dim=hidden_dim,
+        text_encoder_projection_dim=text_encoder_2.config.projection_dim if text_encoder_2 else None
     )
+
+    # Prepare added conditions
+    added_cond_kwargs = {
+        "text_embeds": pooled_text_embeddings,
+        "time_ids": time_ids
+    }
+
+    # Get sigmas and compute loss
+    sigmas = get_sigmas(height=height, width=width, device=device)
     sigma = sigmas[0]
-    
-    # Compute loss with detailed metrics
-    loss, v_pred_metrics = training_loss_v_prediction(
+
+    loss, metrics = training_loss_v_prediction(
         model=unet,
         x_0=pixel_values,
         sigma=sigma,
@@ -324,19 +311,16 @@ def forward_pass(
         added_cond_kwargs=added_cond_kwargs,
         return_metrics=True
     )
-    
-    # Gather forward pass metrics
-    metrics = {
-        "v_pred/target_mean": v_pred_metrics["target_mean"],
-        "v_pred/target_std": v_pred_metrics["target_std"],
-        "v_pred/pred_mean": v_pred_metrics["pred_mean"],
-        "v_pred/pred_std": v_pred_metrics["pred_std"],
-        "v_pred/error": v_pred_metrics["error"],
+
+    return loss, {
+        "v_pred/target_mean": metrics["target_mean"],
+        "v_pred/target_std": metrics["target_std"], 
+        "v_pred/pred_mean": metrics["pred_mean"],
+        "v_pred/pred_std": metrics["pred_std"],
+        "v_pred/error": metrics["error"],
         "sigma/value": sigma.mean().item(),
         "embeddings/norm": text_embeddings.norm().item(),
     }
-    
-    return loss, metrics
 
 def clear_caches() -> None:
     """Clear all caches and buffers."""
