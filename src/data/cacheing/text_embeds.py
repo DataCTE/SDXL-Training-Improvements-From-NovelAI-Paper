@@ -111,10 +111,10 @@ class TextEmbeddingCache:
         tokens1 = self.tokenizer1(
             text,
             padding="max_length",
-            max_length=77,  # SDXL's max token length
+            max_length=77,
             truncation=True,
             return_tensors="pt"
-        )  # Returns dict with 'input_ids' and 'attention_mask'
+        )
         
         tokens2 = self.tokenizer2(
             text, 
@@ -131,22 +131,22 @@ class TextEmbeddingCache:
             
         with torch.amp.autocast('cuda'):
             # First encoder (CLIP-L/14)
-            outputs1 = self.text_encoder1(
-                **tokens1  # Unpack dict properly
-            )
+            outputs1 = self.text_encoder1(**tokens1)
             hidden_states1 = outputs1.last_hidden_state  # [batch, 77, 768]
             
             # Second encoder (CLIP-G/14)
-            outputs2 = self.text_encoder2(
-                **tokens2  # Unpack dict properly
-            )
+            outputs2 = self.text_encoder2(**tokens2)
             hidden_states2 = outputs2.last_hidden_state  # [batch, 77, 1280]
-            pooled_output = outputs2.pooled_output      # [batch, 1280]
+            
+            # Get pooled output from second encoder's last hidden state
+            # Take the first token's embedding (CLS token) as pooled representation
+            pooled_output = hidden_states2[:, 0]  # [batch, 1280]
             
             # Verify shapes match SDXL exactly
             assert hidden_states1.shape[-1] == 768, f"CLIP-L hidden size must be 768, got {hidden_states1.shape[-1]}"
             assert hidden_states2.shape[-1] == 1280, f"CLIP-G hidden size must be 1280, got {hidden_states2.shape[-1]}"
             assert hidden_states1.shape[1] == hidden_states2.shape[1] == 77, f"Sequence length must be 77"
+            assert pooled_output.shape[-1] == 1280, f"Pooled output size must be 1280, got {pooled_output.shape[-1]}"
                     
             # Concatenate along hidden dimension as per SDXL
             combined_hidden = torch.cat([hidden_states1, hidden_states2], dim=-1)

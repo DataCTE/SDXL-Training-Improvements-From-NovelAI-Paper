@@ -2,11 +2,7 @@
 
 import torch
 import torch.nn as nn
-from typing import Dict, Optional, Tuple, Union
-import numpy as np
-from concurrent.futures import ThreadPoolExecutor
-import threading
-from collections import OrderedDict
+from typing import Dict, Optional
 import logging
 from torch.cuda import amp
 from pathlib import Path
