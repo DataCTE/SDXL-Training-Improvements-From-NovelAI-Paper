@@ -85,12 +85,25 @@ def train_sdxl(
     
     train_captions = load_captions(train_image_paths)
     
-    # Create train dataset
-    logger.info("Creating training dataset...")
+    # Create bucket manager for training
+    bucket_manager = BucketManager(
+        max_resolution=config.max_resolution,
+        min_batch_size=1,
+        max_batch_size=config.batch_size,
+        num_workers=config.num_workers
+    )
+    
+    # Add training images to bucket manager
+    for path in train_image_paths:
+        with Image.open(path) as img:
+            width, height = img.size
+        bucket_manager.add_image(path, width, height)
+    
+    # Create train dataset with bucket manager
     train_dataset = MultiAspectDataset(
         image_paths=train_image_paths,
         captions=train_captions,
-        bucket_manager=None,  # Will be created internally
+        bucket_manager=bucket_manager,  # Pass the initialized bucket manager
         vae_cache=vae_cache,
         text_cache=text_embedding_cache,
         num_workers=config.num_workers,
@@ -230,11 +243,25 @@ def train_vae(
         max_memory_gb=config.max_memory_gb
     )
     
-    # Create dataset
+    # Create bucket manager for training
+    bucket_manager = BucketManager(
+        max_resolution=config.max_resolution,
+        min_batch_size=1,
+        max_batch_size=config.batch_size,
+        num_workers=config.num_workers
+    )
+    
+    # Add training images to bucket manager
+    for path in train_image_paths:
+        with Image.open(path) as img:
+            width, height = img.size
+        bucket_manager.add_image(path, width, height)
+    
+    # Create train dataset with bucket manager
     train_dataset = MultiAspectDataset(
         image_paths=train_image_paths,
         captions=train_captions,
-        bucket_manager=None,
+        bucket_manager=bucket_manager,  # Pass the initialized bucket manager
         vae_cache=vae_cache,
         text_cache=text_cache,
         num_workers=config.num_workers,
