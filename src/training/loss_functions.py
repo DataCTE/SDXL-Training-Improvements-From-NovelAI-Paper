@@ -1,168 +1,123 @@
-"""Ultra-optimized loss functions with maximum GPU acceleration."""
+"""Ultra-optimized loss functions implementing NAI's SDXL improvements."""
 
 import torch
 import torch.nn.functional as F
 from torch.amp import autocast
 import logging
-from typing import Dict, Any, Optional, Tuple, Union
-import torch.nn as nn
-from functools import lru_cache
+from typing import Dict, Any, Optional, Tuple
 import math
 
 logger = logging.getLogger(__name__)
 
-# Pre-allocated buffers for common operations - properly typed and initialized
+# Pre-allocated buffers
 _buffers: Dict[str, torch.Tensor] = {}
 _sigma_cache: Dict[str, torch.Tensor] = {}
-_scheduler_buffers: Dict[str, torch.Tensor] = {}
-
 
 @torch.jit.script
-def _compute_v_target(noise: torch.Tensor, sigma: torch.Tensor, sigma_data: float = 1.0) -> torch.Tensor:
+def _compute_v_target(noise: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
     """
     Compute v-prediction target per NAI paper section 2.1.
     Transitions from ε-prediction to x0-prediction as SNR changes.
+    Args:
+        noise: Noise tensor [B, C, H, W]
+        sigma: Noise levels [B]
+    Returns:
+        v-target tensor [B, C, H, W]
     """
-    # v = ε * σ_data / sqrt(σ² + σ_data²)
+    sigma_data = 1.0  # Fixed data variance
     return noise * sigma_data / (sigma ** 2 + sigma_data ** 2) ** 0.5
 
 @torch.jit.script
-def _compute_snr(sigma: torch.Tensor, sigma_data: float = 1.0) -> torch.Tensor:
+def _compute_snr(sigma: torch.Tensor) -> torch.Tensor:
     """
-    Compute Signal-to-Noise Ratio (SNR) with support for Zero Terminal SNR.
-    
+    Compute Signal-to-Noise Ratio (SNR).
     Args:
-        sigma: Noise levels
-        sigma_data: Data standard deviation (typically 1.0)
+        sigma: Noise levels [B]
     Returns:
-        SNR tensor
+        SNR tensor [B]
     """
-    # SNR = (σ_data/σ)^2
-    # Handle potential numerical instability at very high sigmas
-    snr = (sigma_data**2) / (sigma**2 + 1e-8)  # Add small epsilon for stability
-    return snr
+    sigma_data = 1.0
+    return (sigma_data ** 2) / (sigma ** 2)
 
 @torch.jit.script
-def _compute_min_snr_weights(
-    sigma: torch.Tensor,
-    sigma_data: float = 1.0,
-    min_snr_gamma: float = 5.0,
-    scale: float = 1.0
-) -> torch.Tensor:
+def _compute_min_snr_weights(sigma: torch.Tensor, min_snr_gamma: float, scale: float) -> torch.Tensor:
     """
     Compute MinSNR loss weights per NAI paper section 2.4.
     Args:
-        sigma: Noise levels
-        sigma_data: Data standard deviation (typically 1.0)
-        min_snr_gamma: SNR clamping value (default 5.0 per paper)
+        sigma: Noise levels [B]
+        min_snr_gamma: SNR clamping value (default 5.0)
         scale: Optional scaling factor
     Returns:
-        Loss weights tensor
+        Loss weights tensor [B, 1, 1, 1]
     """
-    # Compute SNR = (sigma_data/sigma)^2
-    snr = (sigma_data ** 2) / (sigma ** 2)
-    
-    # Clamp SNR and compute weights
-    # w(t) = min(SNR(t), γ) / SNR(t)
+    snr = _compute_snr(sigma)
     weights = torch.minimum(snr, torch.tensor(min_snr_gamma, device=sigma.device))
     weights = weights / snr
-    
-    # Apply optional scaling
-    if scale != 1.0:
-        weights = weights * scale
-        
-    return weights.view(-1, 1, 1, 1)  # Add dims for broadcasting
-
+    weights = weights * scale
+    return weights.view(-1, 1, 1, 1)
 
 @torch.jit.script
-def _compute_resolution_scale(height: int, width: int, base_resolution: float = 1024.0) -> float:
-    """JIT-optimized resolution scale computation."""
-    return math.sqrt((float(height) * float(width)) / (base_resolution * base_resolution))
-
-@lru_cache(maxsize=32)
-def _get_resolution_scaled_sigma_schedule(
-    num_steps: int,
-    sigma_min: float, 
-    height: int,
-    width: int,
-    sigma_max: Optional[float] = None,  # Moved and made optional
-    rho: float = 7.0,  # Karras schedule parameter
-    min_snr_gamma: float = 5.0,
-    use_ztsnr: bool = True,  # Added flag to toggle ZTSNR
-    ztsnr_sigma: float = 20000.0,  # NAI practical ZTSNR approximation
-) -> torch.Tensor:
+def _compute_resolution_scale(height: int, width: int) -> float:
     """
-    Compute sigma schedule with NAI's resolution-based scaling and ZTSNR support.
-    
+    Compute resolution-based sigma scaling per NAI paper section 2.3.
     Args:
-        num_steps: Number of diffusion steps
-        sigma_min: Minimum noise level
-        sigma_max: Maximum noise level (used when ZTSNR is disabled)
         height: Image height
         width: Image width
-        rho: Karras schedule parameter
-        min_snr_gamma: SNR clamping value
-        use_ztsnr: Whether to use Zero Terminal SNR (NAI section 2.2)
-        ztsnr_sigma: Sigma value for ZTSNR approximation
     Returns:
-        Tensor of sigma values
+        Resolution scale factor
+    """
+    base_res = 1024.0
+    return math.sqrt((float(height) * float(width)) / (base_res * base_res))
+
+def _get_resolution_scaled_sigma_schedule(
+    num_steps: int,
+    height: int,
+    width: int,
+    sigma_min: float = 0.0292,
+    rho: float = 7.0,
+) -> torch.Tensor:
+    """
+    Compute sigma schedule with NAI's resolution scaling and ZTSNR.
+    Args:
+        num_steps: Number of diffusion steps
+        height: Image height
+        width: Image width
+        sigma_min: Minimum noise level
+        rho: Karras schedule parameter
+    Returns:
+        Tensor of sigma values [num_steps]
     """
     # Resolution-based scaling (NAI section 2.3)
     scale = _compute_resolution_scale(height, width)
+    scaled_sigma_min = sigma_min * math.sqrt(scale)
     
-    # Apply NAI's adaptive sigma scaling
-    scaled_sigma_min = sigma_min * math.sqrt(scale)  # Square root scaling for min sigma
+    # Use fixed ZTSNR value (NAI appendix A.2)
+    sigma_max = 20000.0
     
-    # Choose max sigma based on ZTSNR setting (NAI section 2.2)
-    if use_ztsnr:
-        scaled_sigma_max = ztsnr_sigma  # Use fixed ZTSNR value
-    else:
-        scaled_sigma_max = sigma_max * scale if sigma_max else ztsnr_sigma
-    
-    # Generate timesteps with improved spacing
+    # Generate timesteps
     steps = torch.linspace(0, num_steps - 1, num_steps, dtype=torch.float32)
-    inv_rho = 1.0 / rho
-    
-    # Compute sigmas with NAI's improvements
-    sigmas = torch.exp(-steps * inv_rho)
-    sigmas = sigmas * (scaled_sigma_max - scaled_sigma_min) + scaled_sigma_min
-    
-    # Apply dynamic SNR clamping (NAI improvement)
-    snr = _compute_snr(sigmas, 1.0)
-    sigmas = torch.where(
-        snr > min_snr_gamma,
-        torch.sqrt((1.0 + min_snr_gamma) / snr) * sigmas,
-        sigmas
-    )
+    sigmas = torch.exp(-steps / rho)
+    sigmas = sigmas * (sigma_max - scaled_sigma_min) + scaled_sigma_min
     
     return sigmas
 
 @autocast('cuda')
 def get_sigmas(
-    num_inference_steps: int = 28,
-    sigma_min: float = 0.0292,
-    sigma_max: float = 20000.0,  # Changed to NAI's ZTSNR value
-    height: int = 1024,
-    width: int = 1024,
+    num_inference_steps: int,
+    height: int,
+    width: int,
     device: Optional[torch.device] = None,
-    min_snr_gamma: float = 5.0,
-    use_ztsnr: bool = True,  # Added ZTSNR flag
 ) -> torch.Tensor:
-    """Get optimized sigma schedule with SDXL defaults and NovelAI improvements."""
+    """Get optimized sigma schedule with NAI improvements."""
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Use cached schedule with resolution scaling
-    cache_key = f"sigmas_{num_inference_steps}_{sigma_min}_{sigma_max}_{height}_{width}_{min_snr_gamma}_{use_ztsnr}"
+    cache_key = f"sigmas_{num_inference_steps}_{height}_{width}"
     if cache_key not in _sigma_cache:
         _sigma_cache[cache_key] = _get_resolution_scaled_sigma_schedule(
             num_inference_steps,
-            sigma_min,
             height,
-            width,
-            sigma_max=sigma_max,
-            min_snr_gamma=min_snr_gamma,
-            use_ztsnr=use_ztsnr
+            width
         )
     
     return _sigma_cache[cache_key].to(device)
@@ -170,42 +125,39 @@ def get_sigmas(
 @autocast('cuda')
 def training_loss_v_prediction(
     model: torch.nn.Module,
-    x_0: torch.Tensor,
-    sigma: torch.Tensor,
-    text_embeddings: torch.Tensor,
-    noise: Optional[torch.Tensor] = None,
-    use_snr_weighting: bool = True,
+    x_0: torch.Tensor,  # [B, C, H, W]
+    sigma: torch.Tensor,  # [B]
+    text_embeddings: torch.Tensor,  # [B, 77, D]
+    noise: torch.Tensor,  # [B, C, H, W]
+    added_cond_kwargs: Dict[str, torch.Tensor],  # {"text_embeds": [B, 1, D], "time_ids": [B, 6]}
     min_snr_gamma: float = 5.0,
     scale_factor: float = 1.0,
-    added_cond_kwargs: Optional[Dict[str, torch.Tensor]] = None,
     return_metrics: bool = False,
-    optimizer_type: str = "lion"
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
-    Compute v-prediction loss with NAI improvements and Lion support.
+    Compute v-prediction loss with NAI improvements.
+    Args:
+        model: UNet model
+        x_0: Input images
+        sigma: Noise levels
+        text_embeddings: Text condition embeddings
+        noise: Gaussian noise
+        added_cond_kwargs: Additional conditioning (text_embeds, time_ids)
+        min_snr_gamma: SNR clamping value
+        scale_factor: Loss scaling factor
+        return_metrics: Whether to return additional metrics
+    Returns:
+        loss: Training loss
+        metrics: Optional dict of metrics if return_metrics=True
     """
-    # Scale sigma based on resolution
+    # Scale sigma based on resolution [B]
     height, width = x_0.shape[-2:]
     sigma = sigma * _compute_resolution_scale(height, width)
     
-    # Generate noise if not provided
-    if noise is None:
-        noise = torch.randn_like(x_0)
-    
-    # Add noise to input
+    # Add noise to input [B, C, H, W]
     noised = x_0 + sigma.view(-1, 1, 1, 1) * noise
     
-    # Process added conditioning
-    if added_cond_kwargs is not None:
-        # SDXL expects time_ids to be passed directly without embedding
-        time_ids = added_cond_kwargs.get("time_ids")
-        if time_ids is not None:
-            # Ensure time_ids has correct shape [B, 6]
-            if time_ids.ndim == 1:
-                time_ids = time_ids.unsqueeze(0)
-            added_cond_kwargs["time_ids"] = time_ids.to(dtype=torch.float32)
-    
-    # Forward pass with proper conditioning
+    # Forward pass [B, C, H, W]
     v_pred = model(
         noised,
         sigma,
@@ -213,19 +165,11 @@ def training_loss_v_prediction(
         added_cond_kwargs=added_cond_kwargs
     ).sample
     
-    # Compute v-target with NAI's formulation
+    # Compute v-target [B, C, H, W]
     v_target = _compute_v_target(noise, sigma)
     
-    # Compute MinSNR loss weights
-    if use_snr_weighting:
-        weights = _compute_min_snr_weights(
-            sigma,
-            sigma_data=1.0,
-            min_snr_gamma=min_snr_gamma,
-            scale=scale_factor
-        )
-    else:
-        weights = torch.ones_like(sigma.view(-1, 1, 1, 1))
+    # Compute MinSNR weights [B, 1, 1, 1]
+    weights = _compute_min_snr_weights(sigma, min_snr_gamma, scale_factor)
     
     # Compute weighted MSE loss
     loss = F.mse_loss(
@@ -234,238 +178,27 @@ def training_loss_v_prediction(
         reduction='none'
     ).mean()
 
-    # Lion-specific loss scaling
-    if optimizer_type == "lion":
-        loss = loss * 0.5
-
-    if return_metrics:
-        with torch.no_grad():
-            metrics = {
-                "target_mean": v_target.mean().item(),
-                "target_std": v_target.std().item(),
-                "pred_mean": v_pred.mean().item(),
-                "pred_std": v_pred.std().item(),
-                "error": torch.abs(v_pred - v_target).mean().item(),
-                "snr": _compute_snr(sigma).mean().item(),
-                "weight_mean": weights.mean().item(),
-                "sigma_mean": sigma.mean().item(),
-                "sigma_std": sigma.std().item(),
-                "v_pred_loss": loss.item(),
-            }
-            return loss, metrics
+    if not return_metrics:
+        return loss, {}
+        
+    # Compute metrics
+    with torch.no_grad():
+        metrics = {
+            "target_mean": v_target.mean().item(),
+            "target_std": v_target.std().item(),
+            "pred_mean": v_pred.mean().item(),
+            "pred_std": v_pred.std().item(),
+            "error": torch.abs(v_pred - v_target).mean().item(),
+            "snr": _compute_snr(sigma).mean().item(),
+            "weight_mean": weights.mean().item(),
+            "sigma_mean": sigma.mean().item(),
+            "sigma_std": sigma.std().item(),
+            "v_pred_loss": loss.item(),
+        }
     
-    return loss
-
-@torch.jit.script
-def _compute_warmup_factor(current_step: int, num_warmup_steps: int) -> float:
-    """JIT-optimized warmup factor computation."""
-    return float(current_step) / float(max(1, num_warmup_steps))
-
-@torch.jit.script
-def _compute_cosine_decay(progress: float, num_cycles: float) -> float:
-    """JIT-optimized cosine decay computation."""
-    return max(0.0, 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)))
-
-@lru_cache(maxsize=16)
-def _get_scheduler_buffer(num_steps: int, device: torch.device) -> torch.Tensor:
-    """Cached computation of progress tensor for scheduler."""
-    return torch.arange(num_steps, dtype=torch.float32, device=device) / max(1, num_steps)
-
-def get_cosine_schedule_with_warmup(
-    optimizer: torch.optim.Optimizer,
-    num_warmup_steps: int,
-    num_training_steps: int,
-    num_cycles: float = 0.5,
-    last_epoch: int = -1,
-    device: Optional[torch.device] = None,
-) -> torch.optim.lr_scheduler.LambdaLR:
-    """Create an ultra-optimized cosine learning rate schedule with warmup."""
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # Get pre-computed progress tensor from buffer
-    progress = _get_scheduler_buffer(num_training_steps, device)
-    
-    def lr_lambda(current_step: int) -> float:
-        if current_step < num_warmup_steps:
-            # Use pre-computed warmup factors if available
-            if "warmup_factors" in _scheduler_buffers:
-                return _scheduler_buffers["warmup_factors"][current_step].item()
-            return _compute_warmup_factor(current_step, num_warmup_steps)
-            
-        # Use pre-computed progress values
-        step_progress = progress[current_step].item()
-        return _compute_cosine_decay(step_progress, num_cycles)
-    
-    # Pre-compute warmup factors if not already cached
-    if "warmup_factors" not in _scheduler_buffers:
-        _scheduler_buffers["warmup_factors"] = torch.tensor(
-            [_compute_warmup_factor(i, num_warmup_steps) for i in range(num_warmup_steps)],
-            device=device
-        )
-    
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda, last_epoch)
+    return loss, metrics
 
 def clear_caches() -> None:
     """Clear all caches and buffers."""
     _buffers.clear()
     _sigma_cache.clear()
-    _scheduler_buffers.clear()
-    _get_scheduler_buffer.cache_clear()
-    _get_resolution_scaled_sigma_schedule.cache_clear()  # Added for completeness
-
-def apply_model(
-    model: torch.nn.Module,
-    x: torch.Tensor,
-    t: torch.Tensor, 
-    text_embeddings: torch.Tensor,
-    added_cond_kwargs: Optional[Dict[str, torch.Tensor]] = None
-) -> torch.Tensor:
-    """
-    Apply model with proper conditioning handling.
-    Supports SDXL's dual text encoder and additional conditionings.
-    """
-    # Handle added conditioning kwargs
-    if added_cond_kwargs is None:
-        added_cond_kwargs = {}
-        
-    # Ensure all tensors are on same device
-    device = x.device
-    for k, v in added_cond_kwargs.items():
-        added_cond_kwargs[k] = v.to(device)
-        
-    # Forward pass with all conditionings
-    return model(
-        x,
-        t,
-        text_embeddings,
-        added_cond_kwargs=added_cond_kwargs
-    ).sample
-
-def _get_add_time_ids(
-    batch_size: int,
-    height: int,
-    width: int,
-    dtype: torch.dtype,
-    device: torch.device,
-    crop_coords: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """
-    Get additional time embeddings per SDXL paper section 2.2 and 2.3.
-    Returns embeddings with shape [batch_size, 6]
-    """
-    # Original image size conditioning
-    original_size = torch.tensor([height, width], device=device, dtype=torch.long)
-    original_size = original_size.unsqueeze(0).expand(batch_size, -1)
-    
-    # Crop conditioning 
-    if crop_coords is None:
-        crops_coords_top_left = torch.zeros((batch_size, 2), device=device, dtype=torch.long)
-    else:
-        crops_coords_top_left = crop_coords.to(device=device, dtype=torch.long)
-    
-    # Target size is same as original for training
-    target_size = original_size.clone()
-    
-    # Concatenate all time embeddings
-    add_time_ids = torch.cat([
-        original_size,
-        crops_coords_top_left,
-        target_size
-    ], dim=1)  # [batch_size, 6]
-    
-    return add_time_ids.to(dtype=dtype)
-
-def _get_fourier_embedding(
-    x: torch.Tensor,
-    dim: int = 256,
-    max_period: int = 10000
-) -> torch.Tensor:
-    """
-    Fourier feature embedding as used in SDXL.
-    See SDXL paper Figure 16 for reference implementation.
-    """
-    # Reshape if needed
-    if x.ndim == 1:
-        x = x.unsqueeze(-1)
-    assert x.ndim == 2
-    
-    batch_size = x.shape[0]  # Only use batch_size from shape
-    
-    # Compute frequencies
-    half_dim = dim // 2
-    frequencies = torch.exp(
-        -math.log(max_period) * torch.arange(0, half_dim, device=x.device) / half_dim
-    )
-    
-    # Compute angles
-    angles = x.unsqueeze(-1) * frequencies.unsqueeze(0).unsqueeze(0)
-    
-    # Get embeddings
-    embeddings = torch.cat([angles.sin(), angles.cos()], dim=-1)
-    
-    # Reshape to match SDXL's implementation
-    return embeddings.reshape(batch_size, -1)
-
-def compute_snr_weight(sigma: torch.Tensor, gamma: float = 5.0) -> torch.Tensor:
-    """Compute MinSNR weight from NAI section 2.4"""
-    snr = 1 / (sigma ** 2)
-    weight = torch.minimum(snr, torch.ones_like(snr) * gamma) / snr
-    return weight
-
-def forward_pass(
-    args: Any,
-    model_dict: Dict[str, torch.nn.Module],
-    batch: Dict[str, torch.Tensor],
-    device: torch.device,
-    dtype: torch.dtype,
-) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """Forward pass with NAI improvements"""
-    unet = model_dict["unet"]
-    
-    # Process input images [B, C, H, W]
-    pixel_values = batch["pixel_values"].to(device=device, dtype=dtype)
-    batch_size, _, height, width = pixel_values.shape
-    
-    # Get text embeddings [B, 77, D]
-    text_embeddings = batch["text_embeddings"].to(device=device)
-    # Get pooled embeddings [B, D]
-    pooled_text_embeddings = batch["pooled_text_embeddings"].to(device=device)
-    
-    # Get time embeddings [B, 6]
-    add_time_ids = _get_add_time_ids(
-        batch_size=batch_size,
-        height=height,
-        width=width,
-        dtype=dtype,
-        device=device
-    )
-    
-    # Format conditioning inputs
-    added_cond_kwargs = {
-        "text_embeds": pooled_text_embeddings.unsqueeze(1),  # [B, 1, D]
-        "time_ids": add_time_ids  # [B, 6]
-    }
-    
-    # Get noise schedule
-    sigma = get_sigmas(
-        num_inference_steps=args.num_inference_steps,
-        height=height,
-        width=width,
-        device=device
-    )[0]
-    
-    # Compute loss
-    loss, metrics = training_loss_v_prediction(
-        model=unet,
-        x_0=pixel_values,
-        sigma=sigma,
-        text_embeddings=text_embeddings,
-        added_cond_kwargs=added_cond_kwargs,
-        return_metrics=True,
-        use_snr_weighting=args.use_min_snr,
-        min_snr_gamma=args.min_snr_gamma
-    )
-    
-    return loss, metrics
-
