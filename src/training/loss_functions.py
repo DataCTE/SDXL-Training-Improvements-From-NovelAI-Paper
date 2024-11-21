@@ -197,12 +197,13 @@ def training_loss_v_prediction(
     
     # Process added conditioning
     if added_cond_kwargs is not None:
-        # Ensure time_ids has correct shape [B, 1280] for SDXL
-        if "time_ids" in added_cond_kwargs:
-            time_ids = added_cond_kwargs["time_ids"]  # [B, 6]
-            # Project to higher dimension using learned embedding
-            time_embeds = model.time_embedding(time_ids.float())  # [B, 1280]
-            added_cond_kwargs["time_ids"] = time_embeds
+        # SDXL expects time_ids to be passed directly without embedding
+        time_ids = added_cond_kwargs.get("time_ids")
+        if time_ids is not None:
+            # Ensure time_ids has correct shape [B, 6]
+            if time_ids.ndim == 1:
+                time_ids = time_ids.unsqueeze(0)
+            added_cond_kwargs["time_ids"] = time_ids.to(dtype=torch.float32)
     
     # Forward pass with proper conditioning
     v_pred = model(
