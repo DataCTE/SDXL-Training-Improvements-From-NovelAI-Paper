@@ -129,8 +129,8 @@ def train_vae(
     config: VAEConfig,
     text_encoder_1: torch.nn.Module,
     text_encoder_2: torch.nn.Module,
-    tokenizer_1: Any,
-    tokenizer_2: Any,
+    tokenizer_1: any,
+    tokenizer_2: any,
     device: torch.device = torch.device("cuda"),
 ) -> VAEFinetuner:
     """
