@@ -56,55 +56,33 @@ class TextEmbeddingCache:
 
     def _process_embeddings(
         self,
-        text_encoder: torch.nn.Module,
+        text: str,
+        encoder: torch.nn.Module,
         tokenizer: object,
-        text_input: str,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Process text through CLIP encoder.
-        Args:
-            text_encoder: CLIP text encoder
-            tokenizer: CLIP tokenizer
-            text_input: Input text
-        Returns:
-            pooled: Pooled text embeddings [1, D]
-            hidden: Hidden state embeddings [1, 77, D]
-        """
-        # Tokenize text (on CPU)
+        max_length: int = 77
+    ) -> torch.Tensor:
+        """Process text through CLIP encoder with proper output handling."""
+        
+        # Tokenize text
         tokens = tokenizer(
-            text_input,
+            text,
             padding="max_length",
-            max_length=tokenizer.model_max_length,
+            max_length=max_length,
             truncation=True,
             return_tensors="pt"
-        )
+        ).to(self.device)
         
-        # Move tokens to device
-        tokens = {
-            'input_ids': tokens['input_ids'].to(self.device),
-            'attention_mask': tokens['attention_mask'].to(self.device)
-        }
-        
-        # Get embeddings
+        # Get encoder output
         with torch.no_grad():
-            encoder_output = text_encoder(
-                input_ids=tokens['input_ids'],
-                attention_mask=tokens['attention_mask'],
-                output_hidden_states=True,
-                return_dict=True
-            )
-            
-            # Get penultimate hidden state [1, 77, D]
-            hidden = encoder_output.hidden_states[-2]
-            
-            # Get pooled output [1, D]
-            pooled = encoder_output.text_embeds
-            
-            # Move to CPU for caching
-            hidden = hidden.cpu()
-            pooled = pooled.cpu()
-            
-        return pooled, hidden
+            encoder_output = encoder(**tokens)
+        
+        # Get pooled output (NAI uses pooled embeddings)
+        pooled = encoder_output.pooler_output
+        
+        # Normalize embeddings
+        pooled = pooled / pooled.norm(dim=-1, keepdim=True)
+        
+        return pooled
 
     def encode(self, text_input: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -128,19 +106,21 @@ class TextEmbeddingCache:
         
         # Generate embeddings
         hidden_1 = self._process_embeddings(
+            text_input,
             self.text_encoder_1,
             self.tokenizer_1,
-            text_input
+            77
         )
         
-        pooled_2, hidden_2 = self._process_embeddings(
+        pooled_2 = self._process_embeddings(
+            text_input,
             self.text_encoder_2,
             self.tokenizer_2,
-            text_input
+            77
         )
         
         # Format outputs
-        text_embeddings = torch.cat([hidden_1, hidden_2], dim=-1)  # [1, 77, D]
+        text_embeddings = hidden_1.unsqueeze(1)  # [1, 1, D]
         pooled_text_embeddings = pooled_2  # [1, D] (only use second encoder pooled)
         
         # Cache results
