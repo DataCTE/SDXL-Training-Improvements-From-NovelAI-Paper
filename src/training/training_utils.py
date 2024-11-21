@@ -83,9 +83,11 @@ def initialize_training_components(
     
     # NAI-style warmup scheduler
     components["scheduler"] = get_cosine_schedule_with_warmup(
-        optimizer=components["optimizer"],
         num_warmup_steps=int(config.scheduler.num_training_steps * 0.02),  # 2% warmup
-        num_training_steps=config.scheduler.num_training_steps
+        num_training_steps=config.scheduler.num_training_steps,
+        height=config.image_size[0],
+        width=config.image_size[1],
+        sigma_max=20000.0  # NAI Appendix A.2: practical ZTSNR approximation
     )
     
     # Setup gradient scaler for mixed precision training
