@@ -395,9 +395,6 @@ def parse_args() -> TrainingConfig:
     parser.add_argument("--eval_steps", type=int,
                        default=DEFAULTS["training"].get("eval_steps", 100),
                        help="Run evaluation every N steps")
-    parser.add_argument("--logging_steps", type=int,
-                       default=DEFAULTS["training"].get("logging_steps", 10),
-                       help="Log metrics every N steps")
     
     args = parser.parse_args()
     
