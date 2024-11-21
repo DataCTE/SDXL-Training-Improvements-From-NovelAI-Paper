@@ -8,7 +8,6 @@ from torch.cuda.amp import GradScaler
 from src.config.args import TrainingConfig
 from src.training.training_steps import train_step
 from src.training.training_utils import initialize_training_components
-from src.training.validation import generate_validation_images
 from src.training.metrics import MetricsManager
 from src.training.ema import setup_ema_model
 from src.utils.progress import ProgressTracker

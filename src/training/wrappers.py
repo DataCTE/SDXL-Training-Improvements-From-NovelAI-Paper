@@ -2,11 +2,8 @@
 
 import torch
 import logging
-from typing import Dict, Any, Optional, Union, List
+from typing import Optional, Union
 from pathlib import Path
-from dataclasses import asdict, dataclass
-from PIL import Image
-
 from src.config.args import TrainingConfig, VAEConfig
 from src.training.trainer import SDXLTrainer
 from src.training.vae_finetuner import VAEFinetuner
@@ -16,8 +13,7 @@ from src.data.cacheing.vae import VAECache
 from src.data.cacheing.text_embeds import TextEmbeddingCache
 from src.data.image_processing.validation import validate_image
 from src.data.prompt.caption_processor import load_captions
-from src.models.SDXL.pipeline import StableDiffusionXLPipeline
-from src.models.SDXL.scheduler import EDMEulerScheduler
+
 
 logger = logging.getLogger(__name__)
 
