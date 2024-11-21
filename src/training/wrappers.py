@@ -14,6 +14,8 @@ from src.data.cacheing.text_embeds import TextEmbeddingCache
 from src.data.image_processing.validation import validate_image
 from src.data.prompt.caption_processor import load_captions
 from src.data.multiaspect.dataset import MultiAspectDataset
+from PIL import Image
+from src.data.multiaspect.bucket_manager import BucketManager
 
 
 logger = logging.getLogger(__name__)
@@ -120,26 +122,29 @@ def train_sdxl(
         
         if val_image_paths:
             val_captions = load_captions(val_image_paths)
-            val_dataset = MultiAspectDataset(
-                image_paths=val_image_paths,
-                captions=val_captions,
-                bucket_manager=None,
-                vae_cache=vae_cache,
-                text_cache=text_embedding_cache,
-                num_workers=config.num_workers,
-                token_dropout=0.0,  # No dropout for validation
-                caption_dropout=0.0,
-                rarity_factor=config.tag_weighting.rarity_factor,
-                emphasis_factor=config.tag_weighting.emphasis_factor
+            
+            # Create bucket manager for validation
+            val_bucket_manager = BucketManager(
+                max_resolution=config.max_resolution,
+                min_batch_size=1,
+                max_batch_size=config.batch_size,
+                num_workers=config.num_workers
             )
             
-            val_dataloader = create_train_dataloader(
-                dataset=val_dataset,
-                batch_size=config.batch_size,
-                num_workers=config.num_workers,
-                shuffle=False,
-                pin_memory=True,
-                drop_last=False
+            # Add validation images to bucket manager
+            for path in val_image_paths:
+                with Image.open(path) as img:
+                    width, height = img.size
+                val_bucket_manager.add_image(path, width, height)
+            
+            # Create validation dataloader with bucket manager
+            val_dataloader = create_validation_dataloader(
+                image_paths=val_image_paths,
+                captions=val_captions,
+                config=config,
+                bucket_manager=val_bucket_manager,
+                vae_cache=vae_cache,
+                text_cache=text_embedding_cache
             )
     
     # Create trainer with NAI improvements
