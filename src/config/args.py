@@ -132,6 +132,10 @@ class TrainingConfig:
     cache_dir: Optional[str] = None
     no_caching: bool = False
     cache_size: int = DEFAULTS["training"]["cache_size"]
+    save_steps: int = DEFAULTS["training"].get("save_steps", 500)
+    eval_steps: int = DEFAULTS["training"].get("eval_steps", 100)
+    logging_steps: int = DEFAULTS["training"].get("logging_steps", 10)
+    
     
     # Image configuration
     max_resolution: int = DEFAULTS["training"]["max_resolution"]
@@ -384,6 +388,17 @@ def parse_args() -> TrainingConfig:
     parser.add_argument("--num_cycles", type=float,
                        default=DEFAULTS["scheduler"]["num_cycles"])
     
+    # Add new arguments
+    parser.add_argument("--save_steps", type=int,
+                       default=DEFAULTS["training"].get("save_steps", 500),
+                       help="Save checkpoint every N steps")
+    parser.add_argument("--eval_steps", type=int,
+                       default=DEFAULTS["training"].get("eval_steps", 100),
+                       help="Run evaluation every N steps")
+    parser.add_argument("--logging_steps", type=int,
+                       default=DEFAULTS["training"].get("logging_steps", 10),
+                       help="Log metrics every N steps")
+    
     args = parser.parse_args()
     
     # Convert to config
@@ -391,6 +406,9 @@ def parse_args() -> TrainingConfig:
         pretrained_model_path=args.pretrained_model_path,
         train_data_dir=args.train_data_dir,
         output_dir=args.output_dir,
+        save_steps=args.save_steps,
+        eval_steps=args.eval_steps,
+        logging_steps=args.logging_steps,
         cache_size=args.cache_size,
         max_resolution=args.max_resolution,
         resolution_type=args.resolution_type,

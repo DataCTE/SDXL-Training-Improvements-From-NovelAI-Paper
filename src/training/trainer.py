@@ -97,11 +97,11 @@ class SDXLTrainer:
         
         self.wandb_run = self.logger.wandb_run if config.wandb.use_wandb else None
         
-        # Setup progress tracking
+        # Setup progress tracking with correct config values
         self.progress = ProgressTracker(
             description="SDXL Training",
             total_steps=config.num_epochs * len(train_dataloader),
-            log_steps=config.wandb.logging_steps,
+            log_steps=config.logging_steps,
             save_steps=config.save_steps,
             eval_steps=config.eval_steps
         )
