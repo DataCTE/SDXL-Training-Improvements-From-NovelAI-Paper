@@ -18,41 +18,25 @@ def _compute_v_target(noise: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
     """
     Compute v-prediction target per NAI paper section 2.1.
     Transitions from ε-prediction to x0-prediction as SNR changes.
-    Args:
-        noise: Noise tensor [B, C, H, W]
-        sigma: Noise levels [B]
-    Returns:
-        v-target tensor [B, C, H, W]
     """
-    sigma_data = 1.0  # Fixed data variance
+    sigma_data = 1.0  # Fixed data variance per NAI
     return noise * sigma_data / (sigma ** 2 + sigma_data ** 2) ** 0.5
 
 @torch.jit.script
 def _compute_snr(sigma: torch.Tensor) -> torch.Tensor:
-    """
-    Compute Signal-to-Noise Ratio (SNR).
-    Args:
-        sigma: Noise levels [B]
-    Returns:
-        SNR tensor [B]
-    """
-    sigma_data = 1.0
+    """Compute Signal-to-Noise Ratio (SNR)."""
+    sigma_data = 1.0  # Fixed data variance per NAI
     return (sigma_data ** 2) / (sigma ** 2)
 
 @torch.jit.script
 def _compute_min_snr_weights(sigma: torch.Tensor, min_snr_gamma: float, scale: float) -> torch.Tensor:
     """
     Compute MinSNR loss weights per NAI paper section 2.4.
-    Args:
-        sigma: Noise levels [B]
-        min_snr_gamma: SNR clamping value (default 5.0)
-        scale: Optional scaling factor
-    Returns:
-        Loss weights tensor [B, 1, 1, 1]
+    Balances learning across timesteps.
     """
     snr = _compute_snr(sigma)
     weights = torch.minimum(snr, torch.tensor(min_snr_gamma, device=sigma.device))
-    weights = weights / snr
+    weights = weights / snr  # Normalize by SNR
     weights = weights * scale
     return weights.view(-1, 1, 1, 1)
 
@@ -60,44 +44,53 @@ def _compute_min_snr_weights(sigma: torch.Tensor, min_snr_gamma: float, scale: f
 def _compute_resolution_scale(height: int, width: int) -> float:
     """
     Compute resolution-based sigma scaling per NAI paper section 2.3.
-    Args:
-        height: Image height
-        width: Image width
-    Returns:
-        Resolution scale factor
+    Doubles sigma_max when canvas area quadruples.
     """
-    base_res = 1024.0
+    base_res = 1024.0  # SDXL base resolution
     return math.sqrt((float(height) * float(width)) / (base_res * base_res))
 
-def _get_resolution_scaled_sigma_schedule(
-    num_steps: int,
+def get_cosine_schedule_with_warmup(
+    num_training_steps: int,
+    num_warmup_steps: int,
     height: int,
     width: int,
     sigma_min: float = 0.0292,
+    sigma_max: float = 20000.0,  # NAI Appendix A.2: practical ZTSNR approximation
     rho: float = 7.0,
+    device: torch.device = torch.device("cuda")
 ) -> torch.Tensor:
     """
-    Compute sigma schedule with NAI's resolution scaling and ZTSNR.
+    Get ZTSNR noise schedule with cosine warmup per NAI paper.
     Args:
-        num_steps: Number of diffusion steps
+        num_training_steps: Total number of training steps
+        num_warmup_steps: Number of warmup steps
         height: Image height
         width: Image width
         sigma_min: Minimum noise level
+        sigma_max: Maximum noise level (NAI uses 20000.0 as ∞ approximation)
         rho: Karras schedule parameter
+        device: Compute device
     Returns:
-        Tensor of sigma values [num_steps]
+        Tensor of sigma values [num_training_steps]
     """
     # Resolution-based scaling (NAI section 2.3)
     scale = _compute_resolution_scale(height, width)
     scaled_sigma_min = sigma_min * math.sqrt(scale)
     
-    # Use fixed ZTSNR value (NAI appendix A.2)
-    sigma_max = 20000.0
-    
     # Generate timesteps
-    steps = torch.linspace(0, num_steps - 1, num_steps, dtype=torch.float32)
+    steps = torch.linspace(0, num_training_steps - 1, num_training_steps, device=device)
+    
+    # Compute warmup schedule
+    warmup_steps = torch.arange(num_warmup_steps, device=device)
+    warmup_factor = warmup_steps / max(1, num_warmup_steps)
+    
+    # Generate Karras schedule (NAI section 2.2)
     sigmas = torch.exp(-steps / rho)
     sigmas = sigmas * (sigma_max - scaled_sigma_min) + scaled_sigma_min
+    
+    # Apply warmup
+    if num_warmup_steps > 0:
+        sigmas[:num_warmup_steps] *= warmup_factor
     
     return sigmas
 
@@ -106,18 +99,21 @@ def get_sigmas(
     num_inference_steps: int,
     height: int,
     width: int,
-    device: Optional[torch.device] = None,
+    device: torch.device = torch.device("cuda"),
 ) -> torch.Tensor:
-    """Get optimized sigma schedule with NAI improvements."""
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
+    """Get ZTSNR schedule with resolution scaling."""
     cache_key = f"sigmas_{num_inference_steps}_{height}_{width}"
+    
     if cache_key not in _sigma_cache:
-        _sigma_cache[cache_key] = _get_resolution_scaled_sigma_schedule(
-            num_inference_steps,
-            height,
-            width
+        _sigma_cache[cache_key] = get_cosine_schedule_with_warmup(
+            num_training_steps=num_inference_steps,
+            num_warmup_steps=0,  # No warmup for inference
+            height=height,
+            width=width,
+            sigma_min=0.0292,
+            sigma_max=20000.0,  # NAI ZTSNR approximation
+            rho=7.0,
+            device=torch.device("cpu")  # Cache on CPU
         )
     
     return _sigma_cache[cache_key].to(device)
@@ -135,20 +131,11 @@ def training_loss_v_prediction(
     return_metrics: bool = False,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
-    Compute v-prediction loss with NAI improvements.
-    Args:
-        model: UNet model
-        x_0: Input images
-        sigma: Noise levels
-        text_embeddings: Text condition embeddings
-        noise: Gaussian noise
-        added_cond_kwargs: Additional conditioning (text_embeds, time_ids)
-        min_snr_gamma: SNR clamping value
-        scale_factor: Loss scaling factor
-        return_metrics: Whether to return additional metrics
-    Returns:
-        loss: Training loss
-        metrics: Optional dict of metrics if return_metrics=True
+    Compute v-prediction loss with NAI improvements:
+    1. v-prediction parameterization (Section 2.1)
+    2. ZTSNR noise schedule (Section 2.2)
+    3. Resolution-based sigma scaling (Section 2.3)
+    4. MinSNR loss weighting (Section 2.4)
     """
     # Scale sigma based on resolution [B]
     height, width = x_0.shape[-2:]
