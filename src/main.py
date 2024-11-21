@@ -98,7 +98,7 @@ def main():
         trainer = train_sdxl(
             train_data_dir=config.train_data_dir,
             output_dir=str(output_dir),
-            validation_config=validation_config,
+            device=config.device,
             config=config
         )
         
