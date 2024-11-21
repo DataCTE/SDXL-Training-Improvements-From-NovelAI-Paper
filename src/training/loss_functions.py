@@ -198,6 +198,79 @@ def training_loss_v_prediction(
     
     return loss, metrics
 
+@autocast('cuda')
+def forward_pass(
+    model_dict: Dict[str, torch.nn.Module],
+    batch: Dict[str, torch.Tensor],
+    num_inference_steps: int,
+    min_snr_gamma: float = 5.0,
+    scale_factor: float = 1.0,
+    device: torch.device = torch.device("cuda"),
+    dtype: torch.dtype = torch.float32,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    Forward pass implementing NAI's SDXL improvements.
+    Args:
+        model_dict: Dictionary containing UNet model
+        batch: Training batch containing:
+            - pixel_values: [B, C, H, W]
+            - text_embeddings: [B, 77, D]
+            - pooled_text_embeddings: [B, D]
+            - time_ids: [B, 6]
+        num_inference_steps: Number of inference steps
+        min_snr_gamma: SNR clamping value
+        scale_factor: Loss scaling factor
+        device: Compute device
+        dtype: Compute dtype
+    Returns:
+        loss: Training loss
+        metrics: Training metrics
+    """
+    # Get models
+    unet = model_dict["unet"]
+    
+    # Process inputs
+    pixel_values = batch["pixel_values"].to(device=device, dtype=dtype)  # [B, C, H, W]
+    text_embeddings = batch["text_embeddings"].to(device=device)  # [B, 77, D]
+    pooled_text_embeddings = batch["pooled_text_embeddings"].to(device=device)  # [B, D]
+    time_ids = batch["time_ids"].to(device=device, dtype=dtype)  # [B, 6]
+    
+    # Get batch dimensions
+    batch_size, _, height, width = pixel_values.shape
+    
+    # Format conditioning inputs
+    added_cond_kwargs = {
+        "text_embeds": pooled_text_embeddings.unsqueeze(1),  # [B, 1, D]
+        "time_ids": time_ids  # [B, 6]
+    }
+    
+    # Get noise schedule
+    sigmas = get_sigmas(
+        num_inference_steps=num_inference_steps,
+        height=height,
+        width=width,
+        device=device
+    )
+    sigma = sigmas[0]  # Use highest noise level
+    
+    # Generate noise
+    noise = torch.randn_like(pixel_values)  # [B, C, H, W]
+    
+    # Compute loss with NAI improvements
+    loss, metrics = training_loss_v_prediction(
+        model=unet,
+        x_0=pixel_values,
+        sigma=sigma.expand(batch_size),  # [B]
+        text_embeddings=text_embeddings,
+        noise=noise,
+        added_cond_kwargs=added_cond_kwargs,
+        min_snr_gamma=min_snr_gamma,
+        scale_factor=scale_factor,
+        return_metrics=True
+    )
+    
+    return loss, metrics
+
 def clear_caches() -> None:
     """Clear all caches and buffers."""
     _buffers.clear()

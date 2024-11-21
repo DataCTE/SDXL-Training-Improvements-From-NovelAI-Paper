@@ -1,49 +1,44 @@
-"""
-Ultra-optimized text embedding cache system.
-
-This module provides an ultra-optimized text embedding cache with parallel processing, 
-mixed precision, and efficient memory management.
-"""
+"""Ultra-optimized text embedding cache system for SDXL."""
 
 import torch
-import torch.nn as nn
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, Tuple
 import logging
 from .memory import MemoryCache
-import multiprocessing
-from multiprocessing import Pool
 import hashlib
-
 
 logger = logging.getLogger(__name__)
 
-if torch.cuda.is_available():
-    # Set start method to 'spawn' for CUDA multiprocessing
-    multiprocessing.set_start_method('spawn', force=True)
-
 class TextEmbeddingCache:
-    """Ultra-optimized text embedding cache system."""
+    """SDXL text embedding cache with mixed precision and memory management."""
     
     def __init__(
         self,
-        text_encoder1,
-        text_encoder2,
-        tokenizer1,
-        tokenizer2,
-        device: str = "cuda" if torch.cuda.is_available() else "cpu",
+        text_encoder_1: torch.nn.Module,  # CLIP ViT-L/14
+        text_encoder_2: torch.nn.Module,  # CLIP ViT-G/14
+        tokenizer_1: object,  # CLIPTokenizer
+        tokenizer_2: object,  # CLIPTokenizer
+        device: torch.device = torch.device("cuda"),
         max_memory_gb: float = 32.0,
         max_cache_size: int = 100000,
-        batch_size: int = 16,
-        num_workers: int = 4,
         cache_dir: str = None
     ):
-        """Initialize cache with encoders and settings."""
-        self.text_encoder1 = text_encoder1
-        self.text_encoder2 = text_encoder2
-        self.tokenizer1 = tokenizer1
-        self.tokenizer2 = tokenizer2
+        """
+        Initialize SDXL text embedding cache.
+        Args:
+            text_encoder_1: First CLIP text encoder (ViT-L/14)
+            text_encoder_2: Second CLIP text encoder (ViT-G/14)
+            tokenizer_1: First CLIP tokenizer
+            tokenizer_2: Second CLIP tokenizer
+            device: Compute device
+            max_memory_gb: Maximum cache memory in GB
+            max_cache_size: Maximum number of cached items
+            cache_dir: Optional path to persistent cache
+        """
+        self.text_encoder_1 = text_encoder_1
+        self.text_encoder_2 = text_encoder_2
+        self.tokenizer_1 = tokenizer_1
+        self.tokenizer_2 = tokenizer_2
         self.device = device
-        self._batch_size = batch_size
         
         # Initialize memory cache
         self._memory_cache = MemoryCache(
@@ -52,9 +47,6 @@ class TextEmbeddingCache:
             cache_dir=cache_dir
         )
         
-        # Setup parallel processing
-        self._pool = Pool(num_workers) if num_workers > 0 else None
-        
         # Initialize stats
         self._stats = {
             'hits': 0,
@@ -62,9 +54,23 @@ class TextEmbeddingCache:
             'evictions': 0
         }
 
-    def _process_embeddings(self, text_encoder, tokenizer, text_input, device) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Process text through encoder and handle dimensionality."""
-        # Tokenize text (keep on CPU initially)
+    def _process_embeddings(
+        self,
+        text_encoder: torch.nn.Module,
+        tokenizer: object,
+        text_input: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Process text through CLIP encoder.
+        Args:
+            text_encoder: CLIP text encoder
+            tokenizer: CLIP tokenizer
+            text_input: Input text
+        Returns:
+            pooled: Pooled text embeddings [1, D]
+            hidden: Hidden state embeddings [1, 77, D]
+        """
+        # Tokenize text (on CPU)
         tokens = tokenizer(
             text_input,
             padding="max_length",
@@ -73,34 +79,44 @@ class TextEmbeddingCache:
             return_tensors="pt"
         )
         
-        # Move tokens to device only when needed
-        device_tokens = {
-            'input_ids': tokens['input_ids'].to(device),
-            'attention_mask': tokens['attention_mask'].to(device)
+        # Move tokens to device
+        tokens = {
+            'input_ids': tokens['input_ids'].to(self.device),
+            'attention_mask': tokens['attention_mask'].to(self.device)
         }
         
-        # Get embeddings from text encoder
+        # Get embeddings
         with torch.no_grad():
             encoder_output = text_encoder(
-                input_ids=device_tokens['input_ids'],
-                attention_mask=device_tokens['attention_mask'],
+                input_ids=tokens['input_ids'],
+                attention_mask=tokens['attention_mask'],
                 output_hidden_states=True,
                 return_dict=True
             )
             
-            # Get last hidden state and use first token ([CLS]) as pooled output
-            hidden = encoder_output.hidden_states[-2]  # Use penultimate layer as per SDXL paper
-            pooled = hidden[:, 0:1, :]  # Take [CLS] token embedding as pooled output
+            # Get penultimate hidden state [1, 77, D]
+            hidden = encoder_output.hidden_states[-2]
             
-            # Move results back to CPU for caching
+            # Get pooled output [1, D]
+            pooled = encoder_output.text_embeds
+            
+            # Move to CPU for caching
             hidden = hidden.cpu()
             pooled = pooled.cpu()
             
         return pooled, hidden
 
-    def encode(self, text_input: str) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Encode text input to embeddings."""
-        # Check cache first
+    def encode(self, text_input: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Encode text input to SDXL embeddings.
+        Args:
+            text_input: Input text
+        Returns:
+            text_embeddings: Concatenated hidden states [1, 77, D]
+            pooled_text_embeddings: Second encoder pooled output [1, D]
+            time_ids: SDXL time embeddings [1, 6]
+        """
+        # Check cache
         key = self._get_cache_key(text_input)
         cached = self._memory_cache.get(key)
         
@@ -110,28 +126,25 @@ class TextEmbeddingCache:
         
         self._stats['misses'] += 1
         
-        # Generate embeddings for uncached text
-        pooled1, hidden1 = self._process_embeddings(
-            self.text_encoder1,
-            self.tokenizer1,
-            text_input, 
-            self.device
+        # Generate embeddings
+        hidden_1 = self._process_embeddings(
+            self.text_encoder_1,
+            self.tokenizer_1,
+            text_input
         )
         
-        pooled2, hidden2 = self._process_embeddings(
-            self.text_encoder2,
-            self.tokenizer2,
-            text_input,
-            self.device
-        )
-
-        # Concatenate embeddings (on CPU)
-        result = (
-            torch.cat([pooled1, pooled2], dim=-1),  # Concatenate pooled embeddings
-            torch.cat([hidden1, hidden2], dim=-1)   # Concatenate hidden states
+        pooled_2, hidden_2 = self._process_embeddings(
+            self.text_encoder_2,
+            self.tokenizer_2,
+            text_input
         )
         
-        # Store in cache
+        # Format outputs
+        text_embeddings = torch.cat([hidden_1, hidden_2], dim=-1)  # [1, 77, D]
+        pooled_text_embeddings = pooled_2  # [1, D] (only use second encoder pooled)
+        
+        # Cache results
+        result = (text_embeddings, pooled_text_embeddings)
         self._memory_cache.put(key, result)
         
         return result
@@ -154,11 +167,5 @@ class TextEmbeddingCache:
         }
 
     def __len__(self) -> int:
-        """Get number of items in cache."""
+        """Get number of cached items."""
         return len(self._memory_cache)
-
-    def __del__(self):
-        """Clean up resources."""
-        if self._pool:
-            self._pool.close()
-            self._pool.join()
