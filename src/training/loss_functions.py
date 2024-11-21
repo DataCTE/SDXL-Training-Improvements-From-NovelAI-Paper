@@ -193,7 +193,7 @@ def forward_pass(
     min_snr_gamma: float = 5.0,
     scale_factor: float = 1.0,
     device: torch.device = torch.device("cuda"),
-    dtype: torch.dtype = torch.float32,
+    dtype: torch.dtype = torch.float16,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Forward pass implementing NAI's SDXL improvements.
