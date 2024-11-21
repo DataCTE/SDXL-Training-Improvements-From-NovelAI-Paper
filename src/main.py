@@ -98,7 +98,6 @@ def main():
         trainer = train_sdxl(
             train_data_dir=config.train_data_dir,
             output_dir=str(output_dir),
-            pretrained_model_path=config.pretrained_model_path,
             models=models,
             validation_config=validation_config,
             config=config
