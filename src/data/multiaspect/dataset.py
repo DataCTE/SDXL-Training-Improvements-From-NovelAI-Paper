@@ -202,26 +202,24 @@ class MultiAspectDataset(Dataset):
         """Get dataset size."""
         return len(self.image_paths)
     
-    def __getitem__(self, idx: int, training: bool = True) -> Dict[str, torch.Tensor]:
-        """Get a single item with caching."""
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        """Get a training example."""
         path = self.image_paths[idx]
-        bucket = self.bucket_manager.get_bucket(path)
         
-        if bucket is None:
-            raise ValueError(f"No bucket found for {path}")
+        # Load and process image
+        pixel_values = self._prepare_image(path)
         
-        # Load and transform image
-        image = self._load_image(path)
-        pixel_values = self._transform_image(image, bucket)
+        # Get text embeddings
+        text_embeds = self._prepare_text(path, training=True)
         
-        # Prepare text embeddings
-        text_embeds = self._prepare_text(path, training=training)
-        
-        return {
-            'pixel_values': pixel_values,
-            'text_embeddings': text_embeds[0],
-            'pooled_text_embeddings': text_embeds[1]
+        # Ensure all tensors are on CPU for pinning
+        batch = {
+            "pixel_values": pixel_values.cpu(),
+            "text_embeds": tuple(t.cpu() for t in text_embeds),
+            "path": path
         }
+        
+        return batch
     
     def get_stats(self) -> Dict[str, int]:
         """Get dataset statistics."""
@@ -289,86 +287,45 @@ class MultiAspectDataset(Dataset):
 
 
 def create_train_dataloader(
-    image_paths: List[str],
-    captions: Dict[str, str],
-    config: TrainingConfig,
-    bucket_manager: Optional[BucketManager] = None,
-    vae_cache: Optional[VAECache] = None,
-    text_cache: Optional[TextEmbeddingCache] = None,
+    dataset: MultiAspectDataset,
+    batch_size: int,
+    num_workers: int = 4,
+    shuffle: bool = True,
+    pin_memory: bool = True,
+    drop_last: bool = True,
 ) -> DataLoader:
-    """Create an optimized DataLoader for training.
-    
-    Args:
-        image_paths: List of paths to training images
-        captions: Dictionary mapping image paths to their captions
-        config: Training configuration
-        bucket_manager: Optional BucketManager instance
-        vae_cache: Optional VAE cache for faster encoding
-        text_cache: Optional text embedding cache
-        
-    Returns:
-        DataLoader configured for training
-    """
-    def collate_fn(batch):
-        """Custom collate function to ensure consistent sizes within batches."""
-        # Group by size
-        size_groups = {}
-        for item in batch:
-            size = item['pixel_values'].shape
-            if size not in size_groups:
-                size_groups[size] = []
-            size_groups[size].append(item)
-        
-        # Use largest group
-        largest_group = max(size_groups.values(), key=len)
-        
-        # Stack tensors from the same size group
-        return {
-            'pixel_values': torch.stack([x['pixel_values'] for x in largest_group]),
-            'text_embeddings': torch.stack([x['text_embeddings'] for x in largest_group]),
-            'pooled_text_embeddings': torch.stack([x['pooled_text_embeddings'] for x in largest_group])
-        }
-    # Create bucket manager if not provided
-    if bucket_manager is None:
-        bucket_manager = BucketManager(
-            max_resolution=config.max_resolution,
-            min_batch_size=1,
-            max_batch_size=config.batch_size,
-            num_workers=config.num_workers
-        )
-        
-        # Add images to bucket manager
-        for image_path in image_paths:
-            try:
-                with Image.open(image_path) as img:
-                    width, height = img.size
-                bucket_manager.add_image(image_path, width, height)
-            except Exception as e:
-                logger.warning(f"Failed to process {image_path}: {e}")
-    
-    # Create dataset
-    dataset = MultiAspectDataset(
-        image_paths=image_paths,
-        captions=captions,
-        bucket_manager=bucket_manager,
-        vae_cache=vae_cache,
-        text_cache=text_cache,
-        num_workers=0,  # Force single worker
-        token_dropout=config.tag_weighting.token_dropout_rate,
-        caption_dropout=config.tag_weighting.caption_dropout_rate,
-        rarity_factor=config.tag_weighting.rarity_factor,
-        emphasis_factor=config.tag_weighting.emphasis_factor
-    )
-    
+    """Create training dataloader with proper memory handling."""
     return DataLoader(
         dataset,
-        batch_size=config.batch_size,
-        shuffle=True,
-        num_workers=0,  # Disable multiprocessing
-        pin_memory=True,
-        drop_last=True,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=drop_last,
+        pin_memory_device="cuda" if torch.cuda.is_available() else "cpu",
+        persistent_workers=True if num_workers > 0 else False,
         collate_fn=collate_fn
     )
+
+def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    """Custom collate function that handles text embedding tuples."""
+    elem = batch[0]
+    collated = {}
+    
+    for key in elem:
+        if key == "text_embeds":
+            # Handle text embedding tuples
+            text_embeds_list = [b[key] for b in batch]
+            collated[key] = tuple(
+                torch.stack([emb[i] for emb in text_embeds_list])
+                for i in range(len(text_embeds_list[0]))
+            )
+        elif key == "path":
+            collated[key] = [b[key] for b in batch]
+        else:
+            collated[key] = torch.stack([b[key] for b in batch])
+            
+    return collated
 
 def create_validation_dataloader(
     image_paths: List[str],

@@ -103,7 +103,8 @@ class TextEmbeddingCache:
         
         if cached is not None:
             self._stats['hits'] += 1
-            return cached
+            # Ensure cached tensors are on CPU
+            return tuple(t.cpu() for t in cached)
         
         self._stats['misses'] += 1
         
@@ -128,9 +129,9 @@ class TextEmbeddingCache:
                 77
             )
         
-        # Format outputs
-        text_embeddings = hidden_1  # [1, 77, D]
-        pooled_text_embeddings = pooled_2  # [1, D]
+        # Move tensors to CPU before caching
+        text_embeddings = hidden_1.cpu()  # [1, 77, D]
+        pooled_text_embeddings = pooled_2.cpu()  # [1, D]
         
         # Cache results
         result = (text_embeddings, pooled_text_embeddings)
