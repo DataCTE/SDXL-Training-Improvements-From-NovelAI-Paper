@@ -92,8 +92,8 @@ def train_sdxl(
         vae_cache=vae_cache,
         text_cache=text_embedding_cache,
         num_workers=config.num_workers,
-        token_dropout=config.tag_weighting.token_dropout,
-        caption_dropout=config.tag_weighting.caption_dropout,
+        token_dropout=config.tag_weighting.token_dropout_rate,
+        caption_dropout=config.tag_weighting.caption_dropout_rate,
         rarity_factor=config.tag_weighting.rarity_factor,
         emphasis_factor=config.tag_weighting.emphasis_factor
     )

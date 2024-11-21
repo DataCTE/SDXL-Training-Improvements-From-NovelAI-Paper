@@ -52,6 +52,7 @@ class EMAConfig:
 
 @dataclass
 class TagWeightingConfig:
+    """Configuration for tag weighting and dropout."""
     token_dropout_rate: float = DEFAULTS["tag_weighting"]["token_dropout_rate"]
     caption_dropout_rate: float = DEFAULTS["tag_weighting"]["caption_dropout_rate"]
     rarity_factor: float = DEFAULTS["tag_weighting"]["rarity_factor"]
@@ -59,6 +60,16 @@ class TagWeightingConfig:
     min_tag_freq: int = DEFAULTS["tag_weighting"]["min_tag_freq"]
     min_cluster_size: int = DEFAULTS["tag_weighting"]["min_cluster_size"]
     similarity_threshold: float = DEFAULTS["tag_weighting"]["similarity_threshold"]
+    
+    @property
+    def token_dropout(self) -> float:
+        """Alias for token_dropout_rate."""
+        return self.token_dropout_rate
+    
+    @property
+    def caption_dropout(self) -> float:
+        """Alias for caption_dropout_rate."""
+        return self.caption_dropout_rate
 
 @dataclass
 class VAEConfig:
