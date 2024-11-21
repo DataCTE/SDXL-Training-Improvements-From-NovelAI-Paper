@@ -45,6 +45,10 @@ class EMAConfig:
     update_after_step: int = DEFAULTS["ema"]["update_after_step"]
     use_warmup: bool = DEFAULTS["ema"]["use_warmup"]
     warmup_steps: int = DEFAULTS["ema"]["warmup_steps"]
+    power: float = DEFAULTS["ema"]["power"]
+    inv_gamma: float = DEFAULTS["ema"]["inv_gamma"]
+    min_value: float = DEFAULTS["ema"]["min_value"]
+    max_value: float = DEFAULTS["ema"]["max_value"]
 
 @dataclass
 class TagWeightingConfig:
@@ -434,6 +438,10 @@ def parse_args() -> TrainingConfig:
     # Update EMA config
     config.ema.decay = args.ema_decay
     config.ema.warmup_steps = args.ema_warmup_steps
+    config.ema.power = DEFAULTS["ema"]["power"]
+    config.ema.inv_gamma = DEFAULTS["ema"]["inv_gamma"]
+    config.ema.min_value = DEFAULTS["ema"]["min_value"]
+    config.ema.max_value = DEFAULTS["ema"]["max_value"]
     
     # Update WandB config
     config.wandb.use_wandb = args.use_wandb

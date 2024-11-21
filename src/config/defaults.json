@@ -50,7 +50,11 @@
       "decay": 0.9999,
       "update_after_step": 100,
       "use_warmup": true,
-      "warmup_steps": 2000
+      "warmup_steps": 2000,
+      "power": 0.75,
+      "inv_gamma": 1.0,
+      "min_value": 0.0,
+      "max_value": 0.9999
     },
     "vae": {
       "enable_vae_finetuning": false,

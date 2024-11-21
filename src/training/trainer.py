@@ -113,8 +113,9 @@ class SDXLTrainer:
                 model=models["unet"],
                 device=self.device,
                 power=0.75,
-                max_value=config.ema_decay,
-                update_after_step=config.ema_update_after_step
+                max_value=config.ema.decay,
+                update_after_step=config.ema.update_after_step,
+                inv_gamma=1.0
             )
             if ema_model is not None:
                 self.ema_models["unet"] = ema_model
