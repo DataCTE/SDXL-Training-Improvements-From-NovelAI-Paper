@@ -431,7 +431,7 @@ def forward_pass(
     # Get text embeddings
     if "text_embeddings" in batch:
         text_embeddings = batch["text_embeddings"].to(device=device)
-        pooled_embeddings = batch["pooled_text_embeddings"].to(device=device)
+        pooled_text_embeddings = batch["pooled_text_embeddings"].to(device=device)
     else:
         with torch.no_grad():
             encoder_output = text_encoder(batch["input_ids"].to(device))
@@ -439,7 +439,7 @@ def forward_pass(
             
             encoder_output_2 = text_encoder_2(batch["input_ids"].to(device))
             text_embeds_2 = encoder_output_2[0]
-            pooled_embeddings = encoder_output_2[1]
+            pooled_text_embeddings = encoder_output_2[1]
             
             text_embeddings = torch.cat([text_embeds_1, text_embeds_2], dim=-1)
     
@@ -452,9 +452,12 @@ def forward_pass(
         device=device
     )
     
+    # Reshape pooled embeddings to match time embeddings
+    pooled_text_embeddings = pooled_text_embeddings.view(batch_size, 1, -1)
+    
     added_cond_kwargs = {
-        "text_embeds": pooled_embeddings,
-        "time_ids": add_time_ids
+        "text_embeds": pooled_text_embeddings,  # [B, 1, D]
+        "time_ids": add_time_ids  # [B, 6]
     }
     
     # Get sigmas and compute loss
