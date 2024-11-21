@@ -13,6 +13,7 @@ from src.data.cacheing.vae import VAECache
 from src.data.cacheing.text_embeds import TextEmbeddingCache
 from src.data.image_processing.validation import validate_image
 from src.data.prompt.caption_processor import load_captions
+from src.data.multiaspect.dataset import MultiAspectDataset
 
 
 logger = logging.getLogger(__name__)
@@ -82,14 +83,30 @@ def train_sdxl(
     
     train_captions = load_captions(train_image_paths)
     
+    # Create train dataset
+    logger.info("Creating training dataset...")
+    train_dataset = MultiAspectDataset(
+        image_paths=train_image_paths,
+        captions=train_captions,
+        bucket_manager=None,  # Will be created internally
+        vae_cache=vae_cache,
+        text_cache=text_embedding_cache,
+        num_workers=config.num_workers,
+        token_dropout=config.tag_weighting.token_dropout,
+        caption_dropout=config.tag_weighting.caption_dropout,
+        rarity_factor=config.tag_weighting.rarity_factor,
+        emphasis_factor=config.tag_weighting.emphasis_factor
+    )
+    
     # Create train dataloader
     logger.info("Creating training dataloader...")
     train_dataloader = create_train_dataloader(
-        image_paths=train_image_paths,
-        captions=train_captions,
-        config=config,
-        vae_cache=vae_cache,
-        text_cache=text_embedding_cache
+        dataset=train_dataset,
+        batch_size=config.batch_size,
+        num_workers=config.num_workers,
+        shuffle=True,
+        pin_memory=True,
+        drop_last=True
     )
     
     # Create validation dataloader if provided
@@ -103,12 +120,26 @@ def train_sdxl(
         
         if val_image_paths:
             val_captions = load_captions(val_image_paths)
-            val_dataloader = create_validation_dataloader(
+            val_dataset = MultiAspectDataset(
                 image_paths=val_image_paths,
                 captions=val_captions,
-                config=config,
+                bucket_manager=None,
                 vae_cache=vae_cache,
-                text_cache=text_embedding_cache
+                text_cache=text_embedding_cache,
+                num_workers=config.num_workers,
+                token_dropout=0.0,  # No dropout for validation
+                caption_dropout=0.0,
+                rarity_factor=config.tag_weighting.rarity_factor,
+                emphasis_factor=config.tag_weighting.emphasis_factor
+            )
+            
+            val_dataloader = create_train_dataloader(
+                dataset=val_dataset,
+                batch_size=config.batch_size,
+                num_workers=config.num_workers,
+                shuffle=False,
+                pin_memory=True,
+                drop_last=False
             )
     
     # Create trainer with NAI improvements
@@ -194,13 +225,28 @@ def train_vae(
         max_memory_gb=config.max_memory_gb
     )
     
-    # Create dataloader
-    train_dataloader = create_train_dataloader(
+    # Create dataset
+    train_dataset = MultiAspectDataset(
         image_paths=train_image_paths,
         captions=train_captions,
-        config=config,
+        bucket_manager=None,
         vae_cache=vae_cache,
-        text_cache=text_cache
+        text_cache=text_cache,
+        num_workers=config.num_workers,
+        token_dropout=0.0,  # No dropout for VAE training
+        caption_dropout=0.0,
+        rarity_factor=0.0,
+        emphasis_factor=0.0
+    )
+    
+    # Create dataloader
+    train_dataloader = create_train_dataloader(
+        dataset=train_dataset,
+        batch_size=config.batch_size,
+        num_workers=config.num_workers,
+        shuffle=True,
+        pin_memory=True,
+        drop_last=True
     )
     
     # Create VAE trainer
