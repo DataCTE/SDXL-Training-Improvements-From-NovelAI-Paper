@@ -76,23 +76,26 @@ class TextEmbeddingCache:
         with torch.no_grad():
             encoder_output = encoder(**tokens)
         
-        # Get pooled output (NAI uses pooled embeddings)
-        pooled = encoder_output.pooler_output
+        # Get hidden states and mean pool
+        hidden_states = encoder_output.last_hidden_state  # [batch_size, seq_len, hidden_size]
+        
+        # Mean pool over sequence length (excluding padding)
+        attention_mask = tokens.attention_mask.unsqueeze(-1)  # [batch_size, seq_len, 1]
+        pooled = (hidden_states * attention_mask).sum(dim=1) / attention_mask.sum(dim=1)
         
         # Normalize embeddings
         pooled = pooled / pooled.norm(dim=-1, keepdim=True)
         
         return pooled
 
-    def encode(self, text_input: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def encode(self, text_input: str) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Encode text input to SDXL embeddings.
         Args:
             text_input: Input text
         Returns:
-            text_embeddings: Concatenated hidden states [1, 77, D]
+            text_embeddings: First encoder hidden states [1, 77, D]
             pooled_text_embeddings: Second encoder pooled output [1, D]
-            time_ids: SDXL time embeddings [1, 6]
         """
         # Check cache
         key = self._get_cache_key(text_input)
@@ -105,23 +108,29 @@ class TextEmbeddingCache:
         self._stats['misses'] += 1
         
         # Generate embeddings
-        hidden_1 = self._process_embeddings(
-            text_input,
-            self.text_encoder_1,
-            self.tokenizer_1,
-            77
-        )
-        
-        pooled_2 = self._process_embeddings(
-            text_input,
-            self.text_encoder_2,
-            self.tokenizer_2,
-            77
-        )
+        with torch.no_grad():
+            # First encoder: get hidden states
+            tokens_1 = self.tokenizer_1(
+                text_input,
+                padding="max_length",
+                max_length=77,
+                truncation=True,
+                return_tensors="pt"
+            ).to(self.device)
+            
+            hidden_1 = self.text_encoder_1(**tokens_1).last_hidden_state
+            
+            # Second encoder: get pooled output
+            pooled_2 = self._process_embeddings(
+                text_input,
+                self.text_encoder_2,
+                self.tokenizer_2,
+                77
+            )
         
         # Format outputs
-        text_embeddings = hidden_1.unsqueeze(1)  # [1, 1, D]
-        pooled_text_embeddings = pooled_2  # [1, D] (only use second encoder pooled)
+        text_embeddings = hidden_1  # [1, 77, D]
+        pooled_text_embeddings = pooled_2  # [1, D]
         
         # Cache results
         result = (text_embeddings, pooled_text_embeddings)
