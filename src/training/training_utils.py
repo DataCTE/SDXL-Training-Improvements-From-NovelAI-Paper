@@ -9,6 +9,7 @@ from src.training.loss_functions import get_cosine_schedule_with_warmup
 import warnings
 from torch.cuda.amp import GradScaler
 from src.training.optimizers.lion.__init__ import Lion
+import math
 
 # Suppress the specific deprecation warning
 warnings.filterwarnings("ignore", category=FutureWarning, 
@@ -61,13 +62,20 @@ def initialize_training_components(
     """Initialize training components with NAI recommendations"""
     components = {}
     
+    # Calculate resolution-aware sigma max based on image size
+    height, width = config.image_size
+    area = height * width
+    base_res = 1024.0 * 1024.0  # SDXL base resolution
+    sigma_scale = math.sqrt(area / base_res)
+    sigma_max = 20000.0 * sigma_scale  # Scale sigma_max based on resolution
+    
     # Setup optimizer based on type
     if config.optimizer.optimizer_type == "lion":
         components["optimizer"] = Lion(
             models["unet"].parameters(),
             lr=config.optimizer.learning_rate,
             weight_decay=config.optimizer.weight_decay,
-            betas=config.optimizer.lion_betas  # Use NAI's recommended values
+            betas=config.optimizer.lion_betas
         )
     else:
         components["optimizer"] = setup_optimizer(
@@ -81,20 +89,29 @@ def initialize_training_components(
             use_8bit_optimizer=config.optimizer.use_8bit_adam
         )
     
-    # NAI-style warmup scheduler
-    components["scheduler"] = get_cosine_schedule_with_warmup(
-        num_warmup_steps=int(config.scheduler.num_training_steps * 0.02),  # 2% warmup
+    # Get ZTSNR schedule
+    get_cosine_schedule_with_warmup(
         num_training_steps=config.scheduler.num_training_steps,
-        height=config.image_size[0],
-        width=config.image_size[1],
-        sigma_max=20000.0  # NAI Appendix A.2: practical ZTSNR approximation
+        num_warmup_steps=int(config.scheduler.num_training_steps * 0.02),  # 2% warmup
+        height=height,
+        width=width,
+        sigma_min=0.0292,
+        sigma_max=sigma_max,  # Use resolution-scaled sigma_max
+        rho=7.0,
+        device=models["unet"].device
+    )
+    
+    # Setup scheduler with ZTSNR sigmas
+    components["scheduler"] = torch.optim.lr_scheduler.LambdaLR(
+        optimizer=components["optimizer"],
+        lr_lambda=lambda step: max(0.0, 1.0 - step / config.scheduler.num_training_steps)
     )
     
     # Setup gradient scaler for mixed precision training
     if config.mixed_precision != "no":
-        components["scaler"] = GradScaler("cuda")
+        components["scaler"] = GradScaler()
     
-    # Setup EMA using custom implementation
+    # Setup EMA
     if config.use_ema:
         components["ema_model"] = setup_ema_model(
             model=models["unet"],

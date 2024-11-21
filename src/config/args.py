@@ -122,6 +122,11 @@ class TrainingConfig:
     pretrained_model_path: str  
     train_data_dir: str  
     
+    # Add image size configuration
+    image_size: tuple[int, int] = field(
+        default_factory=lambda: (1024, 1024)  # Default SDXL resolution
+    )
+    
     # Training parameters
     output_dir: str = DEFAULTS["training"]["output_dir"]
     cache_dir: Optional[str] = None
