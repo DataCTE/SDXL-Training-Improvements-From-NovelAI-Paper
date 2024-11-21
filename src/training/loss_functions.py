@@ -422,28 +422,17 @@ def forward_pass(
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Forward pass with NAI improvements"""
     unet = model_dict["unet"]
-    text_encoder = model_dict.get("text_encoder")
-    text_encoder_2 = model_dict.get("text_encoder_2")
     
+    # Process input images [B, C, H, W]
     pixel_values = batch["pixel_values"].to(device=device, dtype=dtype)
     batch_size, _, height, width = pixel_values.shape
     
-    # Get text embeddings
-    if "text_embeddings" in batch:
-        text_embeddings = batch["text_embeddings"].to(device=device)
-        pooled_text_embeddings = batch["pooled_text_embeddings"].to(device=device)
-    else:
-        with torch.no_grad():
-            encoder_output = text_encoder(batch["input_ids"].to(device))
-            text_embeds_1 = encoder_output[0]
-            
-            encoder_output_2 = text_encoder_2(batch["input_ids"].to(device))
-            text_embeds_2 = encoder_output_2[0]
-            pooled_text_embeddings = encoder_output_2[1]
-            
-            text_embeddings = torch.cat([text_embeds_1, text_embeds_2], dim=-1)
+    # Get text embeddings [B, 77, D]
+    text_embeddings = batch["text_embeddings"].to(device=device)
+    # Get pooled embeddings [B, D]
+    pooled_text_embeddings = batch["pooled_text_embeddings"].to(device=device)
     
-    # Get time embeddings
+    # Get time embeddings [B, 6]
     add_time_ids = _get_add_time_ids(
         batch_size=batch_size,
         height=height,
@@ -452,15 +441,13 @@ def forward_pass(
         device=device
     )
     
-    # Reshape pooled embeddings to match time embeddings
-    pooled_text_embeddings = pooled_text_embeddings.view(batch_size, 1, -1)
-    
+    # Format conditioning inputs
     added_cond_kwargs = {
-        "text_embeds": pooled_text_embeddings,  # [B, 1, D]
+        "text_embeds": pooled_text_embeddings.unsqueeze(1),  # [B, 1, D]
         "time_ids": add_time_ids  # [B, 6]
     }
     
-    # Get sigmas and compute loss
+    # Get noise schedule
     sigma = get_sigmas(
         num_inference_steps=args.num_inference_steps,
         height=height,
@@ -468,18 +455,17 @@ def forward_pass(
         device=device
     )[0]
     
+    # Compute loss
     loss, metrics = training_loss_v_prediction(
         model=unet,
         x_0=pixel_values,
         sigma=sigma,
         text_embeddings=text_embeddings,
         added_cond_kwargs=added_cond_kwargs,
-        return_metrics=True
+        return_metrics=True,
+        use_snr_weighting=args.use_min_snr,
+        min_snr_gamma=args.min_snr_gamma
     )
-    
-    if args.use_min_snr:
-        weight = compute_snr_weight(sigma, gamma=args.min_snr_gamma)
-        loss = loss * weight
     
     return loss, metrics
 
