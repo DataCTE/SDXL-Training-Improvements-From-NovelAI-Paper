@@ -203,18 +203,27 @@ class SDXLTrainer(BaseTrainer):
         return loss, pred_images, v_prediction, timesteps
 
     def train_epoch(self, dataloader: DataLoader) -> float:
-        """Train for one epoch"""
         self.model.train()
         total_loss = 0
         num_batches = len(dataloader)
         
-        for batch_idx, batch in enumerate(tqdm(dataloader)):
+        # Only show progress bar on main process
+        iterator = (
+            tqdm(dataloader) 
+            if (self.local_rank == -1 or self.local_rank == 0) 
+            else dataloader
+        )
+        
+        for batch_idx, batch in enumerate(iterator):
             try:
                 # Clear cache at start of batch
                 torch.cuda.empty_cache()
                 
-                # Unpack batch
-                images, text_embeds, tag_weights = batch
+                # Unpack batch and move to device
+                images, text_embeds, tag_weights = [
+                    x.to(self.device) if torch.is_tensor(x) else x 
+                    for x in batch
+                ]
                 
                 # Training step
                 self.optimizer.zero_grad(set_to_none=True)
@@ -227,29 +236,29 @@ class SDXLTrainer(BaseTrainer):
                 # Backward pass
                 loss.backward()
                 
-                # Log metrics
-                grad_norm = self.compute_grad_norm()
-                self.log_metrics({
-                    'loss/total': loss.item(),
-                    'v_pred/mean': v_pred.mean().item(),
-                    'v_pred/std': v_pred.std().item(),
-                    'v_pred/min': v_pred.min().item(),
-                    'v_pred/max': v_pred.max().item(),
-                    'grad/norm': grad_norm,
-                    'timesteps/mean': timesteps.float().mean().item(),
-                    'timesteps/std': timesteps.float().std().item()
-                })
+                # Log metrics (only on main process)
+                if self.local_rank == -1 or self.local_rank == 0:
+                    grad_norm = self.compute_grad_norm()
+                    self.log_metrics({
+                        'loss/total': loss.item(),
+                        'v_pred/mean': v_pred.mean().item(),
+                        'v_pred/std': v_pred.std().item(),
+                        'v_pred/min': v_pred.min().item(),
+                        'v_pred/max': v_pred.max().item(),
+                        'grad/norm': grad_norm,
+                        'timesteps/mean': timesteps.float().mean().item(),
+                        'timesteps/std': timesteps.float().std().item()
+                    })
                 
                 self.optimizer.step()
                 
                 total_loss += loss.item()
                 self.global_step += 1
                 
-                # Console logging
-                if batch_idx % self.config.log_interval == 0:
+                # Console logging (only on main process)
+                if (self.local_rank == -1 or self.local_rank == 0) and batch_idx % self.config.log_interval == 0:
                     print(f'Epoch {self.current_epoch} [{batch_idx}/{num_batches}]:')
                     print(f'  Loss = {loss.item():.4f}')
-                    print(f'  Grad norm = {grad_norm:.4f}')
                     print(f'  Memory: {torch.cuda.memory_allocated()/1e9:.1f}GB')
                 
             except Exception as e:
@@ -258,5 +267,10 @@ class SDXLTrainer(BaseTrainer):
                 print(f"  Allocated: {torch.cuda.memory_allocated()/1e9:.1f}GB")
                 print(f"  Max allocated: {torch.cuda.max_memory_allocated()/1e9:.1f}GB")
                 raise
-                
+        
+        # Average loss across all processes
+        if self.local_rank != -1:
+            dist.all_reduce(torch.tensor(total_loss, device=self.device))
+            total_loss /= dist.get_world_size()
+        
         return total_loss / num_batches 

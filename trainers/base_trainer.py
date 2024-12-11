@@ -4,6 +4,8 @@ from torch.utils.data import DataLoader
 import wandb
 from pathlib import Path
 from typing import Optional, Dict, Any
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from utils.checkpoints import CheckpointManager
 
@@ -15,13 +17,23 @@ class BaseTrainer:
         device: torch.device,
         config: Any,
         accelerator = None,
-        checkpoint_manager: Optional[CheckpointManager] = None
+        checkpoint_manager: Optional[CheckpointManager] = None,
+        local_rank: int = -1
     ):
         self.model = model
         self.optimizer = optimizer
         self.device = device
         self.config = config
         self.accelerator = accelerator
+        self.local_rank = local_rank
+        
+        # Wrap model in DDP if using distributed training
+        if self.local_rank != -1:
+            self.model = DDP(
+                self.model,
+                device_ids=[self.local_rank],
+                output_device=self.local_rank
+            )
         
         self.checkpoint_manager = checkpoint_manager or CheckpointManager()
         
@@ -55,15 +67,13 @@ class BaseTrainer:
         raise NotImplementedError
         
     def log_metrics(self, metrics: Dict[str, float]):
-        """Log metrics to all trackers"""
-        if self.accelerator and self.accelerator.is_main_process:
-            # Log to wandb
+        """Log metrics to all trackers (only on main process)"""
+        if self.local_rank == -1 or self.local_rank == 0:
             if wandb.run:
                 wandb.log(metrics, step=self.global_step)
+            if self.accelerator:
+                self.accelerator.log(metrics, step=self.global_step)
                 
-            # Log to tensorboard via accelerator
-            self.accelerator.log(metrics, step=self.global_step)
-            
     def compute_grad_norm(self) -> float:
         """Compute total gradient norm"""
         total_norm = 0.0

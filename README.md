@@ -70,6 +70,8 @@ python train.py \
   - Training state preservation
   - Easy resumption
 
+### Multi-GPU Training
+
 ## Project Structure
 ```
 sdxl_train/

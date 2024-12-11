@@ -4,8 +4,10 @@ import signal
 import sys
 import torch
 import wandb
+import torch.multiprocessing as mp
 from pathlib import Path
 from accelerate import Accelerator
+from torch.utils.data import DataLoader
 from diffusers import AutoencoderKL, UNet2DConditionModel, DDPMScheduler
 from safetensors.torch import load_file
 from adamw_bf16 import AdamWBF16
@@ -15,6 +17,7 @@ from trainers.sdxl_trainer import SDXLTrainer
 from data.dataset import NovelAIDataset
 from data.sampler import AspectBatchSampler
 from utils.checkpoints import CheckpointManager
+from utils.distributed import setup_distributed, cleanup_distributed
 
 def setup_wandb(config: TrainingConfig):
     wandb.init(
@@ -74,106 +77,83 @@ def load_unet(args, config: TrainingConfig, device: torch.device):
         ).to(device)
 
 def main():
-    # Parse arguments
     parser = argparse.ArgumentParser()
-    parser.add_argument("--resume_from_checkpoint", type=str, 
-                       help="Path to checkpoint directory to resume from")
-    parser.add_argument("--unet_path", type=str, 
-                       help="Path to UNet safetensors file to start from")
+    parser.add_argument("--local_rank", type=int, default=-1)
+    parser.add_argument("--world_size", type=int, default=None)
+    parser.add_argument("--unet_path", type=str, required=True)
+    parser.add_argument("--resume_from_checkpoint", type=str)
     args = parser.parse_args()
-
-    # Initialize config and components
-    config = TrainingConfig()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    checkpoint_manager = CheckpointManager(config.checkpoint_dir)
     
-    # Setup wandb
-    setup_wandb(config)
+    # Setup distributed training if needed
+    if args.local_rank != -1:
+        device = setup_distributed(args.local_rank, args.world_size)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Load models
-    print("Loading VAE...")
-    vae = AutoencoderKL.from_pretrained(
-        config.pretrained_model_name,
-        subfolder="vae",
-        torch_dtype=torch.bfloat16
-    ).to(device)
-    vae.eval()
-    vae.requires_grad_(False)
-    
-    print("Loading UNet...")
-    unet = load_unet(args, config, device)
-    unet.enable_gradient_checkpointing()
-    unet.enable_xformers_memory_efficient_attention()
-    
-    # Setup dataset and dataloader
-    print("Creating dataset...")
-    dataset = NovelAIDataset(
-        image_dirs=config.image_dirs,
-        transform=config.get_transform(),
-        device=device,
-        vae=vae,
-        cache_dir=config.cache_dir,
-        text_cache_dir=config.text_cache_dir
-    )
-    
-    print("Creating dataloader...")
-    dataloader = AspectBatchSampler(
-        dataset=dataset,
-        batch_size=config.batch_size,
-        shuffle=True
-    )
-    
-    # Setup optimizer and scheduler
-    print("Setting up optimizer...")
-    optimizer = AdamWBF16(
-        unet.parameters(),
-        lr=config.learning_rate,
-        betas=(0.9, 0.999),
-        weight_decay=1e-2,
-        eps=1e-8
-    )
-    
-    print("Setting up noise scheduler...")
-    noise_scheduler = DDPMScheduler.from_pretrained(
-        config.pretrained_model_name,
-        subfolder="scheduler",
-        torch_dtype=torch.bfloat16
-    )
-    
-    # Setup accelerator
-    print("Setting up accelerator...")
-    accelerator = Accelerator(
-        gradient_accumulation_steps=config.grad_accum_steps,
-        mixed_precision="bf16",
-        log_with="tensorboard",
-        project_dir="logs",
-        device_placement=True,
-    )
-    
-    if accelerator.is_main_process:
-        accelerator.init_trackers("sdxl_finetune")
-    
-    # Create trainer
-    trainer = SDXLTrainer(
-        model=unet,
-        vae=vae,
-        optimizer=optimizer,
-        scheduler=noise_scheduler,
-        device=device,
-        config=config,
-        accelerator=accelerator,
-        checkpoint_manager=checkpoint_manager
-    )
-    
-    # Training loop
     try:
-        trainer.train()
-    except KeyboardInterrupt:
-        print("\nTraining interrupted. Saving checkpoint...")
-        trainer.save_checkpoint("interrupted_checkpoint")
+        config = TrainingConfig()
+        
+        # Initialize wandb only on main process
+        if args.local_rank == -1 or args.local_rank == 0:
+            setup_wandb(config)
+        
+        # Load models
+        unet = UNet2DConditionModel.from_pretrained(args.unet_path)
+        vae = AutoencoderKL.from_pretrained("stabilityai/sdxl-vae")
+        
+        # Initialize optimizer
+        optimizer = AdamWBF16(
+            unet.parameters(),
+            lr=config.learning_rate,
+            betas=config.adam_betas,
+            weight_decay=config.weight_decay,
+            max_grad_norm=config.max_grad_norm
+        )
+        
+        # Initialize dataset and sampler
+        dataset = NovelAIDataset(config.data_path)
+        sampler = AspectBatchSampler(
+            dataset,
+            batch_size=config.batch_size,
+            shuffle=True,
+            world_size=args.world_size,
+            rank=args.local_rank
+        )
+        
+        dataloader = DataLoader(
+            dataset,
+            batch_sampler=sampler,
+            num_workers=config.num_workers,
+            pin_memory=True
+        )
+        
+        # Initialize trainer
+        trainer = SDXLTrainer(
+            model=unet,
+            vae=vae,
+            optimizer=optimizer,
+            scheduler=DDPMScheduler(),
+            device=device,
+            config=config,
+            local_rank=args.local_rank
+        )
+        
+        if args.resume_from_checkpoint:
+            trainer.load_checkpoint(args.resume_from_checkpoint)
+        
+        # Training loop
+        for epoch in range(trainer.current_epoch, config.num_epochs):
+            trainer.current_epoch = epoch
+            avg_loss = trainer.train_epoch(dataloader)
+            
+            if args.local_rank == -1 or args.local_rank == 0:
+                print(f"Epoch {epoch} completed with average loss: {avg_loss:.4f}")
+                trainer.save_checkpoint()
+                
     finally:
-        wandb.finish()
-        accelerator.end_training()
+        cleanup_distributed()
+        if args.local_rank == -1 or args.local_rank == 0:
+            wandb.finish()
 
 if __name__ == "__main__":
     main()
