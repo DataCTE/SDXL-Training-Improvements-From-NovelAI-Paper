@@ -6,6 +6,8 @@ import glob
 from pathlib import Path
 from tqdm import tqdm
 from typing import List, Optional, Tuple, Callable
+import hashlib
+import torch.nn as nn
 
 from .buckets import AspectRatioBucket, ImageBucket
 from models.embedder import TextEmbedder
@@ -23,31 +25,23 @@ class NovelAIDataset(Dataset):
         min_bucket_size: int = 1,
         cache_dir: str = "latent_cache",
         text_cache_dir: str = "text_cache",
-        vae = None
+        vae = None,
+        local_rank: int = -1,
+        world_size: int = 1
     ):
         self.transform = transform
         self.device = device
         self.text_embedder = TextEmbedder(device=device)
         self.tag_weighter = TagWeighter()
         self.vae = vae
+        self.local_rank = local_rank
+        self.world_size = world_size
         
-        # Setup cache directories
+        # Single cache directory for all processes
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(exist_ok=True)
         self.text_cache_dir = Path(text_cache_dir)
         self.text_cache_dir.mkdir(exist_ok=True)
-        
-        # Process directories and cache latents and text embeddings
-        self._process_and_cache_data(
-            image_dirs=image_dirs,
-            max_image_size=max_image_size,
-            max_dim=max_dim,
-            bucket_step=bucket_step,
-            min_bucket_size=min_bucket_size
-        )
-        
-        # Cleanup embedder to free memory
-        self._cleanup_embedder()
 
     def _cleanup_embedder(self):
         """Clean up text embedder to free memory"""
@@ -69,91 +63,41 @@ class NovelAIDataset(Dataset):
 
     def _process_and_cache_data(self, image_dirs, max_image_size, max_dim, bucket_step, min_bucket_size):
         """Process all images and cache latents/embeddings"""
-        bucket_manager = AspectRatioBucket(
-            max_image_size=max_image_size,
-            max_dim=max_dim,
-            bucket_step=bucket_step
-        )
-        
-        self.items = []
-        total_found = 0
-        total_processed = 0
-        total_cached_latents = 0
-        total_cached_text = 0
-        total_skipped = 0
-        
+        # Collect all image files first
+        all_image_files = []
         for image_dir in image_dirs:
-            print(f"\nProcessing directory: {image_dir}")
-            image_files = []
-            for ext in ['*.jpg', '*.jpeg', '*.png', '*.webp', '*.bmp', '*.tiff', '*.tif', '*.gif']:
-                image_files.extend(glob.glob(os.path.join(image_dir, '**', ext), recursive=True))
-                image_files.extend(glob.glob(os.path.join(image_dir, '**', ext.upper()), recursive=True))
-            
-            dir_found = len(image_files)
-            total_found += dir_found
-            print(f"Found {dir_found} images")
-            
-            dir_processed = 0
-            dir_cached_latents = 0
-            dir_cached_text = 0
-            dir_skipped = 0
-            
-            for img_path in tqdm(image_files, desc="Loading images"):
-                txt_path = img_path.replace(os.path.splitext(img_path)[1], '.txt')
-                if not os.path.exists(txt_path):
-                    continue
-                
-                img_cache_path = self.cache_dir / f"{Path(img_path).stem}.pt"
-                text_cache_path = self.text_cache_dir / f"{Path(img_path).stem}.pt"
-                
-                try:
-                    with Image.open(img_path) as img:
-                        width, height = img.size
-                        best_bucket = bucket_manager.find_bucket(width, height)
-                        
-                        if best_bucket is not None:
-                            if not img_cache_path.exists() and self.vae is not None:
-                                processed_img = self._process_image(img_path, best_bucket)
-                                with torch.no_grad():
-                                    latent = self.vae.encode(
-                                        processed_img.unsqueeze(0).to(self.device)
-                                    ).latent_dist.sample()
-                                    latent = latent * 0.13025
-                                    torch.save(latent.cpu(), img_cache_path)
-                                dir_cached_latents += 1
-                            
-                            if not text_cache_path.exists():
-                                with open(txt_path, 'r', encoding='utf-8') as f:
-                                    caption = f.read().strip()
-                                text_embeds = self.text_embedder(caption)
-                                torch.save({
-                                    'embeds': text_embeds,
-                                    'tags': parse_tags(caption)
-                                }, text_cache_path)
-                                dir_cached_text += 1
-                            
-                            self.items.append((img_path, best_bucket, img_cache_path, text_cache_path))
-                            dir_processed += 1
-                            
-                except Exception as e:
-                    print(f"Error processing {img_path}: {e}")
-            
-            total_processed += dir_processed
-            total_cached_latents += dir_cached_latents
-            total_cached_text += dir_cached_text
-            total_skipped += dir_skipped
-            
-            print(f"Successfully processed {dir_processed} images")
-            print(f"  - {dir_cached_latents} new latents cached")
-            print(f"  - {dir_cached_text} new text embeddings cached")
-            print(f"  - {dir_skipped} existing items skipped")
-        
-        print(f"\nFinal Summary:")
-        print(f"Total images found: {total_found}")
-        print(f"Total images processed: {total_processed}")
-        print(f"  - {total_cached_latents} new latents cached")
-        print(f"  - {total_cached_text} new text embeddings cached")
-        print(f"  - {total_skipped} existing items skipped")
+            for ext in ['*.jpg', '*.jpeg', '*.png', '*.webp']:
+                all_image_files.extend(glob.glob(os.path.join(image_dir, '**', ext), recursive=True))
+
+        # Partition work across GPUs
+        if self.world_size > 1:
+            # Calculate partition for this GPU
+            partition_size = len(all_image_files) // self.world_size
+            start_idx = self.local_rank * partition_size
+            end_idx = start_idx + partition_size if self.local_rank < self.world_size - 1 else len(all_image_files)
+            # This GPU only processes its partition
+            image_files = all_image_files[start_idx:end_idx]
+            print(f"Rank {self.local_rank} processing {len(image_files)} images")
+        else:
+            image_files = all_image_files
+
+        # Process assigned partition
+        for img_path in tqdm(image_files, desc=f"Rank {self.local_rank} processing"):
+            img_cache_path = self.cache_dir / f"{Path(img_path).stem}.pt"
+            if not img_cache_path.exists():
+                # Process and cache image
+                self._cache_single_image(img_path, img_cache_path)
+
+        # Wait for all processes to finish caching
+        if self.world_size > 1:
+            torch.distributed.barrier()
+
+        # After caching, all processes load the full dataset
+        self.items = []
+        for img_path in all_image_files:
+            img_cache_path = self.cache_dir / f"{Path(img_path).stem}.pt"
+            if img_cache_path.exists():
+                self.items.append((img_path, img_cache_path))
 
     def _process_image(self, image_path: str, bucket: ImageBucket) -> torch.Tensor:
         """Process a single image to fit in its bucket"""

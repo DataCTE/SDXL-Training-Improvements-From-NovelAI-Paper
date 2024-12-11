@@ -110,8 +110,12 @@ def main():
             max_grad_norm=config.max_grad_norm
         )
         
-        # Initialize dataset and sampler
-        dataset = NovelAIDataset(config.data_path)
+        # Initialize dataset with local_rank
+        dataset = NovelAIDataset(
+            config.data_path,
+            device=device,
+            local_rank=args.local_rank
+        )
         sampler = AspectBatchSampler(
             dataset,
             batch_size=config.batch_size,
