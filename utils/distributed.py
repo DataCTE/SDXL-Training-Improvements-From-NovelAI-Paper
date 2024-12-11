@@ -2,7 +2,9 @@ import os
 import torch
 import torch.distributed as dist
 from typing import Optional
+from utils.error_handling import error_handler
 
+@error_handler
 def setup_distributed(
     local_rank: int,
     world_size: Optional[int] = None,
@@ -29,11 +31,13 @@ def setup_distributed(
     
     return device
 
+@error_handler
 def cleanup_distributed():
     """Cleanup distributed training"""
     if dist.is_initialized():
         dist.destroy_process_group()
 
+@error_handler
 def is_main_process() -> bool:
     """Check if this is the main process"""
     return not dist.is_initialized() or dist.get_rank() == 0 

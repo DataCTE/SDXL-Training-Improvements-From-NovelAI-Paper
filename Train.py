@@ -18,6 +18,7 @@ from data.dataset import NovelAIDataset
 from data.sampler import AspectBatchSampler
 from utils.checkpoints import CheckpointManager
 from utils.distributed import setup_distributed, cleanup_distributed
+from utils.error_handling import error_handler
 
 def setup_wandb(config: TrainingConfig):
     wandb.init(
@@ -76,6 +77,7 @@ def load_unet(args, config: TrainingConfig, device: torch.device):
             use_safetensors=True
         ).to(device)
 
+@error_handler
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--local_rank", type=int, default=-1)

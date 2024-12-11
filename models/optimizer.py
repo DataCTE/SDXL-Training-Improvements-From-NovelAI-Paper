@@ -1,6 +1,7 @@
 import torch
 from adamw_bf16 import AdamW_BF16 as BaseBF16Optimizer
 from typing import Optional, Callable
+from utils.error_handling import error_handler
 
 class SDXLAdamWBF16(BaseBF16Optimizer):
     """
@@ -37,6 +38,7 @@ class SDXLAdamWBF16(BaseBF16Optimizer):
         self.max_grad_norm = max_grad_norm
         self.noise_scale = noise_scale
 
+    @error_handler
     @torch.no_grad()
     def step(self, closure=None, zero_grad: bool = False):
         """
@@ -74,6 +76,7 @@ class SDXLAdamWBF16(BaseBF16Optimizer):
 
         return loss
 
+    @error_handler
     def zero_grad(self, set_to_none: bool = True):
         """
         Resets the gradients of all optimized parameters.

@@ -5,6 +5,7 @@ from tqdm import tqdm
 from typing import Dict, Tuple, Any
 
 from .base_trainer import BaseTrainer
+from utils.error_handling import error_handler
 
 class SDXLTrainer(BaseTrainer):
     def __init__(
@@ -97,6 +98,7 @@ class SDXLTrainer(BaseTrainer):
         
         return add_time_ids.reshape(batch_size, -1)
 
+    @error_handler
     def training_step(
         self,
         images: torch.Tensor,
@@ -202,10 +204,14 @@ class SDXLTrainer(BaseTrainer):
         
         return loss, pred_images, v_prediction, timesteps
 
+    @error_handler
     def train_epoch(self, dataloader: DataLoader) -> float:
         self.model.train()
         total_loss = 0
         num_batches = len(dataloader)
+        
+        # Scale learning rate for gradient accumulation
+        effective_batch = self.config.batch_size * self.config.grad_accum_steps * (self.world_size if self.local_rank != -1 else 1)
         
         # Only show progress bar on main process
         iterator = (
@@ -215,6 +221,10 @@ class SDXLTrainer(BaseTrainer):
         )
         
         for batch_idx, batch in enumerate(iterator):
+            # Zero gradients at start of accumulation steps
+            if batch_idx % self.config.grad_accum_steps == 0:
+                self.optimizer.zero_grad(set_to_none=True)
+            
             try:
                 # Clear cache at start of batch
                 torch.cuda.empty_cache()
@@ -225,16 +235,19 @@ class SDXLTrainer(BaseTrainer):
                     for x in batch
                 ]
                 
-                # Training step
-                self.optimizer.zero_grad(set_to_none=True)
-                
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     loss, pred_images, v_pred, timesteps = self.training_step(
                         images, text_embeds, tag_weights
                     )
+                    # Scale loss for gradient accumulation
+                    loss = loss / self.config.grad_accum_steps
                 
-                # Backward pass
                 loss.backward()
+                
+                # Only step optimizer after accumulation
+                if (batch_idx + 1) % self.config.grad_accum_steps == 0:
+                    self.optimizer.step()
+                    self.optimizer.zero_grad(set_to_none=True)
                 
                 # Log metrics (only on main process)
                 if self.local_rank == -1 or self.local_rank == 0:
@@ -249,8 +262,6 @@ class SDXLTrainer(BaseTrainer):
                         'timesteps/mean': timesteps.float().mean().item(),
                         'timesteps/std': timesteps.float().std().item()
                     })
-                
-                self.optimizer.step()
                 
                 total_loss += loss.item()
                 self.global_step += 1

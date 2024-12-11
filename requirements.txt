@@ -14,3 +14,7 @@ realesrgan
 spacy>=3.8.0
 scikit-learn
 adamw_bf16
+filelock>=3.12.0
+torch>=2.0.0
+accelerate>=0.20.0
+filelock>=3.12.0

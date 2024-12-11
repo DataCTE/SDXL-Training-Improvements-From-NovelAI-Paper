@@ -2,6 +2,7 @@ import os
 import torch
 import shutil
 from pathlib import Path
+from utils.error_handling import error_handler
 
 class CheckpointManager:
     def __init__(self, save_dir: str = "checkpoints", max_checkpoints: int = 3):
@@ -9,6 +10,7 @@ class CheckpointManager:
         self.save_dir.mkdir(exist_ok=True)
         self.max_checkpoints = max_checkpoints
         
+    @error_handler
     def save_checkpoint(self, model, optimizer, epoch, global_step, name=None):
         """Save a checkpoint with specified name"""
         if name is None:
@@ -47,6 +49,7 @@ class CheckpointManager:
                 old_path = self.save_dir / old_ckpt
                 shutil.rmtree(old_path)
                 
+    @error_handler
     def load_checkpoint(self, checkpoint_path: str):
         """Load a checkpoint and return the training state"""
         checkpoint_path = Path(checkpoint_path)

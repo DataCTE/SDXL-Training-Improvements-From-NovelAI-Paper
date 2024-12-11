@@ -1,5 +1,6 @@
-from typing import List
+from typing import List, Dict
 import torch
+from utils.error_handling import error_handler
 
 class TagWeighter:
     def __init__(
@@ -16,6 +17,7 @@ class TagWeighter:
         self.total_count = 0
         self.tag_weights = {}
 
+    @error_handler
     def update_frequencies(self, tags: List[str]):
         """Update tag frequency counters"""
         for tag in tags:
@@ -24,6 +26,7 @@ class TagWeighter:
             self.tag_counts[tag] += 1
             self.total_count += 1
             
+    @error_handler
     def compute_weights(self):
         """Compute weights for all seen tags"""
         if not self.total_count:
@@ -36,6 +39,7 @@ class TagWeighter:
             weight = min(self.max_weight, max(self.min_weight, raw_weight))
             self.tag_weights[tag] = weight
                 
+    @error_handler
     def get_weight(self, tags: List[str]) -> float:
         """Get combined weight for a set of tags"""
         if not tags:
@@ -44,6 +48,7 @@ class TagWeighter:
         weights = [self.tag_weights.get(tag, self.default_weight) for tag in tags]
         return torch.tensor(weights).mean().item()
 
+@error_handler
 def parse_tags(caption: str) -> List[str]:
     """Extract tags from caption"""
     parts = caption.lower().split(',')

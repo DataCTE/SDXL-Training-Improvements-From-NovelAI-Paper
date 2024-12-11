@@ -8,10 +8,13 @@ from tqdm import tqdm
 from typing import List, Optional, Tuple, Callable
 import hashlib
 import torch.nn as nn
+import fcntl
+from filelock import FileLock
 
 from .buckets import AspectRatioBucket, ImageBucket
 from models.embedder import TextEmbedder
 from models.tag_weighter import TagWeighter, parse_tags
+from utils.error_handling import error_handler
 
 class NovelAIDataset(Dataset):
     def __init__(
@@ -61,43 +64,82 @@ class NovelAIDataset(Dataset):
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
 
+    @error_handler
+    def _cache_single_image(self, img_path: str, cache_path: Path) -> None:
+        """Thread-safe image caching"""
+        # Create a file lock for this specific cache file
+        lock_path = str(cache_path) + '.lock'
+        
+        with FileLock(lock_path):
+            # Double-check pattern in case another process created the file
+            if not cache_path.exists():
+                try:
+                    # Process image
+                    with Image.open(img_path) as img:
+                        pixel_values = self.transform(img).unsqueeze(0)
+                    
+                    if self.device:
+                        pixel_values = pixel_values.to(self.device)
+                        
+                    with torch.no_grad():
+                        latents = self.vae.encode(pixel_values).latent_dist.sample()
+                    
+                    # Use temporary file for atomic write
+                    temp_path = cache_path.with_suffix('.tmp')
+                    torch.save(latents.cpu(), temp_path)
+                    temp_path.rename(cache_path)
+                    
+                except Exception as e:
+                    # Clean up temporary files if something goes wrong
+                    if temp_path.exists():
+                        temp_path.unlink()
+                    raise e
+                finally:
+                    # Clean up lock file
+                    try:
+                        os.unlink(lock_path)
+                    except:
+                        pass
+
+    @error_handler
     def _process_and_cache_data(self, image_dirs, max_image_size, max_dim, bucket_step, min_bucket_size):
-        """Process all images and cache latents/embeddings"""
+        """Process all images and cache latents/embeddings with distributed coordination"""
         # Collect all image files first
         all_image_files = []
         for image_dir in image_dirs:
             for ext in ['*.jpg', '*.jpeg', '*.png', '*.webp']:
                 all_image_files.extend(glob.glob(os.path.join(image_dir, '**', ext), recursive=True))
 
-        # Partition work across GPUs
+        # Sort for deterministic ordering across processes
+        all_image_files.sort()
+
         if self.world_size > 1:
-            # Calculate partition for this GPU
-            partition_size = len(all_image_files) // self.world_size
-            start_idx = self.local_rank * partition_size
-            end_idx = start_idx + partition_size if self.local_rank < self.world_size - 1 else len(all_image_files)
-            # This GPU only processes its partition
-            image_files = all_image_files[start_idx:end_idx]
-            print(f"Rank {self.local_rank} processing {len(image_files)} images")
+            # Each process takes its chunk
+            chunk_size = len(all_image_files) // self.world_size
+            start_idx = self.local_rank * chunk_size
+            end_idx = start_idx + chunk_size if self.local_rank < self.world_size - 1 else len(all_image_files)
+            process_files = all_image_files[start_idx:end_idx]
+            
+            print(f"Rank {self.local_rank}: Processing {len(process_files)} files ({start_idx} to {end_idx})")
         else:
-            image_files = all_image_files
+            process_files = all_image_files
 
-        # Process assigned partition
-        for img_path in tqdm(image_files, desc=f"Rank {self.local_rank} processing"):
-            img_cache_path = self.cache_dir / f"{Path(img_path).stem}.pt"
-            if not img_cache_path.exists():
-                # Process and cache image
-                self._cache_single_image(img_path, img_cache_path)
+        # Process files with proper locking
+        for img_path in tqdm(process_files, desc=f"Rank {self.local_rank} processing"):
+            cache_path = self.cache_dir / f"{hashlib.md5(img_path.encode()).hexdigest()}.pt"
+            if not cache_path.exists():
+                self._cache_single_image(img_path, cache_path)
 
-        # Wait for all processes to finish caching
+        # Synchronize processes before loading
         if self.world_size > 1:
             torch.distributed.barrier()
 
-        # After caching, all processes load the full dataset
+        # Now all processes load the complete dataset
         self.items = []
         for img_path in all_image_files:
-            img_cache_path = self.cache_dir / f"{Path(img_path).stem}.pt"
-            if img_cache_path.exists():
-                self.items.append((img_path, img_cache_path))
+            cache_path = self.cache_dir / f"{hashlib.md5(img_path.encode()).hexdigest()}.pt"
+            if cache_path.exists():
+                self.items.append((img_path, cache_path))
 
     def _process_image(self, image_path: str, bucket: ImageBucket) -> torch.Tensor:
         """Process a single image to fit in its bucket"""

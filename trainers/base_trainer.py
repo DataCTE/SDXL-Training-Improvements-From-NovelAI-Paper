@@ -8,6 +8,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from utils.checkpoints import CheckpointManager
+from utils.error_handling import error_handler
 
 class BaseTrainer:
     def __init__(
@@ -41,7 +42,8 @@ class BaseTrainer:
         self.current_epoch = 0
         self.global_step = 0
         
-    def save_checkpoint(self, name: str = None):
+    @error_handler
+    def save_checkpoint(self, name: Optional[str] = None):
         """Save training checkpoint"""
         self.checkpoint_manager.save_checkpoint(
             model=self.model,
@@ -51,6 +53,7 @@ class BaseTrainer:
             name=name
         )
         
+    @error_handler
     def load_checkpoint(self, checkpoint_path: str):
         """Load from checkpoint"""
         training_state = self.checkpoint_manager.load_checkpoint(checkpoint_path)
@@ -66,6 +69,7 @@ class BaseTrainer:
         """Single training step"""
         raise NotImplementedError
         
+    @error_handler
     def log_metrics(self, metrics: Dict[str, float]):
         """Log metrics to all trackers (only on main process)"""
         if self.local_rank == -1 or self.local_rank == 0:
@@ -74,6 +78,7 @@ class BaseTrainer:
             if self.accelerator:
                 self.accelerator.log(metrics, step=self.global_step)
                 
+    @error_handler
     def compute_grad_norm(self) -> float:
         """Compute total gradient norm"""
         total_norm = 0.0

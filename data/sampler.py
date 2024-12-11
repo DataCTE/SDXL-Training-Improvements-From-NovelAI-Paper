@@ -4,6 +4,7 @@ from torch.utils.data import Sampler
 from PIL import Image
 from typing import List, Tuple, Optional
 from torch.utils.data.distributed import DistributedSampler
+from utils.error_handling import error_handler
 
 class AspectBatchSampler(Sampler):
     def __init__(
@@ -27,6 +28,7 @@ class AspectBatchSampler(Sampler):
         self.groups = self._group_indices()
         self.batches = self._create_batches()
         
+    @error_handler
     def _group_indices(self):
         # Group indices by exact bucket dimensions
         groups = {}
@@ -37,6 +39,7 @@ class AspectBatchSampler(Sampler):
             groups[key].append(idx)
         return groups
     
+    @error_handler
     def _create_batches(self):
         batches = []
         # Create batches of exactly matching dimensions
@@ -71,6 +74,7 @@ class AspectBatchSampler(Sampler):
             
         return batches
     
+    @error_handler
     def __iter__(self):
         if self.shuffle:
             random.shuffle(self.batches)
