@@ -110,11 +110,12 @@ def main():
             max_grad_norm=config.max_grad_norm
         )
         
-        # Initialize dataset with local_rank
+        # Initialize dataset with distributed info
         dataset = NovelAIDataset(
             config.data_path,
             device=device,
-            local_rank=args.local_rank
+            local_rank=args.local_rank,
+            world_size=args.world_size if args.local_rank != -1 else 1
         )
         sampler = AspectBatchSampler(
             dataset,
