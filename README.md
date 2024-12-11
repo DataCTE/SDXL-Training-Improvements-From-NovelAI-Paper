@@ -1,4 +1,4 @@
-# SDXL Training with Zero Terminal SNR (ZTSNR)
+# SDXL Training with NAI V3 improvements
 
 > **Note**: This repository implements SDXL training with increased maximum noise deviation (σ_max ≈ 20000.0) and Zero Terminal SNR, significantly improving color accuracy and composition stability.
 
