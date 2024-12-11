@@ -11,6 +11,9 @@ from torch.utils.data import DataLoader
 from diffusers import AutoencoderKL, UNet2DConditionModel, DDPMScheduler
 from safetensors.torch import load_file
 from adamw_bf16 import AdamWBF16
+import random
+import numpy as np
+from torch.distributed import dist
 
 from configs.training_config import TrainingConfig
 from trainers.sdxl_trainer import SDXLTrainer
@@ -77,8 +80,32 @@ def load_unet(args, config: TrainingConfig, device: torch.device):
             use_safetensors=True
         ).to(device)
 
+def signal_handler(signum, frame):
+    global trainer
+    
+    if dist.is_initialized():
+        # Notify all processes about shutdown
+        shutdown_tensor = torch.tensor(1, device="cuda")
+        dist.all_reduce(shutdown_tensor)
+        dist.barrier()
+    
+    print(f"\nReceived {signal.Signals(signum).name} signal. Attempting to save checkpoint...")
+    if trainer is not None and (not dist.is_initialized() or dist.get_rank() == 0):
+        try:
+            emergency_save_path = os.path.join("checkpoints", "emergency_checkpoint")
+            trainer.save_checkpoint(emergency_save_path)
+            print("Emergency checkpoint saved successfully.")
+        except Exception as e:
+            print(f"Failed to save emergency checkpoint: {e}")
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
 @error_handler
 def main():
+    global trainer
+    trainer = None
+    
     parser = argparse.ArgumentParser()
     parser.add_argument("--local_rank", type=int, default=-1)
     parser.add_argument("--world_size", type=int, default=None)
@@ -86,11 +113,12 @@ def main():
     parser.add_argument("--resume_from_checkpoint", type=str)
     args = parser.parse_args()
     
-    # Setup distributed training if needed
+    # Setup distributed training first
     if args.local_rank != -1:
+        torch.cuda.set_device(args.local_rank)
         device = setup_distributed(args.local_rank, args.world_size)
-    else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Important: Set this for proper data loading
+        torch.backends.cudnn.benchmark = True
     
     try:
         config = TrainingConfig()
@@ -99,9 +127,26 @@ def main():
         if args.local_rank == -1 or args.local_rank == 0:
             setup_wandb(config)
         
+        # Add at start of main after args parsing:
+        if args.local_rank != -1:
+            # Set same seed across all processes
+            seed = config.seed if hasattr(config, 'seed') else 42
+            torch.manual_seed(seed)
+            torch.cuda.manual_seed(seed)
+            random.seed(seed)
+            np.random.seed(seed)
+            # Make CuDNN behavior deterministic
+            torch.backends.cudnn.deterministic = True
+        
         # Load models
-        unet = UNet2DConditionModel.from_pretrained(args.unet_path)
-        vae = AutoencoderKL.from_pretrained("stabilityai/sdxl-vae")
+        unet = UNet2DConditionModel.from_pretrained(
+            args.unet_path,
+            torch_dtype=torch.bfloat16
+        ).to(device)
+        vae = AutoencoderKL.from_pretrained(
+            "stabilityai/sdxl-vae",
+            torch_dtype=torch.bfloat16
+        ).to(device)
         
         # Initialize optimizer
         optimizer = AdamWBF16(
@@ -146,10 +191,29 @@ def main():
         )
         
         if args.resume_from_checkpoint:
-            trainer.load_checkpoint(args.resume_from_checkpoint)
+            # Need barrier to ensure all processes wait for main process to load
+            if args.local_rank != -1:
+                torch.distributed.barrier()
+            if args.local_rank == 0:
+                trainer.load_checkpoint(args.resume_from_checkpoint)
+            if args.local_rank != -1:
+                torch.distributed.barrier()
+        
+        # After loading model weights, need to broadcast to all processes
+        if args.local_rank != -1:
+            # Broadcast model parameters
+            for param in unet.parameters():
+                dist.broadcast(param.data, src=0)
+            # Broadcast optimizer state
+            for state in optimizer.state.values():
+                for tensor_name, tensor_value in state.items():
+                    if isinstance(tensor_value, torch.Tensor):
+                        dist.broadcast(tensor_value, src=0)
         
         # Training loop
         for epoch in range(trainer.current_epoch, config.num_epochs):
+            if args.local_rank != -1:
+                sampler.set_epoch(epoch)
             trainer.current_epoch = epoch
             avg_loss = trainer.train_epoch(dataloader)
             

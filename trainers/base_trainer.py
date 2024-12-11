@@ -33,7 +33,8 @@ class BaseTrainer:
             self.model = DDP(
                 self.model,
                 device_ids=[self.local_rank],
-                output_device=self.local_rank
+                output_device=self.local_rank,
+                find_unused_parameters=False
             )
         
         self.checkpoint_manager = checkpoint_manager or CheckpointManager()
@@ -45,21 +46,26 @@ class BaseTrainer:
     @error_handler
     def save_checkpoint(self, name: Optional[str] = None):
         """Save training checkpoint"""
-        self.checkpoint_manager.save_checkpoint(
-            model=self.model,
-            optimizer=self.optimizer,
-            epoch=self.current_epoch,
-            global_step=self.global_step,
-            name=name
-        )
+        if self.local_rank == 0:
+            state_dict = self.model.module.state_dict() if isinstance(self.model, DDP) else self.model.state_dict()
+            self.checkpoint_manager.save_checkpoint(
+                model=state_dict,
+                optimizer=self.optimizer,
+                epoch=self.current_epoch,
+                global_step=self.global_step,
+                name=name
+            )
         
     @error_handler
     def load_checkpoint(self, checkpoint_path: str):
         """Load from checkpoint"""
-        training_state = self.checkpoint_manager.load_checkpoint(checkpoint_path)
-        self.current_epoch = training_state["epoch"]
-        self.global_step = training_state["global_step"]
-        self.optimizer.load_state_dict(training_state["optimizer_state"])
+        if self.local_rank == 0:
+            state_dict = torch.load(checkpoint_path)
+            if self.local_rank != -1:
+                state_dict = self.broadcast_object(state_dict)
+            self.current_epoch = state_dict["epoch"]
+            self.global_step = state_dict["global_step"]
+            self.optimizer.load_state_dict(state_dict["optimizer_state"])
         
     def train_epoch(self, dataloader: DataLoader) -> float:
         """Train for one epoch"""

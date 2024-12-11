@@ -28,7 +28,15 @@ class SDXLTrainer(BaseTrainer):
             checkpoint_manager=checkpoint_manager
         )
         
-        self.vae = vae
+        if self.local_rank != -1:
+            self.vae = vae.to(device)
+            if not vae.requires_grad:
+                self.vae = vae.to(device)
+            else:
+                self.vae = DDP(vae, device_ids=[self.local_rank])
+        else:
+            self.vae = vae
+        
         self.scheduler = scheduler
         
         # Add projection layer for CLIP embeddings
@@ -53,6 +61,21 @@ class SDXLTrainer(BaseTrainer):
         
         # Pre-compute sigmas
         self.register_buffer('sigmas', self.get_sigmas())
+        
+        # Convert batch norm to sync batch norm for better multi-GPU training
+        self.model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.model)
+        self.model = DDP(
+            self.model,
+            device_ids=[self.local_rank],
+            output_device=self.local_rank,
+            find_unused_parameters=False
+        )
+        
+        # Add stream initialization
+        if self.local_rank != -1:
+            self.compute_stream = torch.cuda.Stream()
+            self.transfer_stream = torch.cuda.Stream()
+            self.cache_stream = torch.cuda.Stream()
 
     def get_sigmas(self) -> torch.Tensor:
         """Generate noise schedule with ZTSNR"""
@@ -202,6 +225,14 @@ class SDXLTrainer(BaseTrainer):
         )
         loss = (loss * combined_weights).mean()
         
+        # Need to clear cache periodically
+        if self.global_step % self.config.cache_cleanup_interval == 0:
+            torch.cuda.empty_cache()
+            if hasattr(self.model, 'module'):
+                self.model.module.zero_grad(set_to_none=True)
+            else:
+                self.model.zero_grad(set_to_none=True)
+        
         return loss, pred_images, v_prediction, timesteps
 
     @error_handler
@@ -220,68 +251,97 @@ class SDXLTrainer(BaseTrainer):
             else dataloader
         )
         
-        for batch_idx, batch in enumerate(iterator):
-            # Zero gradients at start of accumulation steps
-            if batch_idx % self.config.grad_accum_steps == 0:
-                self.optimizer.zero_grad(set_to_none=True)
-            
-            try:
-                # Clear cache at start of batch
-                torch.cuda.empty_cache()
-                
-                # Unpack batch and move to device
-                images, text_embeds, tag_weights = [
-                    x.to(self.device) if torch.is_tensor(x) else x 
-                    for x in batch
-                ]
-                
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    loss, pred_images, v_pred, timesteps = self.training_step(
-                        images, text_embeds, tag_weights
-                    )
-                    # Scale loss for gradient accumulation
-                    loss = loss / self.config.grad_accum_steps
-                
-                loss.backward()
-                
-                # Only step optimizer after accumulation
-                if (batch_idx + 1) % self.config.grad_accum_steps == 0:
-                    self.optimizer.step()
-                    self.optimizer.zero_grad(set_to_none=True)
-                
-                # Log metrics (only on main process)
-                if self.local_rank == -1 or self.local_rank == 0:
-                    grad_norm = self.compute_grad_norm()
-                    self.log_metrics({
-                        'loss/total': loss.item(),
-                        'v_pred/mean': v_pred.mean().item(),
-                        'v_pred/std': v_pred.std().item(),
-                        'v_pred/min': v_pred.min().item(),
-                        'v_pred/max': v_pred.max().item(),
-                        'grad/norm': grad_norm,
-                        'timesteps/mean': timesteps.float().mean().item(),
-                        'timesteps/std': timesteps.float().std().item()
-                    })
-                
-                total_loss += loss.item()
-                self.global_step += 1
-                
-                # Console logging (only on main process)
-                if (self.local_rank == -1 or self.local_rank == 0) and batch_idx % self.config.log_interval == 0:
-                    print(f'Epoch {self.current_epoch} [{batch_idx}/{num_batches}]:')
-                    print(f'  Loss = {loss.item():.4f}')
-                    print(f'  Memory: {torch.cuda.memory_allocated()/1e9:.1f}GB')
-                
-            except Exception as e:
-                print(f"Error in batch {batch_idx}: {e}")
-                print(f"Memory stats:")
-                print(f"  Allocated: {torch.cuda.memory_allocated()/1e9:.1f}GB")
-                print(f"  Max allocated: {torch.cuda.max_memory_allocated()/1e9:.1f}GB")
-                raise
-        
-        # Average loss across all processes
         if self.local_rank != -1:
-            dist.all_reduce(torch.tensor(total_loss, device=self.device))
-            total_loss /= dist.get_world_size()
-        
+            # Create separate CUDA streams for overlap
+            self.compute_stream = torch.cuda.Stream()
+            self.transfer_stream = torch.cuda.Stream()
+            
+            with torch.cuda.stream(self.compute_stream):
+                for batch_idx, batch in enumerate(iterator):
+                    # Zero gradients at start of accumulation steps
+                    if batch_idx % self.config.grad_accum_steps == 0:
+                        self.optimizer.zero_grad(set_to_none=True)
+                    
+                    try:
+                        # Clear cache at start of batch
+                        torch.cuda.empty_cache()
+                        
+                        # Unpack batch and move to device
+                        images, text_embeds, tag_weights = [
+                            x.to(self.device) if torch.is_tensor(x) else x 
+                            for x in batch
+                        ]
+                        
+                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                            loss, pred_images, v_pred, timesteps = self.training_step(
+                                images, text_embeds, tag_weights
+                            )
+                            # Scale loss for gradient accumulation
+                            loss = loss / self.config.grad_accum_steps
+                        
+                        loss.backward()
+                        
+                        # Only step optimizer after accumulation
+                        if (batch_idx + 1) % self.config.grad_accum_steps == 0:
+                            self.optimizer.step()
+                            self.optimizer.zero_grad(set_to_none=True)
+                        
+                        # Log metrics (only on main process)
+                        if self.local_rank == -1 or self.local_rank == 0:
+                            grad_norm = self.compute_grad_norm()
+                            self.log_metrics({
+                                'loss/total': loss.item(),
+                                'v_pred/mean': v_pred.mean().item(),
+                                'v_pred/std': v_pred.std().item(),
+                                'v_pred/min': v_pred.min().item(),
+                                'v_pred/max': v_pred.max().item(),
+                                'grad/norm': grad_norm,
+                                'timesteps/mean': timesteps.float().mean().item(),
+                                'timesteps/std': timesteps.float().std().item()
+                            })
+                        
+                        total_loss += loss.item()
+                        self.global_step += 1
+                        
+                        # Console logging (only on main process)
+                        if (self.local_rank == -1 or self.local_rank == 0) and batch_idx % self.config.log_interval == 0:
+                            print(f'Epoch {self.current_epoch} [{batch_idx}/{num_batches}]:')
+                            print(f'  Loss = {loss.item():.4f}')
+                            print(f'  Memory: {torch.cuda.memory_allocated()/1e9:.1f}GB')
+                        
+                        # Add periodic memory cleanup
+                        if self.local_rank != -1:
+                            torch.cuda.empty_cache()
+                            if (batch_idx + 1) % self.config.cleanup_interval == 0:
+                                # Force synchronize to ensure all GPUs are cleaned
+                                torch.cuda.synchronize()
+                                dist.barrier()
+                    
+                    except Exception as e:
+                        print(f"Error in batch {batch_idx}: {e}")
+                        print(f"Memory stats:")
+                        print(f"  Allocated: {torch.cuda.memory_allocated()/1e9:.1f}GB")
+                        print(f"  Max allocated: {torch.cuda.max_memory_allocated()/1e9:.1f}GB")
+                        raise
+            
+            # Average loss across all processes
+            if self.local_rank != -1:
+                # Create tensor on correct device and use in-place operation
+                loss_tensor = torch.tensor(total_loss, device=self.device)
+                dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM, async_op=False)
+                total_loss = loss_tensor.item()
+            
         return total_loss / num_batches 
+
+    def load_checkpoint(self, path):
+        if self.local_rank != -1:
+            # Verify checkpoint integrity across processes
+            if self.local_rank == 0:
+                checkpoint_hash = torch.tensor(hash(str(torch.load(path).keys())))
+            else:
+                checkpoint_hash = torch.tensor(0)
+            dist.broadcast(checkpoint_hash, src=0)
+            # All processes should have same checkpoint structure
+            if self.local_rank != 0:
+                local_hash = hash(str(torch.load(path).keys()))
+                assert local_hash == checkpoint_hash.item(), "Checkpoint mismatch across processes"

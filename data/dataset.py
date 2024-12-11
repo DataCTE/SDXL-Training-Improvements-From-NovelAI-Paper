@@ -46,6 +46,15 @@ class NovelAIDataset(Dataset):
         self.text_cache_dir = Path(text_cache_dir)
         self.text_cache_dir.mkdir(exist_ok=True)
 
+        if self.world_size > 1:
+            # Verify dataset size is sufficient for sharding
+            min_size = self.world_size * self.config.batch_size
+            if len(self.items) < min_size:
+                raise ValueError(
+                    f"Dataset size ({len(self.items)}) must be at least "
+                    f"world_size * batch_size ({min_size})"
+                )
+
     def _cleanup_embedder(self):
         """Clean up text embedder to free memory"""
         if self.text_embedder is not None:

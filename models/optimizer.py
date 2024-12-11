@@ -2,6 +2,7 @@ import torch
 from adamw_bf16 import AdamW_BF16 as BaseBF16Optimizer
 from typing import Optional, Callable
 from utils.error_handling import error_handler
+from torch.distributed import dist
 
 class SDXLAdamWBF16(BaseBF16Optimizer):
     """
@@ -66,6 +67,18 @@ class SDXLAdamWBF16(BaseBF16Optimizer):
                 for p in group['params']:
                     if p.grad is not None:
                         p.grad.data *= self.noise_scale
+
+        # Add check for gradient synchronization
+        if dist.is_initialized():
+            # Only average gradients on final accumulation step
+            if (self.global_step + 1) % self.grad_accum_steps == 0:
+                # Ensure all processes are ready
+                dist.barrier()
+                for param in self.param_groups[0]['params']:
+                    if param.grad is not None:
+                        # In-place operation to save memory
+                        dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM)
+                        param.grad.data.div_(dist.get_world_size())
 
         # Call parent class step (handles bfloat16 conversion and correction terms)
         super().step(closure=None)
