@@ -934,7 +934,7 @@ def main():
             "batch_size": 32,
             "grad_accum_steps": 4,
             "effective_batch": 128,
-            "learning_rate": 4e-6,
+            "learning_rate": 4e-7,
             "num_epochs": 10,
             "model": "SDXL-base-1.0",
             "optimizer": "AdamW-BF16",
@@ -948,7 +948,8 @@ def main():
         r"/workspace/collage",
         r"/workspace/upscaled",
         r"/workspace/High-quality-photo10k",
-        r"/workspace/LAION_220k_GPT4Vision_captions"
+        r"/workspace/LAION_220k_GPT4Vision_captions",
+        r"/workspace/photo-concept-bucket/train"
     ]
     
     pretrained_model_name = "stabilityai/stable-diffusion-xl-base-1.0"
@@ -1038,7 +1039,7 @@ def main():
     print("Setting up optimizer...")
     optimizer = AdamWBF16(
         unet.parameters(),
-        lr=4e-6,  # For effective batch size of 128 (32 * 4)
+        lr=4e-7,
         betas=(0.9, 0.999),
         weight_decay=1e-2,
         eps=1e-8
@@ -1069,7 +1070,7 @@ def main():
                 "train_batch_size": 32,
                 "gradient_accumulation_steps": 4,  # Updated to 4 steps
                 "effective_batch_size": 128,  # Updated effective batch size (32 * 4)
-                "learning_rate": 4e-6,  # Updated learning rate
+                "learning_rate": 4e-7,  # Updated learning rate
                 "num_epochs": 10,
             }
         )
