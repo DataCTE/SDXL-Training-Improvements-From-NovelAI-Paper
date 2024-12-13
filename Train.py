@@ -187,7 +187,6 @@ def main():
                 lr=config.learning_rate,
                 betas=config.adam_betas,
                 weight_decay=config.weight_decay,
-                max_grad_norm=config.max_grad_norm
             )
         
         # Initialize dataset with distributed info
@@ -198,16 +197,16 @@ def main():
             vae=vae,
             cache_dir=config.cache_dir,
             text_cache_dir=config.text_cache_dir,
-            local_rank=args.local_rank,
-            world_size=args.world_size if args.local_rank != -1 else 1
+            #local_rank=args.local_rank,
+            #world_size=args.world_size if args.local_rank != -1 else 1
         )
         
         sampler = AspectBatchSampler(
             dataset,
             batch_size=config.batch_size,
             shuffle=True,
-            world_size=args.world_size if args.local_rank != -1 else 1,
-            rank=args.local_rank
+            #world_size=args.world_size if args.local_rank != -1 else 1,
+            #rank=args.local_rank
         )
         
         dataloader = DataLoader(

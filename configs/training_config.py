@@ -10,13 +10,18 @@ class TrainingConfig:
        r'path/to/your/dataset'
     ])
     
-    # Training hyperparameters
+     # Training hyperparameters
     batch_size: int = 32
     grad_accum_steps: int = 4
     learning_rate: float = 4e-7
     num_epochs: int = 10
     save_interval: int = 1000
     log_interval: int = 10
+    
+    # Optimizer parameters
+    adam_betas: Tuple[float, float] = (0.9, 0.999)
+    weight_decay: float = 1e-2
+    max_grad_norm: float = 1.0
     
     # Model configuration
     pretrained_model_name: str = "stabilityai/stable-diffusion-xl-base-1.0"
@@ -37,6 +42,10 @@ class TrainingConfig:
     cache_dir: str = "latent_cache"
     text_cache_dir: str = "text_cache"
     checkpoint_dir: str = "checkpoints"
+    
+    # System settings
+    num_workers: int = 4
+    seed: int = 42
     
     def get_transform(self):
         return transforms.Compose([
