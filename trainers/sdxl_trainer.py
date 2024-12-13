@@ -104,7 +104,7 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         # Update ZTSNR parameters
         self.sigma_data = 1.0
         self.sigma_min = 0.002
-        self.sigma_max = float('inf')
+        self.sigma_max = 20000.0
         self.rho = 7.0
         self.num_timesteps = 1000
         self.min_snr_gamma = 0.1
@@ -159,9 +159,11 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         text_embeds: Dict[str, torch.Tensor],
         tag_weights: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Execute training step with ZTSNR and EDM formulation"""
+        """Execute single training step with memory management"""
+        # Zero gradients at the start of each step
         self.optimizer.zero_grad()
         
+        # Get batch size and split into micro-batches
         batch_size = images.shape[0]
         micro_batch_size = batch_size // self.gradient_accumulation_steps
         
@@ -175,12 +177,18 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             # Get micro-batch
             batch_images = images[start_idx:end_idx]
             batch_text_embeds = {k: v[start_idx:end_idx] for k, v in text_embeds.items()}
-            batch_tag_weights = batch_tag_weights[start_idx:end_idx].view(-1, 1, 1, 1)
+            batch_tag_weights = tag_weights[start_idx:end_idx]
             
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                with torch.inference_mode():
-                    # Get latent dimensions and scale factor
-                    height, width = batch_images.shape[2:4]
+            # Forward pass with mixed precision
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16):  # Fixed autocast usage
+                # Ensure tag_weights has correct shape for broadcasting
+                batch_tag_weights = batch_tag_weights.view(-1, 1, 1, 1)
+                
+                with torch.inference_mode():  # Separate context for VAE encoding
+                    # Get latent dimensions
+                    height = batch_images.shape[2]
+                    width = batch_images.shape[3]
+                    
                     area = torch.tensor(height * width, device=self.device, dtype=torch.float32)
                     noise_scale = torch.sqrt(area / self.base_area)
                     
@@ -195,59 +203,42 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                     (batch_latents.shape[0],), device=self.device
                 )
                 
-                # Get sigmas for EDM formulation
-                sigma = self.sigmas[timesteps] * noise_scale
-                is_infinite = torch.isinf(sigma)
+                # Get sigmas for current timesteps
+                sigmas = self.sigmas[timesteps]
                 
-                # Apply noising with EDM/k-diffusion formulation
-                noisy_latents = torch.where(
-                    is_infinite.view(-1, 1, 1, 1),
-                    noise,  # For infinite sigma, use pure noise
-                    batch_latents + noise * sigma.view(-1, 1, 1, 1)  # Otherwise scale noise by sigma
-                )
+                # Add noise with proper scaling
+                noisy_latents = batch_latents + sigmas.view(-1, 1, 1, 1) * noise
                 
-                # Get Karras preconditioner scalings
-                c_skip = self.sigma_data**2 / (sigma**2 + self.sigma_data**2)
-                c_out = -sigma * self.sigma_data / torch.sqrt(sigma**2 + self.sigma_data**2)
-                c_in = 1 / torch.sqrt(sigma**2 + self.sigma_data**2)
+                # Get Karras preconditioner scaling factors
+                c_skip, c_out, c_in = self.get_karras_scalings(sigmas)
                 
-                # Scale input according to preconditioner
-                model_input = noisy_latents * c_in.view(-1, 1, 1, 1)
+                # Scale input according to Karras preconditioner
+                scaled_input = c_in.view(-1, 1, 1, 1) * noisy_latents
                 
                 # Get model prediction
-                v_pred = self.model(
-                    model_input,
+                model_output = self.model(
+                    scaled_input,
                     timesteps,
                     encoder_hidden_states=batch_text_embeds["hidden_states"],
                     added_cond_kwargs=batch_text_embeds.get("added_cond", None)
                 ).sample
                 
-                # Compute prediction using preconditioner
-                pred_latents = torch.where(
-                    is_infinite.view(-1, 1, 1, 1),
-                    -self.sigma_data * v_pred,  # Special case for infinite sigma
-                    noisy_latents * c_skip.view(-1, 1, 1, 1) + v_pred * c_out.view(-1, 1, 1, 1)
-                )
+                # Apply Karras preconditioner scaling to model output
+                model_pred = c_skip.view(-1, 1, 1, 1) * noisy_latents + c_out.view(-1, 1, 1, 1) * model_output
                 
-                # Compute loss with SNR weighting
-                loss = F.mse_loss(pred_latents, batch_latents, reduction='none')
-                snr = self.get_snr(sigma)
-                min_snr = torch.tensor(self.min_snr_gamma, device=self.device)
-                snr_weights = torch.where(
-                    is_infinite.view(-1, 1, 1, 1),
-                    min_snr.view(-1, 1, 1, 1),
-                    torch.minimum(snr, min_snr).view(-1, 1, 1, 1)
-                )
+                # Calculate v-prediction target
+                v_pred_target = self.scheduler.get_velocity(batch_latents, noise, timesteps)
                 
-                # Apply tag weights and reduce
-                loss = loss * snr_weights * batch_tag_weights
+                # Calculate loss with tag weights
+                loss = F.mse_loss(model_pred.float(), v_pred_target.float(), reduction="none")
+                loss = loss.mean(dim=list(range(1, len(loss.shape)))) * batch_tag_weights.squeeze()
                 loss = loss.mean() / self.gradient_accumulation_steps
                 
                 # Accumulate predictions for logging
                 if total_v_pred is None:
-                    total_v_pred = v_pred.detach()
+                    total_v_pred = model_pred.detach()
                 else:
-                    total_v_pred = torch.cat([total_v_pred, v_pred.detach()], dim=0)
+                    total_v_pred = torch.cat([total_v_pred, model_pred.detach()], dim=0)
             
             # Backward pass with gradient scaling
             self.scaler.scale(loss).backward()
@@ -259,6 +250,14 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.scaler.step(self.optimizer)
         self.scaler.update()
+        
+        # Log metrics
+        self.log_detailed_metrics(
+            loss=torch.tensor(total_loss),
+            v_pred=total_v_pred,
+            grad_norm=grad_norm,
+            timesteps=timesteps
+        )
         
         return total_loss, total_v_pred, grad_norm, timesteps
 
@@ -301,43 +300,49 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         return add_time_ids.reshape(batch_size, -1)
 
     def get_sigmas(self) -> torch.Tensor:
-        """Generate sigma schedule for EDM training"""
-        ramp = torch.linspace(0, 1, self.num_timesteps)
+        """
+        Modified to properly handle ZTSNR with correct scaling factors.
+        The last timestep should use σ = 20000 as a practical approximation of ∞.
+        """
+        ramp = torch.linspace(0, 1, self.num_timesteps, device=self.device)
         min_inv_rho = self.sigma_min ** (1 / self.rho)
-        max_inv_rho = self.sigma_max ** (1 / self.rho)
-        sigmas = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** self.rho
-        return sigmas
+        sigmas = torch.empty_like(ramp)
+        
+        # Regular steps (all except last)
+        sigmas[:-1] = (min_inv_rho * (1 - ramp[:-1])) ** self.rho
+        
+        # Set final step to practical infinity (20000) for ZTSNR
+        sigmas[-1] = 20000.0  # Practical approximation of infinity
+        
+        return sigmas.to(self.device)
 
     def get_karras_scalings(self, sigma: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Modified Karras Preconditioner scaling factors for v-prediction with ZTSNR support.
-        For σ = ∞:
-            cskip(σ) = 0
-            cout(σ) = -σ_data
-            cin(σ) = 1/√(σ² + σ_data²)
+        For high σ (approximating ∞):
+            cskip(σ) = σ²_data / (σ² + σ²_data) ≈ 0
+            cout(σ) = -σ·σ_data / √(σ² + σ²_data) ≈ -σ_data
+            cin(σ) = 1/√(σ² + σ²_data)
         """
-        is_infinite = torch.isinf(sigma)
         sigma_sq = sigma * sigma
         sigma_data_sq = self.sigma_data * self.sigma_data
         denominator = sigma_data_sq + sigma_sq
         denominator_sqrt = torch.sqrt(denominator)
         
-        # Handle infinite sigma case explicitly
-        c_skip = torch.where(is_infinite,
-                            torch.zeros_like(sigma),  # cskip(∞) = 0
-                            sigma_data_sq / denominator)
-        
-        c_out = torch.where(is_infinite,
-                           -self.sigma_data * torch.ones_like(sigma),  # cout(∞) = -σ_data
-                           -sigma * self.sigma_data / denominator_sqrt)
-        
-        c_in = 1.0 / denominator_sqrt  # cin(σ) = 1/√(σ² + σ_data²)
+        # Compute scaling factors according to v-prediction formulation
+        c_skip = sigma_data_sq / denominator
+        c_out = -sigma * self.sigma_data / denominator_sqrt
+        c_in = 1.0 / denominator_sqrt
         
         return c_skip, c_out, c_in
 
+
     def get_snr(self, sigma: torch.Tensor) -> torch.Tensor:
-        """Compute Signal-to-Noise Ratio for given sigma"""
-        return self.sigma_data**2 / sigma**2
+        """
+        Signal-to-Noise Ratio as defined in the paper for given sigma:
+        SNR(σ) = (σ_data / σ)²
+        """
+        return (self.sigma_data / sigma)**2
 
     def get_minsnr_weights(self, timesteps: torch.Tensor) -> torch.Tensor:
         """
