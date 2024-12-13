@@ -19,6 +19,7 @@ import wandb
 import numpy as np
 import tqdm
 from torch.utils.data import DataLoader
+from .training_utils import TrainingProfiler, AutoTuner
 
 
 class NovelAIDiffusionV3Trainer(torch.nn.Module):
@@ -29,10 +30,11 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         optimizer: torch.optim.Optimizer,
         scheduler: DDPMScheduler,
         device: torch.device,
+        batch_size: int = 1,
         accelerator: Optional[Accelerator] = None,
         resume_from_checkpoint: Optional[str] = None,
         max_vram_usage: float = 0.8,
-        gradient_accumulation_steps: int = 4  # Add gradient accumulation steps
+        gradient_accumulation_steps: int = 4
     ):
         super().__init__()
         
@@ -112,6 +114,16 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             
         # Allocate activation buffers after model is fully initialized
         self.activation_allocator.allocate_buffers(device)
+        
+        # Initialize profiler and auto-tuner
+        self.profiler = TrainingProfiler(window_size=50)
+        self.auto_tuner = AutoTuner(
+            initial_params={
+                "batch_size": batch_size,
+                "gradient_accumulation_steps": gradient_accumulation_steps
+            },
+            min_samples=50
+        )
         
     def forward(
         self,
@@ -441,7 +453,7 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
     @staticmethod
     def create_dataloader(
         dataset: NovelAIDataset,
-        batch_size: int,
+        batch_size: Optional[int] = None,
         num_workers: int = 4,
         shuffle: bool = True,
         pin_memory: bool = True,
@@ -449,18 +461,10 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         prefetch_factor: int = 2,
         drop_last: bool = True
     ) -> DataLoader:
-        """Create optimized dataloader for training
+        """Create optimized dataloader for training"""
+        if batch_size is None:
+            batch_size = 1  # Default batch size if not specified
         
-        Args:
-            dataset: The NovelAIDataset instance
-            batch_size: Number of samples per batch
-            num_workers: Number of worker processes for data loading
-            shuffle: Whether to shuffle the data
-            pin_memory: Pin memory for faster GPU transfer
-            persistent_workers: Keep worker processes alive between epochs
-            prefetch_factor: Number of batches to prefetch per worker
-            drop_last: Drop last incomplete batch
-        """
         # Create sampler that groups by latent dimensions
         sampler = AspectBatchSampler(
             dataset=dataset,

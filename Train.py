@@ -34,6 +34,7 @@ import contextlib
 import time
 import re
 from collections import defaultdict
+from accelerate import Accelerator
 
 try:
     import bitsandbytes as bnb
@@ -216,6 +217,17 @@ def main():
             pin_memory=True
         )
         
+        # Initialize accelerator if using distributed training
+        if args.local_rank != -1:
+            accelerator = Accelerator(
+                gradient_accumulation_steps=config.grad_accum_steps,
+                mixed_precision="bf16",
+                log_with="wandb",
+                project_dir="logs"
+            )
+        else:
+            accelerator = None
+        
         # Initialize trainer with memory management
         trainer = NovelAIDiffusionV3Trainer(
             model=unet,
@@ -223,10 +235,10 @@ def main():
             optimizer=optimizer,
             scheduler=DDPMScheduler(),
             device=device,
-            config=config,
-            local_rank=args.local_rank,
-            layer_conductor=layer_conductor,
-            offload_strategy=offload_strategy
+            accelerator=accelerator,
+            resume_from_checkpoint=args.resume_from_checkpoint,
+            max_vram_usage=args.max_vram_usage,
+            gradient_accumulation_steps=config.grad_accum_steps
         )
         
         if args.resume_from_checkpoint:
@@ -255,7 +267,7 @@ def main():
             # Clear cache before each epoch
             torch_gc()
             
-            avg_loss = trainer.train_epoch(dataloader)
+            avg_loss = trainer.train_epoch(dataloader, epoch)
             
             if args.local_rank == -1 or args.local_rank == 0:
                 print(f"Epoch {epoch} completed with average loss: {avg_loss:.4f}")
