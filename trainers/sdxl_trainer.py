@@ -61,6 +61,11 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         # Setup memory management before registering modules
         self.memory_manager.setup_memory_management(model, device)
         
+        # Initialize activation allocator
+        from memory.layeroffloading import StaticActivationAllocator
+        self.activation_allocator = StaticActivationAllocator(model)
+        self.activation_allocator.allocate_buffers(device)
+        
         # Register all layers with memory manager
         for name, module in model.named_modules():
             if len(list(module.parameters())) > 0:
