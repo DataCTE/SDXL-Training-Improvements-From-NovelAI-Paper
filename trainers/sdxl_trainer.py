@@ -20,6 +20,7 @@ import numpy as np
 import tqdm
 from torch.utils.data import DataLoader
 from .training_utils import TrainingProfiler, AutoTuner
+from configs.training_config import TrainingConfig
 
 
 class NovelAIDiffusionV3Trainer(torch.nn.Module):
@@ -34,7 +35,8 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         accelerator: Optional[Accelerator] = None,
         resume_from_checkpoint: Optional[str] = None,
         max_vram_usage: float = 0.8,
-        gradient_accumulation_steps: int = 4
+        gradient_accumulation_steps: int = 4,
+        config: Optional[TrainingConfig] = None
     ):
         super().__init__()
         
@@ -58,28 +60,29 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         # Initialize gradient scaler for mixed precision
         self.scaler = torch.cuda.amp.GradScaler()
         
-        # Add memory manager initialization
-        self.memory_manager = MemoryManager()
-        
         # Initialize memory management systems
-        self.layer_strategy = LayerOffloadStrategy(model, max_vram_usage)
-        self.layer_conductor = LayerOffloadConductor(model, device)
+        self.memory_manager = MemoryManager(max_vram_usage=max_vram_usage)
+        # Setup memory management before registering modules
+        self.memory_manager.setup_memory_management(model, device)
         
-        # Setup quantization
-        self.quantization = MemoryEfficientQuantization()
-        self.quantization.setup_quantization(model, device, torch.bfloat16)
-        
-        # Calculate total size needed for layer parameters
-        total_param_size = sum(self.layer_strategy.layer_sizes.values())
-        self.layer_allocator = StaticLayerAllocator(total_param_size, device)
-        
-        # Initialize activation management
-        self.activation_allocator = StaticActivationAllocator(model)
-        
-        # Register all layers with conductor
+        # Register all layers with memory manager
         for name, module in model.named_modules():
             if len(list(module.parameters())) > 0:
-                self.layer_conductor.register_layer(name, module)
+                self.memory_manager.register_module(name, module)
+        
+        # Initialize profiler and auto-tuner with config and memory management
+        self.profiler = TrainingProfiler(window_size=50, config=config)
+        self.auto_tuner = AutoTuner(
+            initial_params={
+                "batch_size": batch_size,
+                "gradient_accumulation_steps": gradient_accumulation_steps
+            },
+            config=config,
+            min_samples=50
+        )
+        
+        # Add memory monitoring to profiler
+        self.profiler.add_memory_callback(self.memory_manager.get_current_usage)
         
         # Add projection layer for CLIP embeddings
         self.hidden_proj = nn.Linear(768, model.config.cross_attention_dim).to(
@@ -115,16 +118,6 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         # Allocate activation buffers after model is fully initialized
         self.activation_allocator.allocate_buffers(device)
         
-        # Initialize profiler and auto-tuner
-        self.profiler = TrainingProfiler(window_size=50)
-        self.auto_tuner = AutoTuner(
-            initial_params={
-                "batch_size": batch_size,
-                "gradient_accumulation_steps": gradient_accumulation_steps
-            },
-            min_samples=50
-        )
-        
     def forward(
         self,
         x: torch.Tensor,
@@ -135,35 +128,22 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         phase: str = 'forward'
     ) -> torch.Tensor:
         """Forward pass with memory-efficient layer handling"""
-        # Handle layer offloading if needed
+        # Handle layer memory management if needed
         if current_layer:
-            # Get required layers for current computation
-            required_layers = self.layer_strategy.get_required_layers(current_layer, phase)
-            
-            # Get layers to offload
-            to_offload = self.layer_strategy.suggest_offload(required_layers)
-            
-            # Offload layers to CPU
-            for layer_name in to_offload:
-                self.layer_conductor.offload_to_cpu(layer_name)
-                self.layer_strategy.update_vram_usage(layer_name, False)
-            
-            # Load required layers to GPU
-            for layer_name in required_layers:
-                self.layer_conductor.load_to_gpu(layer_name)
-                self.layer_strategy.update_vram_usage(layer_name, True)
-            
-            # Synchronize transfers
-            self.layer_conductor.synchronize()
+            self.memory_manager.before_layer_computation(current_layer, phase)
         
-        # Call UNet's forward pass
-        return self.model(
-            sample=x,
-            timestep=timesteps,
-            encoder_hidden_states=encoder_hidden_states,
-            added_cond_kwargs=added_cond_kwargs,
-            return_dict=False
-        )[0]
+        try:
+            # Call UNet's forward pass
+            return self.model(
+                sample=x,
+                timestep=timesteps,
+                encoder_hidden_states=encoder_hidden_states,
+                added_cond_kwargs=added_cond_kwargs,
+                return_dict=False
+            )[0]
+        finally:
+            if current_layer:
+                self.memory_manager.after_layer_computation(current_layer)
 
     def training_step(
         self,

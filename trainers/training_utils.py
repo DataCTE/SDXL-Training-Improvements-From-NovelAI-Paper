@@ -1,8 +1,9 @@
 import time
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, Callable
 from dataclasses import dataclass
 import numpy as np
 from contextlib import contextmanager
+from configs.training_config import TrainingConfig
 
 
 @dataclass
@@ -33,11 +34,17 @@ class ProfileMetrics:
 class TrainingProfiler:
     """Profiler for tracking training performance metrics"""
     
-    def __init__(self, window_size: int = 50):
+    def __init__(self, window_size: int = 50, config: Optional[TrainingConfig] = None):
         self.window_size = window_size
         self.metrics = ProfileMetrics([], [], [], [])
         self.current_range: Optional[str] = None
         self.range_start_time: Optional[float] = None
+        self.config = config
+        self.memory_callback = None
+    
+    def add_memory_callback(self, callback: Callable[[], float]):
+        """Add callback for getting current memory usage"""
+        self.memory_callback = callback
     
     @contextmanager
     def profile_range(self, range_name: str):
@@ -63,7 +70,12 @@ class TrainingProfiler:
         """Record metrics for a training step"""
         self.metrics.batch_times.append(batch_time)
         self.metrics.batch_sizes.append(batch_size)
+        
+        # Use memory callback if available, otherwise use provided value
+        if self.memory_callback is not None:
+            memory_used = self.memory_callback()
         self.metrics.memory_usage.append(memory_used)
+        
         self.metrics.losses.append(loss)
         
         # Keep only recent samples
@@ -84,6 +96,7 @@ class AutoTuner:
     def __init__(
         self,
         initial_params: Dict[str, Any],
+        config: Optional[TrainingConfig] = None,
         min_samples: int = 50,
         throughput_threshold: float = 0.9,
         memory_threshold: float = 0.90
@@ -95,6 +108,15 @@ class AutoTuner:
         self.throughput_threshold = throughput_threshold
         self.memory_threshold = memory_threshold
         self.stable_steps = 0
+        self.config = config
+        
+        # Initialize with config values if provided
+        if config:
+            self.current_params.update({
+                "batch_size": config.batch_size,
+                "gradient_accumulation_steps": config.grad_accum_steps
+            })
+            self.best_params = self.current_params.copy()
         
     def update(self, profiler: TrainingProfiler) -> Dict[str, Any]:
         """Update hyperparameters based on profiling metrics"""
@@ -118,30 +140,43 @@ class AutoTuner:
         # Adjust parameters based on metrics
         new_params = self.current_params.copy()
         
-        # Adjust batch size based on memory usage
+        # Adjust batch size based on memory usage and config limits
         if "batch_size" in new_params:
+            max_batch_size = getattr(self.config, 'max_batch_size', 64)  # Default max batch size
             if memory_usage > self.memory_threshold * 80:  # 80GB GPU
                 new_params["batch_size"] = max(1, new_params["batch_size"] - 1)
             elif memory_usage < self.memory_threshold * 65:  # More aggressive scaling for 80GB
-                new_params["batch_size"] += 1
-                # Allow larger increases when far below threshold
-                if memory_usage < self.memory_threshold * 40:
+                if new_params["batch_size"] < max_batch_size:
                     new_params["batch_size"] += 1
+                    # Allow larger increases when far below threshold
+                    if memory_usage < self.memory_threshold * 40:
+                        new_params["batch_size"] = min(
+                            new_params["batch_size"] + 1,
+                            max_batch_size
+                        )
         
-        # Adjust gradient accumulation steps based on throughput
+        # Adjust gradient accumulation steps based on throughput and config
         if "gradient_accumulation_steps" in new_params:
+            max_grad_steps = getattr(self.config, 'max_grad_accum_steps', 8)
             if current_throughput < self.best_throughput * self.throughput_threshold:
-                new_params["gradient_accumulation_steps"] = max(1, new_params["gradient_accumulation_steps"] - 1)
+                new_params["gradient_accumulation_steps"] = max(
+                    1, 
+                    new_params["gradient_accumulation_steps"] - 1
+                )
             elif self.stable_steps > 50:  # More aggressive adjustment for higher capacity GPU
-                new_params["gradient_accumulation_steps"] += 1
-                self.stable_steps = 0
-            # Allow larger step increases when performance is stable
-            if self.stable_steps > 200:
-                new_params["gradient_accumulation_steps"] += 2
+                if new_params["gradient_accumulation_steps"] < max_grad_steps:
+                    new_params["gradient_accumulation_steps"] += 1
+                    self.stable_steps = 0
+                    # Allow larger step increases when performance is stable
+                    if self.stable_steps > 200:
+                        new_params["gradient_accumulation_steps"] = min(
+                            new_params["gradient_accumulation_steps"] + 2,
+                            max_grad_steps
+                        )
         
         # Update current parameters if changes were made
         if new_params != self.current_params:
             self.current_params = new_params
             self.stable_steps = 0
         
-        return self.current_params 
+        return self.current_params

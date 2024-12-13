@@ -165,15 +165,7 @@ def main():
             "stabilityai/sdxl-vae",
             torch_dtype=torch.bfloat16
         ).to(device)
-        
-        # Initialize memory management if enabled
-        if args.max_vram_usage < 1.0:
-            layer_conductor = LayerOffloadConductor(unet, device)
-            offload_strategy = LayerOffloadStrategy(unet, args.max_vram_usage)
-        else:
-            layer_conductor = None
-            offload_strategy = None
-        
+      
         # Initialize optimizer with memory-efficient settings
         if HAVE_BNB:
             optimizer = bnb.optim.AdamW8bit(
@@ -228,17 +220,19 @@ def main():
         else:
             accelerator = None
         
-        # Initialize trainer with memory management
+        # Initialize trainer with memory management and config
         trainer = NovelAIDiffusionV3Trainer(
             model=unet,
             vae=vae,
             optimizer=optimizer,
             scheduler=DDPMScheduler(),
             device=device,
+            batch_size=config.batch_size,
             accelerator=accelerator,
             resume_from_checkpoint=args.resume_from_checkpoint,
             max_vram_usage=args.max_vram_usage,
-            gradient_accumulation_steps=config.grad_accum_steps
+            gradient_accumulation_steps=config.grad_accum_steps,
+            config=config
         )
         
         if args.resume_from_checkpoint:
