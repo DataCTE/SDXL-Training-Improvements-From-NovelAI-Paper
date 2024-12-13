@@ -17,6 +17,7 @@ import tqdm
 from torch.utils.data import DataLoader
 from .training_utils import TrainingProfiler, AutoTuner
 from configs.training_config import TrainingConfig
+from .progress import TrainProgress
 
 
 class NovelAIDiffusionV3Trainer(torch.nn.Module):
@@ -114,6 +115,9 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         # Add tracking for epochs and steps
         self.current_epoch = 0
         self.global_step = 0
+        
+        # Replace individual progress tracking with TrainProgress
+        self.progress = TrainProgress()
         
         # Resume from checkpoint if provided
         if resume_from_checkpoint:
@@ -296,20 +300,24 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         
         return accumulated_loss, pred_images, v_prediction, timesteps
 
-    def load_checkpoint(self, checkpoint_path: str):
-        """Load model and training state from checkpoint"""
-        print(f"Resuming from checkpoint: {checkpoint_path}")
+    def load_checkpoint(self, path: str):
+        """Load checkpoint with progress information"""
+        checkpoint = torch.load(path)
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         
-        # Load training state
-        training_state_path = os.path.join(checkpoint_path, "training_state.pt")
-        if os.path.exists(training_state_path):
-            training_state = torch.load(training_state_path)
-            self.current_epoch = training_state["epoch"]
-            self.global_step = training_state["global_step"]
-            self.optimizer.load_state_dict(training_state["optimizer_state"])
-            print(f"Resumed from epoch {self.current_epoch}, step {self.global_step}")
-        else:
-            print("No training state found, starting from scratch with pretrained weights")
+        # Restore progress state
+        if 'progress' in checkpoint:
+            self.progress = checkpoint['progress']
+        
+        # Restore profiler and auto-tuner states if available
+        if 'profiler_state' in checkpoint:
+            self.profiler.metrics = checkpoint['profiler_state']
+        if 'auto_tuner_state' in checkpoint:
+            self.auto_tuner.current_params = checkpoint['auto_tuner_state']['current_params']
+            self.auto_tuner.best_params = checkpoint['auto_tuner_state']['best_params']
+            self.auto_tuner.best_throughput = checkpoint['auto_tuner_state']['best_throughput']
 
     @torch.no_grad()
     def _get_add_time_ids(self, images: torch.Tensor) -> torch.Tensor:
@@ -399,16 +407,26 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
 
     def train_epoch(self, dataloader: DataLoader, epoch: int, log_interval: int = 10) -> float:
         """Train for one epoch with performance profiling"""
-        self.current_epoch = epoch
+        self.progress.epoch = epoch
         self.model.train()
         total_loss = 0
         
         with self.profiler.start_profiling() as prof:
-            for batch_idx, batch in enumerate(tqdm(dataloader)):
+            progress_bar = tqdm.tqdm(
+                dataloader,
+                desc=f"Epoch {self.progress.epoch}",
+                leave=True,
+                dynamic_ncols=True
+            )
+            
+            for batch_idx, batch in enumerate(progress_bar):
                 start_time = time.time()
                 
                 with self.profiler.profile_range("training_step"):
                     loss, _, _, _ = self.training_step(batch[0], batch[1], batch[2])
+                
+                # Update progress tracking
+                self.progress.next_step(batch[0].shape[0])
                 
                 # Record metrics
                 batch_time = time.time() - start_time
@@ -432,6 +450,17 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                 
                 total_loss += loss.item()
                 
+                # Update progress bar with more info
+                progress_bar.set_postfix({
+                    'loss': f'{loss.item():.4f}',
+                    'memory': f'{memory_used/1e9:.1f}GB',
+                    'batch_time': f'{batch_time:.3f}s',
+                    'global_step': self.progress.global_step,
+                    'samples': self.progress.epoch_sample
+                })
+        
+        # Update epoch progress
+        self.progress.next_epoch()
         return total_loss / len(dataloader)
 
     @staticmethod
@@ -468,40 +497,21 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             worker_init_fn=lambda worker_id: np.random.seed(42 + worker_id),  # Seed workers
         )
 
-    def save_checkpoint(self, save_path: str):
-        """Save model checkpoint with only modified components in fp16 format"""
-        if self.accelerator is not None:
-            # Unwrap model if using accelerator
-            unwrapped_model = self.accelerator.unwrap_model(self.model)
-        else:
-            unwrapped_model = self.model
-
-        # Create checkpoint directory
-        os.makedirs(save_path, exist_ok=True)
-
-        # Temporarily convert model to float16 for saving
-        original_dtype = unwrapped_model.dtype
-        unwrapped_model = unwrapped_model.to(torch.float16)
-
-        try:
-            # Save UNet weights in fp16
-            unwrapped_model.save_pretrained(
-                os.path.join(save_path, "unet"),
-                safe_serialization=True  # Use safetensors format
-            )
-        finally:
-            # Convert back to original dtype
-            unwrapped_model = unwrapped_model.to(original_dtype)
-
-        # Save training state
-        training_state = {
-            "epoch": self.current_epoch,
-            "global_step": self.global_step,
-            "optimizer_state": self.optimizer.state_dict(),
+    def save_checkpoint(self, path: str):
+        """Save checkpoint with progress information"""
+        checkpoint = {
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
+            'progress': self.progress,  # Save progress state
+            'profiler_state': self.profiler.metrics,
+            'auto_tuner_state': {
+                'current_params': self.auto_tuner.current_params,
+                'best_params': self.auto_tuner.best_params,
+                'best_throughput': self.auto_tuner.best_throughput
+            }
         }
-        torch.save(training_state, os.path.join(save_path, "training_state.pt"))
-
-        print(f"Saved checkpoint to {save_path} in fp16 format")
+        torch.save(checkpoint, path)
 
     def compute_grad_norm(self):
         """Compute total gradient norm"""
