@@ -5,80 +5,58 @@ from PIL import Image
 from typing import List, Tuple, Optional
 from torch.utils.data.distributed import DistributedSampler
 from utils.error_handling import error_handler
+from data.dataset import NovelAIDataset
 
-class AspectBatchSampler(Sampler):
-    def __init__(
-        self, 
-        dataset,
-        batch_size: int,
-        shuffle: bool = True,
-        world_size: Optional[int] = None,
-        rank: Optional[int] = None
-    ):
+class AspectBatchSampler(torch.utils.data.Sampler):
+    def __init__(self, dataset: NovelAIDataset, batch_size: int, shuffle: bool = True):
         self.dataset = dataset
         self.batch_size = batch_size
         self.shuffle = shuffle
         
-        # Distributed training setup
-        self.world_size = world_size or 1
-        self.rank = rank or 0
-        self.distributed = world_size is not None
+        # Group indices by latent dimensions
+        self.groups = {}
+        for idx in range(len(dataset)):
+            img_cache_path = dataset.cache_dir / f"{dataset.image_files[idx].stem}.pt"
+            if img_cache_path.exists():
+                # Load cached latents to get dimensions
+                try:
+                    latents = torch.load(img_cache_path, map_location='cpu')
+                    key = (latents.shape[2], latents.shape[3])  # Group by latent height, width
+                    if key not in self.groups:
+                        self.groups[key] = []
+                    self.groups[key].append(idx)
+                except Exception as e:
+                    print(f"Error loading latents from {img_cache_path}: {e}")
+                    continue
+            else:
+                # If latents not cached, get dimensions from original image
+                try:
+                    with Image.open(dataset.image_files[idx]) as img:
+                        width, height = img.size
+                        # Convert to latent dimensions (divide by 8)
+                        latent_height = height // 8
+                        latent_width = width // 8
+                        key = (latent_height, latent_width)
+                        if key not in self.groups:
+                            self.groups[key] = []
+                        self.groups[key].append(idx)
+                except Exception as e:
+                    print(f"Error processing {dataset.image_files[idx]}: {e}")
+                    continue
         
-        # Group indices by exact bucket dimensions
-        self.groups = self._group_indices()
-        self.batches = self._create_batches()
-        
-    @error_handler
-    def _group_indices(self):
-        # Group indices by exact bucket dimensions
-        groups = {}
-        for idx, (_, bucket, img_cache_path, _) in enumerate(self.dataset.items):
-            key = (bucket.width, bucket.height)
-            if key not in groups:
-                groups[key] = []
-            groups[key].append(idx)
-        return groups
-    
-    @error_handler
-    def _create_batches(self):
-        batches = []
-        # Create batches of exactly matching dimensions
+        # Create batches from groups
+        self.batches = []
         for indices in self.groups.values():
-            # Sort indices by actual image dimensions
-            sorted_indices = []
-            for idx in indices:
-                img_path, _, _, _ = self.dataset.items[idx]
-                with Image.open(img_path) as img:
-                    width, height = img.size
-                    sorted_indices.append((idx, (width, height)))
-            
-            # Group by exact dimensions
-            exact_groups = {}
-            for idx, dims in sorted_indices:
-                if dims not in exact_groups:
-                    exact_groups[dims] = []
-                exact_groups[dims].append(idx)
-            
-            # Create batches from each exact group
-            for exact_indices in exact_groups.values():
-                for i in range(0, len(exact_indices), self.batch_size):
-                    batch = exact_indices[i:i + self.batch_size]
-                    if len(batch) == self.batch_size:  # Only use full batches
-                        batches.append(batch)
-        
-        if self.distributed:
-            # Ensure number of batches is divisible by world size
-            num_batches = len(batches)
-            padding = (self.world_size - (num_batches % self.world_size)) % self.world_size
-            batches.extend(batches[:padding])
-            
-        return batches
+            # Create batches of exactly matching dimensions
+            for i in range(0, len(indices), self.batch_size):
+                batch = indices[i:i + self.batch_size]
+                if len(batch) == self.batch_size:  # Only use full batches
+                    self.batches.append(batch)
     
-    @error_handler
     def __iter__(self):
         if self.shuffle:
             random.shuffle(self.batches)
         return iter(self.batches)
     
     def __len__(self):
-        return len(self.batches) 
+        return len(self.batches)

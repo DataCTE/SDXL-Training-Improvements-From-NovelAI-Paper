@@ -1,219 +1,189 @@
 import torch
 from torch.utils.data import Dataset
 from PIL import Image
-import os
-import glob
 from pathlib import Path
 from tqdm import tqdm
 from typing import List, Optional, Tuple, Callable
-import hashlib
-import torch.nn as nn
-import fcntl
 from filelock import FileLock
 
 from .buckets import AspectRatioBucket, ImageBucket
 from models.embedder import TextEmbedder
-from models.tag_weighter import TagWeighter, parse_tags
+from models.tag_weighter import FastTagWeighter, parse_tags
 from utils.error_handling import error_handler
+from diffusers import AutoencoderKL
+from typing import Dict
 
-class NovelAIDataset(Dataset):
+class MultiDirectoryImageDataset(Dataset):
+    """Dataset that handles multiple image directories with efficient loading"""
+    
     def __init__(
         self,
         image_dirs: List[str],
         transform: Optional[Callable] = None,
-        device: torch.device = torch.device('cpu'),
-        max_image_size: Tuple[int, int] = (768, 1024),
-        max_dim: int = 1024,
-        bucket_step: int = 64,
-        min_bucket_size: int = 1,
         cache_dir: str = "latent_cache",
         text_cache_dir: str = "text_cache",
-        vae = None,
-        local_rank: int = -1,
-        world_size: int = 1
+        min_size: int = 512,
+        max_size: int = 2048,
+        aspect_ratio_range: Tuple[float, float] = (0.5, 2.0)
     ):
         self.transform = transform
-        self.device = device
-        self.text_embedder = TextEmbedder(device=device)
-        self.tag_weighter = TagWeighter()
-        self.vae = vae
-        self.local_rank = local_rank
-        self.world_size = world_size
-        
-        # Single cache directory for all processes
         self.cache_dir = Path(cache_dir)
-        self.cache_dir.mkdir(exist_ok=True)
         self.text_cache_dir = Path(text_cache_dir)
+        self.min_size = min_size
+        self.max_size = max_size
+        self.aspect_ratio_range = aspect_ratio_range
+        
+        # Create cache directories
+        self.cache_dir.mkdir(exist_ok=True)
         self.text_cache_dir.mkdir(exist_ok=True)
-
-        if self.world_size > 1:
-            # Verify dataset size is sufficient for sharding
-            min_size = self.world_size * self.config.batch_size
-            if len(self.items) < min_size:
-                raise ValueError(
-                    f"Dataset size ({len(self.items)}) must be at least "
-                    f"world_size * batch_size ({min_size})"
-                )
-
-    def _cleanup_embedder(self):
-        """Clean up text embedder to free memory"""
-        if self.text_embedder is not None:
-            for encoder in self.text_embedder.text_encoders.values():
-                del encoder
-            self.text_embedder.text_encoders.clear()
-            
-            for tokenizer in self.text_embedder.tokenizers.values():
-                del tokenizer
-            self.text_embedder.tokenizers.clear()
-            
-            del self.text_embedder
-            self.text_embedder = None
-            
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-
-    @error_handler
-    def _cache_single_image(self, img_path: str, cache_path: Path) -> None:
-        """Thread-safe image caching"""
-        # Create a file lock for this specific cache file
-        lock_path = str(cache_path) + '.lock'
         
-        with FileLock(lock_path):
-            # Double-check pattern in case another process created the file
-            if not cache_path.exists():
-                try:
-                    # Process image
-                    with Image.open(img_path) as img:
-                        pixel_values = self.transform(img).unsqueeze(0)
-                    
-                    if self.device:
-                        pixel_values = pixel_values.to(self.device)
-                        
-                    with torch.no_grad():
-                        latents = self.vae.encode(pixel_values).latent_dist.sample()
-                    
-                    # Use temporary file for atomic write
-                    temp_path = cache_path.with_suffix('.tmp')
-                    torch.save(latents.cpu(), temp_path)
-                    temp_path.rename(cache_path)
-                    
-                except Exception as e:
-                    # Clean up temporary files if something goes wrong
-                    if temp_path.exists():
-                        temp_path.unlink()
-                    raise e
-                finally:
-                    # Clean up lock file
+        # Process all image directories
+        self.image_files = []
+        self.text_files = []
+        self._process_directories(image_dirs)
+        
+    def _process_directories(self, image_dirs: List[str]):
+        """Process multiple image directories efficiently"""
+        image_extensions = {'.jpg', '.jpeg', '.png', '.webp'}
+        
+        for dir_path in image_dirs:
+            dir_path = Path(dir_path)
+            if not dir_path.exists():
+                print(f"Warning: Directory {dir_path} does not exist, skipping")
+                continue
+                
+            print(f"Processing directory: {dir_path}")
+            
+            # Find all image files with valid extensions
+            for ext in image_extensions:
+                image_files = list(dir_path.rglob(f"*{ext}"))
+                
+                # Filter images by size and aspect ratio
+                for img_path in tqdm(image_files, desc=f"Validating {ext} files"):
                     try:
-                        os.unlink(lock_path)
-                    except:
-                        pass
-
-    @error_handler
-    def _process_and_cache_data(self, image_dirs, max_image_size, max_dim, bucket_step, min_bucket_size):
-        """Process all images and cache latents/embeddings with distributed coordination"""
-        # Collect all image files first
-        all_image_files = []
-        for image_dir in image_dirs:
-            for ext in ['*.jpg', '*.jpeg', '*.png', '*.webp']:
-                all_image_files.extend(glob.glob(os.path.join(image_dir, '**', ext), recursive=True))
-
-        # Sort for deterministic ordering across processes
-        all_image_files.sort()
-
-        if self.world_size > 1:
-            # Each process takes its chunk
-            chunk_size = len(all_image_files) // self.world_size
-            start_idx = self.local_rank * chunk_size
-            end_idx = start_idx + chunk_size if self.local_rank < self.world_size - 1 else len(all_image_files)
-            process_files = all_image_files[start_idx:end_idx]
+                        with Image.open(img_path) as img:
+                            width, height = img.size
+                            
+                            # Check only size constraints if aspect_ratio_range is None
+                            if self.aspect_ratio_range is None:
+                                size_ok = (min(width, height) >= self.min_size and
+                                         max(width, height) <= self.max_size)
+                            else:
+                                aspect_ratio = width / height
+                                size_ok = (min(width, height) >= self.min_size and
+                                         max(width, height) <= self.max_size and
+                                         self.aspect_ratio_range[0] <= aspect_ratio <= self.aspect_ratio_range[1])
+                            
+                            if size_ok:
+                                # Look for corresponding text file
+                                txt_path = img_path.with_suffix('.txt')
+                                if txt_path.exists():
+                                    self.image_files.append(img_path)
+                                    self.text_files.append(txt_path)
+                                    
+                    except Exception as e:
+                        print(f"Error processing {img_path}: {e}")
+                        continue
             
-            print(f"Rank {self.local_rank}: Processing {len(process_files)} files ({start_idx} to {end_idx})")
-        else:
-            process_files = all_image_files
-
-        # Process files with proper locking
-        for img_path in tqdm(process_files, desc=f"Rank {self.local_rank} processing"):
-            cache_path = self.cache_dir / f"{hashlib.md5(img_path.encode()).hexdigest()}.pt"
-            if not cache_path.exists():
-                self._cache_single_image(img_path, cache_path)
-
-        # Synchronize processes before loading
-        if self.world_size > 1:
-            torch.distributed.barrier()
-
-        # Now all processes load the complete dataset
-        self.items = []
-        for img_path in all_image_files:
-            cache_path = self.cache_dir / f"{hashlib.md5(img_path.encode()).hexdigest()}.pt"
-            if cache_path.exists():
-                self.items.append((img_path, cache_path))
-
-    def _process_image(self, image_path: str, bucket: ImageBucket) -> torch.Tensor:
-        """Process a single image to fit in its bucket"""
-        with Image.open(image_path) as img:
-            img = img.convert('RGB')
-            
-            width, height = img.size
-            scale = min(bucket.width / width, bucket.height / height)
-            new_width = int(width * scale)
-            new_height = int(height * scale)
-            
-            img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-            
-            left = (new_width - bucket.width) // 2
-            top = (new_height - bucket.height) // 2
-            right = left + bucket.width
-            bottom = top + bucket.height
-            
-            left = max(0, left)
-            top = max(0, top)
-            right = min(new_width, right)
-            bottom = min(new_height, bottom)
-            
-            img = img.crop((left, top, right, bottom))
-            
-            if img.size != (bucket.width, bucket.height):
-                new_img = Image.new('RGB', (bucket.width, bucket.height))
-                paste_left = (bucket.width - img.size[0]) // 2
-                paste_top = (bucket.height - img.size[1]) // 2
-                new_img.paste(img, (paste_left, paste_top))
-                img = new_img
-            
-            if self.transform:
-                img = self.transform(img)
+            print(f"Found {len(self.image_files)} valid images in {dir_path}")
+    
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], torch.Tensor]:
+        img_path = self.image_files[idx]
+        txt_path = self.text_files[idx]
+        
+        # Generate cache paths
+        img_cache_path = self.cache_dir / f"{img_path.stem}.pt"
+        text_cache_path = self.text_cache_dir / f"{img_path.stem}.pt"
+        
+        # Load or generate image tensor
+        try:
+            if img_cache_path.exists():
+                img = torch.load(img_cache_path, map_location='cpu')
             else:
-                img = transforms.ToTensor()(img)
-                img = img[:3]
-                img = transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])(img)
-                img = img.to(torch.bfloat16)
+                img = Image.open(img_path).convert('RGB')
+                if self.transform:
+                    img = self.transform(img)
+                torch.save(img, img_cache_path)
+        except Exception as e:
+            print(f"Error loading image {img_path}: {e}")
+            # Return a default/empty tensor
+            img = torch.zeros((3, 256, 256))
             
-            return img
-
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, dict, torch.Tensor]:
-        """Get a single item from the dataset"""
-        img_path, bucket, img_cache_path, text_cache_path = self.items[idx]
-        
+        # Load or generate text embeddings
         try:
-            img = torch.load(img_cache_path, weights_only=True)
-            if len(img.shape) == 4:
-                img = img.squeeze(0)
+            if text_cache_path.exists():
+                text_data = torch.load(text_cache_path, map_location='cpu')
+                text_embeds = text_data['embeds']
+                tag_weight = text_data['tag_weight']
+            else:
+                with open(txt_path, 'r', encoding='utf-8') as f:
+                    caption = f.read().strip()
+                text_embeds = self.text_embedder(caption) if hasattr(self, 'text_embedder') else {}
+                tag_weight = torch.tensor(1.0)  # Default weight
+                torch.save({'embeds': text_embeds, 'tag_weight': tag_weight}, text_cache_path)
         except Exception as e:
-            print(f"Error loading cached latent {img_cache_path}: {e}")
-            raise e
-        
-        try:
-            cached_text = torch.load(text_cache_path, weights_only=True)
-            text_embeds = cached_text['embeds']
-            tags = cached_text['tags']
-        except Exception as e:
-            print(f"Error loading cached text {text_cache_path}: {e}")
-            raise e
-        
-        tag_weight = torch.tensor(self.tag_weighter.get_weight(tags))
-        
+            print(f"Error loading text {txt_path}: {e}")
+            # Return empty embeddings
+            text_embeds = {}
+            tag_weight = torch.tensor(1.0)
+            
         return img, text_embeds, tag_weight
-
+    
     def __len__(self) -> int:
-        return len(self.items) 
+        return len(self.image_files)
+
+class NovelAIDataset(MultiDirectoryImageDataset):
+    def __init__(
+        self,
+        image_dirs: List[str],
+        transform: Optional[Callable] = None,
+        device: torch.device = None,
+        vae: Optional[AutoencoderKL] = None,
+        cache_dir: str = "latent_cache",
+        text_cache_dir: str = "text_cache"
+    ):
+        super().__init__(
+            image_dirs=image_dirs,
+            transform=transform,
+            cache_dir=cache_dir,
+            text_cache_dir=text_cache_dir
+        )
+        self.device = device
+        self.vae = vae
+        self.text_embedder = TextEmbedder(device=device)
+        
+        # Initialize optimized tag weighter
+        self.tag_weighter = FastTagWeighter(
+            min_weight=0.1,
+            max_weight=2.0,
+            default_weight=1.0,
+            smoothing_factor=0.1,
+            rarity_scale=0.5,
+            cache_size=10000
+        )
+        
+        # Pre-compute tag weights with optimized system
+        print("Computing tag weights with optimized system...")
+        self._precompute_tag_weights()
+        
+        # Print statistics after initialization
+        self.tag_weighter.print_stats()
+        
+    def _precompute_tag_weights(self):
+        """Pre-compute weights for all tags with optimized parsing"""
+        for txt_path in tqdm(self.text_files, desc="Processing tags"):
+            try:
+                with open(txt_path, 'r', encoding='utf-8') as f:
+                    caption = f.read().strip()
+                tags = parse_tags(caption)  # Using optimized parser
+                self.tag_weighter.update_frequencies(tags)
+            except Exception as e:
+                print(f"Error processing tags from {txt_path}: {e}")
+                continue
+
+    def _get_default_text_embeds(self) -> Dict[str, torch.Tensor]:
+        """Create default text embeddings with correct structure"""
+        return {
+            'base_text_embeds': torch.zeros((1, 77, 768)),  # [batch, seq_len, hidden_dim]
+            'base_pooled_embeds': torch.zeros((1, 768)),    # [batch, hidden_dim]
+        }

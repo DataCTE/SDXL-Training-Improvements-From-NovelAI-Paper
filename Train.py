@@ -1,43 +1,64 @@
-import argparse
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+import numpy as np
+import math
+from PIL import Image
+from pathlib import Path
+import random
+from dataclasses import dataclass
+from typing import List, Optional, Dict, Tuple, Callable, Union
+from transformers import CLIPTokenizer, CLIPTextModel
+from diffusers import StableDiffusionXLPipeline, UNet2DConditionModel, AutoencoderKL, DDPMScheduler
+from torchvision import transforms
+from accelerate import Accelerator
+from adamw_bf16 import AdamWBF16
+import glob
 import os
+from tqdm import tqdm
+import wandb
+from torch.nn.utils import clip_grad_norm_
+import shutil
+import argparse
+from safetensors.torch import load_file
 import signal
 import sys
-import torch
-import wandb
-import torch.multiprocessing as mp
-from pathlib import Path
-from accelerate import Accelerator
-from torch.utils.data import DataLoader
-from diffusers import AutoencoderKL, UNet2DConditionModel, DDPMScheduler
-from safetensors.torch import load_file
-from adamw_bf16 import AdamWBF16
-import random
-import numpy as np
-from torch.distributed import dist
+import torch.cuda.streams as streams
+import json
+import torch.distributed as dist
+from abc import ABCMeta, abstractmethod
+from collections.abc import Callable
+from math import ceil
+import contextlib
+import time
+import re
+from collections import defaultdict
 
-from configs.training_config import TrainingConfig
+try:
+    import bitsandbytes as bnb
+    from bitsandbytes.nn import Linear8bitLt, LinearNf4
+    HAVE_BNB = True
+except ImportError:
+    HAVE_BNB = False
+    Linear8bitLt = None
+    LinearNf4 = None
+    bnb = None
+
+try:
+    from torch.cuda import empty_cache as torch_gc
+except ImportError:
+    def torch_gc():
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+
+# Import all the necessary components from modules
+from memory.layeroffloading import LayerOffloadConductor, LayerOffloadStrategy
+from data.dataset import NovelAIDataset, AspectBatchSampler
 from trainers.sdxl_trainer import SDXLTrainer
-from data.dataset import NovelAIDataset
-from data.sampler import AspectBatchSampler
-from utils.checkpoints import CheckpointManager
-from utils.distributed import setup_distributed, cleanup_distributed
-from utils.error_handling import error_handler
-
-def setup_wandb(config: TrainingConfig):
-    wandb.init(
-        project="sdxl-finetune",
-        config={
-            "batch_size": config.batch_size,
-            "grad_accum_steps": config.grad_accum_steps,
-            "effective_batch": config.batch_size * config.grad_accum_steps,
-            "learning_rate": config.learning_rate,
-            "num_epochs": config.num_epochs,
-            "model": "SDXL-base-1.0",
-            "optimizer": "AdamW-BF16",
-            "scheduler": "DDPM",
-            "min_snr_gamma": config.min_snr_gamma,
-        }
-    )
+from configs.training_config import TrainingConfig
+from utils import setup_wandb, setup_distributed, cleanup_distributed
 
 def load_unet(args, config: TrainingConfig, device: torch.device):
     """Load UNet model based on arguments"""
@@ -84,7 +105,6 @@ def signal_handler(signum, frame):
     global trainer
     
     if dist.is_initialized():
-        # Notify all processes about shutdown
         shutdown_tensor = torch.tensor(1, device="cuda")
         dist.all_reduce(shutdown_tensor)
         dist.barrier()
@@ -101,7 +121,6 @@ def signal_handler(signum, frame):
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
-@error_handler
 def main():
     global trainer
     trainer = None
@@ -111,14 +130,16 @@ def main():
     parser.add_argument("--world_size", type=int, default=None)
     parser.add_argument("--unet_path", type=str, required=True)
     parser.add_argument("--resume_from_checkpoint", type=str)
+    parser.add_argument("--max_vram_usage", type=float, default=0.8)
     args = parser.parse_args()
     
     # Setup distributed training first
     if args.local_rank != -1:
         torch.cuda.set_device(args.local_rank)
         device = setup_distributed(args.local_rank, args.world_size)
-        # Important: Set this for proper data loading
         torch.backends.cudnn.benchmark = True
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     try:
         config = TrainingConfig()
@@ -127,35 +148,45 @@ def main():
         if args.local_rank == -1 or args.local_rank == 0:
             setup_wandb(config)
         
-        # Add at start of main after args parsing:
-        if args.local_rank != -1:
-            # Set same seed across all processes
-            seed = config.seed if hasattr(config, 'seed') else 42
-            torch.manual_seed(seed)
-            torch.cuda.manual_seed(seed)
-            random.seed(seed)
-            np.random.seed(seed)
-            # Make CuDNN behavior deterministic
-            torch.backends.cudnn.deterministic = True
+        # Set seeds for reproducibility
+        seed = config.seed if hasattr(config, 'seed') else 42
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.backends.cudnn.deterministic = True
         
         # Load models
-        unet = UNet2DConditionModel.from_pretrained(
-            args.unet_path,
-            torch_dtype=torch.bfloat16
-        ).to(device)
+        unet = load_unet(args, config, device)
         vae = AutoencoderKL.from_pretrained(
             "stabilityai/sdxl-vae",
             torch_dtype=torch.bfloat16
         ).to(device)
         
-        # Initialize optimizer
-        optimizer = AdamWBF16(
-            unet.parameters(),
-            lr=config.learning_rate,
-            betas=config.adam_betas,
-            weight_decay=config.weight_decay,
-            max_grad_norm=config.max_grad_norm
-        )
+        # Initialize memory management if enabled
+        if args.max_vram_usage < 1.0:
+            layer_conductor = LayerOffloadConductor(unet, device)
+            offload_strategy = LayerOffloadStrategy(unet, args.max_vram_usage)
+        else:
+            layer_conductor = None
+            offload_strategy = None
+        
+        # Initialize optimizer with memory-efficient settings
+        if HAVE_BNB:
+            optimizer = bnb.optim.AdamW8bit(
+                unet.parameters(),
+                lr=config.learning_rate,
+                betas=config.adam_betas,
+                weight_decay=config.weight_decay,
+            )
+        else:
+            optimizer = AdamWBF16(
+                unet.parameters(),
+                lr=config.learning_rate,
+                betas=config.adam_betas,
+                weight_decay=config.weight_decay,
+                max_grad_norm=config.max_grad_norm
+            )
         
         # Initialize dataset with distributed info
         dataset = NovelAIDataset(
@@ -164,11 +195,12 @@ def main():
             local_rank=args.local_rank,
             world_size=args.world_size if args.local_rank != -1 else 1
         )
+        
         sampler = AspectBatchSampler(
             dataset,
             batch_size=config.batch_size,
             shuffle=True,
-            world_size=args.world_size,
+            world_size=args.world_size if args.local_rank != -1 else 1,
             rank=args.local_rank
         )
         
@@ -179,7 +211,7 @@ def main():
             pin_memory=True
         )
         
-        # Initialize trainer
+        # Initialize trainer with memory management
         trainer = SDXLTrainer(
             model=unet,
             vae=vae,
@@ -187,11 +219,12 @@ def main():
             scheduler=DDPMScheduler(),
             device=device,
             config=config,
-            local_rank=args.local_rank
+            local_rank=args.local_rank,
+            layer_conductor=layer_conductor,
+            offload_strategy=offload_strategy
         )
         
         if args.resume_from_checkpoint:
-            # Need barrier to ensure all processes wait for main process to load
             if args.local_rank != -1:
                 torch.distributed.barrier()
             if args.local_rank == 0:
@@ -199,22 +232,24 @@ def main():
             if args.local_rank != -1:
                 torch.distributed.barrier()
         
-        # After loading model weights, need to broadcast to all processes
+        # Broadcast model state to all processes
         if args.local_rank != -1:
-            # Broadcast model parameters
             for param in unet.parameters():
                 dist.broadcast(param.data, src=0)
-            # Broadcast optimizer state
             for state in optimizer.state.values():
                 for tensor_name, tensor_value in state.items():
                     if isinstance(tensor_value, torch.Tensor):
                         dist.broadcast(tensor_value, src=0)
         
-        # Training loop
+        # Training loop with improved memory management
         for epoch in range(trainer.current_epoch, config.num_epochs):
             if args.local_rank != -1:
                 sampler.set_epoch(epoch)
             trainer.current_epoch = epoch
+            
+            # Clear cache before each epoch
+            torch_gc()
+            
             avg_loss = trainer.train_epoch(dataloader)
             
             if args.local_rank == -1 or args.local_rank == 0:

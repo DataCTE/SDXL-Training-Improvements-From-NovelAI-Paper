@@ -14,13 +14,13 @@ class TextEmbedder:
         self.device = device
         self.max_length = 77
         
-        # Load tokenizers
+        # Load tokenizers (remove subfolder paths)
         self.tokenizers = {
             "base": CLIPTokenizer.from_pretrained(tokenizer_paths["base"]),
             "large": CLIPTokenizer.from_pretrained(tokenizer_paths["large"])
         }
         
-        # Load text encoders with bfloat16
+        # Load text encoders with bfloat16 (remove subfolder paths)
         self.text_encoders = {
             "base": CLIPTextModel.from_pretrained(tokenizer_paths["base"]).to(device).to(torch.bfloat16),
             "large": CLIPTextModel.from_pretrained(tokenizer_paths["large"]).to(device).to(torch.bfloat16)
@@ -48,20 +48,26 @@ class TextEmbedder:
         # Generate embeddings
         embeds = {}
         for k, encoder in self.text_encoders.items():
+            # Move tokens to GPU but keep as int64 for embedding layer
             tokens_gpu = {key: val.to(self.device) for key, val in tokens[k].items()}
+            
+            # Generate embeddings
             output = encoder(**tokens_gpu)
             
+            # Ensure text embeddings have shape [batch_size, seq_len, hidden_dim]
             last_hidden_state = output.last_hidden_state
             if last_hidden_state.dim() == 2:
                 last_hidden_state = last_hidden_state.unsqueeze(0)
             
+            # Ensure pooled embeddings have shape [batch_size, hidden_dim]
             pooled_output = output.pooler_output
             if pooled_output.dim() == 1:
                 pooled_output = pooled_output.unsqueeze(0)
             elif pooled_output.dim() == 3:
                 pooled_output = pooled_output.squeeze(1)
             
-            embeds[f"{k}_text_embeds"] = last_hidden_state.cpu()
-            embeds[f"{k}_pooled_embeds"] = pooled_output.cpu()
+            # Keep embeddings on CPU with consistent dimensions
+            embeds[f"{k}_text_embeds"] = last_hidden_state.cpu()  # [batch_size, seq_len, hidden_dim]
+            embeds[f"{k}_pooled_embeds"] = pooled_output.cpu()   # [batch_size, hidden_dim]
             
-        return embeds 
+        return embeds
