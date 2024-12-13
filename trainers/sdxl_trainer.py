@@ -155,150 +155,112 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
 
     def training_step(
         self,
-        latents: torch.Tensor,
+        images: torch.Tensor,
         text_embeds: Dict[str, torch.Tensor],
         tag_weights: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Memory-efficient training step with gradient accumulation"""
-        # Memory management at start of step
-        self.memory_manager.clear_cache()
+        """Execute training step with ZTSNR and EDM formulation"""
+        self.optimizer.zero_grad()
         
-        # Initialize accumulated loss
-        accumulated_loss = 0
+        batch_size = images.shape[0]
+        micro_batch_size = batch_size // self.gradient_accumulation_steps
         
-        for accumulation_step in range(self.gradient_accumulation_steps):
-            # Get batch slice for current accumulation step
-            batch_size = latents.shape[0] // self.gradient_accumulation_steps
-            start_idx = accumulation_step * batch_size
-            end_idx = start_idx + batch_size
+        total_loss = 0
+        total_v_pred = None
+        
+        for i in range(self.gradient_accumulation_steps):
+            start_idx = i * micro_batch_size
+            end_idx = (i + 1) * micro_batch_size
             
-            batch_latents = latents[start_idx:end_idx].reshape(batch_size, -1, latents.shape[-2], latents.shape[-1])
+            # Get micro-batch
+            batch_images = images[start_idx:end_idx]
             batch_text_embeds = {k: v[start_idx:end_idx] for k, v in text_embeds.items()}
-            batch_tag_weights = tag_weights[start_idx:end_idx]
+            batch_tag_weights = batch_tag_weights[start_idx:end_idx].view(-1, 1, 1, 1)
             
-            # Forward pass with mixed precision
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                # Ensure tag_weights has correct shape for broadcasting
-                batch_tag_weights = batch_tag_weights.view(-1, 1, 1, 1)
-                
-                with torch.inference_mode(), torch.amp.autocast(dtype=torch.bfloat16):
-                    # Get latent dimensions
-                    height = batch_latents.shape[2] * 8
-                    width = batch_latents.shape[3] * 8
-                    
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                with torch.inference_mode():
+                    # Get latent dimensions and scale factor
+                    height, width = batch_images.shape[2:4]
                     area = torch.tensor(height * width, device=self.device, dtype=torch.float32)
                     noise_scale = torch.sqrt(area / self.base_area)
                     
-                    # Sample timesteps and get sigmas
-                    timesteps = torch.randint(0, self.scheduler.config.num_train_timesteps, (batch_size,), device=self.device)
-                    sigma = self.sigmas[timesteps] * noise_scale
-                    
-                    # Generate noise
-                    noise = torch.randn_like(batch_latents, dtype=torch.float32, device=self.device)
-                    is_infinite = torch.isinf(sigma)
-                    
-                    # Apply noising
-                    noisy_images = torch.where(
-                        is_infinite.view(-1, 1, 1, 1),
-                        noise,
-                        batch_latents + noise * sigma.view(-1, 1, 1, 1)
-                    )
-                    
-                    # Get Karras scalings
-                    c_skip, c_out, c_in = self.get_karras_scalings(sigma)
-                    model_input = noisy_images * c_in.view(-1, 1, 1, 1)
-                    
-                    # Process text embeddings efficiently with non-blocking transfers
-                    base_hidden = batch_text_embeds["base_text_embeds"].to(
-                        device=self.device,
-                        dtype=torch.bfloat16,
-                        non_blocking=True
-                    ).squeeze(1)
-                    
-                    base_pooled = batch_text_embeds["base_pooled_embeds"].to(
-                        device=self.device,
-                        dtype=torch.bfloat16,
-                        non_blocking=True
-                    ).squeeze(1)
-                    
-                    # Project text embeddings
-                    batch_size, seq_len, _ = base_hidden.shape
-                    base_hidden_float32 = base_hidden.to(dtype=torch.float32)
-                    encoder_hidden_states = self.hidden_proj(
-                        base_hidden_float32.view(-1, 768)
-                    ).view(batch_size, seq_len, -1)
-                    
-                    # Get time embeddings
-                    time_ids = self._get_add_time_ids(batch_latents)
-                    added_cond_kwargs = {
-                        "text_embeds": base_pooled,
-                        "time_ids": time_ids
-                    }
+                    # Encode images to latent space
+                    batch_latents = self.vae.encode(batch_images).latent_dist.sample()
+                    batch_latents = batch_latents * self.vae.config.scaling_factor * noise_scale
                 
-                # Forward pass with layer offloading and activation checkpointing
-                v_prediction = None
-                for layer_idx, (name, layer) in enumerate(self.model.named_modules()):
-                    if not list(layer.parameters()):
-                        continue
-                    
-                    if v_prediction is not None:
-                        self.activation_allocator.store_activation(name, v_prediction)
-                    
-                    self.layer_conductor.before_layer(layer_idx, name)
-                    
-                    with torch.amp.autocast(dtype=torch.bfloat16):
-                        v_prediction = self.forward(
-                            model_input if layer_idx == 0 else v_prediction,
-                            timesteps,
-                            encoder_hidden_states=encoder_hidden_states,
-                            added_cond_kwargs=added_cond_kwargs,
-                            current_layer=name,
-                            phase='forward'
-                        ).sample
-                    
-                    self.layer_conductor.after_layer(layer_idx, name)
-                    self.memory_manager.clear_cache()
+                # Sample noise and timesteps
+                noise = torch.randn_like(batch_latents)
+                timesteps = torch.randint(
+                    0, self.scheduler.config.num_train_timesteps, 
+                    (batch_latents.shape[0],), device=self.device
+                )
                 
-                # Compute prediction and loss
-                with torch.amp.autocast(dtype=torch.bfloat16):
-                    pred_images = torch.where(
-                        is_infinite.view(-1, 1, 1, 1),
-                        -self.sigma_data * v_prediction,
-                        noisy_images * c_skip.view(-1, 1, 1, 1) + v_prediction * c_out.view(-1, 1, 1, 1)
-                    )
-                    
-                    # Compute loss with SNR weighting
-                    loss = F.mse_loss(pred_images, batch_latents, reduction='none')
-                    snr = self.get_snr(sigma)
-                    min_snr = torch.tensor(self.min_snr_gamma, device=self.device)
-                    snr_weights = torch.where(
-                        is_infinite.view(-1, 1, 1, 1),
-                        min_snr.view(-1, 1, 1, 1),
-                        torch.minimum(snr, min_snr).view(-1, 1, 1, 1)
-                    )
-                    
-                    # Apply tag weights and reduce
-                    loss = loss * snr_weights * batch_tag_weights
-                    loss = loss.mean() / self.gradient_accumulation_steps
+                # Get sigmas for EDM formulation
+                sigma = self.sigmas[timesteps] * noise_scale
+                is_infinite = torch.isinf(sigma)
+                
+                # Apply noising with EDM/k-diffusion formulation
+                noisy_latents = torch.where(
+                    is_infinite.view(-1, 1, 1, 1),
+                    noise,  # For infinite sigma, use pure noise
+                    batch_latents + noise * sigma.view(-1, 1, 1, 1)  # Otherwise scale noise by sigma
+                )
+                
+                # Get Karras preconditioner scalings
+                c_skip = self.sigma_data**2 / (sigma**2 + self.sigma_data**2)
+                c_out = -sigma * self.sigma_data / torch.sqrt(sigma**2 + self.sigma_data**2)
+                c_in = 1 / torch.sqrt(sigma**2 + self.sigma_data**2)
+                
+                # Scale input according to preconditioner
+                model_input = noisy_latents * c_in.view(-1, 1, 1, 1)
+                
+                # Get model prediction
+                v_pred = self.model(
+                    model_input,
+                    timesteps,
+                    encoder_hidden_states=batch_text_embeds["hidden_states"],
+                    added_cond_kwargs=batch_text_embeds.get("added_cond", None)
+                ).sample
+                
+                # Compute prediction using preconditioner
+                pred_latents = torch.where(
+                    is_infinite.view(-1, 1, 1, 1),
+                    -self.sigma_data * v_pred,  # Special case for infinite sigma
+                    noisy_latents * c_skip.view(-1, 1, 1, 1) + v_pred * c_out.view(-1, 1, 1, 1)
+                )
+                
+                # Compute loss with SNR weighting
+                loss = F.mse_loss(pred_latents, batch_latents, reduction='none')
+                snr = self.get_snr(sigma)
+                min_snr = torch.tensor(self.min_snr_gamma, device=self.device)
+                snr_weights = torch.where(
+                    is_infinite.view(-1, 1, 1, 1),
+                    min_snr.view(-1, 1, 1, 1),
+                    torch.minimum(snr, min_snr).view(-1, 1, 1, 1)
+                )
+                
+                # Apply tag weights and reduce
+                loss = loss * snr_weights * batch_tag_weights
+                loss = loss.mean() / self.gradient_accumulation_steps
+                
+                # Accumulate predictions for logging
+                if total_v_pred is None:
+                    total_v_pred = v_pred.detach()
+                else:
+                    total_v_pred = torch.cat([total_v_pred, v_pred.detach()], dim=0)
             
             # Backward pass with gradient scaling
             self.scaler.scale(loss).backward()
-            accumulated_loss += loss.item() * self.gradient_accumulation_steps
-            
-            # Clear activations and cache
-            self.activation_allocator.clear()
-            self.memory_manager.clear_cache()
+            total_loss += loss.item()
         
-        # Clip gradients
+        # Clip gradients and update weights
+        grad_norm = self.compute_grad_norm()
         self.scaler.unscale_(self.optimizer)
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-        
-        # Optimizer step with gradient scaling
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.scaler.step(self.optimizer)
         self.scaler.update()
-        self.optimizer.zero_grad()
         
-        return accumulated_loss, pred_images, v_prediction, timesteps
+        return total_loss, total_v_pred, grad_norm, timesteps
 
     def load_checkpoint(self, path: str):
         """Load checkpoint with progress information"""
@@ -339,22 +301,12 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         return add_time_ids.reshape(batch_size, -1)
 
     def get_sigmas(self) -> torch.Tensor:
-        """
-        Generate noise schedule with zero-terminal SNR, handling infinite noise timestep.
-        The last timestep is set to sigma = ∞ for ZTSNR.
-        """
-        # Create regular sigma schedule for t in [0,1)
-        ramp = torch.linspace(0, 1, self.num_timesteps, device=self.device)
+        """Generate sigma schedule for EDM training"""
+        ramp = torch.linspace(0, 1, self.num_timesteps)
         min_inv_rho = self.sigma_min ** (1 / self.rho)
-        sigmas = torch.empty_like(ramp)
-        
-        # Regular steps (all except last)
-        sigmas[:-1] = (min_inv_rho * (1 - ramp[:-1])) ** self.rho
-        
-        # Set final step to infinity for ZTSNR
-        sigmas[-1] = float('inf')
-        
-        return sigmas.to(self.device)
+        max_inv_rho = self.sigma_max ** (1 / self.rho)
+        sigmas = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** self.rho
+        return sigmas
 
     def get_karras_scalings(self, sigma: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -384,11 +336,8 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         return c_skip, c_out, c_in
 
     def get_snr(self, sigma: torch.Tensor) -> torch.Tensor:
-        """
-        Signal-to-Noise Ratio as defined in the paper for given sigma:
-        SNR(σ) = (σ_data / σ)²
-        """
-        return (self.sigma_data / sigma)**2
+        """Compute Signal-to-Noise Ratio for given sigma"""
+        return self.sigma_data**2 / sigma**2
 
     def get_minsnr_weights(self, timesteps: torch.Tensor) -> torch.Tensor:
         """
