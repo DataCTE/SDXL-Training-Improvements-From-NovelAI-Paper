@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Tuple
 import torch
 from torchvision import transforms
@@ -6,14 +6,14 @@ from torchvision import transforms
 @dataclass
 class TrainingConfig:
     # Dataset paths
-    image_dirs: List[str] = [
-        r'path/to/your/dataset'
-    ]
+    image_dirs: List[str] = field(default_factory=lambda: [
+       r'path/to/your/dataset'
+    ])
     
     # Training hyperparameters
     batch_size: int = 32
     grad_accum_steps: int = 4
-    learning_rate: float = 4e-6
+    learning_rate: float = 4e-7
     num_epochs: int = 10
     save_interval: int = 1000
     log_interval: int = 10

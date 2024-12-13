@@ -1,10 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, Any
 from diffusers import UNet2DConditionModel
 from diffusers import AutoencoderKL
-from diffusers import DDPMSolverMultistepScheduler
+from diffusers import DDPMScheduler
 from memory.layeroffloading import LayerOffloadConductor, LayerOffloadStrategy
 from memory.EfficientQuantization import MemoryEfficientQuantization
 from memory.layeroffloading import StaticLayerAllocator
@@ -27,7 +27,7 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         model: UNet2DConditionModel,
         vae: AutoencoderKL,
         optimizer: torch.optim.Optimizer,
-        scheduler: DDPMSolverMultistepScheduler,
+        scheduler: DDPMScheduler,
         device: torch.device,
         accelerator: Optional[Accelerator] = None,
         resume_from_checkpoint: Optional[str] = None,

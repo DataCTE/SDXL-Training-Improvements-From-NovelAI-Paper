@@ -55,10 +55,12 @@ except ImportError:
 
 # Import all the necessary components from modules
 from memory.layeroffloading import LayerOffloadConductor, LayerOffloadStrategy
-from data.dataset import NovelAIDataset, AspectBatchSampler
-from trainers.sdxl_trainer import SDXLTrainer
+from data.dataset import NovelAIDataset
+from data.sampler import AspectBatchSampler
+from trainers.sdxl_trainer import NovelAIDiffusionV3Trainer
 from configs.training_config import TrainingConfig
-from utils import setup_wandb, setup_distributed, cleanup_distributed
+from utils.distributed import setup_distributed, cleanup_distributed
+from utils.reporting import setup_wandb
 
 def load_unet(args, config: TrainingConfig, device: torch.device):
     """Load UNet model based on arguments"""
@@ -128,7 +130,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--local_rank", type=int, default=-1)
     parser.add_argument("--world_size", type=int, default=None)
-    parser.add_argument("--unet_path", type=str, required=True)
+    parser.add_argument("--unet_path", type=str, default=None)
     parser.add_argument("--resume_from_checkpoint", type=str)
     parser.add_argument("--max_vram_usage", type=float, default=0.8)
     args = parser.parse_args()
@@ -190,8 +192,12 @@ def main():
         
         # Initialize dataset with distributed info
         dataset = NovelAIDataset(
-            config.data_path,
+            image_dirs=config.image_dirs,
+            transform=config.get_transform(),
             device=device,
+            vae=vae,
+            cache_dir=config.cache_dir,
+            text_cache_dir=config.text_cache_dir,
             local_rank=args.local_rank,
             world_size=args.world_size if args.local_rank != -1 else 1
         )
@@ -212,7 +218,7 @@ def main():
         )
         
         # Initialize trainer with memory management
-        trainer = SDXLTrainer(
+        trainer = NovelAIDiffusionV3Trainer(
             model=unet,
             vae=vae,
             optimizer=optimizer,

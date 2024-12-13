@@ -1,7 +1,7 @@
 import torch
 import torch.cuda
 import torch.cuda.memory
-from torch.cuda import torch_gc
+import gc
 
 class MemoryManager:
     def __init__(self):
@@ -16,7 +16,7 @@ class MemoryManager:
     def clear_cache(self):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
-        torch_gc()
+        gc.collect()
         
     def handle_oom(self):
         self.oom_count += 1
