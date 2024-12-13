@@ -40,7 +40,7 @@ class TrainingProfiler:
         self.current_range: Optional[str] = None
         self.range_start_time: Optional[float] = None
         self.config = config
-        self.memory_callback = None
+        self.memory_callback: Optional[Callable[[], float]] = None
     
     def add_memory_callback(self, callback: Callable[[], float]):
         """Add callback for getting current memory usage"""
@@ -87,6 +87,13 @@ class TrainingProfiler:
     
     def get_current_metrics(self) -> Dict[str, float]:
         """Get current average metrics"""
+        if not self.metrics.batch_times:  # Check if we have any metrics
+            return {
+                "avg_batch_time": 0.0,
+                "avg_throughput": 0.0,
+                "avg_memory_gb": 0.0 if not self.memory_callback else self.memory_callback() / (1024 ** 3),
+                "avg_loss": 0.0
+            }
         return self.metrics.get_averages()
 
 

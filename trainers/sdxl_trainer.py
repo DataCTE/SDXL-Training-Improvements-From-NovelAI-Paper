@@ -1,14 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Dict, Tuple, Any
+from typing import Optional, Dict, Tuple
 from diffusers import UNet2DConditionModel
 from diffusers import AutoencoderKL
 from diffusers import DDPMScheduler
-from memory.layeroffloading import LayerOffloadConductor, LayerOffloadStrategy
-from memory.EfficientQuantization import MemoryEfficientQuantization
-from memory.layeroffloading import StaticLayerAllocator
-from memory.layeroffloading import StaticActivationAllocator
 from memory.Manager import MemoryManager
 from data.dataset import NovelAIDataset
 from data.sampler import AspectBatchSampler
@@ -82,7 +78,10 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         )
         
         # Add memory monitoring to profiler
-        self.profiler.add_memory_callback(self.memory_manager.get_current_usage)
+        if hasattr(self.memory_manager, 'get_current_usage'):
+            self.profiler.add_memory_callback(self.memory_manager.get_current_usage)
+        else:
+            print("Warning: Memory manager does not support current usage tracking")
         
         # Add projection layer for CLIP embeddings
         self.hidden_proj = nn.Linear(768, model.config.cross_attention_dim).to(
