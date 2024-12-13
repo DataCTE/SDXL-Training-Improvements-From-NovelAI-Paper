@@ -31,7 +31,7 @@ class OptimizedTagClassifier:
             ),
             TagCategory.STYLE: (
                 r"(realistic|photorealistic|abstract|"
-                r"anime|cartoon|digital art|"
+                r"anime|cartoon|digital art|manga"
                 r"painting|sketch|drawing)",
                 1.1
             ),
@@ -85,18 +85,21 @@ class OptimizedTagClassifier:
             for category, (pattern, importance) in self.category_patterns.items()
         }
         
-        # Cache for tag classifications
+        # Track which categories are actually present in the current set
+        self.active_categories = set()
         self.classification_cache = {}
     
     def classify_tag(self, tag: str) -> Tuple[str, float]:
-        """Classify a tag with caching for performance"""
+        """Classify a tag, but only consider active categories"""
         # Check cache first
         if tag in self.classification_cache:
             return self.classification_cache[tag]
         
-        # Match against compiled patterns
+        # Only match against patterns that have been found in the current set
         for category, (pattern, importance) in self.compiled_patterns.items():
             if pattern.search(tag):
+                # Add to active categories when found
+                self.active_categories.add(category)
                 result = (category, importance)
                 self.classification_cache[tag] = result
                 return result
@@ -105,6 +108,11 @@ class OptimizedTagClassifier:
         result = ("other", 1.0)
         self.classification_cache[tag] = result
         return result
+
+    def reset_active_categories(self):
+        """Reset active categories for new batch of tags"""
+        self.active_categories.clear()
+        self.classification_cache.clear()
 
 class FastTagWeighter:
     """Performance optimized tag weighting system"""
@@ -194,7 +202,10 @@ class FastTagWeighter:
         return combined_weights
     
     def update_frequencies(self, tags: List[str]):
-        """Vectorized frequency update"""
+        """Vectorized frequency update with active category tracking"""
+        # Reset active categories for new batch
+        self.classifier.reset_active_categories()
+        
         self.total_samples += 1
         
         # Convert tags to indices
@@ -291,12 +302,13 @@ class FastTagWeighter:
         return self._compute_combined_weight(weights)
     
     def print_stats(self):
-        """Print cache performance statistics"""
+        """Print cache performance statistics and active categories"""
         total = self.weight_cache_hits + self.weight_cache_misses
         hit_rate = self.weight_cache_hits / total if total > 0 else 0
         print(f"Weight cache hit rate: {hit_rate:.2%}")
         print(f"Unique tags: {self.next_tag_idx}")
         print(f"Cache size: {len(self.weight_cache)}")
+        print(f"Active categories: {sorted(self.classifier.active_categories)}")
 
 def parse_tags(caption: str) -> List[str]:
     """Enhanced tag parsing with better handling of special cases"""
