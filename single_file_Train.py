@@ -1609,12 +1609,7 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             
         # Allocate activation buffers after model is fully initialized
         self.activation_allocator.allocate_buffers(device)
-        self.profiler = PerformanceProfiler(enabled=True)
-        self.auto_tuner = AutoTuner({
-            "batch_size": 4,
-            "bucket_step": 64,
-            "max_vram_usage": 0.8
-        })
+        
         
     def forward(
         self,
@@ -1675,16 +1670,16 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             start_idx = accumulation_step * batch_size
             end_idx = start_idx + batch_size
             
-            batch_latents = latents[start_idx:end_idx]
+            batch_latents = latents[start_idx:end_idx].reshape(batch_size, -1, latents.shape[-2], latents.shape[-1])
             batch_text_embeds = {k: v[start_idx:end_idx] for k, v in text_embeds.items()}
             batch_tag_weights = tag_weights[start_idx:end_idx]
             
             # Forward pass with mixed precision
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 # Ensure tag_weights has correct shape for broadcasting
                 batch_tag_weights = batch_tag_weights.view(-1, 1, 1, 1)
                 
-                with torch.inference_mode(), torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                with torch.inference_mode(), torch.amp.autocast(dtype=torch.bfloat16):
                     # Get latent dimensions
                     height = batch_latents.shape[2] * 8
                     width = batch_latents.shape[3] * 8
@@ -1749,7 +1744,7 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                     
                     self.layer_conductor.before_layer(layer_idx, name)
                     
-                    with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                    with torch.amp.autocast(dtype=torch.bfloat16):
                         v_prediction = self.forward(
                             model_input if layer_idx == 0 else v_prediction,
                             timesteps,
@@ -1763,7 +1758,7 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                     self.memory_manager.clear_cache()
                 
                 # Compute prediction and loss
-                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                with torch.amp.autocast(dtype=torch.bfloat16):
                     pred_images = torch.where(
                         is_infinite.view(-1, 1, 1, 1),
                         -self.sigma_data * v_prediction,
