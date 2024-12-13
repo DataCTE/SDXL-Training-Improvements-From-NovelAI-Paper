@@ -11,7 +11,7 @@ class TrainingConfig:
     ])
     
      # Training hyperparameters
-    batch_size: int = 32
+    batch_size: int = 16
     grad_accum_steps: int = 4
     learning_rate: float = 4e-7
     num_epochs: int = 10

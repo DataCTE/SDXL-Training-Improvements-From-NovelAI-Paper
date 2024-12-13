@@ -47,6 +47,9 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             torch.backends.cuda.enable_flash_sdp(True)
         
         self.model = model
+        # Enable gradient checkpointing for memory efficiency
+        self.model.enable_gradient_checkpointing()
+        
         self.vae = vae
         self.optimizer = optimizer
         self.scheduler = scheduler
@@ -145,17 +148,29 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             self.memory_manager.before_layer_computation(current_layer, phase)
         
         try:
-            # Call UNet's forward pass
-            return self.model(
-                sample=x,
-                timestep=timesteps,
-                encoder_hidden_states=encoder_hidden_states,
-                added_cond_kwargs=added_cond_kwargs,
-                return_dict=False
-            )[0]
+            # Clear cache before forward pass
+            torch.cuda.empty_cache()
+            
+            # Call UNet's forward pass with gradient checkpointing
+            with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16):
+                output = self.model(
+                    sample=x,
+                    timestep=timesteps,
+                    encoder_hidden_states=encoder_hidden_states,
+                    added_cond_kwargs=added_cond_kwargs,
+                    return_dict=False
+                )[0]
+            
+            # Clear unnecessary tensors
+            del x
+            torch.cuda.empty_cache()
+            
+            return output
+            
         finally:
             if current_layer:
                 self.memory_manager.after_layer_computation(current_layer)
+                torch.cuda.empty_cache()
 
     def training_step(
         self,
