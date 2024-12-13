@@ -54,11 +54,10 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         self.accelerator = accelerator
         self.gradient_accumulation_steps = gradient_accumulation_steps
         
-        # Initialize gradient scaler for mixed precision
-        self.scaler = torch.cuda.amp.GradScaler()
         
         # Initialize memory management systems
         self.memory_manager = MemoryManager(max_vram_usage=max_vram_usage)
+        
         # Setup memory management before registering modules
         self.memory_manager.setup_memory_management(model, device)
         
@@ -67,10 +66,15 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         self.activation_allocator = StaticActivationAllocator(model)
         self.activation_allocator.allocate_buffers(device)
         
-        # Register all layers with memory manager
+        # Initialize layer conductor
+        from memory.layeroffloading import LayerOffloadConductor
+        self.layer_conductor = LayerOffloadConductor(model, device)
+        
+        # Register all layers with memory manager and conductor
         for name, module in model.named_modules():
             if len(list(module.parameters())) > 0:
                 self.memory_manager.register_module(name, module)
+                self.layer_conductor.register_layer(name, module)
         
         # Initialize profiler and auto-tuner with config and memory management
         self.profiler = TrainingProfiler(window_size=50, config=config)
@@ -168,43 +172,47 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         text_embeds = {k: v.to(self.device) for k, v in text_embeds.items()}
         tag_weights = tag_weights.to(self.device)
         
-        print(f"[1] Initial images shape: {images.shape}")
+        # print(f"[1] Initial images shape: {images.shape}")
         
         # Zero gradients at the start of each step
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)  # More memory efficient than False
 
         batch_size = images.shape[0]
-        print(f"[2] Batch size: {batch_size}")
+        # print(f"[2] Batch size: {batch_size}")
         micro_batch_size = batch_size // self.gradient_accumulation_steps
-        print(f"[3] Micro batch size: {micro_batch_size}")
+        # print(f"[3] Micro batch size: {micro_batch_size}")
 
         total_loss = 0
         total_v_pred = None
 
         for i in range(self.gradient_accumulation_steps):
+            # Clear cache at the start of each micro-batch
+            torch.cuda.empty_cache()
+            
             start_idx = i * micro_batch_size
             end_idx = (i + 1) * micro_batch_size
 
             # Get micro-batch
             batch_images = images[start_idx:end_idx]
-            print(f"[4] Micro-batch images shape: {batch_images.shape}")
+            # print(f"[4] Micro-batch images shape: {batch_images.shape}")
             batch_text_embeds = {k: v[start_idx:end_idx] for k, v in text_embeds.items()}
             batch_tag_weights = tag_weights[start_idx:end_idx]
 
             # Forward pass with mixed precision
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                # Memory management at start of step
+                self.memory_manager.clear_cache()
+                
                 # Ensure tag_weights has correct shape for broadcasting
                 batch_tag_weights = batch_tag_weights.view(-1, 1, 1, 1)
                 
-                print(f"[5] Before VAE encode shape: {batch_images.shape}")
+                # print(f"[5] Before VAE encode shape: {batch_images.shape}")
                 
                 # Reshape images to correct format for VAE
-                # Input shape is [B, 1, 4, H, W]
-                # Need to reshape to [B, 3, H, W]
                 batch_images = batch_images.squeeze(1)  # Remove the extra dimension -> [B, 4, H, W]
                 batch_images = batch_images[:, :3]  # Take only first 3 channels -> [B, 3, H, W]
                 
-                print(f"[5] After fix VAE encode shape: {batch_images.shape}")
+                # print(f"[5] After fix VAE encode shape: {batch_images.shape}")
                 
                 with torch.inference_mode():  # Separate context for VAE encoding
                     # Get latent dimensions
@@ -216,8 +224,12 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                     
                     # Encode images to latent space
                     batch_latents = self.vae.encode(batch_images).latent_dist.sample()
-                    print(f"[6] After VAE encode shape: {batch_latents.shape}")
+                    # print(f"[6] After VAE encode shape: {batch_latents.shape}")
                     batch_latents = batch_latents * self.vae.config.scaling_factor * noise_scale
+                    
+                    # Clear VAE inputs to save memory
+                    del batch_images
+                    torch.cuda.empty_cache()
                 
                 # Sample noise and timesteps
                 noise = torch.randn_like(batch_latents)
@@ -239,19 +251,63 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                 # Scale input according to Karras preconditioner
                 scaled_input = c_in.view(-1, 1, 1, 1) * noisy_latents
                 
-                # Get model prediction
-                model_output = self.model(
-                    scaled_input,
-                    timesteps,
-                    encoder_hidden_states=batch_text_embeds["large_text_embeds"].squeeze(1),
-                    added_cond_kwargs={
-                        "text_embeds": batch_text_embeds["large_pooled_embeds"].squeeze(1),
-                        "time_ids": self._get_add_time_ids(batch_latents)
-                    },
-                    return_dict=False
-                )[0]
+                # print(f"[7] Before scaled input shape: {scaled_input.shape}")
+                # print(f"[8] Before base text embeds shape: {batch_text_embeds['base_text_embeds'].shape}")
+                # print(f"[9] Before base pooled embeds shape: {batch_text_embeds['base_pooled_embeds'].shape}")
+
+                # Process base model embeddings
+                base_hidden = batch_text_embeds["base_text_embeds"].squeeze(1)  # [B, 77, 768]
+                base_pooled = batch_text_embeds["base_pooled_embeds"].squeeze(1)  # [B, 768]
+                
+                # Project text embeddings
+                batch_size, seq_len, _ = base_hidden.shape
+                base_hidden_float32 = base_hidden.to(dtype=torch.float32)
+                encoder_hidden_states = self.hidden_proj(
+                    base_hidden_float32.view(-1, 768)
+                ).view(batch_size, seq_len, -1)
+                
+                # Clear intermediate tensors
+                del base_hidden_float32
+                torch.cuda.empty_cache()
+                
+                # print(f"[10] After encoder hidden states shape: {encoder_hidden_states.shape}")
+                # print(f"[11] After base pooled embeds shape: {base_pooled.shape}")
+                
+                time_ids = self._get_add_time_ids(batch_latents)    
+                
+                # print(f"[12] After time ids shape: {time_ids.shape}")
+                
+                added_cond_kwargs = {
+                    "text_embeds": base_pooled,
+                    "time_ids": time_ids
+                }
+
+                # Forward pass with layer offloading and activation checkpointing
+                v_prediction = None
+                for layer_idx, (name, layer) in enumerate(self.model.named_modules()):
+                    if not list(layer.parameters()):
+                        continue
+                    
+                    if v_prediction is not None:
+                        self.activation_allocator.store_activation(name, v_prediction)
+                    
+                    self.layer_conductor.before_layer(layer_idx, name)
+                    
+                    with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                        v_prediction = self.forward(
+                            scaled_input if layer_idx == 0 else v_prediction,
+                            timesteps,
+                            encoder_hidden_states=encoder_hidden_states,
+                            added_cond_kwargs=added_cond_kwargs,
+                            current_layer=name,
+                            phase='forward'
+                        )
+                    
+                    self.layer_conductor.after_layer(layer_idx, name)
+                    self.memory_manager.clear_cache()
+
                 # Apply Karras preconditioner scaling to model output
-                model_pred = c_skip.view(-1, 1, 1, 1) * noisy_latents + c_out.view(-1, 1, 1, 1) * model_output
+                model_pred = c_skip.view(-1, 1, 1, 1) * noisy_latents + c_out.view(-1, 1, 1, 1) * v_prediction
                 
                 # Calculate v-prediction target
                 v_pred_target = self.scheduler.get_velocity(batch_latents, noise, timesteps)
@@ -260,23 +316,29 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                 loss = F.mse_loss(model_pred.float(), v_pred_target.float(), reduction="none")
                 loss = loss.mean(dim=list(range(1, len(loss.shape)))) * batch_tag_weights.squeeze()
                 loss = loss.mean() / self.gradient_accumulation_steps
-                
+
                 # Accumulate predictions for logging
                 if total_v_pred is None:
                     total_v_pred = model_pred.detach()
                 else:
                     total_v_pred = torch.cat([total_v_pred, model_pred.detach()], dim=0)
 
-            # Backward pass with gradient scaling
-            self.scaler.scale(loss).backward()
+            # Backward pass
+            loss.backward()
             total_loss += loss.item()
+            
+            # Clear intermediate tensors
+            del model_pred, v_pred_target, noisy_latents, scaled_input
+            
+            # Clear activations and cache
+            self.activation_allocator.clear()
+            self.memory_manager.clear_cache()
+            torch.cuda.empty_cache()
 
         # Clip gradients and update weights
         grad_norm = self.compute_grad_norm()
-        self.scaler.unscale_(self.optimizer)
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
+        self.optimizer.step()
 
         # Log metrics
         self.log_detailed_metrics(
@@ -310,31 +372,22 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
 
     @torch.no_grad()
     def _get_add_time_ids(self, images: torch.Tensor) -> torch.Tensor:
-        """Generate time_ids for SDXL conditioning"""
+        """Optimized time_ids computation for H100"""
         batch_size = images.shape[0]
-        orig_height = images.shape[2] * 8  # VAE scaling factor
-        orig_width = images.shape[3] * 8   # VAE scaling factor
-        target_height = orig_height
-        target_width = orig_width
+        orig_height = images.shape[2] * 8
+        orig_width = images.shape[3] * 8
         
-        # SDXL expects 6 time_ids:
-        # [orig_height, orig_width, crop_top, crop_left, target_height, target_width]
-        add_time_ids = torch.zeros((batch_size, 6), device=self.device, dtype=torch.bfloat16)
-        add_time_ids[:, 0] = orig_height
-        add_time_ids[:, 1] = orig_width
-        add_time_ids[:, 2] = 0  # crop_top
-        add_time_ids[:, 3] = 0  # crop_left
-        add_time_ids[:, 4] = target_height
-        add_time_ids[:, 5] = target_width
+        add_time_ids = torch.empty((batch_size, 2, 4), device=self.device, dtype=torch.bfloat16)
+        add_time_ids[:, 0, 0] = orig_height
+        add_time_ids[:, 0, 1] = orig_width
+        add_time_ids[:, 0, 2] = self.aesthetic_score
+        add_time_ids[:, 0, 3] = self.zero_score
+        add_time_ids[:, 1, 0] = orig_height
+        add_time_ids[:, 1, 1] = orig_width
+        add_time_ids[:, 1, 2] = self.crop_score
+        add_time_ids[:, 1, 3] = self.zero_score
         
-        # Add aesthetic score and crop score
-        add_time_ids = torch.cat([
-            add_time_ids,
-            torch.full((batch_size, 1), self.aesthetic_score, device=self.device, dtype=torch.bfloat16),
-            torch.full((batch_size, 1), self.crop_score, device=self.device, dtype=torch.bfloat16)
-        ], dim=1)
-        
-        return add_time_ids
+        return add_time_ids.reshape(batch_size, -1)
 
     def get_sigmas(self) -> torch.Tensor:
         """
