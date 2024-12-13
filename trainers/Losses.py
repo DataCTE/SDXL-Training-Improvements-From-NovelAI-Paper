@@ -5,9 +5,12 @@ from typing import List
 from torchvision import transforms
 from diffusers import UNet2DConditionModel
 from diffusers import AutoencoderKL
-from memory.quantization import MemoryEfficientQuantization
+from memory.EfficientQuantization import MemoryEfficientQuantization
+from memory.EfficientAttention import replace_sdxl_attention_layers
+from memory.layeroffloading import ensure_three_channels, convert_to_bfloat16
 from memory.Manager import MemoryManager
 from data.dataset import NovelAIDataset
+from trainers.sdxl_trainer import NovelAIDiffusionV3Trainer
 from tqdm import tqdm
 import json
 
