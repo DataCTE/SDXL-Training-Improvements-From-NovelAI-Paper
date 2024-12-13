@@ -20,7 +20,6 @@ class TagCategory:
 class OptimizedTagClassifier:
     """Memory and compute optimized tag classifier"""
     def __init__(self):
-        # Pre-compile all patterns into a single regex per category for faster matching
         self.category_patterns = {
             TagCategory.SUBJECT: (
                 r"(person|man|woman|girl|boy|child|people|"
@@ -31,7 +30,7 @@ class OptimizedTagClassifier:
             ),
             TagCategory.STYLE: (
                 r"(realistic|photorealistic|abstract|"
-                r"anime|cartoon|digital art|manga"
+                r"anime|cartoon|digital art|manga|"
                 r"painting|sketch|drawing)",
                 1.1
             ),
@@ -79,38 +78,31 @@ class OptimizedTagClassifier:
             )
         }
         
-        # Compile patterns once
         self.compiled_patterns = {
             category: (re.compile(pattern, re.IGNORECASE), importance)
             for category, (pattern, importance) in self.category_patterns.items()
         }
         
-        # Track which categories are actually present in the current set
         self.active_categories = set()
         self.classification_cache = {}
     
-    def classify_tag(self, tag: str) -> Tuple[str, float]:
-        """Classify a tag, but only consider active categories"""
-        # Check cache first
+    def classify_tag(self, tag: str):
+        """Classify a tag, returning None if no match."""
         if tag in self.classification_cache:
             return self.classification_cache[tag]
         
-        # Only match against patterns that have been found in the current set
         for category, (pattern, importance) in self.compiled_patterns.items():
             if pattern.search(tag):
-                # Add to active categories when found
                 self.active_categories.add(category)
                 result = (category, importance)
                 self.classification_cache[tag] = result
                 return result
         
-        # Cache and return default for unknown tags
-        result = ("other", 1.0)
-        self.classification_cache[tag] = result
-        return result
+        # If no pattern matches, return None instead of 'other'.
+        self.classification_cache[tag] = None
+        return None
 
     def reset_active_categories(self):
-        """Reset active categories for new batch of tags"""
         self.active_categories.clear()
         self.classification_cache.clear()
 
@@ -207,66 +199,81 @@ class FastTagWeighter:
         self.classifier.reset_active_categories()
         
         self.total_samples += 1
-        
-        # Convert tags to indices
-        tag_indices = np.array([self._get_tag_idx(tag) for tag in tags])
-        
-        # Get categories and importance values
-        categories = []
+
+        tag_indices = []
+        category_indices = []
         importance_values = []
+
         for tag in tags:
-            category, importance = self.classifier.classify_tag(tag)
-            categories.append(self.category_to_idx[category])
+            classification = self.classifier.classify_tag(tag)
+            if classification is None:
+                # The tag doesn't match any known pattern, skip it.
+                # Optionally, you can still record it or ignore it completely.
+                continue
+
+            category, importance = classification
+            tag_idx = self._get_tag_idx(tag)
+            cat_idx = self.category_to_idx.get(category, None)
+            if cat_idx is None:
+                # If category is not recognized for some reason, skip as well.
+                continue
+
+            tag_indices.append(tag_idx)
+            category_indices.append(cat_idx)
             importance_values.append(importance)
-        
-        category_indices = np.array(categories)
-        
+
+        # If no valid tags matched, just return early
+        if not tag_indices:
+            return
+
+        tag_indices = np.array(tag_indices)
+        category_indices = np.array(category_indices)
+
         # Vectorized updates
         np.add.at(self.tag_counts, tag_indices, 1)
         np.add.at(self.category_counts, category_indices, 1)
-        
-        # Update moving averages in batches
+
+        # Update moving averages
         tag_freqs = self.tag_counts[tag_indices] / self.total_samples
         category_freqs = self.category_counts[category_indices] / self.total_samples
-        
+
         current_tag_weights = 1.0 / (tag_freqs + self.smoothing_factor)
         current_category_weights = 1.0 / (category_freqs + self.smoothing_factor)
-        
-        # Vectorized moving average update
+
         self.tag_moving_avg[tag_indices] = (
             self.tag_moving_avg[tag_indices] * (1 - self.smoothing_factor) +
             current_tag_weights * self.smoothing_factor
         )
-        
+
         np.add.at(
             self.category_moving_avg,
             category_indices,
             (current_category_weights - self.category_moving_avg[category_indices]) * self.smoothing_factor
         )
-        
+
         # Clear weight cache when frequencies update
         if len(self.weight_cache) > self.weight_cache_size:
             self.weight_cache.clear()
+
     
     def get_tag_weight(self, tag: str) -> float:
-        """Get cached or compute tag weight"""
-        # Check cache
-        if tag in self.weight_cache:
-            self.weight_cache_hits += 1
-            return self.weight_cache[tag]
+        """Get the weight of a single tag or skip if None."""
+        # Check if tag classification is None
+        classification = self.classifier.classify_tag(tag)
+        if classification is None:
+            # Tag doesn't match any known patterns; skip it by returning default or 1.0
+            return self.default_weight
         
-        self.weight_cache_misses += 1
-        
-        # Get tag index and category
+        category, importance = classification
         tag_idx = self._get_tag_idx(tag)
-        category, importance = self.classifier.classify_tag(tag)
-        category_idx = self.category_to_idx[category]
         
-        # Convert to tensors for fast computation
-        tag_freq = torch.tensor(self.tag_counts[tag_idx] / self.total_samples)
-        category_freq = torch.tensor(self.category_counts[category_idx] / self.total_samples)
+        tag_freq = torch.tensor(self.tag_counts[tag_idx] / self.total_samples if self.total_samples > 0 else 0.0)
+        category_idx = self.category_to_idx.get(category, None)
+        if category_idx is None:
+            # If the category is somehow not recognized, default to no adjustment
+            return self.default_weight
+        category_freq = torch.tensor(self.category_counts[category_idx] / self.total_samples if self.total_samples > 0 else 0.0)
         
-        # Compute weight using JIT-compiled function
         weight = self._compute_weights_fast(
             tag_freq.unsqueeze(0),
             category_freq.unsqueeze(0),
@@ -277,13 +284,6 @@ class FastTagWeighter:
             self.smoothing_factor
         )[0].item()
         
-        # Cache result
-        self.weight_cache[tag] = weight
-        
-        # Clear cache if too large
-        if len(self.weight_cache) > self.weight_cache_size:
-            self.weight_cache.clear()
-        
         return weight
     
     @torch.jit.script
@@ -293,13 +293,20 @@ class FastTagWeighter:
         return torch.exp(log_weights.mean()).item()
     
     def get_weights(self, tags: List[str]) -> float:
-        """Get combined weights using vectorized operations"""
-        if not tags:
+        """Compute combined weight ignoring non-matching tags."""
+        filtered_weights = []
+        for tag in tags:
+            classification = self.classifier.classify_tag(tag)
+            if classification is not None:
+                # Only include tags that matched a known pattern
+                filtered_weights.append(self.get_tag_weight(tag))
+        
+        if not filtered_weights:
+            # If no tags matched, return default weight
             return self.default_weight
         
-        # Convert to tensor for fast computation
-        weights = torch.tensor([self.get_tag_weight(tag) for tag in tags])
-        return self._compute_combined_weight(weights)
+        weights_tensor = torch.tensor(filtered_weights)
+        return self._compute_combined_weight(weights_tensor)
     
     def print_stats(self):
         """Print cache performance statistics and active categories"""
