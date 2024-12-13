@@ -104,26 +104,24 @@ class MultiDirectoryImageDataset(Dataset):
                 if self.transform:
                     img = self.transform(img)
                 torch.save(img, img_cache_path)
-        except Exception as e:
-            print(f"Error loading image {img_path}: {e}")
-            # Return a default/empty tensor
+        except Exception:
+            # Return a default/empty tensor silently
             img = torch.zeros((3, 256, 256))
             
         # Load or generate text embeddings
         try:
             if text_cache_path.exists():
                 text_data = torch.load(text_cache_path, map_location='cpu')
-                text_embeds = text_data['embeds']
-                tag_weight = text_data['tag_weight']
+                text_embeds = text_data.get('embeds', {})
+                tag_weight = text_data.get('tag_weight', torch.tensor(1.0))
             else:
                 with open(txt_path, 'r', encoding='utf-8') as f:
                     caption = f.read().strip()
                 text_embeds = self.text_embedder(caption) if hasattr(self, 'text_embedder') else {}
-                tag_weight = torch.tensor(1.0)  # Default weight
+                tag_weight = torch.tensor(1.0)
                 torch.save({'embeds': text_embeds, 'tag_weight': tag_weight}, text_cache_path)
-        except Exception as e:
-            print(f"Error loading text {txt_path}: {e}")
-            # Return empty embeddings
+        except Exception:
+            # Return empty embeddings silently
             text_embeds = {}
             tag_weight = torch.tensor(1.0)
             
@@ -175,10 +173,10 @@ class NovelAIDataset(MultiDirectoryImageDataset):
             try:
                 with open(txt_path, 'r', encoding='utf-8') as f:
                     caption = f.read().strip()
-                tags = parse_tags(caption)  # Using optimized parser
+                tags = parse_tags(caption)
                 self.tag_weighter.update_frequencies(tags)
-            except Exception as e:
-                print(f"Error processing tags from {txt_path}: {e}")
+            except Exception:
+                # Skip silently
                 continue
 
     def _get_default_text_embeds(self) -> Dict[str, torch.Tensor]:

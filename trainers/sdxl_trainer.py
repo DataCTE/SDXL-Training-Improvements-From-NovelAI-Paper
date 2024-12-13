@@ -159,30 +159,52 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         text_embeds: Dict[str, torch.Tensor],
         tag_weights: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Execute single training step with memory management"""
+        """
+        Execute a single training step with memory management, ensuring input images
+        are in (B, 3, H, W) format before passing to the VAE.
+        """
+        # Move inputs to the correct device
+        images = images.to(self.device)
+        text_embeds = {k: v.to(self.device) for k, v in text_embeds.items()}
+        tag_weights = tag_weights.to(self.device)
+        
+        print(f"[1] Initial images shape: {images.shape}")
+        
         # Zero gradients at the start of each step
         self.optimizer.zero_grad()
-        
-        # Get batch size and split into micro-batches
+
         batch_size = images.shape[0]
+        print(f"[2] Batch size: {batch_size}")
         micro_batch_size = batch_size // self.gradient_accumulation_steps
-        
+        print(f"[3] Micro batch size: {micro_batch_size}")
+
         total_loss = 0
         total_v_pred = None
-        
+
         for i in range(self.gradient_accumulation_steps):
             start_idx = i * micro_batch_size
             end_idx = (i + 1) * micro_batch_size
-            
+
             # Get micro-batch
             batch_images = images[start_idx:end_idx]
+            print(f"[4] Micro-batch images shape: {batch_images.shape}")
             batch_text_embeds = {k: v[start_idx:end_idx] for k, v in text_embeds.items()}
             batch_tag_weights = tag_weights[start_idx:end_idx]
-            
+
             # Forward pass with mixed precision
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16):  # Fixed autocast usage
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
                 # Ensure tag_weights has correct shape for broadcasting
                 batch_tag_weights = batch_tag_weights.view(-1, 1, 1, 1)
+                
+                print(f"[5] Before VAE encode shape: {batch_images.shape}")
+                
+                # Reshape images to correct format for VAE
+                # Input shape is [B, 1, 4, H, W]
+                # Need to reshape to [B, 3, H, W]
+                batch_images = batch_images.squeeze(1)  # Remove the extra dimension -> [B, 4, H, W]
+                batch_images = batch_images[:, :3]  # Take only first 3 channels -> [B, 3, H, W]
+                
+                print(f"[5] After fix VAE encode shape: {batch_images.shape}")
                 
                 with torch.inference_mode():  # Separate context for VAE encoding
                     # Get latent dimensions
@@ -194,13 +216,15 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                     
                     # Encode images to latent space
                     batch_latents = self.vae.encode(batch_images).latent_dist.sample()
+                    print(f"[6] After VAE encode shape: {batch_latents.shape}")
                     batch_latents = batch_latents * self.vae.config.scaling_factor * noise_scale
                 
                 # Sample noise and timesteps
                 noise = torch.randn_like(batch_latents)
                 timesteps = torch.randint(
                     0, self.scheduler.config.num_train_timesteps, 
-                    (batch_latents.shape[0],), device=self.device
+                    (batch_latents.shape[0],), 
+                    device=self.device
                 )
                 
                 # Get sigmas for current timesteps
@@ -219,10 +243,13 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                 model_output = self.model(
                     scaled_input,
                     timesteps,
-                    encoder_hidden_states=batch_text_embeds["hidden_states"],
-                    added_cond_kwargs=batch_text_embeds.get("added_cond", None)
-                ).sample
-                
+                    encoder_hidden_states=batch_text_embeds["large_text_embeds"].squeeze(1),
+                    added_cond_kwargs={
+                        "text_embeds": batch_text_embeds["large_pooled_embeds"].squeeze(1),
+                        "time_ids": self._get_add_time_ids(batch_latents)
+                    },
+                    return_dict=False
+                )[0]
                 # Apply Karras preconditioner scaling to model output
                 model_pred = c_skip.view(-1, 1, 1, 1) * noisy_latents + c_out.view(-1, 1, 1, 1) * model_output
                 
@@ -239,18 +266,18 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                     total_v_pred = model_pred.detach()
                 else:
                     total_v_pred = torch.cat([total_v_pred, model_pred.detach()], dim=0)
-            
+
             # Backward pass with gradient scaling
             self.scaler.scale(loss).backward()
             total_loss += loss.item()
-        
+
         # Clip gradients and update weights
         grad_norm = self.compute_grad_norm()
         self.scaler.unscale_(self.optimizer)
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.scaler.step(self.optimizer)
         self.scaler.update()
-        
+
         # Log metrics
         self.log_detailed_metrics(
             loss=torch.tensor(total_loss),
@@ -258,8 +285,9 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             grad_norm=grad_norm,
             timesteps=timesteps
         )
-        
+
         return total_loss, total_v_pred, grad_norm, timesteps
+
 
     def load_checkpoint(self, path: str):
         """Load checkpoint with progress information"""
@@ -282,22 +310,31 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
 
     @torch.no_grad()
     def _get_add_time_ids(self, images: torch.Tensor) -> torch.Tensor:
-        """Optimized time_ids computation for H100"""
+        """Generate time_ids for SDXL conditioning"""
         batch_size = images.shape[0]
-        orig_height = images.shape[2] * 8
-        orig_width = images.shape[3] * 8
+        orig_height = images.shape[2] * 8  # VAE scaling factor
+        orig_width = images.shape[3] * 8   # VAE scaling factor
+        target_height = orig_height
+        target_width = orig_width
         
-        add_time_ids = torch.empty((batch_size, 2, 4), device=self.device, dtype=torch.bfloat16)
-        add_time_ids[:, 0, 0] = orig_height
-        add_time_ids[:, 0, 1] = orig_width
-        add_time_ids[:, 0, 2] = self.aesthetic_score
-        add_time_ids[:, 0, 3] = self.zero_score
-        add_time_ids[:, 1, 0] = orig_height
-        add_time_ids[:, 1, 1] = orig_width
-        add_time_ids[:, 1, 2] = self.crop_score
-        add_time_ids[:, 1, 3] = self.zero_score
+        # SDXL expects 6 time_ids:
+        # [orig_height, orig_width, crop_top, crop_left, target_height, target_width]
+        add_time_ids = torch.zeros((batch_size, 6), device=self.device, dtype=torch.bfloat16)
+        add_time_ids[:, 0] = orig_height
+        add_time_ids[:, 1] = orig_width
+        add_time_ids[:, 2] = 0  # crop_top
+        add_time_ids[:, 3] = 0  # crop_left
+        add_time_ids[:, 4] = target_height
+        add_time_ids[:, 5] = target_width
         
-        return add_time_ids.reshape(batch_size, -1)
+        # Add aesthetic score and crop score
+        add_time_ids = torch.cat([
+            add_time_ids,
+            torch.full((batch_size, 1), self.aesthetic_score, device=self.device, dtype=torch.bfloat16),
+            torch.full((batch_size, 1), self.crop_score, device=self.device, dtype=torch.bfloat16)
+        ], dim=1)
+        
+        return add_time_ids
 
     def get_sigmas(self) -> torch.Tensor:
         """
@@ -374,6 +411,11 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             )
             
             for batch_idx, batch in enumerate(progress_bar):
+                for k, v in batch[1].items():
+                    if isinstance(v, torch.Tensor):
+                        print(f"batch[1][{k}] shape: {v.shape}")
+               
+                
                 start_time = time.time()
                 
                 with self.profiler.profile_range("training_step"):

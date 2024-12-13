@@ -195,6 +195,10 @@ class FastTagWeighter:
     
     def update_frequencies(self, tags: List[str]):
         """Vectorized frequency update with active category tracking"""
+        # Skip empty tag lists silently
+        if not tags:
+            return
+        
         # Reset active categories for new batch
         self.classifier.reset_active_categories()
         
@@ -205,22 +209,23 @@ class FastTagWeighter:
         importance_values = []
 
         for tag in tags:
-            classification = self.classifier.classify_tag(tag)
-            if classification is None:
-                # The tag doesn't match any known pattern, skip it.
-                # Optionally, you can still record it or ignore it completely.
-                continue
+            try:
+                classification = self.classifier.classify_tag(tag)
+                if classification is None:
+                    continue
 
-            category, importance = classification
-            tag_idx = self._get_tag_idx(tag)
-            cat_idx = self.category_to_idx.get(category, None)
-            if cat_idx is None:
-                # If category is not recognized for some reason, skip as well.
-                continue
+                category, importance = classification
+                tag_idx = self._get_tag_idx(tag)
+                cat_idx = self.category_to_idx.get(category)
+                if cat_idx is None:
+                    continue
 
-            tag_indices.append(tag_idx)
-            category_indices.append(cat_idx)
-            importance_values.append(importance)
+                tag_indices.append(tag_idx)
+                category_indices.append(cat_idx)
+                importance_values.append(importance)
+            except Exception:
+                # Silently skip any tags that cause errors
+                continue
 
         # If no valid tags matched, just return early
         if not tag_indices:
@@ -319,30 +324,42 @@ class FastTagWeighter:
 
 def parse_tags(caption: str) -> List[str]:
     """Enhanced tag parsing with better handling of special cases"""
-    # Convert to lowercase and split on commas
-    parts = caption.lower().split(',')
-    
-    # Clean and normalize tags
-    tags = []
-    for part in parts:
-        # Basic cleaning
-        tag = part.strip()
-        
-        # Skip empty tags
-        if not tag:
-            continue
+    try:
+        # Handle empty or invalid captions silently
+        if not caption or not isinstance(caption, str):
+            return []
             
-        # Handle special cases
-        if ':' in tag:  # Handle key:value pairs
-            key, value = tag.split(':', 1)
-            tags.extend([key.strip(), value.strip()])
-        elif 'style of' in tag:  # Handle artist styles
-            artist = tag.replace('style of', '').strip()
-            tags.extend(['style', artist])
-        elif tag.startswith(('by ', 'artist ')):  # Handle artist attribution
-            artist = tag.replace('by', '').replace('artist', '').strip()
-            tags.extend(['artist', artist])
-        else:
-            tags.append(tag)
-    
-    return tags
+        # Convert to lowercase and split on commas
+        parts = caption.lower().split(',')
+        
+        # Clean and normalize tags
+        tags = []
+        for part in parts:
+            try:
+                # Basic cleaning
+                tag = part.strip()
+                
+                # Skip empty tags
+                if not tag:
+                    continue
+                    
+                # Handle special cases
+                if ':' in tag:  # Handle key:value pairs
+                    key, value = tag.split(':', 1)
+                    tags.extend([key.strip(), value.strip()])
+                elif 'style of' in tag:  # Handle artist styles
+                    artist = tag.replace('style of', '').strip()
+                    tags.extend(['style', artist])
+                elif tag.startswith(('by ', 'artist ')):  # Handle artist attribution
+                    artist = tag.replace('by', '').replace('artist', '').strip()
+                    tags.extend(['artist', artist])
+                else:
+                    tags.append(tag)
+            except Exception:
+                # Silently skip any problematic tags
+                continue
+                
+        return tags
+    except Exception:
+        # Return empty list if parsing fails completely
+        return []
