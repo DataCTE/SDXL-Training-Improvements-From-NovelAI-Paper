@@ -99,3 +99,13 @@ class SDXLAdamWBF16(BaseBF16Optimizer):
                               This will in general have lower memory footprint.
         """
         super().zero_grad(set_to_none=set_to_none) 
+
+class OptimizedAdamW(torch.optim.AdamW):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.use_fused_adam = True
+        
+    def step(self, closure=None):
+        if self.use_fused_adam and hasattr(torch.cuda.amp, 'custom_fwd'):
+            return self._fused_step(closure)
+        return super().step(closure) 

@@ -5,6 +5,8 @@ from pathlib import Path
 from tqdm import tqdm
 from typing import List, Optional, Tuple, Callable
 from filelock import FileLock
+import queue
+import threading
 
 from .buckets import AspectRatioBucket, ImageBucket
 from models.embedder import TextEmbedder
@@ -167,6 +169,14 @@ class NovelAIDataset(MultiDirectoryImageDataset):
         # Print statistics after initialization
         self.tag_weighter.print_stats()
         
+        # Add prefetch queue
+        self.prefetch_queue = queue.Queue(maxsize=3)
+        self.prefetch_thread = threading.Thread(
+            target=self._prefetch_worker, 
+            daemon=True
+        )
+        self.prefetch_thread.start()
+        
     def _precompute_tag_weights(self):
         """Pre-compute weights for all tags with optimized parsing"""
         for txt_path in tqdm(self.text_files, desc="Processing tags"):
@@ -185,3 +195,12 @@ class NovelAIDataset(MultiDirectoryImageDataset):
             'base_text_embeds': torch.zeros((1, 77, 768)),  # [batch, seq_len, hidden_dim]
             'base_pooled_embeds': torch.zeros((1, 768)),    # [batch, hidden_dim]
         }
+
+    def _prefetch_worker(self):
+        """Background worker to prefetch next batches"""
+        while True:
+            idx = self.prefetch_queue.get()
+            if idx is None:
+                break
+            # Prefetch and cache next batch
+            self._prefetch_item(idx)

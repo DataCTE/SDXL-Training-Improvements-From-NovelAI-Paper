@@ -13,61 +13,131 @@ class TextEmbedder:
     ):
         self.device = device
         self.max_length = 77
+        self.cache = {}
         
-        # Load tokenizers (remove subfolder paths)
+        # Enable TF32 for text encoder
+        if torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = True
+            
+        # Load tokenizers with optimized settings
         self.tokenizers = {
-            "base": CLIPTokenizer.from_pretrained(tokenizer_paths["base"]),
-            "large": CLIPTokenizer.from_pretrained(tokenizer_paths["large"])
+            model_type: self._load_tokenizer(path)
+            for model_type, path in tokenizer_paths.items()
         }
         
-        # Load text encoders with bfloat16 (remove subfolder paths)
+        # Load text encoders with optimized settings
         self.text_encoders = {
-            "base": CLIPTextModel.from_pretrained(tokenizer_paths["base"]).to(device).to(torch.bfloat16),
-            "large": CLIPTextModel.from_pretrained(tokenizer_paths["large"]).to(device).to(torch.bfloat16)
+            model_type: self._load_text_encoder(path)
+            for model_type, path in tokenizer_paths.items()
         }
         
-        for encoder in self.text_encoders.values():
-            encoder.eval()
-            for param in encoder.parameters():
-                param.requires_grad = False
-
+        # Pre-allocate buffers for common operations
+        self._setup_buffers()
+        
+    def _load_tokenizer(self, path: str) -> CLIPTokenizer:
+        """Load tokenizer with optimized settings"""
+        return CLIPTokenizer.from_pretrained(
+            path,
+            use_fast=True,  # Use fast tokenizer
+            model_max_length=self.max_length,
+            padding_side='right'
+        )
+        
+    def _load_text_encoder(self, path: str) -> CLIPTextModel:
+        """Load text encoder with optimized settings"""
+        encoder = CLIPTextModel.from_pretrained(
+            path,
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+            use_auth_token=False
+        ).to(self.device)
+        
+        # Enable memory optimizations
+        encoder.gradient_checkpointing_enable()
+        
+        # Try to enable memory efficient attention if available
+        if hasattr(encoder, 'enable_xformers_memory_efficient_attention'):
+            encoder.enable_xformers_memory_efficient_attention()
+        
+        # Freeze encoder
+        encoder.eval()
+        for param in encoder.parameters():
+            param.requires_grad = False
+            
+        return encoder
+        
+    def _setup_buffers(self):
+        """Pre-allocate buffers for common operations"""
+        self.empty_text_embeds = {
+            model_type: torch.zeros(
+                (1, self.max_length, encoder.config.hidden_size),
+                dtype=torch.bfloat16,
+                device=self.device
+            )
+            for model_type, encoder in self.text_encoders.items()
+        }
+        
+        self.empty_pooled_embeds = {
+            model_type: torch.zeros(
+                (1, encoder.config.hidden_size),
+                dtype=torch.bfloat16,
+                device=self.device
+            )
+            for model_type, encoder in self.text_encoders.items()
+        }
+        
     @torch.no_grad()
     def __call__(self, prompt: str) -> Dict[str, torch.Tensor]:
-        # Tokenize
-        tokens = {
-            k: tokenizer(
+        """Get embeddings with caching and optimized computation"""
+        # Check cache first
+        if prompt in self.cache:
+            return self.cache[prompt]
+            
+        # Handle empty prompts
+        if not prompt:
+            empty_embeds = {}
+            for model_type in self.tokenizers.keys():
+                empty_embeds[f"{model_type}_text_embeds"] = self.empty_text_embeds[model_type].clone()
+                empty_embeds[f"{model_type}_pooled_embeds"] = self.empty_pooled_embeds[model_type].clone()
+            return empty_embeds
+            
+        # Process with each model type
+        embeds = {}
+        for model_type, tokenizer in self.tokenizers.items():
+            # Tokenize efficiently
+            tokens = tokenizer(
                 prompt,
                 padding="max_length",
                 max_length=self.max_length,
                 truncation=True,
                 return_tensors="pt"
-            )
-            for k, tokenizer in self.tokenizers.items()
-        }
-        
-        # Generate embeddings
-        embeds = {}
-        for k, encoder in self.text_encoders.items():
-            # Move tokens to GPU but keep as int64 for embedding layer
-            tokens_gpu = {key: val.to(self.device) for key, val in tokens[k].items()}
+            ).to(self.device)
             
-            # Generate embeddings
-            output = encoder(**tokens_gpu)
-            
-            # Ensure text embeddings have shape [batch_size, seq_len, hidden_dim]
-            last_hidden_state = output.last_hidden_state
-            if last_hidden_state.dim() == 2:
-                last_hidden_state = last_hidden_state.unsqueeze(0)
-            
-            # Ensure pooled embeddings have shape [batch_size, hidden_dim]
-            pooled_output = output.pooler_output
-            if pooled_output.dim() == 1:
-                pooled_output = pooled_output.unsqueeze(0)
-            elif pooled_output.dim() == 3:
-                pooled_output = pooled_output.squeeze(1)
-            
-            # Keep embeddings on CPU with consistent dimensions
-            embeds[f"{k}_text_embeds"] = last_hidden_state.cpu()  # [batch_size, seq_len, hidden_dim]
-            embeds[f"{k}_pooled_embeds"] = pooled_output.cpu()   # [batch_size, hidden_dim]
-            
+            # Generate embeddings with mixed precision
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                encoder = self.text_encoders[model_type]
+                output = encoder(**tokens)
+                
+                # Ensure correct shapes
+                text_embeds = output.last_hidden_state
+                if text_embeds.dim() == 2:
+                    text_embeds = text_embeds.unsqueeze(0)
+                    
+                pooled_embeds = output.pooler_output
+                if pooled_embeds.dim() == 1:
+                    pooled_embeds = pooled_embeds.unsqueeze(0)
+                elif pooled_embeds.dim() == 3:
+                    pooled_embeds = pooled_embeds.squeeze(1)
+                    
+                # Store embeddings
+                embeds[f"{model_type}_text_embeds"] = text_embeds
+                embeds[f"{model_type}_pooled_embeds"] = pooled_embeds
+                
+        # Cache results
+        self.cache[prompt] = embeds
         return embeds
+        
+    def clear_cache(self):
+        """Clear embedding cache"""
+        self.cache.clear()
+        torch.cuda.empty_cache()

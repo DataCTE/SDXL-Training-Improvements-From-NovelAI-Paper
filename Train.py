@@ -100,6 +100,37 @@ def signal_handler(signum, frame):
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
+def setup_training_optimizations():
+    # Enable tensor cores
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    
+    # Set optimal CUDA settings
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.enable_flash_sdp(True)
+    
+    # Configure memory allocator
+    torch.cuda.memory.set_per_process_memory_fraction(0.95)
+    torch.cuda.memory.set_per_process_memory_fraction(0.95)
+
+def optimize_cuda_allocator():
+    """Configure CUDA memory allocator for optimal performance"""
+    # Use cudnn autotuner
+    torch.backends.cudnn.benchmark = True
+    
+    # Enable TF32 precision
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    
+    # Set memory allocator settings
+    if hasattr(torch.cuda, 'memory_stats'):
+        torch.cuda.memory_stats()
+    torch.cuda.empty_cache()
+    
+    # Enable flash attention if available
+    if hasattr(torch.backends.cuda, 'enable_flash_sdp'):
+        torch.backends.cuda.enable_flash_sdp(True)
+
 def main():
     global trainer
     trainer = None

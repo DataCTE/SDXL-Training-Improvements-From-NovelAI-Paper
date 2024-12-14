@@ -3,6 +3,8 @@ import torch
 from utils.error_handling import error_handler
 import re
 import numpy as np
+from collections import defaultdict
+from functools import lru_cache
 
 
 class TagCategory:
@@ -363,3 +365,44 @@ def parse_tags(caption: str) -> List[str]:
     except Exception:
         # Return empty list if parsing fails completely
         return []
+
+class LRUCache:
+    def __init__(self, maxsize: int):
+        self.maxsize = maxsize
+        self.cache = {}
+        self.order = []
+
+    def __getitem__(self, key):
+        return self.cache[key]
+
+    def __setitem__(self, key, value):
+        if key in self.cache:
+            self.cache[key] = value
+        else:
+            if len(self.cache) >= self.maxsize:
+                self.cache.pop(self.order.pop(0))
+            self.cache[key] = value
+            self.order.append(key)
+
+    def __contains__(self, key):
+        return key in self.cache
+
+class OptimizedTagWeighter:
+    def __init__(self):
+        self.tag_frequencies = defaultdict(int)
+        self.tag_weights = {}
+        self.cache = LRUCache(maxsize=10000)
+        
+    def compute_weights(self, tags: List[str]) -> torch.Tensor:
+        """Compute tag weights with vectorized operations"""
+        cache_key = tuple(sorted(tags))
+        if cache_key in self.cache:
+            return self.cache[cache_key]
+            
+        # Vectorized weight computation
+        frequencies = torch.tensor([self.tag_frequencies[tag] for tag in tags])
+        weights = torch.sigmoid(1 - frequencies.float() / frequencies.max())
+        
+        # Cache result
+        self.cache[cache_key] = weights
+        return weights
