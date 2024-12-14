@@ -34,7 +34,7 @@ pip install -r requirements.txt
 
 ### Basic Training
 ```bash
-python train.py \
+python src/train.py \
   --unet_path path/to/unet.safetensors \
   --resume_from_checkpoint path/to/checkpoint
 ```
@@ -72,21 +72,20 @@ python train.py \
 
 ## Project Structure
 ```
-sdxl_train/
-├── configs/           # Training configurations
-├── data/             # Dataset handling
-│   ├── dataset.py    # Main dataset class
-│   ├── sampler.py    # Aspect ratio batching
-│   └── buckets.py    # Resolution bucketing
-├── models/           # Model components
-│   ├── embedder.py   # Text embedding
-│   ├── optimizer.py  # BF16 optimizer
-│   └── tag_weighter.py
-├── trainers/         # Training logic
-│   ├── base_trainer.py
-│   └── sdxl_trainer.py
-├── utils/            # Utilities
-└── train.py          # Main script
+SDXL-Training-Improvements/
+├── src/
+│ ├── data/ # Dataset and data handling
+│ │ ├── dataset.py
+│ │ ├── sampler.py
+│ │ ├── bucket.py
+│ │ └── tag_weighter.py
+│ ├── training/ # Training logic
+│ │ └── trainer.py
+│ ├── utils/ # Utilities
+│ │ └── transforms.py
+│ └── train.py # Main training script
+├── configs/ # Configuration files
+└── requirements.txt
 ```
 
 ## License
@@ -101,4 +100,3 @@ Apache 2.0
   year={2024}
 }
 ```
-
