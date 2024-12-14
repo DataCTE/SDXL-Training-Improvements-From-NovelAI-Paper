@@ -293,12 +293,16 @@ class MemoryManager:
             return
             
         try:
+            # Get process memory info in a platform-independent way
+            process = psutil.Process()
+            memory_info = process.memory_info()
+            
             stats = MemoryStats(
-                gpu_allocated=torch.cuda.memory_allocated(),
-                gpu_cached=torch.cuda.memory_reserved(),
-                gpu_peak=torch.cuda.max_memory_allocated(),
-                cpu_used=psutil.Process().memory_info().rss,
-                cpu_peak=psutil.Process().memory_info().peak_wset,
+                gpu_allocated=torch.cuda.memory_allocated() if torch.cuda.is_available() else 0,
+                gpu_cached=torch.cuda.memory_reserved() if torch.cuda.is_available() else 0,
+                gpu_peak=torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0,
+                cpu_used=memory_info.rss,  # Resident Set Size - cross-platform
+                cpu_peak=getattr(memory_info, 'peak_wset', memory_info.rss),  # Fallback to RSS if peak not available
                 timestamp=current_time
             )
             
@@ -308,7 +312,9 @@ class MemoryManager:
             self.last_check = current_time
             
             # Log if memory usage is high
-            if self.enable_logging and self.current_memory > 0.9 * self.max_vram_usage * torch.cuda.get_device_properties(0).total_memory:
+            if (torch.cuda.is_available() and 
+                self.enable_logging and 
+                self.current_memory > 0.9 * self.max_vram_usage * torch.cuda.get_device_properties(0).total_memory):
                 logger.warning("High memory usage detected")
                 self.log_memory_stats()
                 

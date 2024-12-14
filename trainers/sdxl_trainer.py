@@ -432,6 +432,8 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                 
             return v_prediction
             
+
+            
         finally:
             # Clean up stored activations
             self.activation_allocator.clear()

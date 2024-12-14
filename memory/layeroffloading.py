@@ -7,6 +7,7 @@ import logging
 import warnings
 from collections import defaultdict
 from enum import Enum, auto
+import time
 
 class LayerOffloadStrategy(Enum):
     """Enum for different layer offloading strategies"""
@@ -614,6 +615,68 @@ class LayerOffloadConductor:
         except Exception as e:
             print(f"Error in load_to_gpu for {name}: {e}")
             self.handle_error(name)
+
+    def before_layer(self, layer_idx: int, name: str):
+        """Handle layer activation before computation"""
+        if name not in self.layer_states:
+            return
+            
+        try:
+            # Load layer to GPU if needed
+            if self.layer_states[name] != 'gpu':
+                self.load_to_gpu(name)
+                
+            # Update access time for LRU tracking
+            if name in self.param_cache:
+                self.param_cache[name]['last_access'] = time.time()
+                
+            # Pre-allocate buffers if needed
+            if name in self.layer_info:
+                self.layer_info[name].prepare_buffers()
+                
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                self.handle_oom(name)
+                # Retry loading after OOM handling
+                self.load_to_gpu(name)
+            else:
+                raise e
+
+    def after_layer(self, layer_idx: int, name: str):
+        """Handle layer cleanup after computation"""
+        if name not in self.layer_states:
+            return
+            
+        try:
+            # Check memory pressure
+            if self.should_offload(name):
+                self.offload_to_cpu(name)
+                
+            # Clear temporary buffers
+            if name in self.layer_info:
+                self.layer_info[name].clear_temp_buffers()
+                
+        except Exception as e:
+            self.logger.error(f"Error in after_layer for {name}: {e}")
+            self.handle_error(name)
+
+    def should_offload(self, name: str) -> bool:
+        """Determine if layer should be offloaded based on memory pressure"""
+        if not torch.cuda.is_available():
+            return False
+            
+        current_memory = torch.cuda.memory_allocated(self.device)
+        if current_memory > self.oom_threshold:
+            # Check layer priority and access patterns
+            if name in self.param_cache:
+                last_access = self.param_cache[name]['last_access']
+                size = self.param_cache[name]['total_size']
+                
+                # Offload if layer is large and not recently accessed
+                if size > 100_000_000 and (time.time() - last_access) > 5.0:
+                    return True
+                    
+        return False
 
 def ensure_three_channels(x):
     return x[:3]
