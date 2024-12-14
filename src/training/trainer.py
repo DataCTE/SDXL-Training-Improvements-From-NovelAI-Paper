@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 from ..data.dataset import NovelAIDataset
 from ..data.sampler import AspectBatchSampler
 
-class NovelAIDiffusionV3Trainer(nn.Module):
+class NovelAIDiffusionV3Trainer(torch.nn.Module):
     def __init__(
         self,
         model: UNet2DConditionModel,
@@ -29,6 +29,8 @@ class NovelAIDiffusionV3Trainer(nn.Module):
         self.scheduler = scheduler
         self.device = device
         self.accelerator = accelerator
+        
+        # Add gradient accumulation steps
         self.gradient_accumulation_steps = gradient_accumulation_steps
         
         # Add projection layer for CLIP embeddings
@@ -79,34 +81,24 @@ class NovelAIDiffusionV3Trainer(nn.Module):
         torch.autograd.profiler.profile(False)
         torch.autograd.profiler.emit_nvtx(False)
 
-    def get_sigmas(self) -> torch.Tensor:
-        """Generate noise schedule for ZTSNR with optimized scaling"""
-        ramp = torch.linspace(0, 1, self.num_timesteps, device=self.device)
+    def load_checkpoint(self, checkpoint_path: str):
+        """Load model and training state from checkpoint"""
+        print(f"Resuming from checkpoint: {checkpoint_path}")
         
-        min_inv_rho = self.sigma_min ** (1/self.rho)
-        max_inv_rho = self.sigma_max ** (1/self.rho)
-        
-        sigmas = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** self.rho
-        
-        sigmas[0] = self.sigma_min
-        sigmas[-1] = self.sigma_max
-        
-        return sigmas
-
-    def get_snr(self, sigma: torch.Tensor) -> torch.Tensor:
-        return (self.sigma_data / sigma).square()
-
-    def get_minsnr_weights(self, timesteps: torch.Tensor) -> torch.Tensor:
-        alphas = self.scheduler.alphas_cumprod.to(timesteps.device)
-        alpha_t = alphas[timesteps]
-        
-        snr = alpha_t / (1 - alpha_t)
-        min_snr = torch.tensor(self.min_snr_gamma, device=self.device)
-        return torch.minimum(snr, min_snr).float()
+        # Load training state
+        training_state_path = os.path.join(checkpoint_path, "training_state.pt")
+        if os.path.exists(training_state_path):
+            training_state = torch.load(training_state_path)
+            self.current_epoch = training_state["epoch"]
+            self.global_step = training_state["global_step"]
+            self.optimizer.load_state_dict(training_state["optimizer_state"])
+            print(f"Resumed from epoch {self.current_epoch}, step {self.global_step}")
+        else:
+            print("No training state found, starting from scratch with pretrained weights")
 
     @torch.no_grad()
     def _get_add_time_ids(self, images: torch.Tensor) -> torch.Tensor:
-        """Optimized time_ids computation"""
+        """Optimized time_ids computation for H100"""
         batch_size = images.shape[0]
         orig_height = images.shape[2] * 8
         orig_width = images.shape[3] * 8
@@ -123,77 +115,146 @@ class NovelAIDiffusionV3Trainer(nn.Module):
         
         return add_time_ids.reshape(batch_size, -1)
 
+    def get_karras_scalings(self, sigma, sigma_data=1.0):
+        # sigma: [batch_size] tensor
+        sigma_sq = sigma * sigma
+        sigma_data_sq = sigma_data * sigma_data
+        denominator = sigma_data_sq + sigma_sq
+        c_skip = sigma_data_sq / denominator
+        c_out = -sigma_data * sigma / torch.sqrt(denominator)
+        c_in = 1.0 / torch.sqrt(denominator)
+        return c_skip, c_out, c_in
+
+    @torch.no_grad()
+    def get_velocity(scheduler: DDPMScheduler, latents: torch.Tensor, noise: torch.Tensor, timesteps: torch.Tensor):
+        # Computes the v_prediction target as described in the paper.
+        # v = (x - x_0) / sqrt(sigma^2 + sigma_data^2)
+        return scheduler.get_velocity(latents, noise, timesteps)
+
+    def get_sigmas(self) -> torch.Tensor:
+            """Generate noise schedule for ZTSNR with optimized scaling.
+            
+            Uses a modified ramp function to ensure:
+            1. First step has σ = σ_min (0.002)
+            2. Last step has σ = σ_max (20000) as practical infinity
+            3. Intermediate steps follow power-law scaling with ρ=7
+            
+            Returns:
+                torch.Tensor: Noise schedule sigmas of shape [num_timesteps]
+            """
+            # Generate ramp on device directly
+            ramp = torch.linspace(0, 1, self.num_timesteps, device=self.device)
+            
+            # Compute inverse rho values
+            min_inv_rho = self.sigma_min ** (1/self.rho)
+            max_inv_rho = self.sigma_max ** (1/self.rho)
+            
+            # Generate full schedule with vectorized operations
+            sigmas = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** self.rho
+            
+            # Ensure exact values at endpoints
+            sigmas[0] = self.sigma_min
+            sigmas[-1] = self.sigma_max
+            
+            return sigmas
+
+    def get_snr(self, sigma: torch.Tensor) -> torch.Tensor:
+        # SNR(σ) = (σ_data / σ)²
+        return (self.sigma_data / sigma).square()
+
+    def get_minsnr_weights(self, timesteps: torch.Tensor) -> torch.Tensor:
+        # Uses the scheduler's alpha values to compute SNR(t) = α/(1-α)
+        # w(t) = min(SNR(t), γ)
+        alphas = self.scheduler.alphas_cumprod.to(timesteps.device)
+        alpha_t = alphas[timesteps]  # [batch_size]
+        
+        # SNR in terms of alpha: SNR = α/(1-α)
+        snr = alpha_t / (1 - alpha_t)
+        
+        # Clamp to min_snr_gamma
+        min_snr = torch.tensor(self.min_snr_gamma, device=self.device)
+        weights = torch.minimum(snr, min_snr).float()
+        return weights
+
     def training_step(
         self,
         images: torch.Tensor,
         text_embeds: Dict[str, torch.Tensor],
         tag_weights: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
-        images = images.to(self.device)
-        text_embeds = {k: v.to(self.device) for k,v in text_embeds.items()}
-        tag_weights = tag_weights.to(self.device)
+        # Pre-compute device transfers with non-blocking for better parallelization
+        images = images.to(self.device, non_blocking=True)
+        text_embeds = {k: v.to(self.device, non_blocking=True) for k,v in text_embeds.items()}
+        tag_weights = tag_weights.to(self.device, non_blocking=True)
 
         self.optimizer.zero_grad(set_to_none=True)
 
         batch_size = images.shape[0]
         micro_batch_size = batch_size // self.gradient_accumulation_steps
+        running_loss = 0.0
         total_loss = 0.0
         total_v_pred = None
-        running_loss = 0.0
 
         for i in range(self.gradient_accumulation_steps):
-            torch.cuda.empty_cache()
+            torch.cuda.empty_cache()  # Keep this from old version as it helped with memory
 
             start_idx = i * micro_batch_size
             end_idx = (i + 1) * micro_batch_size
 
-            # Extract micro-batch
-            batch_latents = images[start_idx:end_idx]
-
+            # Extract micro-batch and scale - use clone() for safety
+            batch_latents = images[start_idx:end_idx].clone()
+            
             # Apply area-based noise scaling
-            height = batch_latents.shape[2]
-            width = batch_latents.shape[3]
+            height, width = batch_latents.shape[2:4]
             area = torch.tensor(height * width, device=self.device, dtype=torch.float32)
             noise_scale = torch.sqrt(area / self.base_area)
             batch_latents = batch_latents * noise_scale
 
             batch_tag_weights = tag_weights[start_idx:end_idx].view(-1,1,1,1)
 
-            # Prepare text embeddings
+            # Prepare text embeddings with explicit cloning
             base_hidden = text_embeds["base_text_embeds"][start_idx:end_idx].squeeze(1).clone()
             base_pooled = text_embeds["base_pooled_embeds"][start_idx:end_idx].squeeze(1).clone()
 
-            # Project text embeddings
+            # Project text embeddings with explicit float32 conversion
             base_hidden_float32 = base_hidden.to(dtype=torch.float32)
             batch_size, seq_len, _ = base_hidden_float32.shape
             encoder_hidden_states = self.hidden_proj(
                 base_hidden_float32.view(-1, 768)
             ).view(batch_size, seq_len, -1)
 
-            # Sample noise and timesteps
-            noise = torch.randn_like(batch_latents)
+            # Generate noise with channels_last memory format
+            noise = torch.randn_like(
+                batch_latents,
+                device=self.device,
+                dtype=batch_latents.dtype,
+                memory_format=torch.channels_last
+            )
+
+            # More efficient timesteps generation
             timesteps = torch.randint(
-                0, self.scheduler.config.num_train_timesteps,
-                (batch_latents.size(0),), 
-                device=self.device
-            ).long()
+                0,
+                self.scheduler.config.num_train_timesteps,
+                (micro_batch_size,),
+                device=self.device,
+                dtype=torch.long,
+                requires_grad=False
+            )
 
+            # Get sigmas and compute scalings
             sigmas = self.sigmas[timesteps]
-
-            # Add noise
-            noisy_latents = batch_latents + sigmas.view(-1,1,1,1)*noise
-
-            # Compute v_target
-            v_target = self.scheduler.get_velocity(batch_latents, noise, timesteps)
-
-            # Generate time_ids
-            time_ids = self._get_add_time_ids(batch_latents).clone()
-
-            # Karras scaling
             c_skip, c_out, c_in = self.get_karras_scalings(sigmas)
 
-            # Ensure input tensors have gradients enabled
-            scaled_input = (c_in.view(-1,1,1,1)*noisy_latents).clone().requires_grad_(True)
+            # Add noise efficiently
+            sigma_expanded = sigmas.view(-1,1,1,1)
+            noisy_latents = batch_latents + sigma_expanded * noise
+            v_target = self.scheduler.get_velocity(batch_latents, noise, timesteps)
+
+            # Generate time embeddings
+            time_ids = self._get_add_time_ids(batch_latents).clone()
+
+            # Prepare model inputs with explicit gradient requirements
+            scaled_input = (c_in.view(-1,1,1,1) * noisy_latents).clone().requires_grad_(True)
             encoder_hidden_states = encoder_hidden_states.clone().requires_grad_(True)
             timesteps = timesteps.clone()
 
@@ -209,23 +270,30 @@ class NovelAIDiffusionV3Trainer(nn.Module):
                     }
                 ).sample
 
-                D_out = c_skip.view(-1,1,1,1)*noisy_latents + c_out.view(-1,1,1,1)*F_out
+                # Compute denoised output
+                D_out = c_skip.view(-1,1,1,1) * noisy_latents + c_out.view(-1,1,1,1) * F_out
 
-                loss_per_sample = F.mse_loss(D_out.float(), v_target.float(), reduction='none')
-                loss_per_sample = loss_per_sample.mean(dim=[1,2,3])
+                # Compute loss efficiently
+                loss_per_sample = F.mse_loss(
+                    D_out.float(),
+                    v_target.float(),
+                    reduction='none'
+                ).mean(dim=[1,2,3])
 
+                # Apply weights
                 snr_weights = self.get_minsnr_weights(timesteps)
-
                 loss_per_sample = loss_per_sample * batch_tag_weights.squeeze() * snr_weights
-
                 loss = loss_per_sample.mean() / self.gradient_accumulation_steps
 
+            # Backward pass
             loss.backward()
-            
+
+            # Update loss tracking
             loss_value = loss.item()
             total_loss += loss_value
             running_loss += loss_value
 
+            # Accumulate predictions
             total_v_pred = D_out.detach() if total_v_pred is None else torch.cat([total_v_pred, D_out.detach()], dim=0)
 
         avg_loss = running_loss / self.gradient_accumulation_steps
@@ -239,96 +307,82 @@ class NovelAIDiffusionV3Trainer(nn.Module):
     ) -> float:
         self.current_epoch = epoch
         self.model.train()
-        total_loss = 0
-        num_batches = len(dataloader)
         
-        for batch_idx, batch in enumerate(dataloader):
-            torch.cuda.empty_cache()
+        # Pre-allocate metrics tracking
+        total_loss = 0.0
+        num_batches = len(dataloader)
+        running_grad_norm = 0.0
+        
+        # Use tqdm for progress tracking
+        progress_bar = tqdm(
+            dataloader,
+            desc=f"Epoch {epoch}",
+            total=num_batches,
+            disable=not self.accelerator.is_main_process
+        )
+        
+        for batch_idx, batch in enumerate(progress_bar):
+            # Efficient batch transfer to device - use non_blocking for async transfer
+            images, text_embeds, tag_weights = [
+                x.to(self.device, dtype=torch.bfloat16, non_blocking=True) 
+                if isinstance(x, torch.Tensor) else 
+                {k: v.to(self.device, dtype=torch.bfloat16, non_blocking=True) for k,v in x.items()}
+                for x in batch
+            ]
             
-            images, text_embeds, tag_weights = batch
-            
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+            # Training step with autocast
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 loss, pred_images, v_pred, timesteps, avg_batch_loss = self.training_step(
                     images, text_embeds, tag_weights
                 )
             
+            # Compute gradient norm before optimizer step
             grad_norm = self.compute_grad_norm()
+            running_grad_norm = 0.9 * running_grad_norm + 0.1 * grad_norm
+            
+            # Optimizer step
             self.optimizer.step()
             
-            if self.accelerator.is_main_process:
-                wandb.log({
-                    'grad/norm': grad_norm,
+            # Update metrics efficiently
+            total_loss += avg_batch_loss
+            avg_loss = total_loss / (batch_idx + 1)
+            
+            # Log metrics less frequently to reduce overhead
+            if self.accelerator.is_main_process and batch_idx % log_interval == 0:
+                metrics = {
+                    'grad/norm': running_grad_norm,
                     'loss/batch': avg_batch_loss,
-                    'loss/running_avg': total_loss / (batch_idx + 1),
+                    'loss/running_avg': avg_loss,
                     'epoch': self.current_epoch,
                     'step': self.global_step,
+                    'lr': self.optimizer.param_groups[0]['lr'],
+                    'memory/allocated_gb': torch.cuda.memory_allocated()/1e9,
+                    'memory/reserved_gb': torch.cuda.max_memory_reserved()/1e9
+                }
+                
+                # Update progress bar
+                progress_bar.set_postfix({
+                    'loss': f'{avg_batch_loss:.4f}',
+                    'avg_loss': f'{avg_loss:.4f}',
+                    'grad': f'{running_grad_norm:.4f}',
+                    'lr': f'{metrics["lr"]:.2e}',
+                    'mem': f'{metrics["memory/allocated_gb"]:.1f}GB'
                 })
-            
-            total_loss += avg_batch_loss
-            
-            if batch_idx % log_interval == 0:
-                avg_loss = total_loss / (batch_idx + 1)
-                print(f'Epoch {epoch} [{batch_idx}/{num_batches}]:')
-                print(f'  Batch Loss = {avg_batch_loss:.4f}')
-                print(f'  Avg Loss = {avg_loss:.4f}')
-                print(f'  Grad norm = {grad_norm:.4f}')
-                print(f'  Memory: {torch.cuda.memory_allocated()/1e9:.1f}GB')
+                
+                # Log to wandb asynchronously
+                wandb.log(metrics, step=self.global_step)
             
             self.global_step += 1
+            
+            # Optional: Update learning rate scheduler if using one
+            if hasattr(self, 'lr_scheduler'):
+                self.lr_scheduler.step()
         
+        # Clean up progress bar
+        progress_bar.close()
+        
+        # Return average loss for the epoch
         return total_loss / num_batches
-
-    def compute_grad_norm(self):
-        """Compute total gradient norm"""
-        total_norm = 0.0
-        for p in self.model.parameters():
-            if p.grad is not None:
-                param_norm = p.grad.detach().data.norm(2)
-                total_norm += param_norm.item() ** 2
-        return total_norm ** 0.5
-
-    def save_checkpoint(self, save_path: str):
-        """Save model checkpoint with only modified components in fp16 format"""
-        if self.accelerator is not None:
-            unwrapped_model = self.accelerator.unwrap_model(self.model)
-        else:
-            unwrapped_model = self.model
-
-        os.makedirs(save_path, exist_ok=True)
-
-        # Temporarily convert model to float16 for saving
-        original_dtype = unwrapped_model.dtype
-        unwrapped_model = unwrapped_model.to(torch.float16)
-
-        try:
-            unwrapped_model.save_pretrained(
-                os.path.join(save_path, "unet"),
-                safe_serialization=True
-            )
-        finally:
-            unwrapped_model = unwrapped_model.to(original_dtype)
-
-        # Save training state
-        training_state = {
-            "epoch": self.current_epoch,
-            "global_step": self.global_step,
-            "optimizer_state": self.optimizer.state_dict(),
-        }
-        torch.save(training_state, os.path.join(save_path, "training_state.pt"))
-
-    def load_checkpoint(self, checkpoint_path: str):
-        """Load model and training state from checkpoint"""
-        print(f"Resuming from checkpoint: {checkpoint_path}")
-        
-        training_state_path = os.path.join(checkpoint_path, "training_state.pt")
-        if os.path.exists(training_state_path):
-            training_state = torch.load(training_state_path)
-            self.current_epoch = training_state["epoch"]
-            self.global_step = training_state["global_step"]
-            self.optimizer.load_state_dict(training_state["optimizer_state"])
-            print(f"Resumed from epoch {self.current_epoch}, step {self.global_step}")
-        else:
-            print("No training state found, starting from scratch with pretrained weights")
 
     @staticmethod
     def create_dataloader(
