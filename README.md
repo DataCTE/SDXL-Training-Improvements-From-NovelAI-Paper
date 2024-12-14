@@ -39,6 +39,29 @@ python src/train.py \
   --resume_from_checkpoint path/to/checkpoint
 ```
 
+### Multi-GPU Training
+
+Training supports Distributed Data Parallel (DDP) with automatic gradient accumulation:
+
+```bash
+# Train with multiple GPUs
+torchrun --nproc_per_node=N train.py \
+    --unet_path path/to/unet.safetensors
+
+# Example with 4 GPUs and custom port
+torchrun --nproc_per_node=4 --master_port=29501 train.py \
+    --unet_path path/to/unet.safetensors
+```
+
+The effective batch size will be:
+batch_size * grad_accum_steps * num_gpus
+
+For example, with:
+- batch_size = 8
+- grad_accum_steps = 4  
+- num_gpus = 4
+The effective batch size will be 128
+
 ## Technical Details
 
 ### 1. ZTSNR Implementation

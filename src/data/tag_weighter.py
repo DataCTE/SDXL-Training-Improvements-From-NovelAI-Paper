@@ -1,6 +1,12 @@
 from typing import List
 import torch
 
+def parse_tags(caption: str) -> List[str]:
+    """Extract tags from caption"""
+    parts = caption.lower().split(',')
+    tags = [tag.strip() for tag in parts]
+    return tags
+
 class TagWeighter:
     def __init__(
         self,
@@ -12,6 +18,7 @@ class TagWeighter:
         self.max_weight = max_weight
         self.default_weight = default_weight
         
+        # Initialize tag tracking
         self.tag_counts = {}
         self.total_count = 0
         self.tag_weights = {}
@@ -29,8 +36,10 @@ class TagWeighter:
         if not self.total_count:
             return
             
+        # Calculate average frequency
         avg_freq = self.total_count / len(self.tag_counts) if self.tag_counts else 1.0
         
+        # Compute weights for each tag
         for tag, count in self.tag_counts.items():
             raw_weight = avg_freq / count
             weight = min(self.max_weight, max(self.min_weight, raw_weight))
@@ -43,8 +52,3 @@ class TagWeighter:
             
         weights = [self.tag_weights.get(tag, self.default_weight) for tag in tags]
         return torch.tensor(weights).mean().item()
-
-def parse_tags(caption: str) -> List[str]:
-    """Extract tags from caption"""
-    parts = caption.lower().split(',')
-    return [tag.strip() for tag in parts] 

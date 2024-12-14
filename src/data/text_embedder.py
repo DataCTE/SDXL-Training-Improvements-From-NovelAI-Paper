@@ -1,6 +1,6 @@
 import torch
-from typing import Dict
 from transformers import CLIPTokenizer, CLIPTextModel
+from typing import Dict
 
 class TextEmbedder:
     def __init__(
@@ -26,6 +26,7 @@ class TextEmbedder:
             "large": CLIPTextModel.from_pretrained(tokenizer_paths["large"]).to(device).to(torch.bfloat16)
         }
         
+        # Set models to eval mode and freeze parameters
         for encoder in self.text_encoders.values():
             encoder.eval()
             for param in encoder.parameters():
@@ -48,20 +49,26 @@ class TextEmbedder:
         # Generate embeddings
         embeds = {}
         for k, encoder in self.text_encoders.items():
+            # Move tokens to GPU
             tokens_gpu = {key: val.to(self.device) for key, val in tokens[k].items()}
+            
+            # Generate embeddings
             output = encoder(**tokens_gpu)
             
+            # Process hidden states
             last_hidden_state = output.last_hidden_state
             if last_hidden_state.dim() == 2:
                 last_hidden_state = last_hidden_state.unsqueeze(0)
             
+            # Process pooled output
             pooled_output = output.pooler_output
             if pooled_output.dim() == 1:
                 pooled_output = pooled_output.unsqueeze(0)
             elif pooled_output.dim() == 3:
                 pooled_output = pooled_output.squeeze(1)
             
+            # Store embeddings
             embeds[f"{k}_text_embeds"] = last_hidden_state.cpu()
             embeds[f"{k}_pooled_embeds"] = pooled_output.cpu()
             
-        return embeds 
+        return embeds

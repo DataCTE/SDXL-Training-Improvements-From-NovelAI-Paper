@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
-import numpy as np
 import math
+import numpy as np
 
 @dataclass
 class ImageBucket:
@@ -26,7 +26,7 @@ class AspectRatioBucket:
         self.bucket_step = bucket_step
         self.buckets: List[ImageBucket] = []
         self._generate_buckets()
-        
+
     def _generate_buckets(self):
         """Generate bucket resolutions following section 4.1.2"""
         # Generate width-first buckets
@@ -71,4 +71,4 @@ class AspectRatioBucket:
         
         # Find closest bucket in log-space
         idx = np.argmin(np.abs(log_aspects - log_image_aspect))
-        return self.buckets[idx] 
+        return self.buckets[idx]
