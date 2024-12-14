@@ -1,8 +1,55 @@
-.aider*
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Training artifacts
+checkpoints/
+logs/
+latent_cache/
+text_cache/
+wandb/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment
 .env
+.venv
+env/
+venv/
+ENV/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Other
 venv
-final.zip
-final
 __pycache__
 *.txt
-train_dreambooth_lora_sdxl.py
+single_file.py

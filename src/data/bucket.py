@@ -1,8 +1,7 @@
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
-import numpy as np
 import math
-import torch
+import numpy as np
 
 @dataclass
 class ImageBucket:
@@ -27,13 +26,12 @@ class AspectRatioBucket:
         self.bucket_step = bucket_step
         self.buckets: List[ImageBucket] = []
         self._generate_buckets()
-        
+
     def _generate_buckets(self):
         """Generate bucket resolutions following section 4.1.2"""
         # Generate width-first buckets
         width = 256
         while width <= self.max_dim:
-            # Find largest height that satisfies constraints
             height = min(
                 self.max_dim,
                 math.floor(self.max_width * self.max_height / width)
@@ -51,7 +49,6 @@ class AspectRatioBucket:
                 self.max_dim,
                 math.floor(self.max_width * self.max_height / height)
             )
-            # Skip if bucket already exists
             if not any(b.width == width and b.height == height for b in self.buckets):
                 self.buckets.append(ImageBucket(
                     width=width,
