@@ -37,6 +37,12 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
     ):
         super().__init__()
         
+        # Create default accelerator if none provided
+        if accelerator is None:
+            self.accelerator = Accelerator()
+        else:
+            self.accelerator = accelerator
+        
         # Enable TF32 for better performance on Ampere GPUs
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
@@ -54,9 +60,7 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.device = device
-        self.accelerator = accelerator
         self.gradient_accumulation_steps = gradient_accumulation_steps
-        
         
         # Initialize memory management systems
         self.memory_manager = MemoryManager(max_vram_usage=max_vram_usage)
@@ -479,10 +483,18 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             )
             
             for batch_idx, batch in enumerate(progress_bar):
-                for k, v in batch[1].items():
-                    if isinstance(v, torch.Tensor):
-                        print(f"batch[1][{k}] shape: {v.shape}")
-               
+                # Safely check if we should log
+                should_log = hasattr(self.accelerator, 'is_main_process') and \
+                            self.accelerator.is_main_process and \
+                            wandb.run is not None
+                
+                # Log tensor shapes to wandb without console output
+                if should_log:
+                    shape_logs = {}
+                    for k, v in batch[1].items():
+                        if isinstance(v, torch.Tensor):
+                            shape_logs[f'shapes/{k}'] = str(tuple(v.shape))
+                    wandb.log(shape_logs, commit=False)
                 
                 start_time = time.time()
                 
@@ -504,10 +516,11 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                 
                 # Auto-tune hyperparameters
                 new_params = self.auto_tuner.update(self.profiler)
-                if new_params != self.auto_tuner.current_params:
-                    print("\nUpdating hyperparameters:")
-                    for k, v in new_params.items():
-                        print(f"  {k}: {v}")
+                if new_params != self.auto_tuner.current_params and should_log:
+                    # Log parameter updates to wandb
+                    param_logs = {f'hyperparams/{k}': v for k, v in new_params.items()}
+                    param_logs['hyperparams/update_step'] = self.global_step
+                    wandb.log(param_logs, commit=False)
                 
                 if prof is not None:
                     prof.step()
@@ -592,7 +605,12 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                             grad_norm: float,
                             timesteps: torch.Tensor):
         """Log detailed training metrics to W&B"""
-        if not self.accelerator.is_main_process:
+        # Safely check if we should log
+        should_log = hasattr(self.accelerator, 'is_main_process') and \
+                     self.accelerator.is_main_process and \
+                     wandb.run is not None
+                 
+        if not should_log:
             return
         
         # Compute v-prediction statistics

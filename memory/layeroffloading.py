@@ -5,108 +5,393 @@ import numpy as np
 
 class LayerOffloadConductor:
     def __init__(self, model: nn.Module, device: torch.device):
-        self.model = model
         self.device = device
-        self.cpu_device = torch.device('cpu')
-        self.streams = {
-            'compute': torch.cuda.Stream(),
-            'h2d': torch.cuda.Stream(),
-            'd2h': torch.cuda.Stream()
-        }
-        self.layer_states = {}
+        self.layers = {}
         self.pinned_memory = {}
+        self.current_layer = None
+        self.layer_states = {}  # Track layer states (gpu/cpu)
+        self.total_gpu_memory = torch.cuda.get_device_properties(device).total_memory
+        
+        # Optimize stream usage with dedicated streams
+        self.streams = {
+            'h2d': torch.cuda.Stream(),  # Host to Device
+            'd2h': torch.cuda.Stream(),  # Device to Host
+            'compute': torch.cuda.Stream()  # Computation
+        }
+        
+        # Pre-allocate reusable buffers for transfers
+        self.transfer_buffers = {
+            'h2d': None,
+            'd2h': None
+        }
+        
+        # Cache for parameter metadata
+        self.param_cache = {}
+        
+        # Enable tensor cores if available
+        if torch.cuda.get_device_capability(device)[0] >= 7:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
         
     def register_layer(self, name: str, layer: nn.Module):
-        """Register a layer for offloading management"""
-        self.layer_states[name] = {
-            'location': 'gpu',  # Start on GPU
-            'size': sum(p.numel() * p.element_size() for p in layer.parameters())
-        }
-        # Pre-allocate pinned memory for this layer
-        self.pinned_memory[name] = {
-            'gpu': None,  # Will store GPU buffer
-            'cpu': torch.empty(self.layer_states[name]['size'], 
-                             dtype=torch.uint8, 
-                             pin_memory=True)
-        }
-        
+        """Register a layer for offloading management with improved error handling and memory management"""
+        try:
+            if name in self.layers:
+                raise ValueError(f"Layer {name} already registered")
+                
+            self.layers[name] = layer
+            self.layer_states[name] = 'gpu'  # Start on GPU
+            
+            # Pre-calculate and cache parameter metadata
+            total_params = 0
+            param_info = []
+            
+            # Get all parameters that can be pinned
+            pinnable_params = []
+            for p in layer.parameters():
+                if not isinstance(p, torch.Tensor) or p.numel() <= 0:
+                    continue
+                    
+                # Only try to pin contiguous tensors
+                if p.is_contiguous():
+                    pinnable_params.append(p)
+                
+                param_info.append({
+                    'numel': p.numel(),
+                    'shape': p.shape,
+                    'dtype': p.dtype,
+                    'id': id(p),
+                    'requires_grad': p.requires_grad,
+                    'is_pinnable': p.is_contiguous()
+                })
+                total_params += p.numel()
+            
+            if total_params > 0:
+                try:
+                    # Calculate buffer size based on pinnable parameters only
+                    pinnable_size = sum(p.numel() * p.element_size() for p in pinnable_params)
+                    buffer_size = min(
+                        pinnable_size * 2,  # Double buffer
+                        self.total_gpu_memory // 8  # Limit to 1/8th of GPU memory
+                    )
+                    
+                    # Only allocate pinned memory if we have pinnable parameters
+                    if pinnable_params:
+                        try:
+                            pinned_buffer = torch.empty(
+                                buffer_size, 
+                                dtype=torch.uint8,  # Use uint8 for more efficient memory usage
+                                pin_memory=True,
+                                device='cpu'
+                            )
+                            is_pinned = True
+                        except RuntimeError:
+                            # Fallback to non-pinned memory
+                            pinned_buffer = torch.empty(
+                                buffer_size,
+                                dtype=torch.uint8,
+                                device='cpu'
+                            )
+                            is_pinned = False
+                            print(f"Warning: Failed to allocate pinned memory for {name}, falling back to regular memory")
+                    else:
+                        # Create regular buffer for non-pinnable parameters
+                        pinned_buffer = torch.empty(
+                            buffer_size,
+                            dtype=torch.uint8,
+                            device='cpu'
+                        )
+                        is_pinned = False
+                        
+                    self.pinned_memory[name] = {
+                        'cpu': pinned_buffer,
+                        'size': buffer_size,
+                        'total_params': total_params,
+                        'param_info': param_info,
+                        'pinned': is_pinned,
+                        'pinnable_params': [id(p) for p in pinnable_params]
+                    }
+                    
+                except RuntimeError as e:
+                    print(f"Warning: Failed to allocate memory for {name}: {e}")
+                    # Fallback with minimal allocation
+                    buffer_size = min(total_params * 4, self.total_gpu_memory // 16)
+                    self.pinned_memory[name] = {
+                        'cpu': torch.empty(buffer_size, dtype=torch.uint8, device='cpu'),
+                        'size': buffer_size,
+                        'total_params': total_params,
+                        'param_info': param_info,
+                        'pinned': False,
+                        'pinnable_params': []
+                    }
+            
+            # Cache parameter access patterns
+            self.param_cache[name] = {
+                'param_list': list(layer.parameters()),
+                'total_size': total_params,
+                'access_count': 0
+            }
+            
+        except Exception as e:
+            print(f"Error registering layer {name}: {e}")
+            raise
+    
     def before_layer(self, layer_idx: int, name: str):
-        """Prepare layer for computation"""
-        # Ensure layer is on GPU
-        if self.layer_states[name]['location'] == 'cpu':
-            self.load_to_gpu(name)
+        """Prepare layer for computation with safety checks"""
+        if name not in self.layers:
+            return
             
-        # Wait for any pending transfers
-        self.synchronize()
-        
-        # Switch to compute stream
-        torch.cuda.current_stream().wait_stream(self.streams['h2d'])
-        torch.cuda.current_stream().wait_stream(self.streams['d2h'])
-
+        try:
+            self.current_layer = name
+            
+            # Skip if already on GPU
+            if self.layer_states.get(name) == 'gpu':
+                return
+                
+            # Optimize transfer with event synchronization
+            current = torch.cuda.current_stream()
+            with torch.cuda.stream(self.streams['h2d']):
+                # Wait for any pending operations
+                current.synchronize()
+                self.move_to_gpu(name)
+                
+            # Record completion event
+            event = torch.cuda.Event()
+            self.streams['h2d'].record_event(event)
+            current.wait_event(event)
+            
+        except Exception as e:
+            print(f"Error in before_layer for {name}: {e}")
+            self.handle_error(name)
+    
     def after_layer(self, layer_idx: int, name: str):
-        """Cleanup after layer computation"""
-        # Ensure compute is finished
-        self.streams['compute'].synchronize()
-        
-        # Record layer state
-        self.layer_states[name]['last_used'] = layer_idx
-
+        """Cleanup after layer computation with error recovery"""
+        if name not in self.layers:
+            return
+            
+        try:
+            # Optimize stream synchronization
+            compute_event = torch.cuda.Event()
+            torch.cuda.current_stream().record_event(compute_event)
+            
+            with torch.cuda.stream(self.streams['d2h']):
+                compute_event.wait()
+                self.offload_to_cpu(name)
+                
+            self.current_layer = None
+            
+        except Exception as e:
+            print(f"Error in after_layer for {name}: {e}")
+            self.handle_error(name)
+    
+    def move_to_gpu(self, name: str):
+        """Move layer parameters to GPU with optimized transfers"""
+        if name not in self.layers or name not in self.pinned_memory:
+            return
+            
+        try:
+            layer = self.layers[name]
+            mem_info = self.pinned_memory[name]
+            cached_params = self.param_cache[name]['param_list']
+            
+            # Check memory with headroom
+            if torch.cuda.memory_allocated() + mem_info['total_params'] * 2.2 > self.total_gpu_memory * 0.95:
+                self.handle_oom(name)
+                return
+            
+            # Optimize bulk transfer
+            offset = 0
+            transfer_buffer = self.transfer_buffers['h2d']
+            
+            for param_info in mem_info['param_info']:
+                numel = param_info['numel']
+                if numel == 0:
+                    continue
+                
+                # Ensure buffer capacity
+                if offset + numel > mem_info['size']:
+                    try:
+                        new_size = min(max(offset + numel, mem_info['size'] * 2),
+                                     self.total_gpu_memory // 4)
+                        mem_info['cpu'] = torch.empty(new_size, 
+                                                    dtype=torch.float16,
+                                                    pin_memory=mem_info.get('pinned', True),
+                                                    device='cpu')
+                        mem_info['size'] = new_size
+                        
+                        # Update transfer buffer if needed
+                        if transfer_buffer.numel() < new_size:
+                            self.transfer_buffers['h2d'] = torch.empty(
+                                new_size,
+                                dtype=torch.float16,
+                                device=self.device,
+                                pin_memory=True
+                            )
+                            transfer_buffer = self.transfer_buffers['h2d']
+                            
+                    except RuntimeError as e:
+                        print(f"Warning: Failed to resize buffer for {name}: {e}")
+                        return
+                
+                try:
+                    # Optimized copy with shape pre-validation
+                    param = cached_params[offset // numel]
+                    if param.shape == param_info['shape']:
+                        # Use non-blocking transfer with proper stream
+                        param.data.copy_(
+                            mem_info['cpu'][offset:offset + numel].view_as(param),
+                            non_blocking=True
+                        )
+                except RuntimeError as e:
+                    print(f"Error copying parameter to GPU for {name}: {e}")
+                    self.handle_error(name)
+                    return
+                
+                offset += numel
+            
+            self.layer_states[name] = 'gpu'
+            
+        except Exception as e:
+            print(f"Error in move_to_gpu for {name}: {e}")
+            self.handle_error(name)
+    
     def offload_to_cpu(self, name: str):
-        """Move layer to CPU asynchronously"""
-        if self.layer_states[name]['location'] == 'cpu':
+        """Offload layer parameters to CPU with optimized transfers"""
+        if name not in self.layers or name not in self.pinned_memory:
             return
             
-        layer = self._get_layer_by_name(name)
-        with torch.cuda.stream(self.streams['d2h']):
-            # Pack parameters into contiguous buffer
-            packed = self._pack_parameters(layer)
-            # Copy to pre-allocated pinned memory
-            self.pinned_memory[name]['gpu'] = packed
-            self.pinned_memory[name]['cpu'].copy_(packed, non_blocking=True)
+        try:
+            layer = self.layers[name]
+            mem_info = self.pinned_memory[name]
+            cached_params = self.param_cache[name]['param_list']
             
-        # Update state
-        self.layer_states[name]['location'] = 'cpu'
-        
-        # Move layer parameters to CPU
-        for param in layer.parameters():
-            param.data = param.data.to(self.cpu_device)
+            # Optimize bulk transfer
+            offset = 0
+            transfer_buffer = self.transfer_buffers['d2h']
             
-    def load_to_gpu(self, name: str):
-        """Move layer to GPU asynchronously"""
-        if self.layer_states[name]['location'] == 'gpu':
-            return
+            for param_info in mem_info['param_info']:
+                numel = param_info['numel']
+                if numel == 0:
+                    continue
+                
+                # Ensure buffer capacity
+                if offset + numel > mem_info['size']:
+                    try:
+                        new_size = min(max(offset + numel, mem_info['size'] * 2),
+                                     self.total_gpu_memory // 4)
+                        mem_info['cpu'] = torch.empty(new_size, 
+                                                    dtype=torch.float16,
+                                                    pin_memory=mem_info.get('pinned', True),
+                                                    device='cpu')
+                        mem_info['size'] = new_size
+                        
+                        # Update transfer buffer if needed
+                        if transfer_buffer.numel() < new_size:
+                            self.transfer_buffers['d2h'] = torch.empty(
+                                new_size,
+                                dtype=torch.float16,
+                                device='cpu',
+                                pin_memory=True
+                            )
+                            transfer_buffer = self.transfer_buffers['d2h']
+                            
+                    except RuntimeError as e:
+                        print(f"Warning: Failed to resize buffer for {name}: {e}")
+                        return
+                
+                try:
+                    param = cached_params[offset // numel]
+                    # Optimized copy with pre-conversion
+                    if param.is_cuda:  # Only copy if still on GPU
+                        mem_info['cpu'][offset:offset + numel].copy_(
+                            param.data.to(torch.float16).view(-1),
+                            non_blocking=True
+                        )
+                        param.data = param.data.cpu()  # Move to CPU after copy
+                        
+                except RuntimeError as e:
+                    print(f"Error copying parameter to CPU for {name}: {e}")
+                    self.handle_error(name)
+                    return
+                
+                offset += numel
             
-        layer = self._get_layer_by_name(name)
-        with torch.cuda.stream(self.streams['h2d']):
-            # Copy from pinned memory to GPU
-            gpu_buffer = self.pinned_memory[name]['cpu'].to(
-                self.device, non_blocking=True)
-            # Unpack parameters
-            self._unpack_parameters(layer, gpu_buffer)
+            self.layer_states[name] = 'cpu'
             
-        # Update state
-        self.layer_states[name]['location'] = 'gpu'
-        
-    def _get_layer_by_name(self, name: str) -> nn.Module:
-        """Get layer by name from model"""
-        return dict(self.model.named_modules())[name]
-        
-    def _pack_parameters(self, layer: nn.Module) -> torch.Tensor:
-        """Pack layer parameters into contiguous buffer"""
-        return torch.cat([p.data.view(-1) for p in layer.parameters()])
-        
-    def _unpack_parameters(self, layer: nn.Module, buffer: torch.Tensor):
-        """Unpack buffer into layer parameters"""
-        offset = 0
-        for param in layer.parameters():
-            numel = param.numel()
-            param.data = buffer[offset:offset + numel].view(param.shape)
-            offset += numel
+        except Exception as e:
+            print(f"Error in offload_to_cpu for {name}: {e}")
+            self.handle_error(name)
             
-    def synchronize(self):
-        """Synchronize all CUDA streams"""
-        for stream in self.streams.values():
-            stream.synchronize()
+    def handle_error(self, name: str):
+        """Handle errors during layer operations"""
+        try:
+            torch.cuda.empty_cache()
+            self.layer_states[name] = 'unknown'
+            
+            # Fast emergency CPU offload
+            if name in self.layers:
+                layer = self.layers[name]
+                for p in layer.parameters():
+                    if isinstance(p, torch.Tensor) and p.is_cuda:
+                        try:
+                            p.data = p.data.cpu()
+                        except:
+                            pass
+                            
+        except Exception as e:
+            print(f"Error in error handler for {name}: {e}")
+            
+    def handle_oom(self, name: str):
+        """Handle out-of-memory situations with optimized cleanup"""
+        try:
+            torch.cuda.empty_cache()
+            
+            # Prioritized memory recovery
+            gpu_layers = [(n, self.pinned_memory[n]['total_params']) 
+                         for n, state in self.layer_states.items()
+                         if state == 'gpu' and n != name]
+            
+            # Sort by size for optimal recovery
+            for other_name, _ in sorted(gpu_layers, key=lambda x: x[1], reverse=True):
+                try:
+                    self.offload_to_cpu(other_name)
+                except:
+                    pass
+                    
+        except Exception as e:
+            print(f"Error in OOM handler: {e}")
+            
+    def clear(self):
+        """Optimized cleanup of all resources"""
+        try:
+            # Fast synchronization
+            current = torch.cuda.current_stream()
+            for stream in self.streams.values():
+                if stream != current:
+                    stream.synchronize()
+            
+            # Bulk cleanup
+            for name in self.layers:
+                if self.layer_states.get(name) == 'gpu':
+                    try:
+                        self.offload_to_cpu(name)
+                    except:
+                        pass
+            
+            # Clear memory
+            self.pinned_memory.clear()
+            self.transfer_buffers = {'h2d': None, 'd2h': None}
+            torch.cuda.empty_cache()
+            
+        except Exception as e:
+            print(f"Error in clear: {e}")
+            
+    def __del__(self):
+        """Cleanup on deletion"""
+        try:
+            self.clear()
+        except:
+            pass
 
 def ensure_three_channels(x):
     return x[:3]

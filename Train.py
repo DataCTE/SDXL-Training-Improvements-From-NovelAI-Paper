@@ -1,41 +1,18 @@
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 import numpy as np
-import math
-from PIL import Image
-from pathlib import Path
 import random
-from dataclasses import dataclass
-from typing import List, Optional, Dict, Tuple, Callable, Union
-from transformers import CLIPTokenizer, CLIPTextModel
 from diffusers import StableDiffusionXLPipeline, UNet2DConditionModel, AutoencoderKL, DDPMScheduler
-from torchvision import transforms
 from accelerate import Accelerator
 from adamw_bf16 import AdamWBF16
-import glob
 import os
-from tqdm import tqdm
 import wandb
-from torch.nn.utils import clip_grad_norm_
-import shutil
 import argparse
 from safetensors.torch import load_file
 import signal
-import sys
-import torch.cuda.streams as streams
-import json
 import torch.distributed as dist
-from abc import ABCMeta, abstractmethod
-from collections.abc import Callable
-from math import ceil
-import contextlib
-import time
-import re
 from collections import defaultdict
 from accelerate import Accelerator
-
 try:
     import bitsandbytes as bnb
     from bitsandbytes.nn import Linear8bitLt, LinearNf4
@@ -55,7 +32,6 @@ except ImportError:
             torch.cuda.ipc_collect()
 
 # Import all the necessary components from modules
-from memory.layeroffloading import LayerOffloadConductor, LayerOffloadStrategy
 from data.dataset import NovelAIDataset
 from data.sampler import AspectBatchSampler
 from trainers.sdxl_trainer import NovelAIDiffusionV3Trainer
