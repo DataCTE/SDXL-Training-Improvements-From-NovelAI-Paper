@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 import numpy as np
 import math
@@ -9,7 +10,6 @@ import random
 from dataclasses import dataclass
 from typing import List, Optional
 from transformers import CLIPTokenizer, CLIPTextModel
-import xformers
 from typing import Dict, List, Optional, Tuple, Callable
 from diffusers import StableDiffusionXLPipeline, UNet2DConditionModel, AutoencoderKL, DDPMScheduler
 from torchvision import transforms
@@ -505,6 +505,8 @@ class AspectBatchSampler(torch.utils.data.Sampler):
     def __len__(self):
         return len(self.batches)
 
+
+
 class NovelAIDiffusionV3Trainer(torch.nn.Module):
     def __init__(
         self,
@@ -515,6 +517,7 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         device: torch.device,
         accelerator: Optional[Accelerator] = None,
         resume_from_checkpoint: Optional[str] = None,
+        gradient_accumulation_steps: int = 4,
     ):
         super().__init__()
         self.model = model
@@ -523,6 +526,9 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         self.scheduler = scheduler
         self.device = device
         self.accelerator = accelerator
+        
+        # Add gradient accumulation steps
+        self.gradient_accumulation_steps = gradient_accumulation_steps
         
         # Add projection layer for CLIP embeddings
         self.hidden_proj = nn.Linear(768, model.config.cross_attention_dim).to(
@@ -554,6 +560,23 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         # Resume from checkpoint if provided
         if resume_from_checkpoint:
             self.load_checkpoint(resume_from_checkpoint)
+
+        # Enable memory efficient attention
+        model.enable_xformers_memory_efficient_attention()
+        
+        # Enable channels last memory format
+        model = model.to(memory_format=torch.channels_last)
+        
+        # Enable gradient checkpointing
+        model.enable_gradient_checkpointing()
+        
+        # Enable cudnn benchmarking
+        torch.backends.cudnn.benchmark = True
+        
+        # Disable debug APIs
+        torch.autograd.set_detect_anomaly(False)
+        torch.autograd.profiler.profile(False)
+        torch.autograd.profiler.emit_nvtx(False)
 
     def load_checkpoint(self, checkpoint_path: str):
         """Load model and training state from checkpoint"""
@@ -589,135 +612,181 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         
         return add_time_ids.reshape(batch_size, -1)
 
+    def get_karras_scalings(self, sigma, sigma_data=1.0):
+        # sigma: [batch_size] tensor
+        sigma_sq = sigma * sigma
+        sigma_data_sq = sigma_data * sigma_data
+        denominator = sigma_data_sq + sigma_sq
+        c_skip = sigma_data_sq / denominator
+        c_out = -sigma_data * sigma / torch.sqrt(denominator)
+        c_in = 1.0 / torch.sqrt(denominator)
+        return c_skip, c_out, c_in
+
+    @torch.no_grad()
+    def get_velocity(scheduler: DDPMScheduler, latents: torch.Tensor, noise: torch.Tensor, timesteps: torch.Tensor):
+        # Computes the v_prediction target as described in the paper.
+        # v = (x - x_0) / sqrt(sigma^2 + sigma_data^2)
+        return scheduler.get_velocity(latents, noise, timesteps)
+
+    def get_sigmas(self) -> torch.Tensor:
+            """Generate noise schedule for ZTSNR with optimized scaling.
+            
+            Uses a modified ramp function to ensure:
+            1. First step has σ = σ_min (0.002)
+            2. Last step has σ = σ_max (20000) as practical infinity
+            3. Intermediate steps follow power-law scaling with ρ=7
+            
+            Returns:
+                torch.Tensor: Noise schedule sigmas of shape [num_timesteps]
+            """
+            # Generate ramp on device directly
+            ramp = torch.linspace(0, 1, self.num_timesteps, device=self.device)
+            
+            # Compute inverse rho values
+            min_inv_rho = self.sigma_min ** (1/self.rho)
+            max_inv_rho = self.sigma_max ** (1/self.rho)
+            
+            # Generate full schedule with vectorized operations
+            sigmas = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** self.rho
+            
+            # Ensure exact values at endpoints
+            sigmas[0] = self.sigma_min
+            sigmas[-1] = self.sigma_max
+            
+            return sigmas
+
+    def get_snr(self, sigma: torch.Tensor) -> torch.Tensor:
+        # SNR(σ) = (σ_data / σ)²
+        return (self.sigma_data / sigma).square()
+
+    def get_minsnr_weights(self, timesteps: torch.Tensor) -> torch.Tensor:
+        # Uses the scheduler's alpha values to compute SNR(t) = α/(1-α)
+        # w(t) = min(SNR(t), γ)
+        alphas = self.scheduler.alphas_cumprod.to(timesteps.device)
+        alpha_t = alphas[timesteps]  # [batch_size]
+        
+        # SNR in terms of alpha: SNR = α/(1-α)
+        snr = alpha_t / (1 - alpha_t)
+        
+        # Clamp to min_snr_gamma
+        min_snr = torch.tensor(self.min_snr_gamma, device=self.device)
+        weights = torch.minimum(snr, min_snr).float()
+        return weights
+
     def training_step(
         self,
         images: torch.Tensor,
         text_embeds: Dict[str, torch.Tensor],
-        tag_weights: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Modified training step with detailed logging"""
-        try:
-            # Process text embeddings
-            base_hidden = text_embeds["base_text_embeds"].to(
-                device=self.device, 
-                dtype=torch.bfloat16,
-                non_blocking=True
-            ).squeeze(1)
-            
-            base_pooled = text_embeds["base_pooled_embeds"].to(
-                device=self.device,
-                dtype=torch.bfloat16,
-                non_blocking=True
-            ).squeeze(1)
-            
-            # Images processing
-            images = images.to(
-                device=self.device,
-                dtype=torch.bfloat16,
-                non_blocking=True,
-                memory_format=torch.channels_last
-            )
-            
-            # Text embedding projection
-            batch_size, seq_len, _ = base_hidden.shape
-            base_hidden_float32 = base_hidden.to(dtype=torch.float32)
-            encoder_hidden_states = self.hidden_proj(base_hidden_float32.view(-1, 768)).view(batch_size, seq_len, -1)
-            
-            # Get time embeddings and setup
-            add_time_ids = self._get_add_time_ids(images)
-            added_cond_kwargs = {
-                "text_embeds": base_pooled,
-                "time_ids": add_time_ids
-            }
-            
-            # Noise calculation and scaling
-            height, width = images.shape[2:]
+        tag_weights: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
+        images = images.to(self.device)  # [B,4,H,W]
+        text_embeds = {k: v.to(self.device) for k,v in text_embeds.items()}
+        tag_weights = tag_weights.to(self.device)
+
+        self.optimizer.zero_grad(set_to_none=True)
+
+        batch_size = images.shape[0]
+        micro_batch_size = batch_size // self.gradient_accumulation_steps
+        total_loss = 0.0
+        total_v_pred = None
+        running_loss = 0.0
+
+        for i in range(self.gradient_accumulation_steps):
+            torch.cuda.empty_cache()
+
+            start_idx = i * micro_batch_size
+            end_idx = (i + 1) * micro_batch_size
+
+            # Extract micro-batch
+            batch_latents = images[start_idx:end_idx]  # [mB,4,H,W]
+
+            # Apply area-based noise scaling
+            height = batch_latents.shape[2]
+            width = batch_latents.shape[3]
             area = torch.tensor(height * width, device=self.device, dtype=torch.float32)
             noise_scale = torch.sqrt(area / self.base_area)
-            
+            batch_latents = batch_latents * noise_scale
+
+            batch_tag_weights = tag_weights[start_idx:end_idx].view(-1,1,1,1)  # [mB,1,1,1]
+
+            # Prepare text embeddings - clone and detach to ensure proper gradient flow
+            base_hidden = text_embeds["base_text_embeds"][start_idx:end_idx].squeeze(1).clone()  # [mB, seq_len, 768]
+            base_pooled = text_embeds["base_pooled_embeds"][start_idx:end_idx].squeeze(1).clone()  # [mB, 768]
+
+            # Project text embeddings
+            base_hidden_float32 = base_hidden.to(dtype=torch.float32)
+            batch_size, seq_len, _ = base_hidden_float32.shape
+            encoder_hidden_states = self.hidden_proj(
+                base_hidden_float32.view(-1, 768)
+            ).view(batch_size, seq_len, -1)
+
+            # Sample noise and timesteps
+            noise = torch.randn_like(batch_latents)
             timesteps = torch.randint(
                 0, self.scheduler.config.num_train_timesteps,
-                (images.shape[0],),
+                (batch_latents.size(0),), 
                 device=self.device
-            )
-            sigma = self.sigmas[timesteps] * noise_scale
-            
-            # Scaling factors
-            sigma_squared = sigma * sigma
-            sigma_data_squared = self.sigma_data * self.sigma_data
-            denominator = sigma_squared + sigma_data_squared
-            denominator_sqrt = denominator.sqrt()
-            
-            c_skip = sigma_data_squared / denominator
-            c_out = -sigma * self.sigma_data / denominator_sqrt
-            c_in = 1 / denominator_sqrt
-            
-            # Generate noise and noisy images
-            noise = torch.randn_like(
-                images, 
-                dtype=torch.float32, 
-                device=self.device,
-                memory_format=torch.channels_last
-            )
-            noisy_images = images + noise * sigma.view(-1, 1, 1, 1)
-            scaled_noisy_images = noisy_images * c_in.view(-1, 1, 1, 1)
-            
-            # Model forward pass
-            v_prediction = self.model(
-                scaled_noisy_images,
-                timesteps,
-                encoder_hidden_states=encoder_hidden_states,
-                added_cond_kwargs=added_cond_kwargs
-            ).sample
-            
-            # Final computations
-            pred_images = noisy_images * c_skip.view(-1, 1, 1, 1) + v_prediction * c_out.view(-1, 1, 1, 1)
-            loss = torch.nn.functional.mse_loss(pred_images, images, reduction='none')
-            
-            tag_weights = tag_weights.to(device=self.device, dtype=torch.float32, non_blocking=True)
-            timestep_weights = self.get_minsnr_weights(timesteps)
-            combined_weights = (
-                tag_weights.view(-1, 1, 1, 1) * 
-                timestep_weights.view(-1, 1, 1, 1)
-            )
-            loss = loss * combined_weights
-            loss = loss.mean()
-            
-            # Log detailed metrics
-            self.log_detailed_metrics(
-                loss=loss,
-                v_pred=v_prediction,
-                grad_norm=0.0,  # Will be updated after backward
-                timesteps=timesteps
-            )
-            
-            return loss, pred_images, v_prediction, timesteps  # Return additional values for logging
+            ).long()  # Ensure long dtype
 
-        except Exception as e:
-            print(f"Unexpected error in training step: {e}")
-            print(f"Initial shapes: images={images.shape}")
-            raise
+            sigmas = self.sigmas[timesteps]
 
-    def get_sigmas(self) -> torch.Tensor:
-        """Generate noise schedule with ZTSNR"""
-        ramp = torch.linspace(0, 1, self.num_timesteps)
-        min_inv_rho = self.sigma_min ** (1/self.rho)
-        max_inv_rho = self.sigma_max ** (1/self.rho)  # sigma_max = 20000 for ZTSNR
-        sigmas = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** self.rho
-        return sigmas.to(self.device)
+            # Add noise
+            noisy_latents = batch_latents + sigmas.view(-1,1,1,1)*noise
 
-    def get_snr(self, sigma: torch.Tensor) -> torch.Tensor:
-        """Calculate signal-to-noise ratio for given sigma"""
-        return (self.sigma_data / sigma) ** 2
+            # Compute v_target
+            v_target = self.scheduler.get_velocity(batch_latents, noise, timesteps)  # [mB,4,H,W]
 
-    def get_minsnr_weights(self, timesteps: torch.Tensor) -> torch.Tensor:
-        """Calculate MinSNR loss weights"""
-        alphas = self.scheduler.alphas_cumprod.to(timesteps.device)
-        alpha_t = alphas[timesteps]
-        snr = alpha_t / (1 - alpha_t)
-        min_snr = torch.tensor(self.min_snr_gamma, device=self.device)
-        weights = torch.minimum(snr, min_snr)
-        return weights.float()
+            # Generate time_ids and ensure they're cloned for gradient checkpointing
+            time_ids = self._get_add_time_ids(batch_latents).clone() # [mB,8]
+
+            # Karras scaling
+            c_skip, c_out, c_in = self.get_karras_scalings(sigmas)
+
+            # Ensure input tensors are cloned and have gradients enabled
+            scaled_input = (c_in.view(-1,1,1,1)*noisy_latents).clone().requires_grad_(True)
+            encoder_hidden_states = encoder_hidden_states.clone().requires_grad_(True)
+            timesteps = timesteps.clone()
+
+            # Forward pass with autocast
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                F_out = self.model(
+                    scaled_input,
+                    timesteps,
+                    encoder_hidden_states=encoder_hidden_states,
+                    added_cond_kwargs={
+                        "text_embeds": base_pooled.clone(),
+                        "time_ids": time_ids
+                    }
+                ).sample
+
+                # D_out = c_skip*x + c_out*F_out
+                D_out = c_skip.view(-1,1,1,1)*noisy_latents + c_out.view(-1,1,1,1)*F_out
+
+                # Compute MSE loss per-sample
+                loss_per_sample = F.mse_loss(D_out.float(), v_target.float(), reduction='none')  # [mB,4,H,W]
+                loss_per_sample = loss_per_sample.mean(dim=[1,2,3])  # [mB]
+
+                # Get SNR weights
+                snr_weights = self.get_minsnr_weights(timesteps)  # [mB]
+
+                # Apply tag weights and SNR weights
+                loss_per_sample = loss_per_sample * batch_tag_weights.squeeze() * snr_weights
+
+                # Average over micro-batch
+                loss = loss_per_sample.mean() / self.gradient_accumulation_steps
+
+            # Backward pass
+            loss.backward()
+            
+            # Convert to float for tracking
+            loss_value = loss.item()
+            total_loss += loss_value
+            running_loss += loss_value
+
+            total_v_pred = D_out.detach() if total_v_pred is None else torch.cat([total_v_pred, D_out.detach()], dim=0)
+
+        avg_loss = running_loss / self.gradient_accumulation_steps
+        return total_loss, batch_latents, total_v_pred, timesteps, avg_loss
 
     def train_epoch(
         self,
@@ -731,70 +800,51 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         num_batches = len(dataloader)
         
         for batch_idx, batch in enumerate(dataloader):
-            try:
-                # Clear cache at start of batch
-                torch.cuda.empty_cache()
-                
-                # Unpack and move batch to device
-                try:
-                    images, text_embeds, tag_weights = batch
-                    images = images.to(self.device, dtype=torch.float32)
-                    text_embeds = {k: v.to(self.device, dtype=torch.float32) 
-                                  for k, v in text_embeds.items()}
-                    tag_weights = tag_weights.to(self.device, dtype=torch.float32)
-                except RuntimeError as e:
-                    print(f"Error moving batch to device: {e}")
-                    raise
-                
-                # Training step
-                try:
-                    self.optimizer.zero_grad(set_to_none=True)
-                    
-                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                        loss, pred_images, v_pred, timesteps = self.training_step(
-                            images, text_embeds, tag_weights
-                        )
-                    
-                    # Backward pass
-                    loss.backward()
-                    
-                    # Compute gradient norm after backward
-                    grad_norm = self.compute_grad_norm()
-                    
-                    # Update metrics with actual grad norm
-                    if self.accelerator.is_main_process:
-                        wandb.log({
-                            'grad/norm': grad_norm
-                        })
-                    
-                    self.optimizer.step()
-                    
-                    current_loss = loss.item()
-                    total_loss += current_loss
-                    
-                except RuntimeError as e:
-                    print(f"Error in training step at batch {batch_idx}: {e}")
-                    print(f"Memory stats:")
-                    print(f"  Allocated: {torch.cuda.memory_allocated()/1e9:.1f}GB")
-                    print(f"  Max allocated: {torch.cuda.max_memory_allocated()/1e9:.1f}GB")
-                    print(f"  Reserved: {torch.cuda.memory_reserved()/1e9:.1f}GB")
-                    raise
-
-                # Console logging
-                if batch_idx % log_interval == 0:
-                    print(f'Epoch {epoch} [{batch_idx}/{num_batches}]:')
-                    print(f'  Loss = {current_loss:.4f}')
-                    print(f'  Grad norm = {grad_norm:.4f}')
-                    print(f'  Memory: {torch.cuda.memory_allocated()/1e9:.1f}GB')
-                    
-                self.global_step += 1
-                
-            except Exception as e:
-                print(f"Fatal error in batch {batch_idx}: {e}")
-                print(f"Current GPU memory: {torch.cuda.memory_allocated()/1e9:.1f}GB")
-                print(f"Peak GPU memory: {torch.cuda.max_memory_allocated()/1e9:.1f}GB")
-                raise
+            # Clear cache at start of batch
+            torch.cuda.empty_cache()
             
+            # Unpack and move batch to device
+            images, text_embeds, tag_weights = batch
+            images = images.to(self.device, dtype=torch.float32)
+            text_embeds = {k: v.to(self.device, dtype=torch.float32) 
+                          for k, v in text_embeds.items()}
+            tag_weights = tag_weights.to(self.device, dtype=torch.float32)
+            
+            # Training step
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                loss, pred_images, v_pred, timesteps, avg_batch_loss = self.training_step(
+                    images, text_embeds, tag_weights
+                )
+            
+            # Compute gradient norm and update optimizer
+            grad_norm = self.compute_grad_norm()
+            self.optimizer.step()
+            
+            # Update metrics
+            if self.accelerator.is_main_process:
+                wandb.log({
+                    'grad/norm': grad_norm,
+                    'loss/batch': avg_batch_loss,
+                    'loss/running_avg': total_loss / (batch_idx + 1),
+                    'epoch': self.current_epoch,
+                    'step': self.global_step,
+                })
+            
+            # Update total loss
+            total_loss += avg_batch_loss
+            
+            # Console logging
+            if batch_idx % log_interval == 0:
+                avg_loss = total_loss / (batch_idx + 1)
+                print(f'Epoch {epoch} [{batch_idx}/{num_batches}]:')
+                print(f'  Batch Loss = {avg_batch_loss:.4f}')
+                print(f'  Avg Loss = {avg_loss:.4f}')
+                print(f'  Grad norm = {grad_norm:.4f}')
+                print(f'  Memory: {torch.cuda.memory_allocated()/1e9:.1f}GB')
+            
+            self.global_step += 1
+        
+        # Return average loss for the epoch
         return total_loss / num_batches
 
     @staticmethod
@@ -934,7 +984,7 @@ def main():
             "batch_size": 32,
             "grad_accum_steps": 4,
             "effective_batch": 128,
-            "learning_rate": 4e-6,
+            "learning_rate": 4e-7,
             "num_epochs": 10,
             "model": "SDXL-base-1.0",
             "optimizer": "AdamW-BF16",
@@ -948,7 +998,8 @@ def main():
         r"/workspace/collage",
         r"/workspace/upscaled",
         r"/workspace/High-quality-photo10k",
-        r"/workspace/LAION_220k_GPT4Vision_captions"
+        r"/workspace/LAION_220k_GPT4Vision_captions",
+        r"/workspace/photo-concept-bucket/train"
     ]
     
     pretrained_model_name = "stabilityai/stable-diffusion-xl-base-1.0"
@@ -1038,7 +1089,7 @@ def main():
     print("Setting up optimizer...")
     optimizer = AdamWBF16(
         unet.parameters(),
-        lr=4e-6,  # For effective batch size of 128 (32 * 4)
+        lr=4e-7,  # For effective batch size of 128 (32 * 4)
         betas=(0.9, 0.999),
         weight_decay=1e-2,
         eps=1e-8
@@ -1069,7 +1120,7 @@ def main():
                 "train_batch_size": 32,
                 "gradient_accumulation_steps": 4,  # Updated to 4 steps
                 "effective_batch_size": 128,  # Updated effective batch size (32 * 4)
-                "learning_rate": 4e-6,  # Updated learning rate
+                "learning_rate": 4e-7,  # Updated learning rate
                 "num_epochs": 10,
             }
         )
@@ -1087,7 +1138,8 @@ def main():
         scheduler=noise_scheduler,
         device=device,
         accelerator=accelerator,
-        resume_from_checkpoint=args.resume_from_checkpoint
+        resume_from_checkpoint=args.resume_from_checkpoint,
+        gradient_accumulation_steps=4
     )
     
     # Adjust starting epoch if resuming
@@ -1190,4 +1242,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
