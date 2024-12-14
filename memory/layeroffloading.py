@@ -45,15 +45,24 @@ class LayerOffloadConductor:
             # Pre-calculate and cache parameter metadata
             total_params = 0
             param_info = []
-            
-            # Get all parameters that can be pinned
             pinnable_params = []
+            
+            # First pass: analyze parameters and memory requirements
+            memory_requirements = 0
             for p in layer.parameters():
                 if not isinstance(p, torch.Tensor) or p.numel() <= 0:
                     continue
                     
-                # Only try to pin contiguous tensors
-                if p.is_contiguous():
+                param_size = p.numel() * p.element_size()
+                memory_requirements += param_size
+                
+                # Check if parameter can be pinned
+                is_pinnable = (p.is_contiguous() and 
+                             not p.is_sparse and 
+                             not p.is_complex() and
+                             param_size >= 1024)  # Only pin parameters larger than 1KB
+                    
+                if is_pinnable:
                     pinnable_params.append(p)
                 
                 param_info.append({
@@ -62,60 +71,70 @@ class LayerOffloadConductor:
                     'dtype': p.dtype,
                     'id': id(p),
                     'requires_grad': p.requires_grad,
-                    'is_pinnable': p.is_contiguous()
+                    'is_pinnable': is_pinnable,
+                    'size': param_size
                 })
                 total_params += p.numel()
             
             if total_params > 0:
                 try:
-                    # Calculate buffer size based on pinnable parameters only
+                    # Calculate optimal buffer size
                     pinnable_size = sum(p.numel() * p.element_size() for p in pinnable_params)
-                    buffer_size = min(
-                        pinnable_size * 2,  # Double buffer
-                        self.total_gpu_memory // 8  # Limit to 1/8th of GPU memory
-                    )
-                    
-                    # Only allocate pinned memory if we have pinnable parameters
-                    if pinnable_params:
-                        try:
-                            pinned_buffer = torch.empty(
-                                buffer_size, 
-                                dtype=torch.uint8,  # Use uint8 for more efficient memory usage
-                                pin_memory=True,
-                                device='cpu'
-                            )
-                            is_pinned = True
-                        except RuntimeError:
-                            # Fallback to non-pinned memory
-                            pinned_buffer = torch.empty(
-                                buffer_size,
-                                dtype=torch.uint8,
-                                device='cpu'
-                            )
-                            is_pinned = False
-                            print(f"Warning: Failed to allocate pinned memory for {name}, falling back to regular memory")
-                    else:
-                        # Create regular buffer for non-pinnable parameters
-                        pinned_buffer = torch.empty(
-                            buffer_size,
-                            dtype=torch.uint8,
-                            device='cpu'
-                        )
+                    if pinnable_size == 0:
+                        # If no pinnable parameters, don't try to allocate pinned memory
+                        buffer_size = min(memory_requirements, self.total_gpu_memory // 16)
+                        pinned_buffer = torch.empty(buffer_size, dtype=torch.uint8, device='cpu')
                         is_pinned = False
+                    else:
+                        # Allocate pinned memory in chunks to avoid fragmentation
+                        chunk_size = min(pinnable_size, 1024 * 1024 * 32)  # 32MB chunks
+                        num_chunks = (pinnable_size + chunk_size - 1) // chunk_size
                         
+                        try:
+                            pinned_chunks = []
+                            for _ in range(num_chunks):
+                                chunk = torch.empty(
+                                    chunk_size,
+                                    dtype=torch.uint8,
+                                    pin_memory=True,
+                                    device='cpu'
+                                )
+                                pinned_chunks.append(chunk)
+                            
+                            # Concatenate chunks
+                            pinned_buffer = torch.cat(pinned_chunks)[:pinnable_size]
+                            is_pinned = True
+                            
+                        except RuntimeError as e:
+                            # If chunked allocation fails, try one more time with regular allocation
+                            try:
+                                pinned_buffer = torch.empty(
+                                    pinnable_size,
+                                    dtype=torch.uint8,
+                                    pin_memory=True,
+                                    device='cpu'
+                                )
+                                is_pinned = True
+                            except RuntimeError:
+                                # Final fallback to non-pinned memory
+                                print(f"Warning: Failed to allocate pinned memory for {name}, falling back to regular memory")
+                                pinned_buffer = torch.empty(pinnable_size, dtype=torch.uint8, device='cpu')
+                                is_pinned = False
+                
                     self.pinned_memory[name] = {
                         'cpu': pinned_buffer,
-                        'size': buffer_size,
+                        'size': pinned_buffer.numel(),
                         'total_params': total_params,
                         'param_info': param_info,
                         'pinned': is_pinned,
-                        'pinnable_params': [id(p) for p in pinnable_params]
+                        'pinnable_params': [id(p) for p in pinnable_params],
+                        'chunks': pinned_chunks if is_pinned and 'pinned_chunks' in locals() else None
                     }
                     
-                except RuntimeError as e:
+                except Exception as e:
                     print(f"Warning: Failed to allocate memory for {name}: {e}")
-                    # Fallback with minimal allocation
-                    buffer_size = min(total_params * 4, self.total_gpu_memory // 16)
+                    # Minimal fallback allocation
+                    buffer_size = min(total_params * 4, self.total_gpu_memory // 32)
                     self.pinned_memory[name] = {
                         'cpu': torch.empty(buffer_size, dtype=torch.uint8, device='cpu'),
                         'size': buffer_size,
