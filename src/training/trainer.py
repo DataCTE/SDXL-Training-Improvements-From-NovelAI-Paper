@@ -9,6 +9,7 @@ from typing import Dict, Tuple, Optional
 from torch.utils.data import DataLoader
 from ..data.dataset import NovelAIDataset
 from ..data.sampler import AspectBatchSampler
+import tqdm
 
 class NovelAIDiffusionV3Trainer(torch.nn.Module):
     def __init__(
