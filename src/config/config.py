@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Tuple, Optional
 import yaml
 
@@ -70,13 +70,13 @@ class PathsConfig:
 
 @dataclass
 class Config:
-    model: ModelConfig = ModelConfig()
-    training: TrainingConfig = TrainingConfig()
     data: DataConfig
-    tag_weighting: TagWeightingConfig = TagWeightingConfig()
-    scoring: ScoringConfig = ScoringConfig()
-    system: SystemConfig = SystemConfig()
-    paths: PathsConfig = PathsConfig()
+    model: ModelConfig = field(default_factory=ModelConfig)
+    training: TrainingConfig = field(default_factory=TrainingConfig)
+    tag_weighting: TagWeightingConfig = field(default_factory=TagWeightingConfig)
+    scoring: ScoringConfig = field(default_factory=ScoringConfig)
+    system: SystemConfig = field(default_factory=SystemConfig)
+    paths: PathsConfig = field(default_factory=PathsConfig)
     
     @classmethod
     def from_yaml(cls, path: str) -> 'Config':
