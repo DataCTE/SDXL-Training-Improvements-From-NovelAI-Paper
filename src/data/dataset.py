@@ -56,6 +56,7 @@ class NovelAIDataset(Dataset):
             torch.cuda.empty_cache()
 
     def _process_and_cache_data(self, image_dirs, max_image_size, max_dim, bucket_step, min_bucket_size):
+        """Process and cache dataset with distributed awareness"""
         bucket_manager = AspectRatioBucket(
             max_image_size=max_image_size,
             max_dim=max_dim,
@@ -66,17 +67,37 @@ class NovelAIDataset(Dataset):
         total_found = 0
         total_processed = 0
         
+        # Get rank and world size for distributed processing
+        if torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+            world_size = torch.distributed.get_world_size()
+        else:
+            rank = 0
+            world_size = 1
+            
         for image_dir in image_dirs:
-            print(f"\nProcessing directory: {image_dir}")
+            if rank == 0:
+                print(f"\nProcessing directory: {image_dir}")
+                
             image_files = []
             for ext in ['*.jpg', '*.jpeg', '*.png', '*.webp']:
                 image_files.extend(glob.glob(os.path.join(image_dir, '**', ext), recursive=True))
             
-            dir_found = len(image_files)
-            total_found += dir_found
-            print(f"Found {dir_found} images")
+            # Sort for deterministic ordering across processes
+            image_files.sort()
             
-            for img_path in tqdm(image_files, desc="Processing images"):
+            # Distribute files across processes
+            per_rank = len(image_files) // world_size
+            start_idx = rank * per_rank
+            end_idx = start_idx + per_rank if rank < world_size - 1 else len(image_files)
+            rank_files = image_files[start_idx:end_idx]
+            
+            dir_found = len(rank_files)
+            total_found += dir_found
+            if rank == 0:
+                print(f"Found {len(image_files)} total images, processing {dir_found} on rank {rank}")
+            
+            for img_path in tqdm(rank_files, desc=f"Processing images (rank {rank})", disable=rank != 0):
                 txt_path = str(Path(img_path).with_suffix('.txt'))
                 if not os.path.exists(txt_path):
                     continue
@@ -110,12 +131,29 @@ class NovelAIDataset(Dataset):
                             
                             self.items.append((img_path, best_bucket, img_cache_path, text_cache_path))
                             total_processed += 1
-                            
+                
                 except Exception as e:
-                    print(f"Error processing {img_path}: {e}")
+                    if rank == 0:
+                        print(f"Error processing {img_path}: {e}")
         
-        print(f"\nTotal images found: {total_found}")
-        print(f"Total images processed: {total_processed}")
+        # Gather statistics across processes
+        if world_size > 1:
+            total_found = torch.tensor(total_found, device=self.device)
+            total_processed = torch.tensor(total_processed, device=self.device)
+            
+            torch.distributed.all_reduce(total_found, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(total_processed, op=torch.distributed.ReduceOp.SUM)
+            
+            total_found = total_found.item()
+            total_processed = total_processed.item()
+        
+        if rank == 0:
+            print(f"\nTotal images found across all processes: {total_found}")
+            print(f"Total images processed across all processes: {total_processed}")
+            
+        # Sync processes before returning
+        if world_size > 1:
+            torch.distributed.barrier()
 
     def _process_image(self, image_path: str, bucket: ImageBucket) -> torch.Tensor:
         with Image.open(image_path) as img:

@@ -5,6 +5,8 @@ import wandb
 import signal
 import sys
 from accelerate import Accelerator
+from accelerate.utils import DistributedType
+from accelerate.utils.dataclasses import FullyShardedDataParallelPlugin
 from diffusers import (
     StableDiffusionXLPipeline,
     UNet2DConditionModel, 
@@ -17,6 +19,7 @@ from typing import Optional
 from pathlib import Path
 import traceback
 import logging
+from training.vae_trainer import VAETrainer
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -29,12 +32,87 @@ from utils.transforms import get_transform
 from adamw_bf16 import AdamWBF16
 from src.config.config import Config
 
+def setup_accelerator(config: Config) -> Accelerator:
+    """Setup accelerator with proper configuration"""
+    # Create FSDP plugin if enabled
+    if config.system.use_fsdp:
+        fsdp_plugin = FullyShardedDataParallelPlugin(
+            sharding_strategy="FULL_SHARD" if config.system.full_shard else "SHARD_GRAD_OP",
+            min_num_params=config.system.min_num_params_per_shard,
+            cpu_offload=config.system.cpu_offload,
+            forward_prefetch=config.system.forward_prefetch,
+            backward_prefetch=config.system.backward_prefetch,
+            limit_all_gathers=config.system.limit_all_gathers,
+            state_dict_type="FULL_STATE_DICT",
+            use_orig_params=True,
+            sync_module_states=True,
+        )
+    else:
+        fsdp_plugin = None
 
-def setup_distributed():
-    """Initialize distributed training"""
-    if dist.is_available() and dist.is_initialized():
-        return dist.get_world_size(), dist.get_rank()
-    return 1, 0
+    # Create accelerator without sync_batch_norm parameter
+    accelerator = Accelerator(
+        gradient_accumulation_steps=config.training.gradient_accumulation_steps,
+        mixed_precision=config.system.mixed_precision,
+        log_with="wandb",
+        project_dir=config.paths.logs_dir,
+        device_placement=True,
+        fsdp_plugin=fsdp_plugin
+    )
+
+    # Handle batch norm synchronization separately if needed
+    if config.system.use_fsdp and config.system.sync_batch_norm:
+        import torch.nn as nn
+        def convert_sync_batchnorm(module):
+            module_output = module
+            if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+                module_output = nn.SyncBatchNorm.convert_sync_batchnorm(module)
+            for name, child in module.named_children():
+                module_output.add_module(name, convert_sync_batchnorm(child))
+            return module_output
+        
+        # This will be applied to models before training
+        accelerator.sync_batchnorm = convert_sync_batchnorm
+
+    return accelerator
+
+def setup_distributed(config: Config):
+    """Initialize distributed training environment"""
+    if not torch.cuda.is_available():
+        return 1, 0
+
+    if torch.distributed.is_initialized():
+        return torch.distributed.get_world_size(), torch.distributed.get_rank()
+
+    # Get world size from environment
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    rank = int(os.environ.get("RANK", 0))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+    if world_size <= 1:
+        return 1, 0
+
+    # Initialize process group
+    torch.distributed.init_process_group(
+        backend=config.system.backend,
+        init_method="env://",
+        world_size=world_size,
+        rank=rank
+    )
+
+    # Set device
+    torch.cuda.set_device(local_rank)
+
+    # Optimize CUDA operations
+    if config.system.cudnn_benchmark:
+        torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    # Sync processes
+    torch.distributed.barrier()
+
+    return world_size, rank
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train SDXL with optimizations')
@@ -54,6 +132,16 @@ def parse_args():
         type=str,
         help='Path to UNet safetensors file to start from'
     )
+    parser.add_argument(
+        '--train_vae',
+        action='store_true',
+        help='Enable VAE training mode'
+    )
+    parser.add_argument(
+        '--vae_path',
+        type=str,
+        help='Path to VAE safetensors file to start from'
+    )
     return parser.parse_args()
 
 def setup_model(
@@ -65,13 +153,23 @@ def setup_model(
     pretrained_model_name = config.model.pretrained_model_name
     
     print("Loading VAE...")
-    vae = AutoencoderKL.from_pretrained(
-        pretrained_model_name,
-        subfolder="vae",
-        torch_dtype=torch.bfloat16
-    ).to(device)
-    vae.eval()
-    vae.requires_grad_(False)
+    if args.train_vae and args.vae_path:
+        print(f"Loading VAE from: {args.vae_path}")
+        vae = AutoencoderKL.from_pretrained(
+            args.vae_path,
+            torch_dtype=torch.bfloat16,
+            use_safetensors=True
+        ).to(device)
+    else:
+        vae = AutoencoderKL.from_pretrained(
+            pretrained_model_name,
+            subfolder="vae",
+            torch_dtype=torch.bfloat16
+        ).to(device)
+        
+    if not args.train_vae:
+        vae.eval()
+        vae.requires_grad_(False)
     
     print("Loading UNet...")
     if args.resume_from_checkpoint:
@@ -119,24 +217,19 @@ def main():
     config = Config.from_yaml(args.config)
     
     # Create directories from config
-    os.makedirs(config.paths.checkpoints_dir, exist_ok=True)
-    os.makedirs(config.paths.logs_dir, exist_ok=True)
-    os.makedirs(config.paths.output_dir, exist_ok=True)
-    os.makedirs(config.data.cache_dir, exist_ok=True)
-    os.makedirs(config.data.text_cache_dir, exist_ok=True)
+    if dist.is_initialized() and dist.get_rank() == 0:
+        os.makedirs(config.paths.checkpoints_dir, exist_ok=True)
+        os.makedirs(config.paths.logs_dir, exist_ok=True)
+        os.makedirs(config.paths.output_dir, exist_ok=True)
+        os.makedirs(config.data.cache_dir, exist_ok=True)
+        os.makedirs(config.data.text_cache_dir, exist_ok=True)
     
     # Setup distributed training
-    world_size, rank = setup_distributed()
+    world_size, rank = setup_distributed(config)
     is_main_process = rank == 0
     
-    # Setup accelerator with config
-    accelerator = Accelerator(
-        gradient_accumulation_steps=config.training.gradient_accumulation_steps,
-        mixed_precision=config.training.mixed_precision,
-        log_with="tensorboard",
-        project_dir="logs",
-        device_placement=True,
-    )
+    # Setup accelerator
+    accelerator = setup_accelerator(config)
     
     device = accelerator.device
     
@@ -150,27 +243,75 @@ def main():
                 "effective_batch": config.training.batch_size * config.training.gradient_accumulation_steps * world_size,
                 "learning_rate": config.training.learning_rate,
                 "num_epochs": config.training.num_epochs,
+                "world_size": world_size,
+                "rank": rank,
+                "backend": config.system.backend
             }
         )
     
     # Setup models with config
     unet, vae = setup_model(args, device, config)
     
-    # Setup optimizer
-    optimizer = AdamWBF16(
-        unet.parameters(),
-        lr=config.training.learning_rate,
-        betas=config.training.optimizer_betas,
-        weight_decay=config.training.weight_decay,
-        eps=config.training.optimizer_eps
-    )
+    if config.system.use_fsdp and config.system.sync_batch_norm:
+        unet = accelerator.sync_batchnorm(unet)
+        if args.train_vae:
+            vae = accelerator.sync_batchnorm(vae)
     
-    # Setup noise scheduler
-    noise_scheduler = DDPMScheduler.from_pretrained(
-        "stabilityai/stable-diffusion-xl-base-1.0",
-        subfolder="scheduler",
-        torch_dtype=torch.bfloat16
-    )
+    if args.train_vae:
+        # Setup VAE trainer
+        trainer = VAETrainer(
+            config=config,
+            accelerator=accelerator,
+            resume_from_checkpoint=args.resume_from_checkpoint
+        )
+    else:
+        # Setup UNet optimizer with distributed wrapper if needed
+        optimizer = AdamWBF16(
+            unet.parameters(),
+            lr=config.training.learning_rate,
+            betas=config.training.optimizer_betas,
+            weight_decay=config.training.weight_decay,
+            eps=config.training.optimizer_eps
+        )
+        
+        # Setup noise scheduler
+        noise_scheduler = DDPMScheduler.from_pretrained(
+            "stabilityai/stable-diffusion-xl-base-1.0",
+            subfolder="scheduler",
+            torch_dtype=torch.bfloat16
+        )
+        
+
+        # Inside the main function, before initializing the trainer
+        precomputed_proj_matrix = torch.randn(
+            config.model.cross_attention_dim, 
+            768, 
+            dtype=torch.bfloat16,
+            device=device
+        )
+
+        # If using distributed training, broadcast the projection matrix to all ranks
+        if dist.is_initialized():
+            if dist.get_rank() == 0:
+                tensor = precomputed_proj_matrix
+            else:
+                tensor = torch.empty_like(precomputed_proj_matrix, device=device)
+            dist.broadcast(tensor, src=0)
+            precomputed_proj_matrix = tensor
+
+
+
+        trainer = NovelAIDiffusionV3Trainer(
+            model=unet,
+            vae=vae,
+            optimizer=optimizer,
+            scheduler=noise_scheduler,
+            device=device,
+            config=config,
+            accelerator=accelerator,
+            resume_from_checkpoint=args.resume_from_checkpoint,
+            precomputed_proj_matrix=precomputed_proj_matrix
+        )
     
     # Validate image directories before dataset creation
     if not config.data.image_dirs:
@@ -207,8 +348,9 @@ def main():
     # Update config with validated directories
     config.data.image_dirs = valid_dirs
     
-    logger.info(f"Found {total_images} valid images across {len(valid_dirs)} directories")
-    
+    if is_main_process:
+        logger.info(f"Found {total_images} valid images across {len(valid_dirs)} directories")
+
     # Setup dataset using validated directories
     dataset = NovelAIDataset(
         image_dirs=valid_dirs,
@@ -220,24 +362,12 @@ def main():
         config=config
     )
     
-    # Create trainer with config
-    trainer = NovelAIDiffusionV3Trainer(
-        model=unet,
-        vae=vae,
-        optimizer=optimizer,
-        scheduler=noise_scheduler,
-        device=device,
-        config=config,
-        accelerator=accelerator,
-        resume_from_checkpoint=args.resume_from_checkpoint
-    )
-    
     # Prepare for distributed training
     trainer, optimizer, dataset = accelerator.prepare(
         trainer, optimizer, dataset
     )
     
-    # Create dataloader
+    # Create dataloader with distributed sampler
     train_dataloader = trainer.create_dataloader(
         dataset=dataset,
         batch_size=config.training.batch_size,
@@ -251,31 +381,42 @@ def main():
     save_dir = config.paths.checkpoints_dir
     
     try:
-        logger.info(f"Starting training from epoch {start_epoch + 1}")
+        if is_main_process:
+            logger.info(f"Starting {'VAE' if args.train_vae else 'UNet'} training from epoch {start_epoch + 1}")
         
         for epoch in range(start_epoch, config.training.num_epochs + 1):
-            logger.info(f"\nStarting epoch {epoch}")
+            if is_main_process:
+                logger.info(f"\nStarting epoch {epoch}")
+            
+            # Set epoch for distributed sampler
+            if hasattr(train_dataloader.sampler, "set_epoch"):
+                train_dataloader.sampler.set_epoch(epoch)
             
             epoch_loss = trainer.train_epoch(
                 epoch=epoch,
                 train_dataloader=train_dataloader
             )
             
-            logger.info(f"Epoch {epoch} completed. Average loss: {epoch_loss:.4f}")
-            
             if is_main_process:
+                logger.info(f"Epoch {epoch} completed. Average loss: {epoch_loss:.4f}")
+                
                 # Save checkpoint
                 trainer.save_checkpoint(save_dir, epoch)
                 
-                # Log metrics
+                # Log metrics with appropriate prefix
+                prefix = "vae_" if args.train_vae else "unet_"
                 wandb.log({
-                    "epoch": epoch,
-                    "loss": epoch_loss,
+                    f"{prefix}epoch": epoch,
+                    f"{prefix}loss": epoch_loss,
                 }, step=trainer.global_step)
             
+            # Sync processes after each epoch
+            if world_size > 1:
+                torch.distributed.barrier()
+            
     except KeyboardInterrupt:
-        logger.info("\nTraining interrupted. Saving final checkpoint...")
         if is_main_process:
+            logger.info("\nTraining interrupted. Saving final checkpoint...")
             trainer.save_checkpoint(save_dir, epoch)
             
     except Exception as e:
@@ -288,7 +429,13 @@ def main():
         if is_main_process:
             wandb.finish()
         accelerator.end_training()
-        logger.info("Training completed!")
+        
+        # Cleanup distributed
+        if world_size > 1:
+            torch.distributed.destroy_process_group()
+            
+        if is_main_process:
+            logger.info("Training completed!")
 
 if __name__ == "__main__":
     main() 

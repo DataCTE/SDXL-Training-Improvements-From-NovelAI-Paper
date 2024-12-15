@@ -57,6 +57,14 @@ def create_training_ui():
         resume_checkpoint: str = None,
         unet_path: str = None,
         enable_wandb: bool = True,
+        # Distributed training options
+        distributed_training: bool = True,
+        backend: str = "nccl",
+        use_fsdp: bool = True,
+        cpu_offload: bool = False,
+        full_shard: bool = True,
+        sync_batch_norm: bool = True,
+        min_num_params_per_shard: int = int(1e6),
     ):
         # Create experiment name
         experiment_name = f"sdxl-train-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -96,6 +104,27 @@ def create_training_ui():
                 "wandb_entity": wandb_entity,
                 "wandb_tags": [tag.strip() for tag in wandb_tags.split(",") if tag.strip()],
                 "experiment_name": experiment_name
+            },
+            "system": {
+                "enable_xformers": True,
+                "channels_last": True,
+                "gradient_checkpointing": True,
+                "cudnn_benchmark": True,
+                "disable_debug_apis": True,
+                "mixed_precision": mixed_precision,
+                "gradient_accumulation_steps": gradient_accumulation_steps,
+                # Distributed training settings
+                "distributed_training": distributed_training,
+                "backend": backend,
+                "use_fsdp": use_fsdp,
+                "cpu_offload": cpu_offload,
+                "full_shard": full_shard,
+                "sync_batch_norm": sync_batch_norm,
+                "min_num_params_per_shard": min_num_params_per_shard,
+                "forward_prefetch": True,
+                "backward_prefetch": True,
+                "limit_all_gathers": True,
+                "find_unused_parameters": False
             }
         }
 
@@ -138,108 +167,99 @@ def create_training_ui():
     with gr.Blocks(title="SDXL Training Interface") as interface:
         gr.Markdown("# SDXL Training Interface")
         
-        with gr.Tab("Basic Settings"):
-            pretrained_model = gr.Textbox(
-                label="Pretrained Model Name",
-                value="stabilityai/stable-diffusion-xl-base-1.0",
-                info="Name or path of the pretrained model to fine-tune"
-            )
-            
-            image_dirs = gr.Textbox(
-                label="Image Directories",
-                info="Comma-separated list of image directory paths",
-                placeholder="/path/to/images1,/path/to/images2"
-            )
-            
-            batch_size = gr.Slider(
-                minimum=1,
-                maximum=32,
-                value=1,
-                step=1,
-                label="Batch Size"
-            )
-            
-            learning_rate = gr.Number(
-                value=1e-5,
-                label="Learning Rate"
-            )
-            
-            num_epochs = gr.Slider(
-                minimum=1,
-                maximum=100,
-                value=10,
-                step=1,
-                label="Number of Epochs"
-            )
-
-        with gr.Tab("Advanced Settings"):
-            gradient_accumulation = gr.Slider(
-                minimum=1,
-                maximum=64,
-                value=4,
-                step=1,
-                label="Gradient Accumulation Steps"
-            )
-            
-            mixed_precision = gr.Dropdown(
-                choices=["no", "fp16", "bf16"],
-                value="bf16",
-                label="Mixed Precision"
-            )
-            
-            num_workers = gr.Slider(
-                minimum=0,
-                maximum=16,
-                value=4,
-                step=1,
-                label="Number of Workers"
-            )
-
+        with gr.Tab("Training Configuration"):
             with gr.Row():
-                log_interval = gr.Number(
-                    value=10,
-                    label="Log Interval (steps)",
-                    info="How often to log training metrics"
+                pretrained_model = gr.Textbox(
+                    label="Pretrained Model Name",
+                    value="stabilityai/stable-diffusion-xl-base-1.0"
                 )
-                save_interval = gr.Number(
-                    value=500,
-                    label="Save Interval (steps)",
-                    info="How often to save checkpoints"
+                image_dirs = gr.Textbox(
+                    label="Image Directories (comma-separated)",
+                    placeholder="/path/to/images1,/path/to/images2"
                 )
-
-        with gr.Tab("Logging Settings"):
+            
             with gr.Row():
-                enable_wandb = gr.Checkbox(
-                    label="Enable WandB Logging",
-                    value=True,
-                    info="Enable logging to Weights & Biases"
+                batch_size = gr.Number(label="Batch Size", value=1)
+                learning_rate = gr.Number(label="Learning Rate", value=1e-5)
+                num_epochs = gr.Number(label="Number of Epochs", value=100)
+                
+            with gr.Row():
+                gradient_accumulation = gr.Number(
+                    label="Gradient Accumulation Steps",
+                    value=4
                 )
-                wandb_project = gr.Textbox(
-                    label="WandB Project",
-                    value="sdxl-finetune",
-                    info="WandB project name"
+                mixed_precision = gr.Dropdown(
+                    label="Mixed Precision",
+                    choices=["no", "fp16", "bf16"],
+                    value="bf16"
                 )
-                wandb_entity = gr.Textbox(
-                    label="WandB Entity",
-                    info="WandB username or team name"
+                num_workers = gr.Number(label="Number of Workers", value=4)
+                
+            with gr.Row():
+                log_interval = gr.Number(label="Log Interval", value=10)
+                save_interval = gr.Number(label="Save Interval", value=1000)
+                
+            with gr.Row():
+                resume_checkpoint = gr.Textbox(
+                    label="Resume from Checkpoint (optional)",
+                    placeholder="/path/to/checkpoint"
                 )
-            
-            wandb_tags = gr.Textbox(
-                label="WandB Tags",
-                info="Comma-separated list of tags",
-                placeholder="tag1, tag2, tag3"
-            )
-
-        with gr.Tab("Checkpointing"):
-            resume_checkpoint = gr.Textbox(
-                label="Resume from Checkpoint",
-                info="Path to checkpoint directory to resume from (optional)"
-            )
-            
-            unet_path = gr.Textbox(
-                label="UNet Path",
-                info="Path to UNet safetensors file to start from (optional)"
-            )
+                unet_path = gr.Textbox(
+                    label="UNet Path (optional)",
+                    placeholder="/path/to/unet.safetensors"
+                )
+                
+            with gr.Row():
+                wandb_project = gr.Textbox(label="W&B Project", value="sdxl-finetune")
+                wandb_entity = gr.Textbox(label="W&B Entity")
+                wandb_tags = gr.Textbox(
+                    label="W&B Tags (comma-separated)",
+                    placeholder="tag1,tag2,tag3"
+                )
+                enable_wandb = gr.Checkbox(label="Enable W&B Logging", value=True)
+                
+            # Add distributed training options
+            with gr.Tab("Distributed Training"):
+                with gr.Row():
+                    distributed_training = gr.Checkbox(
+                        label="Enable Distributed Training",
+                        value=True
+                    )
+                    backend = gr.Dropdown(
+                        label="Backend",
+                        choices=["nccl", "gloo"],
+                        value="nccl"
+                    )
+                    
+                with gr.Row():
+                    use_fsdp = gr.Checkbox(
+                        label="Use FSDP",
+                        value=True,
+                        info="Use Fully Sharded Data Parallel instead of DDP"
+                    )
+                    cpu_offload = gr.Checkbox(
+                        label="CPU Offload",
+                        value=False,
+                        info="Offload parameters to CPU to save GPU memory"
+                    )
+                    
+                with gr.Row():
+                    full_shard = gr.Checkbox(
+                        label="Full Sharding",
+                        value=True,
+                        info="Use full parameter sharding strategy"
+                    )
+                    sync_batch_norm = gr.Checkbox(
+                        label="Sync BatchNorm",
+                        value=True,
+                        info="Synchronize BatchNorm across devices"
+                    )
+                    
+                min_num_params = gr.Number(
+                    label="Min Params per Shard",
+                    value=1e6,
+                    info="Minimum number of parameters per GPU for FSDP"
+                )
 
         with gr.Tab("Training Metrics"):
             with gr.Row():
@@ -272,7 +292,15 @@ def create_training_ui():
                 save_interval,
                 resume_checkpoint,
                 unet_path,
-                enable_wandb
+                enable_wandb,
+                # Add distributed training inputs
+                distributed_training,
+                backend,
+                use_fsdp,
+                cpu_offload,
+                full_shard,
+                sync_batch_norm,
+                min_num_params
             ],
             outputs=[output, loss_plot, lr_plot]
         )

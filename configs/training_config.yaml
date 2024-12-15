@@ -9,12 +9,25 @@ model:
   num_timesteps: 1000
   min_snr_gamma: 0.1
   pretrained_model_name: "stabilityai/stable-diffusion-xl-base-1.0"
+  vae:
+    latent_channels: 16
+    kl_divergence_weight: 0.1
+    lpips_weight: 1.0
+    discriminator_weight: 0.1
+    use_attention: false
+    zero_init_last: true
+    pretrained_vae_name: "AuraDiffusion/16ch-vae"
 
 # Training configuration
 training:
   batch_size: 32
   gradient_accumulation_steps: 4
   learning_rate: 4.0e-7
+  vae_learning_rate: 4.5e-5
+  vae_warmup_steps: 1000
+  vae_min_lr: 1e-6
+  use_discriminator: true
+  discriminator_learning_rate: 4.5e-5
   num_epochs: 10
   save_steps: 1000
   log_steps: 10
@@ -30,7 +43,7 @@ data:
   # image_dirs: 
   #   - "/path/to/dataset1"
   #   - "/path/to/dataset2"
-  image_dirs: []  # Add your image directories here
+  image_dirs: ["path/to/images"]
   image_size: [1024, 1024]
   num_workers: 8
   pin_memory: true
@@ -38,6 +51,9 @@ data:
   shuffle: true
   cache_dir: "latent_cache"
   text_cache_dir: "text_cache"
+  vae_batch_size: 32
+  vae_image_size: [256, 256]
+  vae_validation_split: 0.1
 
 # Tag weighting configuration
 tag_weighting:
@@ -62,9 +78,24 @@ system:
   disable_debug_apis: true
   compile_model: true
   num_gpu_workers: null
+  distributed_training: true
+  backend: "nccl"
+  use_fsdp: true
+  cpu_offload: false
+  full_shard: true
+  mixed_precision: "bf16"
+  gradient_accumulation_steps: 4
+  sync_batch_norm: true
+  min_num_params_per_shard: 1000000  # 1M parameters per shard
+  forward_prefetch: true
+  backward_prefetch: true
+  limit_all_gathers: true
+  find_unused_parameters: false
 
 # Paths configuration
 paths:
   checkpoints_dir: "checkpoints"
   logs_dir: "logs"
   output_dir: "outputs"
+  vae_checkpoints_dir: "vae_checkpoints"
+  vae_samples_dir: "vae_samples"

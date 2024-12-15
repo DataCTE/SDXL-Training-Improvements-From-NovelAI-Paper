@@ -2,6 +2,25 @@ from dataclasses import dataclass, field
 from typing import List, Tuple, Optional
 import yaml
 
+
+
+
+@dataclass
+class VAEModelConfig:
+    latent_channels: int = 16
+    kl_divergence_weight: float = 0.1
+    lpips_weight: float = 1.0
+    discriminator_weight: float = 0.1
+    use_attention: bool = False
+    zero_init_last: bool = True
+    pretrained_vae_name: str = "AuraDiffusion/16ch-vae"
+    in_channels: int = 3
+    out_channels: int = 3
+    down_block_types: Tuple[str, ...] = ("DownEncoderBlock2D",)
+    up_block_types: Tuple[str, ...] = ("UpDecoderBlock2D",)
+    block_out_channels: Tuple[int, ...] = (64, 128, 256, 512)
+    layers_per_block: int = 2
+
 @dataclass
 class ModelConfig:
     hidden_size: int = 768
@@ -13,6 +32,7 @@ class ModelConfig:
     num_timesteps: int = 1000
     min_snr_gamma: float = 0.1
     pretrained_model_name: str = "stabilityai/stable-diffusion-xl-base-1.0"
+    vae: VAEModelConfig = field(default_factory=VAEModelConfig)
 
 @dataclass
 class TrainingConfig:
@@ -26,6 +46,11 @@ class TrainingConfig:
     weight_decay: float = 1.0e-2
     optimizer_eps: float = 1.0e-8
     optimizer_betas: Tuple[float, float] = (0.9, 0.999)
+    vae_learning_rate: float = 4.5e-5
+    vae_warmup_steps: int = 1000
+    vae_min_lr: float = 1e-6
+    use_discriminator: bool = True
+    discriminator_learning_rate: float = 4.5e-5
 
 @dataclass
 class DataConfig:
@@ -37,6 +62,9 @@ class DataConfig:
     shuffle: bool = True
     cache_dir: str = "latent_cache"
     text_cache_dir: str = "text_cache"
+    vae_batch_size: int = 32
+    vae_image_size: Tuple[int, int] = (256, 256)
+    vae_validation_split: float = 0.1
 
 @dataclass
 class TagWeightingConfig:
@@ -61,12 +89,29 @@ class SystemConfig:
     disable_debug_apis: bool = True
     compile_model: bool = True
     num_gpu_workers: Optional[int] = None
+    
+    # Distributed training settings
+    distributed_training: bool = True
+    backend: str = "nccl"  # or "gloo" for CPU
+    use_fsdp: bool = True  # Use FSDP instead of DDP
+    cpu_offload: bool = False  # Offload parameters to CPU
+    full_shard: bool = True  # Use full sharding strategy
+    mixed_precision: str = "bf16"  # Mixed precision type
+    gradient_accumulation_steps: int = 4
+    find_unused_parameters: bool = False
+    sync_batch_norm: bool = True
+    min_num_params_per_shard: int = 1e6  # Min params per GPU for FSDP
+    forward_prefetch: bool = True  # Prefetch next forward pass
+    backward_prefetch: bool = True  # Prefetch next backward pass
+    limit_all_gathers: bool = True  # Limit memory usage during all-gathers
 
 @dataclass
 class PathsConfig:
     checkpoints_dir: str = "checkpoints"
     logs_dir: str = "logs"
     output_dir: str = "outputs"
+    vae_checkpoints_dir: str = "vae_checkpoints"
+    vae_samples_dir: str = "vae_samples"
 
 @dataclass
 class Config:
@@ -82,6 +127,10 @@ class Config:
     def from_yaml(cls, path: str) -> 'Config':
         with open(path, 'r') as f:
             config_dict = yaml.safe_load(f)
+            
+        if 'model' in config_dict and 'vae' in config_dict['model']:
+            config_dict['model']['vae'] = VAEModelConfig(**config_dict['model']['vae'])
+            
         return cls(
             model=ModelConfig(**config_dict['model']),
             training=TrainingConfig(**config_dict['training']),
@@ -90,4 +139,9 @@ class Config:
             scoring=ScoringConfig(**config_dict['scoring']),
             system=SystemConfig(**config_dict['system']),
             paths=PathsConfig(**config_dict['paths'])
-        ) 
+        )
+
+    def get_vae_config(self) -> VAEModelConfig:
+        """Helper method to easily access VAE config"""
+        return self.model.vae
+    
