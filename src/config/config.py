@@ -34,6 +34,8 @@ class DataConfig:
     pin_memory: bool
     persistent_workers: bool
     shuffle: bool
+    min_tag_weight: float = 0.5
+    max_tag_weight: float = 2.0
     image_dirs: List[str]
     cache_dir: str
     text_cache_dir: str

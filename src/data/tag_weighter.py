@@ -25,12 +25,23 @@ class TagWeightingConfig:
     smoothing_factor: float
 
 class TagWeighter:
-    def __init__(self, config: TagWeightingConfig):
+    def __init__(self, config):
+        """Initialize TagWeighter with config
+        
+        Args:
+            config: Raw config object containing tag_weighting section
+        """
+        # Store raw config
         self.config = config
-        self.min_weight = config.min_weight
-        self.max_weight = config.max_weight
-        self.default_weight = config.default_weight
-        self.smoothing_factor = config.smoothing_factor
+        
+        # Initialize weighting parameters from tag_weighting section
+        tag_config = config.tag_weighting if hasattr(config, 'tag_weighting') else {}
+        self.min_weight = getattr(tag_config, 'min_weight', 0.1)
+        self.max_weight = getattr(tag_config, 'max_weight', 2.0)
+        self.default_weight = getattr(tag_config, 'default_weight', 1.0)
+        self.smoothing_factor = getattr(tag_config, 'smoothing_factor', 0.1)
+        self.enabled = getattr(tag_config, 'enabled', True)
+        self.update_frequency = getattr(tag_config, 'update_frequency', 1000)
         
         # Initialize tag tracking
         self.tag_counts = {}
@@ -43,7 +54,7 @@ class TagWeighter:
 
     def update_frequencies(self, tags: List[str]):
         """Update tag frequency counters"""
-        if not self.config.enabled:
+        if not self.enabled:
             return
             
         for tag in tags:
@@ -55,13 +66,13 @@ class TagWeighter:
         self.steps_since_update += 1
         
         # Check if we should recompute weights
-        if self.steps_since_update >= self.config.update_frequency:
+        if self.steps_since_update >= self.update_frequency:
             self.compute_weights()
             self.steps_since_update = 0
             
     def compute_weights(self):
         """Compute weights for all seen tags with smoothing"""
-        if not self.total_count or not self.config.enabled:
+        if not self.total_count or not self.enabled:
             return
             
         # Calculate average frequency
@@ -87,7 +98,7 @@ class TagWeighter:
                 
     def get_weight(self, tags: List[str]) -> float:
         """Get combined weight for a set of tags"""
-        if not self.config.enabled or not tags:
+        if not self.enabled or not tags:
             return self.default_weight
             
         weights = [self.tag_weights.get(tag, self.default_weight) for tag in tags]
@@ -95,7 +106,7 @@ class TagWeighter:
 
     def save_weights(self, path: str):
         """Save current tag weights to file"""
-        if not self.config.enabled:
+        if not self.enabled:
             return
             
         torch.save({
@@ -106,7 +117,7 @@ class TagWeighter:
         
     def load_weights(self, path: str):
         """Load tag weights from file"""
-        if not self.config.enabled:
+        if not self.enabled:
             return
             
         state = torch.load(path)

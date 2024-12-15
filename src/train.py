@@ -173,7 +173,8 @@ def main():
         device=device,
         vae=vae,
         cache_dir=config.data.cache_dir,
-        text_cache_dir=config.data.text_cache_dir
+        text_cache_dir=config.data.text_cache_dir,
+        config=config
     )
     
     # Create trainer with config

@@ -25,12 +25,13 @@ class NovelAIDataset(Dataset):
         min_bucket_size: int = 1,
         cache_dir: str = "latent_cache",
         text_cache_dir: str = "text_cache",
-        vae: Optional[AutoencoderKL] = None
+        vae: Optional[AutoencoderKL] = None,
+        config = None
     ):
         self.transform = transform
         self.device = device
         self.text_embedder = TextEmbedder(device=device)
-        self.tag_weighter = TagWeighter()
+        self.tag_weighter = TagWeighter(config)
         self.vae = vae
         
         # Setup cache directories

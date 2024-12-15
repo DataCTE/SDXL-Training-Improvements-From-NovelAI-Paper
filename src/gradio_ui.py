@@ -1,0 +1,284 @@
+import gradio as gr
+import yaml
+import os
+from typing import List
+import torch
+from pathlib import Path
+import wandb
+import plotly.graph_objects as go
+from datetime import datetime
+import json
+from train import main as train_main
+from src.config.config import Config
+
+def create_training_ui():
+    # Store training metrics
+    class TrainingState:
+        def __init__(self):
+            self.losses = []
+            self.learning_rates = []
+            self.steps = []
+            self.current_epoch = 0
+            self.wandb_run = None
+    
+    state = TrainingState()
+
+    def update_training_plots(losses, learning_rates, steps):
+        # Create loss plot
+        loss_fig = go.Figure()
+        loss_fig.add_trace(go.Scatter(x=steps, y=losses, name='Training Loss'))
+        loss_fig.update_layout(title='Training Loss Over Time',
+                             xaxis_title='Steps',
+                             yaxis_title='Loss')
+
+        # Create learning rate plot
+        lr_fig = go.Figure()
+        lr_fig.add_trace(go.Scatter(x=steps, y=learning_rates, name='Learning Rate'))
+        lr_fig.update_layout(title='Learning Rate Schedule',
+                           xaxis_title='Steps',
+                           yaxis_title='Learning Rate')
+
+        return loss_fig, lr_fig
+
+    def update_config(
+        pretrained_model: str,
+        image_dirs: str,
+        batch_size: int,
+        learning_rate: float,
+        num_epochs: int,
+        gradient_accumulation_steps: int,
+        mixed_precision: str,
+        num_workers: int,
+        wandb_project: str,
+        wandb_entity: str,
+        wandb_tags: str,
+        log_interval: int,
+        save_interval: int,
+        resume_checkpoint: str = None,
+        unet_path: str = None,
+        enable_wandb: bool = True,
+    ):
+        # Create experiment name
+        experiment_name = f"sdxl-train-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        # Create base config structure
+        config = {
+            "model": {
+                "pretrained_model_name": pretrained_model
+            },
+            "data": {
+                "image_dirs": image_dirs.split(","),
+                "cache_dir": "cache",
+                "text_cache_dir": "text_cache",
+                "num_workers": num_workers,
+                "pin_memory": True,
+                "persistent_workers": True
+            },
+            "training": {
+                "batch_size": batch_size,
+                "learning_rate": learning_rate,
+                "num_epochs": num_epochs,
+                "gradient_accumulation_steps": gradient_accumulation_steps,
+                "mixed_precision": mixed_precision,
+                "optimizer_betas": [0.9, 0.999],
+                "weight_decay": 1e-2,
+                "optimizer_eps": 1e-8,
+                "log_steps": log_interval,
+                "save_steps": save_interval
+            },
+            "paths": {
+                "checkpoints_dir": f"checkpoints/{experiment_name}",
+                "logs_dir": f"logs/{experiment_name}",
+                "output_dir": f"outputs/{experiment_name}"
+            },
+            "logging": {
+                "wandb_project": wandb_project,
+                "wandb_entity": wandb_entity,
+                "wandb_tags": [tag.strip() for tag in wandb_tags.split(",") if tag.strip()],
+                "experiment_name": experiment_name
+            }
+        }
+
+        # Save config to yaml file
+        config_path = f"configs/{experiment_name}.yaml"
+        os.makedirs(os.path.dirname(config_path), exist_ok=True)
+        with open(config_path, "w") as f:
+            yaml.dump(config, f)
+
+        # Initialize WandB if enabled
+        if enable_wandb:
+            state.wandb_run = wandb.init(
+                project=wandb_project,
+                entity=wandb_entity,
+                name=experiment_name,
+                config=config,
+                tags=config["logging"]["wandb_tags"],
+                resume="allow"
+            )
+
+        # Prepare training arguments
+        train_args = ["--config", config_path]
+        if resume_checkpoint:
+            train_args.extend(["--resume_from_checkpoint", resume_checkpoint])
+        if unet_path:
+            train_args.extend(["--unet_path", unet_path])
+
+        # Start training
+        try:
+            import sys
+            sys.argv[1:] = train_args
+            train_main()
+            return "Training completed successfully!", None, None
+        except Exception as e:
+            if state.wandb_run:
+                state.wandb_run.finish()
+            return f"Training failed with error: {str(e)}", None, None
+
+    # Create the Gradio interface
+    with gr.Blocks(title="SDXL Training Interface") as interface:
+        gr.Markdown("# SDXL Training Interface")
+        
+        with gr.Tab("Basic Settings"):
+            pretrained_model = gr.Textbox(
+                label="Pretrained Model Name",
+                value="stabilityai/stable-diffusion-xl-base-1.0",
+                info="Name or path of the pretrained model to fine-tune"
+            )
+            
+            image_dirs = gr.Textbox(
+                label="Image Directories",
+                info="Comma-separated list of image directory paths",
+                placeholder="/path/to/images1,/path/to/images2"
+            )
+            
+            batch_size = gr.Slider(
+                minimum=1,
+                maximum=32,
+                value=1,
+                step=1,
+                label="Batch Size"
+            )
+            
+            learning_rate = gr.Number(
+                value=1e-5,
+                label="Learning Rate"
+            )
+            
+            num_epochs = gr.Slider(
+                minimum=1,
+                maximum=100,
+                value=10,
+                step=1,
+                label="Number of Epochs"
+            )
+
+        with gr.Tab("Advanced Settings"):
+            gradient_accumulation = gr.Slider(
+                minimum=1,
+                maximum=64,
+                value=4,
+                step=1,
+                label="Gradient Accumulation Steps"
+            )
+            
+            mixed_precision = gr.Dropdown(
+                choices=["no", "fp16", "bf16"],
+                value="bf16",
+                label="Mixed Precision"
+            )
+            
+            num_workers = gr.Slider(
+                minimum=0,
+                maximum=16,
+                value=4,
+                step=1,
+                label="Number of Workers"
+            )
+
+            with gr.Row():
+                log_interval = gr.Number(
+                    value=10,
+                    label="Log Interval (steps)",
+                    info="How often to log training metrics"
+                )
+                save_interval = gr.Number(
+                    value=500,
+                    label="Save Interval (steps)",
+                    info="How often to save checkpoints"
+                )
+
+        with gr.Tab("Logging Settings"):
+            with gr.Row():
+                enable_wandb = gr.Checkbox(
+                    label="Enable WandB Logging",
+                    value=True,
+                    info="Enable logging to Weights & Biases"
+                )
+                wandb_project = gr.Textbox(
+                    label="WandB Project",
+                    value="sdxl-finetune",
+                    info="WandB project name"
+                )
+                wandb_entity = gr.Textbox(
+                    label="WandB Entity",
+                    info="WandB username or team name"
+                )
+            
+            wandb_tags = gr.Textbox(
+                label="WandB Tags",
+                info="Comma-separated list of tags",
+                placeholder="tag1, tag2, tag3"
+            )
+
+        with gr.Tab("Checkpointing"):
+            resume_checkpoint = gr.Textbox(
+                label="Resume from Checkpoint",
+                info="Path to checkpoint directory to resume from (optional)"
+            )
+            
+            unet_path = gr.Textbox(
+                label="UNet Path",
+                info="Path to UNet safetensors file to start from (optional)"
+            )
+
+        with gr.Tab("Training Metrics"):
+            with gr.Row():
+                loss_plot = gr.Plot(label="Training Loss")
+                lr_plot = gr.Plot(label="Learning Rate")
+            
+            with gr.Row():
+                current_loss = gr.Number(label="Current Loss")
+                current_lr = gr.Number(label="Current Learning Rate")
+                current_step = gr.Number(label="Current Step")
+
+        start_btn = gr.Button("Start Training")
+        output = gr.Textbox(label="Training Status")
+
+        start_btn.click(
+            fn=update_config,
+            inputs=[
+                pretrained_model,
+                image_dirs,
+                batch_size,
+                learning_rate,
+                num_epochs,
+                gradient_accumulation,
+                mixed_precision,
+                num_workers,
+                wandb_project,
+                wandb_entity,
+                wandb_tags,
+                log_interval,
+                save_interval,
+                resume_checkpoint,
+                unet_path,
+                enable_wandb
+            ],
+            outputs=[output, loss_plot, lr_plot]
+        )
+
+    return interface
+
+if __name__ == "__main__":
+    interface = create_training_ui()
+    interface.launch(share=True) 
