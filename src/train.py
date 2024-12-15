@@ -20,7 +20,7 @@ from pathlib import Path
 from data.dataset import NovelAIDataset
 from training.trainer import NovelAIDiffusionV3Trainer
 from utils.transforms import get_transform
-from utils.optimizer import AdamWBF16
+from adamw_bf16 import AdamWBF16
 
 def setup_distributed():
     """Initialize distributed training"""
