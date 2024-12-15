@@ -178,6 +178,31 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         weights = torch.minimum(snr, min_snr).float()
         return weights
 
+    def validate_batch(self, text_embeds: Dict[str, torch.Tensor], start_idx: int, end_idx: int) -> bool:
+        """Validate text embeddings before training step.
+        
+        Args:
+            text_embeds: Dictionary of text embeddings
+            start_idx: Start index of current batch
+            end_idx: End index of current batch
+            
+        Returns:
+            bool: True if batch is valid, False otherwise
+        """
+        base_hidden = text_embeds["base_text_embeds"][start_idx:end_idx]
+        base_pooled = text_embeds["base_pooled_embeds"][start_idx:end_idx]
+        
+        if base_hidden.numel() == 0 or base_pooled.numel() == 0:
+            print(f"Warning: Empty text embeddings detected. Shapes - hidden: {base_hidden.shape}, pooled: {base_pooled.shape}")
+            return False
+        
+        _, _, hidden_dim = base_hidden.shape
+        if hidden_dim != 768:
+            print(f"Warning: Unexpected hidden dimension {hidden_dim}, expected 768")
+            return False
+        
+        return True
+
     def training_step(
         self,
         images: torch.Tensor,
@@ -198,12 +223,16 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         total_v_pred = None
 
         for i in range(self.gradient_accumulation_steps):
-            torch.cuda.empty_cache()  # Keep this from old version as it helped with memory
+            torch.cuda.empty_cache()
 
             start_idx = i * micro_batch_size
             end_idx = (i + 1) * micro_batch_size
 
-            # Extract micro-batch and scale - use clone() for safety
+            # Validate batch before processing
+            if not self.validate_batch(text_embeds, start_idx, end_idx):
+                continue
+
+            # Extract micro-batch and scale
             batch_latents = images[start_idx:end_idx].clone()
             
             # Apply area-based noise scaling
@@ -214,16 +243,16 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
 
             batch_tag_weights = tag_weights[start_idx:end_idx].view(-1,1,1,1)
 
-            # Prepare text embeddings with explicit cloning
-            base_hidden = text_embeds["base_text_embeds"][start_idx:end_idx].squeeze(1).clone()
-            base_pooled = text_embeds["base_pooled_embeds"][start_idx:end_idx].squeeze(1).clone()
+            # Prepare text embeddings
+            base_hidden = text_embeds["base_text_embeds"][start_idx:end_idx].clone()
+            base_pooled = text_embeds["base_pooled_embeds"][start_idx:end_idx].clone()
 
-            # Project text embeddings with explicit float32 conversion
+            # Project text embeddings
             base_hidden_float32 = base_hidden.to(dtype=torch.float32)
             batch_size, seq_len, _ = base_hidden_float32.shape
             encoder_hidden_states = self.hidden_proj(
-                base_hidden_float32.view(-1, 768)
-            ).view(batch_size, seq_len, -1)
+                base_hidden_float32.reshape(-1, 768)
+            ).reshape(batch_size, seq_len, -1)
 
             # Generate noise with channels_last memory format
             noise = torch.randn_like(
@@ -326,6 +355,9 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             disable=not self.accelerator.is_main_process
         )
         
+        # Get batch size from sampler
+        batch_size = dataloader.batch_sampler.batch_size if hasattr(dataloader, 'batch_sampler') else dataloader.batch_size
+        
         for batch_idx, batch in enumerate(progress_bar):
             # Efficient batch transfer to device - use non_blocking for async transfer
             images, text_embeds, tag_weights = [
@@ -376,7 +408,7 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                     # Training progress
                     'training/epoch': self.current_epoch,
                     'training/step': self.global_step,
-                    'training/samples_seen': self.global_step * self.gradient_accumulation_steps * dataloader.batch_size,
+                    'training/samples_seen': self.global_step * self.gradient_accumulation_steps * batch_size,
                     'training/percent_complete': 100 * (batch_idx / num_batches),
                     
                     # Learning rate
@@ -388,9 +420,9 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                     'system/gpu_memory_peak_gb': torch.cuda.max_memory_allocated()/1e9,
                     
                     # Batch statistics
-                    'batch/size': dataloader.batch_size,
+                    'batch/size': batch_size,
                     'batch/grad_accum_steps': self.gradient_accumulation_steps,
-                    'batch/effective_batch_size': dataloader.batch_size * self.gradient_accumulation_steps
+                    'batch/effective_batch_size': batch_size * self.gradient_accumulation_steps
                 }
                 
                 # Update progress bar
