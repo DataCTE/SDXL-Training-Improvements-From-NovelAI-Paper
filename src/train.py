@@ -21,7 +21,7 @@ from data.dataset import NovelAIDataset
 from training.trainer import NovelAIDiffusionV3Trainer
 from utils.transforms import get_transform
 from adamw_bf16 import AdamWBF16
-from config.config import Config
+from src.config.config import Config
 
 
 def setup_distributed():
