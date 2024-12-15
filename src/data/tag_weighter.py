@@ -2,6 +2,19 @@ from typing import List
 import torch
 from dataclasses import dataclass
 
+def parse_tags(caption: str) -> List[str]:
+    """Extract tags from caption.
+    
+    Args:
+        caption: Comma-separated string of tags
+        
+    Returns:
+        List of cleaned and normalized tags
+    """
+    parts = caption.lower().split(',')
+    tags = [tag.strip() for tag in parts]
+    return tags
+
 @dataclass
 class TagWeightingConfig:
     min_weight: float
