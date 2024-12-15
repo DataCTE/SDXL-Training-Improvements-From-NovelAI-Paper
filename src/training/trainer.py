@@ -11,6 +11,74 @@ from tqdm.auto import tqdm
 import math
 from src.data.dataset import NovelAIDataset
 from src.data.sampler import AspectBatchSampler
+import yaml
+from dataclasses import dataclass
+from typing import List, Tuple, Optional, Dict
+
+@dataclass
+class ModelConfig:
+    hidden_size: int
+    cross_attention_dim: int
+    sigma_data: float
+    sigma_min: float
+    sigma_max: float
+    rho: float
+    num_timesteps: int
+    min_snr_gamma: float
+
+@dataclass
+class TrainingConfig:
+    batch_size: int
+    gradient_accumulation_steps: int
+    learning_rate: float
+    num_epochs: int
+    save_steps: int
+    log_steps: int
+    mixed_precision: str
+    weight_decay: float
+    optimizer_eps: float
+    optimizer_betas: Tuple[float, float]
+
+@dataclass
+class DataConfig:
+    image_size: List[int]
+    num_workers: int
+    pin_memory: bool
+    persistent_workers: bool
+    shuffle: bool
+
+@dataclass
+class ScoringConfig:
+    aesthetic_score: float
+    crop_score: float
+
+@dataclass
+class SystemConfig:
+    enable_xformers: bool
+    channels_last: bool
+    gradient_checkpointing: bool
+    cudnn_benchmark: bool
+    disable_debug_apis: bool
+
+@dataclass
+class Config:
+    model: ModelConfig
+    training: TrainingConfig
+    data: DataConfig
+    scoring: ScoringConfig
+    system: SystemConfig
+    
+    @classmethod
+    def from_yaml(cls, path: str) -> 'Config':
+        with open(path, 'r') as f:
+            config_dict = yaml.safe_load(f)
+        return cls(
+            model=ModelConfig(**config_dict['model']),
+            training=TrainingConfig(**config_dict['training']),
+            data=DataConfig(**config_dict['data']),
+            scoring=ScoringConfig(**config_dict['scoring']),
+            system=SystemConfig(**config_dict['system'])
+        )
 
 class NovelAIDiffusionV3Trainer(torch.nn.Module):
     def __init__(
@@ -20,9 +88,9 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         optimizer: torch.optim.Optimizer,
         scheduler: DDPMScheduler,
         device: torch.device,
+        config: Config,
         accelerator: Optional[Accelerator] = None,
         resume_from_checkpoint: Optional[str] = None,
-        gradient_accumulation_steps: int = 4,
     ):
         super().__init__()
         self.model = model
@@ -31,29 +99,39 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         self.scheduler = scheduler
         self.device = device
         self.accelerator = accelerator
+        self.config = config
         
-        # Add gradient accumulation steps
-        self.gradient_accumulation_steps = gradient_accumulation_steps
+        # Add gradient accumulation steps from config
+        self.gradient_accumulation_steps = config.training.gradient_accumulation_steps
         
         # Add projection layer for CLIP embeddings
-        self.hidden_proj = nn.Linear(768, model.config.cross_attention_dim).to(
-            device=device, 
-            dtype=torch.float32
-        )
+        self.hidden_proj = nn.Linear(
+            config.model.hidden_size, 
+            model.config.cross_attention_dim
+        ).to(device=device, dtype=torch.float32)
         
         # Pre-allocate tensors for time embeddings
-        self.register_buffer('base_area', torch.tensor(1024 * 1024, dtype=torch.float32))
-        self.register_buffer('aesthetic_score', torch.tensor(6.0, dtype=torch.bfloat16))
-        self.register_buffer('crop_score', torch.tensor(3.0, dtype=torch.bfloat16))
+        self.register_buffer('base_area', torch.tensor(
+            config.data.image_size[0] * config.data.image_size[1], 
+            dtype=torch.float32
+        ))
+        self.register_buffer('aesthetic_score', torch.tensor(
+            config.scoring.aesthetic_score, 
+            dtype=torch.bfloat16
+        ))
+        self.register_buffer('crop_score', torch.tensor(
+            config.scoring.crop_score, 
+            dtype=torch.bfloat16
+        ))
         self.register_buffer('zero_score', torch.tensor(0.0, dtype=torch.bfloat16))
         
-        # Initialize ZTSNR parameters
-        self.sigma_data = 1.0
-        self.sigma_min = 0.002
-        self.sigma_max = 20000.0
-        self.rho = 7.0
-        self.num_timesteps = 1000
-        self.min_snr_gamma = 0.1
+        # Initialize ZTSNR parameters from config
+        self.sigma_data = config.model.sigma_data
+        self.sigma_min = config.model.sigma_min
+        self.sigma_max = config.model.sigma_max
+        self.rho = config.model.rho
+        self.num_timesteps = config.model.num_timesteps
+        self.min_snr_gamma = config.model.min_snr_gamma
         
         # Pre-compute sigmas
         self.register_buffer('sigmas', self.get_sigmas())
@@ -66,22 +144,23 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         if resume_from_checkpoint:
             self.load_checkpoint(resume_from_checkpoint)
 
-        # Enable memory efficient attention
-        model.enable_xformers_memory_efficient_attention()
+        # Apply system configurations
+        if config.system.enable_xformers:
+            model.enable_xformers_memory_efficient_attention()
         
-        # Enable channels last memory format
-        model = model.to(memory_format=torch.channels_last)
+        if config.system.channels_last:
+            model = model.to(memory_format=torch.channels_last)
         
-        # Enable gradient checkpointing
-        model.enable_gradient_checkpointing()
+        if config.system.gradient_checkpointing:
+            model.enable_gradient_checkpointing()
         
-        # Enable cudnn benchmarking
-        torch.backends.cudnn.benchmark = True
+        if config.system.cudnn_benchmark:
+            torch.backends.cudnn.benchmark = True
         
-        # Disable debug APIs
-        torch.autograd.set_detect_anomaly(False)
-        torch.autograd.profiler.profile(False)
-        torch.autograd.profiler.emit_nvtx(False)
+        if config.system.disable_debug_apis:
+            torch.autograd.set_detect_anomaly(False)
+            torch.autograd.profiler.profile(False)
+            torch.autograd.profiler.emit_nvtx(False)
 
     def load_checkpoint(self, checkpoint_path: str):
         """Load model and training state from checkpoint"""
@@ -196,9 +275,15 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             print(f"Warning: Empty text embeddings detected. Shapes - hidden: {base_hidden.shape}, pooled: {base_pooled.shape}")
             return False
         
-        _, _, hidden_dim = base_hidden.shape
-        if hidden_dim != 768:
-            print(f"Warning: Unexpected hidden dimension {hidden_dim}, expected 768")
+        # Check if shape is correct (batch_size, num_tokens, hidden_dim)
+        if len(base_hidden.shape) != 3:
+            print(f"Warning: Unexpected text embedding shape: {base_hidden.shape}, expected 3 dimensions")
+            return False
+        
+        # Get hidden dimension from last dimension
+        hidden_dim = base_hidden.shape[-1]
+        if hidden_dim != self.config.model.hidden_size:
+            print(f"Warning: Unexpected hidden dimension {hidden_dim}, expected {self.config.model.hidden_size}")
             return False
         
         return True

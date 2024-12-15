@@ -21,6 +21,7 @@ from data.dataset import NovelAIDataset
 from training.trainer import NovelAIDiffusionV3Trainer
 from utils.transforms import get_transform
 from adamw_bf16 import AdamWBF16
+from config.config import Config
 
 
 def setup_distributed():
@@ -32,6 +33,12 @@ def setup_distributed():
 def parse_args():
     parser = argparse.ArgumentParser(description='Train SDXL with optimizations')
     parser.add_argument(
+        '--config',
+        type=str,
+        default='configs/training_config.yaml',
+        help='Path to training configuration file'
+    )
+    parser.add_argument(
         '--resume_from_checkpoint',
         type=str,
         help='Path to checkpoint directory to resume from'
@@ -41,50 +48,16 @@ def parse_args():
         type=str,
         help='Path to UNet safetensors file to start from'
     )
-    parser.add_argument(
-        '--batch_size',
-        type=int,
-        default=8,
-        help='Batch size per GPU'
-    )
-    parser.add_argument(
-        '--grad_accum_steps',
-        type=int,
-        default=4,
-        help='Number of gradient accumulation steps'
-    )
-    parser.add_argument(
-        '--num_epochs',
-        type=int,
-        default=10,
-        help='Number of training epochs'
-    )
-    parser.add_argument(
-        '--learning_rate',
-        type=float,
-        default=4e-7,
-        help='Learning rate'
-    )
-    parser.add_argument(
-        '--save_steps',
-        type=int,
-        default=1000,
-        help='Save checkpoint every N steps'
-    )
-    parser.add_argument(
-        '--log_steps',
-        type=int,
-        default=10,
-        help='Log metrics every N steps'
-    )
     return parser.parse_args()
 
 def setup_model(
     args,
     device: torch.device,
-    pretrained_model_name: str = "stabilityai/stable-diffusion-xl-base-1.0"
+    config: Config
 ) -> tuple[UNet2DConditionModel, AutoencoderKL]:
     """Setup UNet and VAE models"""
+    pretrained_model_name = config.model.pretrained_model_name
+    
     print("Loading VAE...")
     vae = AutoencoderKL.from_pretrained(
         pretrained_model_name,
@@ -136,14 +109,24 @@ def setup_model(
 def main():
     args = parse_args()
     
+    # Load config
+    config = Config.from_yaml(args.config)
+    
+    # Create directories from config
+    os.makedirs(config.paths.checkpoints_dir, exist_ok=True)
+    os.makedirs(config.paths.logs_dir, exist_ok=True)
+    os.makedirs(config.paths.output_dir, exist_ok=True)
+    os.makedirs(config.data.cache_dir, exist_ok=True)
+    os.makedirs(config.data.text_cache_dir, exist_ok=True)
+    
     # Setup distributed training
     world_size, rank = setup_distributed()
     is_main_process = rank == 0
     
-    # Setup accelerator
+    # Setup accelerator with config
     accelerator = Accelerator(
-        gradient_accumulation_steps=args.grad_accum_steps,
-        mixed_precision="bf16",
+        gradient_accumulation_steps=config.training.gradient_accumulation_steps,
+        mixed_precision=config.training.mixed_precision,
         log_with="tensorboard",
         project_dir="logs",
         device_placement=True,
@@ -156,24 +139,24 @@ def main():
         wandb.init(
             project="sdxl-finetune",
             config={
-                "batch_size": args.batch_size,
-                "grad_accum_steps": args.grad_accum_steps,
-                "effective_batch": args.batch_size * args.grad_accum_steps * world_size,
-                "learning_rate": args.learning_rate,
-                "num_epochs": args.num_epochs,
+                "batch_size": config.training.batch_size,
+                "grad_accum_steps": config.training.gradient_accumulation_steps,
+                "effective_batch": config.training.batch_size * config.training.gradient_accumulation_steps * world_size,
+                "learning_rate": config.training.learning_rate,
+                "num_epochs": config.training.num_epochs,
             }
         )
     
-    # Setup models
-    unet, vae = setup_model(args, device)
+    # Setup models with config
+    unet, vae = setup_model(args, device, config)
     
     # Setup optimizer
     optimizer = AdamWBF16(
         unet.parameters(),
-        lr=args.learning_rate,
-        betas=(0.9, 0.999),
-        weight_decay=1e-2,
-        eps=1e-8
+        lr=config.training.learning_rate,
+        betas=config.training.optimizer_betas,
+        weight_decay=config.training.weight_decay,
+        eps=config.training.optimizer_eps
     )
     
     # Setup noise scheduler
@@ -183,32 +166,26 @@ def main():
         torch_dtype=torch.bfloat16
     )
     
-    # Setup dataset and dataloader
-    image_dirs = [
-        "path/to/image/dir1",
-        "path/to/image/dir2",
-        # Add your image directories here
-    ]
-    
+    # Setup dataset using config paths
     dataset = NovelAIDataset(
-        image_dirs=image_dirs,
+        image_dirs=config.data.image_dirs,
         transform=get_transform(),
         device=device,
         vae=vae,
-        cache_dir="latent_cache",
-        text_cache_dir="text_cache"
+        cache_dir=config.data.cache_dir,
+        text_cache_dir=config.data.text_cache_dir
     )
     
-    # Create trainer instance
+    # Create trainer with config
     trainer = NovelAIDiffusionV3Trainer(
         model=unet,
         vae=vae,
         optimizer=optimizer,
         scheduler=noise_scheduler,
         device=device,
+        config=config,
         accelerator=accelerator,
-        resume_from_checkpoint=args.resume_from_checkpoint,
-        gradient_accumulation_steps=args.grad_accum_steps
+        resume_from_checkpoint=args.resume_from_checkpoint
     )
     
     # Prepare for distributed training
@@ -219,10 +196,10 @@ def main():
     # Create dataloader
     dataloader = trainer.create_dataloader(
         dataset=dataset,
-        batch_size=args.batch_size,
-        num_workers=8,
-        pin_memory=True,
-        persistent_workers=True
+        batch_size=config.training.batch_size,
+        num_workers=config.data.num_workers,
+        pin_memory=config.data.pin_memory,
+        persistent_workers=config.data.persistent_workers
     )
     
     # Setup signal handlers for graceful shutdown
@@ -251,13 +228,13 @@ def main():
     
     print(f"\nStarting training from epoch {start_epoch + 1}")
     try:
-        for epoch in range(start_epoch, args.num_epochs):
-            print(f"\nEpoch {epoch+1}/{args.num_epochs}")
+        for epoch in range(start_epoch, config.training.num_epochs):
+            print(f"\nEpoch {epoch+1}/{config.training.num_epochs}")
             
             epoch_loss = trainer.train_epoch(
                 dataloader=dataloader,
                 epoch=epoch,
-                log_interval=args.log_steps
+                log_interval=config.training.log_steps
             )
             
             if is_main_process:
@@ -266,7 +243,7 @@ def main():
                 trainer.save_checkpoint(epoch_checkpoint_path)
                 
                 # Save step checkpoint if interval is reached
-                if trainer.global_step % args.save_steps == 0:
+                if trainer.global_step % config.training.save_steps == 0:
                     step_checkpoint_path = os.path.join(
                         save_dir,
                         f"checkpoint_step_{trainer.global_step}"
