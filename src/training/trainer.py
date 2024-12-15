@@ -7,9 +7,10 @@ import wandb
 import os
 from typing import Dict, Tuple, Optional
 from torch.utils.data import DataLoader
-from ..data.dataset import NovelAIDataset
-from ..data.sampler import AspectBatchSampler
 import tqdm
+
+from src.data.dataset import NovelAIDataset
+from src.data.sampler import AspectBatchSampler
 
 class NovelAIDiffusionV3Trainer(torch.nn.Module):
     def __init__(
