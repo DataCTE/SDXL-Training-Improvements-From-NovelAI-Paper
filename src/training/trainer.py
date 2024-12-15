@@ -821,7 +821,7 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
 
 
     def prepare_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        print(f"Inside prepare_hidden_states - Input shape: {hidden_states.shape}, dtype: {hidden_states.dtype}")
+        #print(f"Inside prepare_hidden_states - Input shape: {hidden_states.shape}, dtype: {hidden_states.dtype}")
 
         # Remove the extra dimension if present
         if hidden_states.dim() == 4 and hidden_states.size(1) == 1:
