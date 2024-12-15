@@ -1,82 +1,82 @@
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 import yaml
 
 @dataclass
 class ModelConfig:
-    hidden_size: int
-    cross_attention_dim: int
-    sigma_data: float
-    sigma_min: float
-    sigma_max: float
-    rho: float
-    num_timesteps: int
-    min_snr_gamma: float
-    pretrained_model_name: str
+    hidden_size: int = 768
+    cross_attention_dim: int = 2048
+    sigma_data: float = 1.0
+    sigma_min: float = 0.002
+    sigma_max: float = 20000.0
+    rho: float = 7.0
+    num_timesteps: int = 1000
+    min_snr_gamma: float = 0.1
+    pretrained_model_name: str = "stabilityai/stable-diffusion-xl-base-1.0"
 
 @dataclass
 class TrainingConfig:
-    batch_size: int
-    gradient_accumulation_steps: int
-    learning_rate: float
-    num_epochs: int
-    save_steps: int
-    log_steps: int
-    mixed_precision: str
-    weight_decay: float
-    optimizer_eps: float
-    optimizer_betas: Tuple[float, float]
+    batch_size: int = 32
+    gradient_accumulation_steps: int = 4
+    learning_rate: float = 4.0e-7
+    num_epochs: int = 10
+    save_steps: int = 1000
+    log_steps: int = 10
+    mixed_precision: str = "bf16"
+    weight_decay: float = 1.0e-2
+    optimizer_eps: float = 1.0e-8
+    optimizer_betas: Tuple[float, float] = (0.9, 0.999)
 
 @dataclass
 class DataConfig:
-    image_size: List[int]
-    num_workers: int
-    pin_memory: bool
-    persistent_workers: bool
-    shuffle: bool
-    min_tag_weight: float = 0.5
-    max_tag_weight: float = 2.0
     image_dirs: List[str]
-    cache_dir: str
-    text_cache_dir: str
+    image_size: Tuple[int, int] = (1024, 1024)
+    num_workers: int = 8
+    pin_memory: bool = True
+    persistent_workers: bool = True
+    shuffle: bool = True
+    cache_dir: str = "latent_cache"
+    text_cache_dir: str = "text_cache"
 
 @dataclass
 class TagWeightingConfig:
-    min_weight: float
-    max_weight: float
-    default_weight: float
-    enabled: bool
-    update_frequency: int
-    smoothing_factor: float
+    enabled: bool = True
+    min_weight: float = 0.1
+    max_weight: float = 2.0
+    default_weight: float = 1.0
+    update_frequency: int = 1000
+    smoothing_factor: float = 0.1
 
 @dataclass
 class ScoringConfig:
-    aesthetic_score: float
-    crop_score: float
+    aesthetic_score: float = 6.0
+    crop_score: float = 3.0
 
 @dataclass
 class SystemConfig:
-    enable_xformers: bool
-    channels_last: bool
-    gradient_checkpointing: bool
-    cudnn_benchmark: bool
-    disable_debug_apis: bool
+    enable_xformers: bool = True
+    channels_last: bool = True
+    gradient_checkpointing: bool = True
+    cudnn_benchmark: bool = True
+    disable_debug_apis: bool = True
+    compile_model: bool = True
+    num_gpu_workers: Optional[int] = None
 
 @dataclass
 class PathsConfig:
-    checkpoints_dir: str
-    logs_dir: str
-    output_dir: str
+    checkpoints_dir: str = "checkpoints"
+    logs_dir: str = "logs"
+    output_dir: str = "outputs"
 
 @dataclass
 class Config:
-    model: ModelConfig
-    training: TrainingConfig
+    model: ModelConfig = ModelConfig()
+    training: TrainingConfig = TrainingConfig()
     data: DataConfig
-    tag_weighting: TagWeightingConfig
-    scoring: ScoringConfig
-    system: SystemConfig
-    paths: PathsConfig
+    tag_weighting: TagWeightingConfig = TagWeightingConfig()
+    scoring: ScoringConfig = ScoringConfig()
+    system: SystemConfig = SystemConfig()
+    paths: PathsConfig = PathsConfig()
     
     @classmethod
     def from_yaml(cls, path: str) -> 'Config':

@@ -25,27 +25,23 @@ training:
 
 # Data configuration
 data:
-  image_size: [1024, 1024]  # Base area for scaling
+  image_dirs: []
+  image_size: [1024, 1024]
   num_workers: 8
   pin_memory: true
   persistent_workers: true
   shuffle: true
-  image_dirs: [
-    "/path/to/dataset1",
-    "/path/to/dataset2",
-    "/path/to/dataset3"
-  ]
   cache_dir: "latent_cache"
   text_cache_dir: "text_cache"
 
 # Tag weighting configuration
 tag_weighting:
+  enabled: true
   min_weight: 0.1
   max_weight: 2.0
   default_weight: 1.0
-  enabled: true  # Whether to use tag weighting
-  update_frequency: 1000  # How often to recompute weights (in steps)
-  smoothing_factor: 0.1  # For exponential moving average of weights
+  update_frequency: 1000
+  smoothing_factor: 0.1
 
 # Scoring configuration
 scoring:
@@ -59,6 +55,8 @@ system:
   gradient_checkpointing: true
   cudnn_benchmark: true
   disable_debug_apis: true
+  compile_model: true
+  num_gpu_workers: null
 
 # Paths configuration
 paths:
