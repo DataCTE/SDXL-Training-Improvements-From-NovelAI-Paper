@@ -7,8 +7,8 @@ import wandb
 import os
 from typing import Dict, Tuple, Optional
 from torch.utils.data import DataLoader
-import tqdm
-
+from tqdm.auto import tqdm
+import math
 from src.data.dataset import NovelAIDataset
 from src.data.sampler import AspectBatchSampler
 
@@ -161,7 +161,7 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             return sigmas
 
     def get_snr(self, sigma: torch.Tensor) -> torch.Tensor:
-        # SNR(σ) = (σ_data / σ)²
+        # SNR(σ) = (��_data / σ)²
         return (self.sigma_data / sigma).square()
 
     def get_minsnr_weights(self, timesteps: torch.Tensor) -> torch.Tensor:
@@ -315,6 +315,9 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         num_batches = len(dataloader)
         running_grad_norm = 0.0
         
+        # Initialize loss tracking
+        loss_history = []
+        
         # Use tqdm for progress tracking
         progress_bar = tqdm(
             dataloader,
@@ -348,18 +351,46 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             # Update metrics efficiently
             total_loss += avg_batch_loss
             avg_loss = total_loss / (batch_idx + 1)
+            loss_history.append(avg_batch_loss)
             
             # Log metrics less frequently to reduce overhead
             if self.accelerator.is_main_process and batch_idx % log_interval == 0:
+                # Calculate loss statistics
+                recent_losses = torch.tensor(loss_history[-100:])  # Last 100 batches
+                loss_std = torch.std(recent_losses).item() if len(loss_history) > 1 else 0.0
+                loss_min = torch.min(recent_losses).item() if len(loss_history) > 0 else 0.0
+                loss_max = torch.max(recent_losses).item() if len(loss_history) > 0 else 0.0
+                
                 metrics = {
-                    'grad/norm': running_grad_norm,
-                    'loss/batch': avg_batch_loss,
-                    'loss/running_avg': avg_loss,
-                    'epoch': self.current_epoch,
-                    'step': self.global_step,
-                    'lr': self.optimizer.param_groups[0]['lr'],
-                    'memory/allocated_gb': torch.cuda.memory_allocated()/1e9,
-                    'memory/reserved_gb': torch.cuda.max_memory_reserved()/1e9
+                    # Gradient metrics
+                    'gradients/norm': running_grad_norm,
+                    'gradients/norm_moving_avg': running_grad_norm,
+                    
+                    # Loss metrics with proper grouping for wandb graphs
+                    'loss/current': avg_batch_loss,
+                    'loss/average': avg_loss,
+                    'loss/std': loss_std,
+                    'loss/min': loss_min,
+                    'loss/max': loss_max,
+                    
+                    # Training progress
+                    'training/epoch': self.current_epoch,
+                    'training/step': self.global_step,
+                    'training/samples_seen': self.global_step * self.gradient_accumulation_steps * dataloader.batch_size,
+                    'training/percent_complete': 100 * (batch_idx / num_batches),
+                    
+                    # Learning rate
+                    'optimizer/learning_rate': self.optimizer.param_groups[0]['lr'],
+                    
+                    # Memory metrics
+                    'system/gpu_memory_allocated_gb': torch.cuda.memory_allocated()/1e9,
+                    'system/gpu_memory_reserved_gb': torch.cuda.max_memory_reserved()/1e9,
+                    'system/gpu_memory_peak_gb': torch.cuda.max_memory_allocated()/1e9,
+                    
+                    # Batch statistics
+                    'batch/size': dataloader.batch_size,
+                    'batch/grad_accum_steps': self.gradient_accumulation_steps,
+                    'batch/effective_batch_size': dataloader.batch_size * self.gradient_accumulation_steps
                 }
                 
                 # Update progress bar
@@ -367,12 +398,16 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                     'loss': f'{avg_batch_loss:.4f}',
                     'avg_loss': f'{avg_loss:.4f}',
                     'grad': f'{running_grad_norm:.4f}',
-                    'lr': f'{metrics["lr"]:.2e}',
-                    'mem': f'{metrics["memory/allocated_gb"]:.1f}GB'
+                    'lr': f'{metrics["optimizer/learning_rate"]:.2e}',
+                    'mem': f'{metrics["system/gpu_memory_allocated_gb"]:.1f}GB'
                 })
                 
-                # Log to wandb asynchronously
-                wandb.log(metrics, step=self.global_step)
+                # Log to wandb asynchronously with proper grouping
+                wandb.log(
+                    metrics,
+                    step=self.global_step,
+                    commit=True
+                )
             
             self.global_step += 1
             
@@ -385,6 +420,63 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         
         # Return average loss for the epoch
         return total_loss / num_batches
+
+    @staticmethod
+    def collate_fn(batch):
+        """Custom collate function to handle variable sized data.
+        
+        Args:
+            batch: List of tuples (image, text_embeds, tag_weights)
+        
+        Returns:
+            Tuple of batched tensors
+        """
+        # Separate batch elements
+        images, text_embeds, tag_weights = zip(*batch)
+        
+        # Stack images if they're all the same size, otherwise pad
+        if len(set(img.shape for img in images)) <= 1:
+            images = torch.stack(images)
+        else:
+            # Get max dimensions
+            max_h = max(img.shape[-2] for img in images)
+            max_w = max(img.shape[-1] for img in images)
+            
+            # Pad images to max size
+            padded_images = []
+            for img in images:
+                h, w = img.shape[-2:]
+                pad_h = max_h - h
+                pad_w = max_w - w
+                padded = F.pad(img, (0, pad_w, 0, pad_h), mode='constant', value=0)
+                padded_images.append(padded)
+            images = torch.stack(padded_images)
+        
+        # Handle text embeddings dictionary
+        batched_text_embeds = {}
+        for key in text_embeds[0].keys():
+            if len(set(emb[key].shape for emb in text_embeds)) <= 1:
+                # All same size, can stack directly
+                batched_text_embeds[key] = torch.stack([emb[key] for emb in text_embeds])
+            else:
+                # Need to pad sequences
+                max_len = max(emb[key].shape[1] for emb in text_embeds)
+                padded_embs = []
+                for emb in text_embeds:
+                    curr_len = emb[key].shape[1]
+                    if curr_len < max_len:
+                        pad = torch.zeros(emb[key].shape[0], max_len - curr_len, emb[key].shape[2],
+                                        dtype=emb[key].dtype, device=emb[key].device)
+                        padded = torch.cat([emb[key], pad], dim=1)
+                    else:
+                        padded = emb[key]
+                    padded_embs.append(padded)
+                batched_text_embeds[key] = torch.stack(padded_embs)
+        
+        # Stack tag weights
+        tag_weights = torch.stack(tag_weights)
+        
+        return images, batched_text_embeds, tag_weights
 
     @staticmethod
     def create_dataloader(
@@ -401,5 +493,83 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             batch_sampler=sampler,
             num_workers=num_workers,
             pin_memory=pin_memory,
-            persistent_workers=persistent_workers
+            persistent_workers=persistent_workers,
+            collate_fn=NovelAIDiffusionV3Trainer.collate_fn
         )
+
+    def save_checkpoint(self, checkpoint_dir: str, epoch: int) -> None:
+        """Save model and training state to checkpoint directory using diffusers format in FP16.
+        
+        Args:
+            checkpoint_dir: Directory to save checkpoint
+            epoch: Current epoch number
+        """
+        if not self.accelerator.is_main_process:
+            return
+        
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        
+        # Save UNet in fp16
+        self.model.save_pretrained(
+            os.path.join(checkpoint_dir, "unet"),
+            safe_serialization=True,
+            dtype=torch.float16
+        )
+        self.model.to(dtype=torch.bfloat16)  # Restore original dtype
+        
+        # Save VAE in fp16 if it exists
+        if self.vae is not None:
+            orig_dtype = self.vae.dtype
+            self.vae.save_pretrained(
+                os.path.join(checkpoint_dir, "vae"),
+                safe_serialization=True,
+                dtype=torch.float16
+            )
+            self.vae.to(dtype=orig_dtype)  # Restore original dtype
+        
+        # Save training state
+        training_state = {
+            "epoch": self.current_epoch,
+            "global_step": self.global_step,
+            "optimizer_state": self.optimizer.state_dict(),
+            "scheduler_config": self.scheduler.config
+        }
+        
+        if hasattr(self, 'lr_scheduler'):
+            training_state["lr_scheduler_state"] = self.lr_scheduler.state_dict()
+        
+        # Save training state using safetensors
+        training_state_path = os.path.join(checkpoint_dir, "training_state.safetensors")
+        from safetensors.torch import save_file
+        
+        # Convert non-tensor values to tensors for safetensors
+        training_state = {
+            k: (v if isinstance(v, torch.Tensor) else torch.tensor(v))
+            for k, v in training_state.items() 
+            if v is not None
+        }
+        
+        save_file(training_state, training_state_path)
+        
+        # Save model config
+        self.model.config.save_pretrained(os.path.join(checkpoint_dir, "unet"))
+        
+        # Log to wandb if available
+        if wandb.run is not None:
+            artifact = wandb.Artifact(
+                f"model-epoch-{epoch}", 
+                type="model",
+                description=f"Model checkpoint from epoch {epoch}"
+            )
+            artifact.add_dir(checkpoint_dir)
+            wandb.log_artifact(artifact)
+        
+        print(f"Saved checkpoint for epoch {epoch} to {checkpoint_dir} in fp16")
+
+    def compute_grad_norm(self):
+        total_norm = 0.0
+        for p in self.model.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+        return math.sqrt(total_norm)

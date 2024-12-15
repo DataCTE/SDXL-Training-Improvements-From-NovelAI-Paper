@@ -22,6 +22,7 @@ from training.trainer import NovelAIDiffusionV3Trainer
 from utils.transforms import get_transform
 from adamw_bf16 import AdamWBF16
 
+
 def setup_distributed():
     """Initialize distributed training"""
     if dist.is_available() and dist.is_initialized():
