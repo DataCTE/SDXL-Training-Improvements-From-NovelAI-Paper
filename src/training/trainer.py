@@ -417,125 +417,66 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
 
     def train_epoch(
         self,
-        dataloader: DataLoader,
         epoch: int,
-        log_interval: int = 10
+        train_dataloader: torch.utils.data.DataLoader
     ) -> float:
+        """Train for one epoch
+        
+        Args:
+            epoch: Current epoch number
+            train_dataloader: DataLoader for training data
+            
+        Returns:
+            Average loss for the epoch
+            
+        Raises:
+            ValueError: If no training data is available
+        """
+        if len(train_dataloader) == 0:
+            raise ValueError(
+                "No training data available. Please ensure image_dirs contains valid paths with images."
+            )
+
         self.current_epoch = epoch
         self.model.train()
         
-        # Pre-allocate metrics tracking
         total_loss = 0.0
-        num_batches = len(dataloader)
-        running_grad_norm = 0.0
-        
-        # Initialize loss tracking
-        loss_history = []
+        num_batches = len(train_dataloader)
         
         # Use tqdm for progress tracking
         progress_bar = tqdm(
-            dataloader,
+            train_dataloader,
             desc=f"Epoch {epoch}",
-            total=num_batches,
             disable=not self.accelerator.is_main_process
         )
         
-        # Get batch size from sampler
-        batch_size = dataloader.batch_sampler.batch_size if hasattr(dataloader, 'batch_sampler') else dataloader.batch_size
-        
-        for batch_idx, batch in enumerate(progress_bar):
-            # Efficient batch transfer to device - use non_blocking for async transfer
-            images, text_embeds, tag_weights = [
-                x.to(self.device, dtype=torch.bfloat16, non_blocking=True) 
-                if isinstance(x, torch.Tensor) else 
-                {k: v.to(self.device, dtype=torch.bfloat16, non_blocking=True) for k,v in x.items()}
-                for x in batch
-            ]
+        for batch in progress_bar:
+            images, text_embeds, tag_weights = batch
             
-            # Training step with autocast
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                loss, pred_images, v_pred, timesteps, avg_batch_loss = self.training_step(
-                    images, text_embeds, tag_weights
-                )
+            loss, _, _, _, avg_batch_loss = self.training_step(
+                images, text_embeds, tag_weights
+            )
             
-            # Compute gradient norm before optimizer step
-            grad_norm = self.compute_grad_norm()
-            running_grad_norm = 0.9 * running_grad_norm + 0.1 * grad_norm
-            
-            # Optimizer step
-            self.optimizer.step()
-            
-            # Update metrics efficiently
             total_loss += avg_batch_loss
-            avg_loss = total_loss / (batch_idx + 1)
-            loss_history.append(avg_batch_loss)
             
-            # Log metrics less frequently to reduce overhead
-            if self.accelerator.is_main_process and batch_idx % log_interval == 0:
-                # Calculate loss statistics
-                recent_losses = torch.tensor(loss_history[-100:])  # Last 100 batches
-                loss_std = torch.std(recent_losses).item() if len(loss_history) > 1 else 0.0
-                loss_min = torch.min(recent_losses).item() if len(loss_history) > 0 else 0.0
-                loss_max = torch.max(recent_losses).item() if len(loss_history) > 0 else 0.0
-                
-                metrics = {
-                    # Gradient metrics
-                    'gradients/norm': running_grad_norm,
-                    'gradients/norm_moving_avg': running_grad_norm,
-                    
-                    # Loss metrics with proper grouping for wandb graphs
-                    'loss/current': avg_batch_loss,
-                    'loss/average': avg_loss,
-                    'loss/std': loss_std,
-                    'loss/min': loss_min,
-                    'loss/max': loss_max,
-                    
-                    # Training progress
-                    'training/epoch': self.current_epoch,
-                    'training/step': self.global_step,
-                    'training/samples_seen': self.global_step * self.gradient_accumulation_steps * batch_size,
-                    'training/percent_complete': 100 * (batch_idx / num_batches),
-                    
-                    # Learning rate
-                    'optimizer/learning_rate': self.optimizer.param_groups[0]['lr'],
-                    
-                    # Memory metrics
-                    'system/gpu_memory_allocated_gb': torch.cuda.memory_allocated()/1e9,
-                    'system/gpu_memory_reserved_gb': torch.cuda.max_memory_reserved()/1e9,
-                    'system/gpu_memory_peak_gb': torch.cuda.max_memory_allocated()/1e9,
-                    
-                    # Batch statistics
-                    'batch/size': batch_size,
-                    'batch/grad_accum_steps': self.gradient_accumulation_steps,
-                    'batch/effective_batch_size': batch_size * self.gradient_accumulation_steps
-                }
-                
-                # Update progress bar
-                progress_bar.set_postfix({
-                    'loss': f'{avg_batch_loss:.4f}',
-                    'avg_loss': f'{avg_loss:.4f}',
-                    'grad': f'{running_grad_norm:.4f}',
-                    'lr': f'{metrics["optimizer/learning_rate"]:.2e}',
-                    'mem': f'{metrics["system/gpu_memory_allocated_gb"]:.1f}GB'
-                })
-                
-                # Log to wandb asynchronously with proper grouping
-                wandb.log(
-                    metrics,
-                    step=self.global_step,
-                    commit=True
-                )
+            # Update progress bar
+            progress_bar.set_postfix({
+                'loss': f'{avg_batch_loss:.4f}',
+                'avg_loss': f'{total_loss/(progress_bar.n+1):.4f}'
+            })
+            
+            # Log metrics if main process
+            if self.accelerator.is_main_process and self.global_step % self.config.training.log_steps == 0:
+                wandb.log({
+                    'loss/batch': avg_batch_loss,
+                    'loss/average': total_loss/(progress_bar.n+1),
+                    'epoch': self.current_epoch,
+                    'step': self.global_step,
+                }, step=self.global_step)
             
             self.global_step += 1
-            
-            # Optional: Update learning rate scheduler if using one
-            if hasattr(self, 'lr_scheduler'):
-                self.lr_scheduler.step()
         
-        # Clean up progress bar
         progress_bar.close()
-        
-        # Return average loss for the epoch
         return total_loss / num_batches
 
     @staticmethod

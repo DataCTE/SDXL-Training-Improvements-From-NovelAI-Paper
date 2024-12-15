@@ -25,7 +25,12 @@ training:
 
 # Data configuration
 data:
-  image_dirs: []
+  # List of directories containing training images
+  # Example:
+  # image_dirs: 
+  #   - "/path/to/dataset1"
+  #   - "/path/to/dataset2"
+  image_dirs: []  # Add your image directories here
   image_size: [1024, 1024]
   num_workers: 8
   pin_memory: true

@@ -15,6 +15,12 @@ from safetensors.torch import load_file
 import torch.distributed as dist
 from typing import Optional
 from pathlib import Path
+import traceback
+import logging
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Import project components
 from data.dataset import NovelAIDataset
@@ -166,9 +172,46 @@ def main():
         torch_dtype=torch.bfloat16
     )
     
-    # Setup dataset using config paths
+    # Validate image directories before dataset creation
+    if not config.data.image_dirs:
+        raise ValueError(
+            "No image directories specified in config. Please add valid image directories to config.data.image_dirs"
+        )
+        
+    total_images = 0
+    valid_dirs = []
+    
+    # Check each directory
+    for img_dir in config.data.image_dirs:
+        if not os.path.exists(img_dir):
+            logger.warning(f"Directory not found: {img_dir}")
+            continue
+            
+        num_images = len([f for f in os.listdir(img_dir) 
+                        if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp'))])
+        
+        if num_images == 0:
+            logger.warning(f"No valid images found in directory: {img_dir}")
+            continue
+            
+        total_images += num_images
+        valid_dirs.append(img_dir)
+        
+    if total_images == 0:
+        raise ValueError(
+            "No valid images found in any of the specified directories. "
+            "Please ensure the directories contain supported image files "
+            "(.png, .jpg, .jpeg, .webp)"
+        )
+        
+    # Update config with validated directories
+    config.data.image_dirs = valid_dirs
+    
+    logger.info(f"Found {total_images} valid images across {len(valid_dirs)} directories")
+    
+    # Setup dataset using validated directories
     dataset = NovelAIDataset(
-        image_dirs=config.data.image_dirs,
+        image_dirs=valid_dirs,
         transform=get_transform(),
         device=device,
         vae=vae,
@@ -195,7 +238,7 @@ def main():
     )
     
     # Create dataloader
-    dataloader = trainer.create_dataloader(
+    train_dataloader = trainer.create_dataloader(
         dataset=dataset,
         batch_size=config.training.batch_size,
         num_workers=config.data.num_workers,
@@ -203,66 +246,49 @@ def main():
         persistent_workers=config.data.persistent_workers
     )
     
-    # Setup signal handlers for graceful shutdown
-    def signal_handler(signum, frame):
-        signal_name = signal.Signals(signum).name
-        print(f"\nReceived {signal_name} signal. Saving checkpoint...")
-        
-        if trainer is not None:
-            try:
-                emergency_save_path = os.path.join("checkpoints", "emergency_checkpoint")
-                trainer.save_checkpoint(emergency_save_path)
-                print("Emergency checkpoint saved successfully.")
-            except Exception as e:
-                print(f"Failed to save emergency checkpoint: {e}")
-        
-        print("Exiting...")
-        sys.exit(1)
-    
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
     # Training loop
     start_epoch = trainer.current_epoch
-    save_dir = "checkpoints"
-    os.makedirs(save_dir, exist_ok=True)
+    save_dir = config.paths.checkpoints_dir
     
-    print(f"\nStarting training from epoch {start_epoch + 1}")
     try:
-        for epoch in range(start_epoch, config.training.num_epochs):
-            print(f"\nEpoch {epoch+1}/{config.training.num_epochs}")
+        logger.info(f"Starting training from epoch {start_epoch + 1}")
+        
+        for epoch in range(start_epoch, config.training.num_epochs + 1):
+            logger.info(f"\nStarting epoch {epoch}")
             
             epoch_loss = trainer.train_epoch(
-                dataloader=dataloader,
                 epoch=epoch,
-                log_interval=config.training.log_steps
+                train_dataloader=train_dataloader
             )
             
-            if is_main_process:
-                # Save epoch checkpoint
-                epoch_checkpoint_path = os.path.join(save_dir, f"checkpoint_epoch_{epoch+1}")
-                trainer.save_checkpoint(epoch_checkpoint_path)
-                
-                # Save step checkpoint if interval is reached
-                if trainer.global_step % config.training.save_steps == 0:
-                    step_checkpoint_path = os.path.join(
-                        save_dir,
-                        f"checkpoint_step_{trainer.global_step}"
-                    )
-                    trainer.save_checkpoint(step_checkpoint_path)
+            logger.info(f"Epoch {epoch} completed. Average loss: {epoch_loss:.4f}")
             
-            print(f"Epoch {epoch+1} completed. Average loss: {epoch_loss:.4f}")
+            if is_main_process:
+                # Save checkpoint
+                trainer.save_checkpoint(save_dir, epoch)
+                
+                # Log metrics
+                wandb.log({
+                    "epoch": epoch,
+                    "loss": epoch_loss,
+                }, step=trainer.global_step)
             
     except KeyboardInterrupt:
-        print("\nTraining interrupted. Saving final checkpoint...")
+        logger.info("\nTraining interrupted. Saving final checkpoint...")
         if is_main_process:
-            trainer.save_checkpoint(os.path.join(save_dir, "final_checkpoint"))
-    
-    # Cleanup
-    if is_main_process:
-        wandb.finish()
-    accelerator.end_training()
-    print("Training completed!")
+            trainer.save_checkpoint(save_dir, epoch)
+            
+    except Exception as e:
+        logger.error(f"Training failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        sys.exit(1)
+        
+    finally:
+        # Cleanup
+        if is_main_process:
+            wandb.finish()
+        accelerator.end_training()
+        logger.info("Training completed!")
 
 if __name__ == "__main__":
     main() 
