@@ -488,6 +488,9 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
 
             loss.backward()
 
+            # Calculate gradient norm
+            grad_norm = self.compute_grad_norm()
+
             loss_value = loss.item()
             total_loss += loss_value
             running_loss += loss_value
@@ -495,7 +498,25 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             # Store predictions
             total_v_pred = D_out.detach() if total_v_pred is None else torch.cat([total_v_pred, D_out.detach()], dim=0)
 
+            # Log metrics if main process
+            if self.accelerator.is_main_process:
+                wandb.log({
+                    'loss/step': loss_value,
+                    'loss/running_avg': running_loss / (i + 1),
+                    'grad_norm': grad_norm,
+                    'learning_rate': self.optimizer.param_groups[0]['lr'],
+                    'global_step': self.global_step,
+                })
+
         avg_loss = running_loss / self.gradient_accumulation_steps
+        
+        # Log final metrics for the full step
+        if self.accelerator.is_main_process:
+            wandb.log({
+                'loss/batch_avg': avg_loss,
+                'epoch': self.current_epoch,
+            })
+        
         return total_loss, batch_latents, total_v_pred, timesteps, avg_loss
 
     def train_epoch(
