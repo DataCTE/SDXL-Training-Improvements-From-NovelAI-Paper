@@ -237,8 +237,7 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             self.config.scoring.crop_score, dtype=torch.bfloat16))
         self.register_buffer('zero_score', torch.tensor(0.0, dtype=torch.bfloat16))
         
-        # Time embeddings
-        self.register_buffer('cached_time_ids', self._precompute_time_ids(self.max_batch_size))
+    
         
         # Noise schedule
         self.register_buffer('sigmas', self.get_sigmas())
@@ -300,25 +299,6 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             torch.autograd.profiler.profile(False)
             torch.autograd.profiler.emit_nvtx(False)
 
-    def _precompute_time_ids(self, max_batch_size: int) -> torch.Tensor:
-        """Pre-compute time_ids for all possible batch sizes."""
-        time_ids = torch.empty(
-            (max_batch_size, 2, 4), 
-            device=self.device, 
-            dtype=torch.bfloat16
-        )
-        
-        # Use config.data directly instead of self.data
-        time_ids[:, 0, 0] = self.config.data.image_size[0]  # orig_height
-        time_ids[:, 0, 1] = self.config.data.image_size[1]  # orig_width
-        time_ids[:, 0, 2] = self.aesthetic_score
-        time_ids[:, 0, 3] = self.zero_score
-        time_ids[:, 1, 0] = self.config.data.image_size[0]  # orig_height
-        time_ids[:, 1, 1] = self.config.data.image_size[1]  # orig_width
-        time_ids[:, 1, 2] = self.crop_score
-        time_ids[:, 1, 3] = self.zero_score
-        
-        return time_ids.reshape(max_batch_size, -1)
 
     def _get_add_time_ids(
         self, 
@@ -326,19 +306,11 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         height: Optional[int] = None, 
         width: Optional[int] = None
     ) -> torch.Tensor:
-        """Dynamically compute time_ids for current batch dimensions.
-        
-        Args:
-            batch_size: Number of samples in batch
-            height: Current image height (optional)
-            width: Current image width (optional)
-        
-        Returns:
-            torch.Tensor: Time embeddings tensor of shape (batch_size, 8)
-        """
-        time_ids = torch.empty(
-            (batch_size, 2, 4), 
-            device=self.device, 
+        """Generate time embeddings for SDXL."""
+        # Initialize with zeros
+        time_ids = torch.zeros(
+            (batch_size, 6), 
+            device=self.device,
             dtype=torch.bfloat16
         )
         
@@ -346,16 +318,15 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         curr_height = height if height is not None else self.config.data.image_size[0]
         curr_width = width if width is not None else self.config.data.image_size[1]
         
-        time_ids[:, 0, 0] = curr_height  # orig_height
-        time_ids[:, 0, 1] = curr_width   # orig_width
-        time_ids[:, 0, 2] = self.aesthetic_score
-        time_ids[:, 0, 3] = self.zero_score
-        time_ids[:, 1, 0] = curr_height  # orig_height
-        time_ids[:, 1, 1] = curr_width   # orig_width
-        time_ids[:, 1, 2] = self.crop_score
-        time_ids[:, 1, 3] = self.zero_score
+        # Fill in the time embeddings
+        time_ids[:, 0] = curr_height  # orig_height
+        time_ids[:, 1] = curr_width   # orig_width
+        time_ids[:, 2] = self.aesthetic_score  # aesthetic_score
+        time_ids[:, 3] = 0  # crops_coords_top
+        time_ids[:, 4] = 0  # crops_coords_left
+        time_ids[:, 5] = 1.0  # target_size_as_tuple
         
-        return time_ids.reshape(batch_size, -1)
+        return time_ids
 
     def load_checkpoint(self, checkpoint_path: str):
         """Load model and training state from checkpoint"""
@@ -446,14 +417,7 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         text_embeds: Dict[str, torch.Tensor],
         tag_weights: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
-        """Execute training step with optimized gradient accumulation.
-        
-        Implements:
-        1. v-prediction parameterization
-        2. Zero Terminal SNR (ZTSNR) noise schedule
-        3. MinSNR loss weighting
-        4. Tag-based loss weighting
-        """
+        """Execute training step with optimized gradient accumulation."""
         
         # Pre-allocate tensors for the entire batch
         total_v_pred = torch.empty(
@@ -529,43 +493,41 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             noise_scale = self.get_noise_scale(batch_size)
             batch_latents = batch_latents * noise_scale
 
-            # After reshaping encoder_hidden_states
-
             # Get text embeddings and reshape directly to correct format
             encoder_hidden_states = text_embeds["base_text_embeds"][batch_indices]
-            #print(f"Before reshape: {encoder_hidden_states.shape}")  # [8, 1, 77, 768]
-            
-            # Let prepare_hidden_states handle reshaping and projection
             encoder_hidden_states = self.prepare_hidden_states(encoder_hidden_states)
-            #print(f"After projection: {encoder_hidden_states.shape}")  # Should be [8, 77, cross_attention_dim]
-        
+
+            # Get pooled embeddings and ensure correct shape
+            pooled_embeds = text_embeds["base_pooled_embeds"][batch_indices]
+            pooled_embeds = pooled_embeds.view(batch_size, -1)  # Ensure 2D shape
+
+            # Get time embeddings with correct shape
+            time_ids = self._get_add_time_ids(
+                batch_size,
+                height=batch_latents.shape[2] * 8,
+                width=batch_latents.shape[3] * 8
+            )
+
             # Add noise efficiently using fused operations
             noisy_latents = batch_latents + sigma_expanded * batch_noise
             v_target = self.scheduler.get_velocity(batch_latents, batch_noise, timesteps)
 
             # Forward pass with automatic mixed precision
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                # Get pooled embeddings
-                pooled_embeds = text_embeds["base_pooled_embeds"][batch_indices]
-                pooled_embeds = pooled_embeds.view(batch_size, -1)  # Ensure 2D shape
-                
-                # Get time embeddings
-                time_ids = self._get_add_time_ids(
-                    batch_size,
-                    height=batch_latents.size(2) * 8,
-                    width=batch_latents.size(3) * 8
-                )
+                # Prepare added conditions
+                added_cond_kwargs = {
+                    "text_embeds": pooled_embeds,
+                    "time_ids": time_ids
+                }
 
                 # Forward pass with memory-efficient attention
                 model_output = self.model(
                     c_in * noisy_latents,
                     timesteps,
                     encoder_hidden_states=encoder_hidden_states,
-                    added_cond_kwargs={
-                        "text_embeds": pooled_embeds,
-                        "time_ids": time_ids
-                    }
-                ).sample
+                    added_cond_kwargs=added_cond_kwargs,
+                    return_dict=False
+                )[0]  # Get only the sample output
 
                 # Compute denoised output using fused operations
                 D_out = c_skip * noisy_latents + c_out * model_output
