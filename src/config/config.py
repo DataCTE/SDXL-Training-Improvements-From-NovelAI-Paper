@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Literal
 import yaml
 
 
@@ -13,13 +13,7 @@ class VAEModelConfig:
     discriminator_weight: float = 0.1
     use_attention: bool = False
     zero_init_last: bool = True
-    pretrained_vae_name: str = "AuraDiffusion/16ch-vae"
-    in_channels: int = 3
-    out_channels: int = 3
-    down_block_types: Tuple[str, ...] = ("DownEncoderBlock2D",)
-    up_block_types: Tuple[str, ...] = ("UpDecoderBlock2D",)
-    block_out_channels: Tuple[int, ...] = (64, 128, 256, 512)
-    layers_per_block: int = 2
+    pretrained_vae_name: str = "madebyollin/sdxl-vae-fp16-fix"
 
 @dataclass
 class ModelConfig:
@@ -51,6 +45,22 @@ class TrainingConfig:
     vae_min_lr: float = 1e-6
     use_discriminator: bool = True
     discriminator_learning_rate: float = 4.5e-5
+    prediction_type: str = "v_prediction"  # v_prediction or epsilon
+    
+    # New timestep bias parameters
+    timestep_bias_strategy: Literal["none", "earlier", "later", "range"] = "none"
+    timestep_bias_multiplier: float = 1.0
+    timestep_bias_begin: int = 0
+    timestep_bias_end: int = 1000
+    timestep_bias_portion: float = 0.25
+    
+    # SNR parameters
+    snr_gamma: Optional[float] = 5.0
+    max_grad_norm: Optional[float] = 1.0
+    
+    # Early stopping parameters
+    early_stopping_patience: Optional[int] = 5
+    early_stopping_threshold: float = 0.01
 
 @dataclass
 class DataConfig:
@@ -92,18 +102,18 @@ class SystemConfig:
     
     # Distributed training settings
     distributed_training: bool = True
-    backend: str = "nccl"  # or "gloo" for CPU
-    use_fsdp: bool = True  # Use FSDP instead of DDP
-    cpu_offload: bool = False  # Offload parameters to CPU
-    full_shard: bool = True  # Use full sharding strategy
-    mixed_precision: str = "bf16"  # Mixed precision type
+    backend: str = "nccl"
+    use_fsdp: bool = True
+    cpu_offload: bool = False
+    full_shard: bool = True
+    mixed_precision: str = "bf16"
     gradient_accumulation_steps: int = 4
     find_unused_parameters: bool = False
     sync_batch_norm: bool = True
-    min_num_params_per_shard: int = 1e6  # Min params per GPU for FSDP
-    forward_prefetch: bool = True  # Prefetch next forward pass
-    backward_prefetch: bool = True  # Prefetch next backward pass
-    limit_all_gathers: bool = True  # Limit memory usage during all-gathers
+    min_num_params_per_shard: int = 1_000_000
+    forward_prefetch: bool = True
+    backward_prefetch: bool = True
+    limit_all_gathers: bool = True
 
 @dataclass
 class PathsConfig:

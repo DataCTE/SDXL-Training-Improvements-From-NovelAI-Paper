@@ -1,9 +1,36 @@
-from typing import List
+from typing import List, Dict, Optional
 import torch
 from dataclasses import dataclass
+import numpy as np
+from pathlib import Path
+import json
+import logging
+
+logger = logging.getLogger(__name__)
+
+@dataclass
+class TagWeightingConfig:
+    """Configuration for tag weighting system."""
+    min_weight: float = 0.1
+    max_weight: float = 2.0
+    default_weight: float = 1.0
+    enabled: bool = True
+    update_frequency: int = 1000
+    smoothing_factor: float = 0.1
+    
+    def __post_init__(self):
+        """Validate configuration parameters."""
+        if self.min_weight <= 0:
+            raise ValueError("min_weight must be positive")
+        if self.max_weight < self.min_weight:
+            raise ValueError("max_weight must be greater than min_weight")
+        if not 0 <= self.smoothing_factor <= 1:
+            raise ValueError("smoothing_factor must be between 0 and 1")
+        if self.update_frequency < 1:
+            raise ValueError("update_frequency must be positive")
 
 def parse_tags(caption: str) -> List[str]:
-    """Extract tags from caption.
+    """Extract and normalize tags from caption.
     
     Args:
         caption: Comma-separated string of tags
@@ -11,117 +38,216 @@ def parse_tags(caption: str) -> List[str]:
     Returns:
         List of cleaned and normalized tags
     """
+    if not isinstance(caption, str):
+        raise ValueError(f"Caption must be a string, got {type(caption)}")
+        
+    # Split and clean tags
     parts = caption.lower().split(',')
-    tags = [tag.strip() for tag in parts]
+    tags = []
+    
+    for tag in parts:
+        tag = tag.strip()
+        # Skip empty tags
+        if not tag:
+            continue
+        # Basic validation
+        if len(tag) > 100:  # Arbitrary limit to catch errors
+            logger.warning(f"Skipping suspiciously long tag: {tag[:20]}...")
+            continue
+        tags.append(tag)
+    
     return tags
 
-@dataclass
-class TagWeightingConfig:
-    min_weight: float
-    max_weight: float
-    default_weight: float
-    enabled: bool
-    update_frequency: int
-    smoothing_factor: float
-
 class TagWeighter:
-    def __init__(self, config):
-        """Initialize TagWeighter with config
+    def __init__(self, config: TagWeightingConfig):
+        """Initialize TagWeighter.
         
         Args:
-            config: Raw config object containing tag_weighting section
+            config: TagWeightingConfig instance
         """
-        # Store raw config
         self.config = config
         
-        # Initialize weighting parameters from tag_weighting section
-        tag_config = config.tag_weighting if hasattr(config, 'tag_weighting') else {}
-        self.min_weight = getattr(tag_config, 'min_weight', 0.1)
-        self.max_weight = getattr(tag_config, 'max_weight', 2.0)
-        self.default_weight = getattr(tag_config, 'default_weight', 1.0)
-        self.smoothing_factor = getattr(tag_config, 'smoothing_factor', 0.1)
-        self.enabled = getattr(tag_config, 'enabled', True)
-        self.update_frequency = getattr(tag_config, 'update_frequency', 1000)
+        # Initialize tracking state
+        self.tag_counts: Dict[str, int] = {}
+        self.total_count: int = 0
+        self.tag_weights: Dict[str, float] = {}
+        self.previous_weights: Dict[str, float] = {}
+        self.steps_since_update: int = 0
         
-        # Initialize tag tracking
-        self.tag_counts = {}
-        self.total_count = 0
-        self.tag_weights = {}
-        self.steps_since_update = 0
+        # Runtime statistics
+        self.updates_performed: int = 0
+        self.total_samples_processed: int = 0
         
-        # For smoothing
-        self.previous_weights = {}
+        logger.info(f"Initialized TagWeighter with config: {config}")
 
-    def update_frequencies(self, tags: List[str]):
-        """Update tag frequency counters"""
-        if not self.enabled:
+    def update_frequencies(self, tags: List[str]) -> None:
+        """Update tag frequency counters.
+        
+        Args:
+            tags: List of tags from current sample
+        """
+        if not self.config.enabled:
             return
-            
-        for tag in tags:
-            if tag not in self.tag_counts:
-                self.tag_counts[tag] = 0
-            self.tag_counts[tag] += 1
-            self.total_count += 1
         
-        self.steps_since_update += 1
-        
-        # Check if we should recompute weights
-        if self.steps_since_update >= self.update_frequency:
-            self.compute_weights()
-            self.steps_since_update = 0
+        try:
+            # Update counts
+            for tag in tags:
+                if tag not in self.tag_counts:
+                    self.tag_counts[tag] = 0
+                self.tag_counts[tag] += 1
+                self.total_count += 1
             
-    def compute_weights(self):
-        """Compute weights for all seen tags with smoothing"""
-        if not self.total_count or not self.enabled:
-            return
+            self.steps_since_update += 1
+            self.total_samples_processed += 1
             
-        # Calculate average frequency
-        avg_freq = self.total_count / len(self.tag_counts) if self.tag_counts else 1.0
-        
-        # Store current weights for smoothing
-        self.previous_weights = self.tag_weights.copy()
-        
-        # Compute new weights for each tag
-        for tag, count in self.tag_counts.items():
-            raw_weight = avg_freq / count
-            new_weight = min(self.max_weight, max(self.min_weight, raw_weight))
-            
-            # Apply exponential moving average if we have previous weights
-            if tag in self.previous_weights:
-                smoothed_weight = (
-                    self.smoothing_factor * new_weight + 
-                    (1 - self.smoothing_factor) * self.previous_weights[tag]
-                )
-                self.tag_weights[tag] = smoothed_weight
-            else:
-                self.tag_weights[tag] = new_weight
+            # Check if we should recompute weights
+            if self.steps_since_update >= self.config.update_frequency:
+                self.compute_weights()
+                self.steps_since_update = 0
+                self.updates_performed += 1
                 
-    def get_weight(self, tags: List[str]) -> float:
-        """Get combined weight for a set of tags"""
-        if not self.enabled or not tags:
-            return self.default_weight
-            
-        weights = [self.tag_weights.get(tag, self.default_weight) for tag in tags]
-        return torch.tensor(weights).mean().item()
+        except Exception as e:
+            logger.error(f"Error updating frequencies: {e}")
+            raise
 
-    def save_weights(self, path: str):
-        """Save current tag weights to file"""
-        if not self.enabled:
+    def compute_weights(self) -> None:
+        """Compute weights for all seen tags with smoothing."""
+        if not self.config.enabled or not self.total_count:
             return
             
-        torch.save({
-            'tag_weights': self.tag_weights,
-            'tag_counts': self.tag_counts,
-            'total_count': self.total_count
-        }, path)
+        try:
+            # Calculate average frequency
+            num_tags = len(self.tag_counts)
+            if num_tags == 0:
+                return
+                
+            avg_freq = self.total_count / num_tags
+            
+            # Store current weights for smoothing
+            self.previous_weights = self.tag_weights.copy()
+            
+            # Compute new weights efficiently using numpy
+            frequencies = np.array(list(self.tag_counts.values()))
+            raw_weights = avg_freq / frequencies
+            
+            # Clip weights to bounds
+            clipped_weights = np.clip(
+                raw_weights, 
+                self.config.min_weight,
+                self.config.max_weight
+            )
+            
+            # Update weights with smoothing
+            for tag, new_weight in zip(self.tag_counts.keys(), clipped_weights):
+                if tag in self.previous_weights:
+                    smoothed_weight = (
+                        self.config.smoothing_factor * new_weight +
+                        (1 - self.config.smoothing_factor) * self.previous_weights[tag]
+                    )
+                    self.tag_weights[tag] = float(smoothed_weight)
+                else:
+                    self.tag_weights[tag] = float(new_weight)
+                    
+        except Exception as e:
+            logger.error(f"Error computing weights: {e}")
+            raise
+
+    def get_weight(self, tags: List[str]) -> float:
+        """Get combined weight for a set of tags.
         
-    def load_weights(self, path: str):
-        """Load tag weights from file"""
-        if not self.enabled:
+        Args:
+            tags: List of tags to get weight for
+            
+        Returns:
+            Combined weight for the tags
+        """
+        if not self.config.enabled or not tags:
+            return self.config.default_weight
+            
+        try:
+            weights = [
+                self.tag_weights.get(tag, self.config.default_weight) 
+                for tag in tags
+            ]
+            return float(np.mean(weights))
+            
+        except Exception as e:
+            logger.error(f"Error getting weights: {e}")
+            return self.config.default_weight
+
+    def save_weights(self, path: str) -> None:
+        """Save current state to file.
+        
+        Args:
+            path: Path to save state to
+        """
+        if not self.config.enabled:
             return
             
-        state = torch.load(path)
-        self.tag_weights = state['tag_weights']
-        self.tag_counts = state['tag_counts']
-        self.total_count = state['total_count']
-        self.previous_weights = self.tag_weights.copy()
+        path = Path(path)
+        try:
+            # Create parent directory if it doesn't exist
+            path.parent.mkdir(parents=True, exist_ok=True)
+            
+            state = {
+                'tag_weights': self.tag_weights,
+                'tag_counts': self.tag_counts,
+                'total_count': self.total_count,
+                'steps_since_update': self.steps_since_update,
+                'updates_performed': self.updates_performed,
+                'total_samples_processed': self.total_samples_processed,
+                'config': vars(self.config)
+            }
+            
+            # Save atomically
+            temp_path = path.with_suffix('.tmp')
+            torch.save(state, temp_path)
+            temp_path.rename(path)
+            
+            logger.info(f"Saved weights to {path}")
+            
+        except Exception as e:
+            logger.error(f"Error saving weights: {e}")
+            raise
+
+    def load_weights(self, path: str) -> None:
+        """Load state from file.
+        
+        Args:
+            path: Path to load state from
+        """
+        if not self.config.enabled:
+            return
+            
+        try:
+            state = torch.load(path)
+            
+            # Restore state
+            self.tag_weights = state['tag_weights']
+            self.tag_counts = state['tag_counts']
+            self.total_count = state['total_count']
+            self.steps_since_update = state.get('steps_since_update', 0)
+            self.updates_performed = state.get('updates_performed', 0)
+            self.total_samples_processed = state.get('total_samples_processed', 0)
+            
+            # Keep previous weights for smoothing
+            self.previous_weights = self.tag_weights.copy()
+            
+            logger.info(f"Loaded weights from {path}")
+            logger.info(f"Restored {len(self.tag_weights)} tag weights")
+            
+        except Exception as e:
+            logger.error(f"Error loading weights: {e}")
+            raise
+            
+    def get_stats(self) -> Dict:
+        """Get current statistics about the weighting system."""
+        return {
+            'total_tags': len(self.tag_counts),
+            'total_samples': self.total_samples_processed,
+            'updates_performed': self.updates_performed,
+            'unique_tags_seen': len(self.tag_weights),
+            'min_weight': min(self.tag_weights.values()) if self.tag_weights else None,
+            'max_weight': max(self.tag_weights.values()) if self.tag_weights else None,
+            'avg_weight': np.mean(list(self.tag_weights.values())) if self.tag_weights else None
+        }

@@ -1,7 +1,5 @@
 # Model configuration
 model:
-  hidden_size: 768
-  cross_attention_dim: 2048
   sigma_data: 1.0
   sigma_min: 0.002
   sigma_max: 20000.0
@@ -9,14 +7,6 @@ model:
   num_timesteps: 1000
   min_snr_gamma: 0.1
   pretrained_model_name: "stabilityai/stable-diffusion-xl-base-1.0"
-  vae:
-    latent_channels: 16
-    kl_divergence_weight: 0.1
-    lpips_weight: 1.0
-    discriminator_weight: 0.1
-    use_attention: false
-    zero_init_last: true
-    pretrained_vae_name: "AuraDiffusion/16ch-vae"
 
 # Training configuration
 training:
@@ -35,6 +25,17 @@ training:
   weight_decay: 1.0e-2
   optimizer_eps: 1.0e-8
   optimizer_betas: [0.9, 0.999]
+  prediction_type: "v_prediction"
+  timestep_bias_strategy: "none"
+  timestep_bias_multiplier: 1.0
+  timestep_bias_begin: 0
+  timestep_bias_end: 1000
+  timestep_bias_portion: 0.25
+  snr_gamma: 5.0
+  max_grad_norm: 1.0
+  early_stopping_patience: 5
+  early_stopping_threshold: 0.01
+  
 
 # Data configuration
 data:
@@ -43,7 +44,13 @@ data:
   # image_dirs: 
   #   - "/path/to/dataset1"
   #   - "/path/to/dataset2"
-  image_dirs: ["path/to/images"]
+  image_dirs: [
+        "/workspace/collage",
+        "/workspace/upscaled",
+        "/workspace/High-quality-photo10k",
+        "/workspace/LAION_220k_GPT4Vision_captions",
+        "/workspace/photo-concept-bucket/train"
+    ]
   image_size: [1024, 1024]
   num_workers: 8
   pin_memory: true

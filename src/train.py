@@ -15,11 +15,11 @@ from diffusers import (
 )
 from safetensors.torch import load_file
 import torch.distributed as dist
-from typing import Optional
+from typing import Optional, Tuple
 from pathlib import Path
 import traceback
 import logging
-from training.vae_trainer import VAETrainer
+from src.training.vae_trainer import VAETrainer
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 # Import project components
 from data.dataset import NovelAIDataset
-from training.trainer import NovelAIDiffusionV3Trainer
+from src.training.trainer import NovelAIDiffusionV3Trainer
 from utils.transforms import get_transform
 from adamw_bf16 import AdamWBF16
 from src.config.config import Config
@@ -76,7 +76,7 @@ def setup_accelerator(config: Config) -> Accelerator:
 
     return accelerator
 
-def setup_distributed(config: Config):
+def setup_distributed(config: Config) -> Tuple[int, int]:
     """Initialize distributed training environment"""
     if not torch.cuda.is_available():
         return 1, 0
@@ -84,7 +84,6 @@ def setup_distributed(config: Config):
     if torch.distributed.is_initialized():
         return torch.distributed.get_world_size(), torch.distributed.get_rank()
 
-    # Get world size from environment
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     rank = int(os.environ.get("RANK", 0))
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -92,7 +91,6 @@ def setup_distributed(config: Config):
     if world_size <= 1:
         return 1, 0
 
-    # Initialize process group
     torch.distributed.init_process_group(
         backend=config.system.backend,
         init_method="env://",
@@ -100,18 +98,14 @@ def setup_distributed(config: Config):
         rank=rank
     )
 
-    # Set device
     torch.cuda.set_device(local_rank)
 
-    # Optimize CUDA operations
     if config.system.cudnn_benchmark:
         torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-    # Sync processes
     torch.distributed.barrier()
-
     return world_size, rank
 
 def parse_args():
@@ -245,7 +239,9 @@ def main():
                 "num_epochs": config.training.num_epochs,
                 "world_size": world_size,
                 "rank": rank,
-                "backend": config.system.backend
+                "backend": config.system.backend,
+                "timestep_bias_strategy": config.training.timestep_bias_strategy,
+                "snr_gamma": config.training.snr_gamma
             }
         )
     
@@ -265,52 +261,12 @@ def main():
             resume_from_checkpoint=args.resume_from_checkpoint
         )
     else:
-        # Setup UNet optimizer with distributed wrapper if needed
-        optimizer = AdamWBF16(
-            unet.parameters(),
-            lr=config.training.learning_rate,
-            betas=config.training.optimizer_betas,
-            weight_decay=config.training.weight_decay,
-            eps=config.training.optimizer_eps
-        )
-        
-        # Setup noise scheduler
-        noise_scheduler = DDPMScheduler.from_pretrained(
-            "stabilityai/stable-diffusion-xl-base-1.0",
-            subfolder="scheduler",
-            torch_dtype=torch.bfloat16
-        )
-        
-
-        # Inside the main function, before initializing the trainer
-        precomputed_proj_matrix = torch.randn(
-            config.model.cross_attention_dim, 
-            768, 
-            dtype=torch.bfloat16,
-            device=device
-        )
-
-        # If using distributed training, broadcast the projection matrix to all ranks
-        if dist.is_initialized():
-            if dist.get_rank() == 0:
-                tensor = precomputed_proj_matrix
-            else:
-                tensor = torch.empty_like(precomputed_proj_matrix, device=device)
-            dist.broadcast(tensor, src=0)
-            precomputed_proj_matrix = tensor
-
-
-
+        # Initialize trainer with new signature
         trainer = NovelAIDiffusionV3Trainer(
+            config_path=args.config,
             model=unet,
             vae=vae,
-            optimizer=optimizer,
-            scheduler=noise_scheduler,
-            device=device,
-            config=config,
-            accelerator=accelerator,
-            resume_from_checkpoint=args.resume_from_checkpoint,
-            precomputed_proj_matrix=precomputed_proj_matrix
+            accelerator=accelerator
         )
     
     # Validate image directories before dataset creation
@@ -362,10 +318,8 @@ def main():
         config=config
     )
     
-    # Prepare for distributed training
-    trainer, optimizer, dataset = accelerator.prepare(
-        trainer, optimizer, dataset
-    )
+    # Prepare for distributed training - optimizer removed since it's handled by trainer
+    trainer, dataset = accelerator.prepare(trainer, dataset)
     
     # Create dataloader with distributed sampler
     train_dataloader = trainer.create_dataloader(

@@ -1,74 +1,149 @@
 import torch
-from transformers import CLIPTokenizer, CLIPTextModel
-from typing import Dict
+from transformers import AutoTokenizer, PretrainedConfig
+from typing import Dict, List, Union, Optional
+import random
+
+def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: str, subfolder: str = "text_encoder"):
+    """Load the correct text encoder class based on config."""
+    text_encoder_config = PretrainedConfig.from_pretrained(
+        pretrained_model_name_or_path, subfolder=subfolder
+    )
+    model_class = text_encoder_config.architectures[0]
+
+    if model_class == "CLIPTextModel":
+        from transformers import CLIPTextModel
+        return CLIPTextModel
+    elif model_class == "CLIPTextModelWithProjection":
+        from transformers import CLIPTextModelWithProjection
+        return CLIPTextModelWithProjection
+    else:
+        raise ValueError(f"{model_class} is not supported.")
 
 class TextEmbedder:
     def __init__(
         self,
+        pretrained_model_name_or_path: str,
         device: torch.device,
-        tokenizer_paths: Dict[str, str] = {
-            "base": "openai/clip-vit-large-patch14",
-            "large": "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k"
-        }
+        max_length: int = 77,
+        dtype: torch.dtype = torch.float16
     ):
+        """Initialize SDXL text embedder.
+        
+        Args:
+            pretrained_model_name_or_path: Path to pretrained SDXL model
+            device: torch device
+            max_length: max token length
+            dtype: torch dtype for models
+        """
         self.device = device
-        self.max_length = 77
+        self.max_length = max_length
+        self.dtype = dtype
         
         # Load tokenizers
-        self.tokenizers = {
-            "base": CLIPTokenizer.from_pretrained(tokenizer_paths["base"]),
-            "large": CLIPTokenizer.from_pretrained(tokenizer_paths["large"])
-        }
+        self.tokenizer_one = AutoTokenizer.from_pretrained(
+            pretrained_model_name_or_path,
+            subfolder="tokenizer",
+            use_fast=False
+        )
+        self.tokenizer_two = AutoTokenizer.from_pretrained(
+            pretrained_model_name_or_path,
+            subfolder="tokenizer_2",
+            use_fast=False
+        )
+
+        # Load text encoders
+        text_encoder_cls_one = import_model_class_from_model_name_or_path(
+            pretrained_model_name_or_path
+        )
+        text_encoder_cls_two = import_model_class_from_model_name_or_path(
+            pretrained_model_name_or_path,
+            subfolder="text_encoder_2"
+        )
+
+        self.text_encoder_one = text_encoder_cls_one.from_pretrained(
+            pretrained_model_name_or_path,
+            subfolder="text_encoder"
+        ).to(device).to(dtype)
         
-        # Load text encoders with bfloat16
-        self.text_encoders = {
-            "base": CLIPTextModel.from_pretrained(tokenizer_paths["base"]).to(device).to(torch.bfloat16),
-            "large": CLIPTextModel.from_pretrained(tokenizer_paths["large"]).to(device).to(torch.bfloat16)
-        }
-        
-        # Set models to eval mode and freeze parameters
-        for encoder in self.text_encoders.values():
-            encoder.eval()
-            for param in encoder.parameters():
-                param.requires_grad = False
+        self.text_encoder_two = text_encoder_cls_two.from_pretrained(
+            pretrained_model_name_or_path,
+            subfolder="text_encoder_2"
+        ).to(device).to(dtype)
+
+        # Freeze text encoders
+        self.text_encoder_one.eval()
+        self.text_encoder_two.eval()
+        for param in self.text_encoder_one.parameters():
+            param.requires_grad = False
+        for param in self.text_encoder_two.parameters():
+            param.requires_grad = False
 
     @torch.no_grad()
-    def __call__(self, prompt: str) -> Dict[str, torch.Tensor]:
-        # Tokenize
-        tokens = {
-            k: tokenizer(
-                prompt,
+    def __call__(
+        self, 
+        prompt: Union[str, List[str]],
+        proportion_empty_prompts: float = 0.0
+    ) -> Dict[str, torch.Tensor]:
+        """Generate text embeddings for SDXL.
+        
+        Args:
+            prompt: Text prompt or list of prompts
+            proportion_empty_prompts: Proportion of prompts to make empty
+            
+        Returns:
+            Dictionary containing text embeddings and pooled embeddings
+        """
+        if isinstance(prompt, str):
+            prompt = [prompt]
+            
+        # Handle empty prompts for training
+        prompts = []
+        for text in prompt:
+            if random.random() < proportion_empty_prompts:
+                prompts.append("")
+            else:
+                prompts.append(text)
+
+        prompt_embeds_list = []
+        
+        # Get embeddings from each text encoder
+        for tokenizer, text_encoder in [(self.tokenizer_one, self.text_encoder_one), 
+                                      (self.tokenizer_two, self.text_encoder_two)]:
+            text_inputs = tokenizer(
+                prompts,
                 padding="max_length",
-                max_length=self.max_length,
+                max_length=tokenizer.model_max_length,
                 truncation=True,
                 return_tensors="pt"
             )
-            for k, tokenizer in self.tokenizers.items()
-        }
+            text_input_ids = text_inputs.input_ids.to(self.device)
+            
+            prompt_embeds = text_encoder(
+                text_input_ids,
+                output_hidden_states=True,
+                return_dict=False
+            )
+            
+            # Extract pooled and hidden state embeddings
+            pooled_prompt_embeds = prompt_embeds[0]  # First element is pooled
+            prompt_embeds = prompt_embeds[-1][-2]  # Get penultimate hidden state
+            
+            # Reshape embeddings
+            bs_embed, seq_len, _ = prompt_embeds.shape
+            prompt_embeds = prompt_embeds.view(bs_embed, seq_len, -1)
+            prompt_embeds_list.append(prompt_embeds)
+            
+            # Store last pooled embeddings
+            last_pooled = pooled_prompt_embeds.view(bs_embed, -1)
+            
+        # Combine embeddings from both encoders
+        prompt_embeds = torch.concat(prompt_embeds_list, dim=-1)
         
-        # Generate embeddings
-        embeds = {}
-        for k, encoder in self.text_encoders.items():
-            # Move tokens to GPU
-            tokens_gpu = {key: val.to(self.device) for key, val in tokens[k].items()}
-            
-            # Generate embeddings
-            output = encoder(**tokens_gpu)
-            
-            # Process hidden states
-            last_hidden_state = output.last_hidden_state
-            if last_hidden_state.dim() == 2:
-                last_hidden_state = last_hidden_state.unsqueeze(0)
-            
-            # Process pooled output
-            pooled_output = output.pooler_output
-            if pooled_output.dim() == 1:
-                pooled_output = pooled_output.unsqueeze(0)
-            elif pooled_output.dim() == 3:
-                pooled_output = pooled_output.squeeze(1)
-            
-            # Store embeddings
-            embeds[f"{k}_text_embeds"] = last_hidden_state.cpu()
-            embeds[f"{k}_pooled_embeds"] = pooled_output.cpu()
-            
-        return embeds
+        return {
+            "prompt_embeds": prompt_embeds.cpu(),
+            "pooled_prompt_embeds": last_pooled.cpu()
+        }
+
+    def encode_prompt_list(self, prompts: List[str], proportion_empty_prompts: float = 0.0):
+        """Batch process a list of prompts."""
+        return self(prompts, proportion_empty_prompts)
