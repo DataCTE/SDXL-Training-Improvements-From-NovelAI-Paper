@@ -62,7 +62,7 @@ class AspectBatchSampler(Sampler[List[int]]):
         self.max_aspect_ratio = max_aspect_ratio
         self.min_bucket_length = min_bucket_length or batch_size
         self.max_consecutive_batch_samples = max_consecutive_batch_samples
-        self.chunk_size = get_optimal_cpu_threads()
+        self.chunk_size = get_optimal_cpu_threads().chunk_size
         
         # Initialize state
         self.buckets: Dict[float, BucketInfo] = {}

@@ -25,7 +25,7 @@ class CacheManager:
         # Initialize thread pool with optimal number of workers
         if max_workers is None:
             max_workers = min(32, multiprocessing.cpu_count() * 4)
-        self.executor = ThreadPoolExecutor(max_workers=get_optimal_cpu_threads())
+        self.executor = ThreadPoolExecutor(max_workers=get_optimal_cpu_threads().num_threads)
         
         # Memory cache with size limit
         self.memory_cache = {}

@@ -84,7 +84,7 @@ class TextEmbedder:
         for param in self.text_encoder_two.parameters():
             param.requires_grad = False
 
-        torch.set_num_threads(get_optimal_cpu_threads())
+        torch.set_num_threads(get_optimal_cpu_threads().num_threads)
 
     @torch.no_grad()
     def __call__(

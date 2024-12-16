@@ -24,7 +24,7 @@ class ImageProcessor:
         self.tensor_buffer = torch.empty(self.buffer_size, 
                                        dtype=self.config.dtype, 
                                        device=self.config.device)
-        self.chunk_size = get_optimal_cpu_threads()
+        self.chunk_size = get_optimal_cpu_threads().chunk_size
 
     def _build_transform(self):
         return transforms.Compose([

@@ -253,4 +253,4 @@ class TagWeighter:
 
     def compute_weights(self):
         # Use optimal chunk size for numpy operations
-        chunk_size = get_optimal_cpu_threads()
+        chunk_size = get_optimal_cpu_threads().chunk_size
