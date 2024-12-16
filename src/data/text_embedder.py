@@ -109,13 +109,15 @@ class TextEmbedder:
         # Get embeddings from each text encoder
         for tokenizer, text_encoder in [(self.tokenizer_one, self.text_encoder_one), 
                                       (self.tokenizer_two, self.text_encoder_two)]:
+            # Simply truncate without warnings
             text_inputs = tokenizer(
                 prompts,
                 padding="max_length",
-                max_length=tokenizer.model_max_length,
+                max_length=self.max_length,
                 truncation=True,
-                return_tensors="pt"
+                return_tensors="pt",
             )
+            
             text_input_ids = text_inputs.input_ids.to(self.device)
             
             prompt_embeds = text_encoder(
@@ -124,16 +126,13 @@ class TextEmbedder:
                 return_dict=False
             )
             
-            # Extract pooled and hidden state embeddings
-            pooled_prompt_embeds = prompt_embeds[0]  # First element is pooled
-            prompt_embeds = prompt_embeds[-1][-2]  # Get penultimate hidden state
+            pooled_prompt_embeds = prompt_embeds[0]
+            prompt_embeds = prompt_embeds[-1][-2]
             
-            # Reshape embeddings
             bs_embed, seq_len, _ = prompt_embeds.shape
             prompt_embeds = prompt_embeds.view(bs_embed, seq_len, -1)
             prompt_embeds_list.append(prompt_embeds)
             
-            # Store last pooled embeddings
             last_pooled = pooled_prompt_embeds.view(bs_embed, -1)
             
         # Combine embeddings from both encoders
