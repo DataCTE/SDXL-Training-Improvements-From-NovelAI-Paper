@@ -1,26 +1,31 @@
 # src/data/dataset.py
-from typing import List, Optional, Tuple, Callable, Dict
+from typing import List, Optional, Tuple, Dict
 import torch
 from torch.utils.data import Dataset
 from pathlib import Path
 import logging
 from dataclasses import dataclass
 import os
-import glob
 from PIL import Image
-import asyncio
 from concurrent.futures import ThreadPoolExecutor
-import multiprocessing
-import time
+import psutil
+from collections import defaultdict
 
 from src.data.text_embedder import TextEmbedder
 from src.data.tag_weighter import TagWeighter
-from src.data.bucket import AspectRatioBucket
 from src.data.image_processor import ImageProcessor, ImageProcessorConfig
 from src.data.cache_manager import CacheManager
 from src.data.batch_processor import BatchProcessor
 from src.data.sampler import AspectBatchSampler
-from src.data import get_optimal_cpu_threads
+from src.data.bucket import BucketManager
+from src.data.utils import (
+    find_matching_files,
+    get_optimal_workers,
+    process_in_chunks,
+    calculate_chunk_size,
+    log_system_info,
+    get_memory_usage_gb
+)
 
 logger = logging.getLogger(__name__)
 
@@ -68,13 +73,23 @@ class NovelAIDataset(Dataset):
             )
         )
         
-        # Initialize parallel processing with 90% of CPU cores
-        self.num_workers = get_optimal_cpu_threads().num_threads
+        # Initialize parallel processing with optimal workers
+        self.num_workers = get_optimal_workers()
         
-        # Initialize cache manager with same worker count
+        # Initialize cache manager
         self.cache_manager = CacheManager(
             cache_dir=config.cache_dir,
             max_workers=self.num_workers
+        )
+        
+        # Initialize bucket manager
+        self.bucket_manager = BucketManager(
+            max_image_size=config.image_size,
+            min_image_size=config.min_size,
+            bucket_step=config.bucket_step,
+            min_bucket_resolution=config.min_size[0] * config.min_size[1],
+            max_aspect_ratio=config.max_aspect_ratio,
+            bucket_tolerance=config.bucket_tolerance
         )
         
         self.batch_processor = BatchProcessor(
@@ -86,28 +101,25 @@ class NovelAIDataset(Dataset):
             batch_size=config.batch_size
         )
 
-        # Initialize bucketing
-        self.bucket_manager = AspectRatioBucket(
-            max_image_size=config.image_size,
-            min_image_size=config.min_size,
-            max_dim=config.max_dim,
-            bucket_step=config.bucket_step
-        )
-
-        # Initialize thread pool executor
-        self.executor = ThreadPoolExecutor(max_workers=self.num_workers)
-        
         # Process data with parallel execution
         self.items = []
         self._parallel_process_data(image_dirs)
         
-        logger.info(f"Initialized dataset with {len(self)} samples in {len(self.bucket_manager.buckets)} buckets using {self.num_workers} CPU threads")
+        logger.info(
+            f"Initialized dataset with {len(self)} samples using {self.num_workers} CPU threads\n"
+            f"Bucket stats: {self.bucket_manager.get_stats()}"
+        )
 
     def get_sampler(self, batch_size: Optional[int] = None, shuffle: bool = True, drop_last: bool = False) -> AspectBatchSampler:
         """Create an aspect-aware batch sampler for the dataset."""
         return AspectBatchSampler(
             dataset=self,
             batch_size=batch_size or self.config.batch_size,
+            max_image_size=self.config.image_size,
+            min_image_size=self.config.min_size,
+            max_dim=self.config.max_dim,
+            bucket_step=self.config.bucket_step,
+            min_bucket_resolution=self.config.min_size[0] * self.config.min_size[1],
             shuffle=shuffle,
             drop_last=drop_last,
             bucket_tolerance=self.config.bucket_tolerance,
@@ -118,107 +130,119 @@ class NovelAIDataset(Dataset):
 
     def _parallel_process_data(self, image_dirs: List[str]):
         """Process data using parallel execution."""
+        # Find all valid image files
         image_files = []
         for image_dir in image_dirs:
-            logger.info(f"Scanning directory: {image_dir}")
-            for ext in ['*.jpg', '*.jpeg', '*.png', '*.webp']:
-                files = glob.glob(os.path.join(image_dir, '**', ext), recursive=True)
-                image_files.extend(files)
-                logger.info(f"Found {len(files)} {ext} files in {image_dir}")
-
+            files = find_matching_files(
+                image_dir,
+                extensions={'.jpg', '.jpeg', '.png', '.webp'},
+                recursive=True,
+                require_text_pair=True
+            )
+            image_files.extend(files)
+            
         total_files = len(image_files)
-        logger.info(f"Processing {total_files} images using {self.num_workers} workers")
+        if total_files == 0:
+            logger.warning("No valid image-text pairs found!")
+            return
 
-        # Process files in parallel chunks
-        chunk_size = max(1, len(image_files) // (self.num_workers * 4))
-        chunks = [image_files[i:i + chunk_size] for i in range(0, len(image_files), chunk_size)]
-        logger.info(f"Split into {len(chunks)} chunks of ~{chunk_size} images each")
+        # Log system info and calculate optimal chunk size
+        log_system_info()
+        optimal_workers = get_optimal_workers()
+        chunk_size = calculate_chunk_size(total_files, optimal_workers)
         
-        futures = []
-        for i, chunk in enumerate(chunks):
-            future = self.executor.submit(self._process_chunk, chunk, i)
-            futures.append(future)
-            logger.debug(f"Submitted chunk {i+1}/{len(chunks)} with {len(chunk)} images")
-            
-        # Collect results with progress tracking
-        processed_files = 0
-        valid_files = 0
-        skipped_files = 0
-        start_time = time.time()
-        
-        for future in futures:
-            chunk_items, chunk_stats = future.result()
-            self.items.extend(chunk_items)
-            processed_files += chunk_stats['total']
-            valid_files += chunk_stats['valid']
-            skipped_files += chunk_stats['skipped']
-            
-            if processed_files % 1000 == 0:
-                elapsed = time.time() - start_time
-                rate = processed_files / elapsed
-                eta = (total_files - processed_files) / rate if rate > 0 else 0
-                logger.info(
-                    f"Progress: {processed_files}/{total_files} images "
-                    f"({(processed_files/total_files)*100:.1f}%) - "
-                    f"Valid: {valid_files} Skipped: {skipped_files} - "
-                    f"Rate: {rate:.1f} img/s - "
-                    f"ETA: {eta/60:.1f}min"
-                )
-
-        elapsed = time.time() - start_time
         logger.info(
-            f"Finished processing {len(self.items)} valid images out of {total_files} total files "
-            f"({skipped_files} skipped) in {elapsed/60:.1f}min "
-            f"(avg rate: {total_files/elapsed:.1f} img/s)"
+            f"Processing configuration:\n"
+            f"- Workers: {optimal_workers}\n"
+            f"- Chunk size: {chunk_size} images\n"
+            f"- Total files: {total_files}"
+        )
+        
+        # Process files in chunks
+        self.items, stats = process_in_chunks(
+            items=image_files,
+            chunk_size=chunk_size,
+            process_fn=self._process_chunk,
+            num_workers=optimal_workers
+        )
+        
+        logger.info(
+            f"Dataset preparation completed:\n"
+            f"- Valid items: {len(self.items)}\n"
+            f"- Total files: {total_files}\n"
+            f"- Success rate: {len(self.items)/total_files*100:.1f}%\n"
+            f"Error types: {stats.get('error_types', {})}"
         )
 
     def _process_chunk(self, image_files: List[str], chunk_id: int) -> Tuple[List[Dict], Dict[str, int]]:
         """Process a chunk of image files."""
         chunk_items = []
-        stats = {'total': 0, 'valid': 0, 'skipped': 0}
-        
-        logger.debug(f"Starting chunk {chunk_id} with {len(image_files)} images")
-        chunk_start = time.time()
+        stats = defaultdict(int)
+        error_types = defaultdict(int)
         
         for img_path in image_files:
             stats['total'] += 1
+            
             try:
-                if not Path(img_path).with_suffix('.txt').exists():
+                # Validate text file
+                txt_path = Path(img_path).with_suffix('.txt')
+                if not txt_path.exists() or txt_path.stat().st_size == 0:
                     stats['skipped'] += 1
+                    error_types['missing_or_empty_text'] += 1
+                    continue
+                
+                # Validate and load image
+                try:
+                    with Image.open(img_path) as img:
+                        if img.mode not in ('RGB', 'RGBA'):
+                            img = img.convert('RGB')
+                        width, height = img.size
+                        
+                        # Basic image validation
+                        if width < 32 or height < 32:
+                            stats['skipped'] += 1
+                            error_types['image_too_small'] += 1
+                            continue
+                            
+                        if width > 8192 or height > 8192:
+                            stats['skipped'] += 1
+                            error_types['image_too_large'] += 1
+                            continue
+                            
+                        # Find appropriate bucket
+                        bucket = self.bucket_manager.find_bucket(width, height)
+                        if bucket is None:
+                            stats['skipped'] += 1
+                            error_types['no_suitable_bucket'] += 1
+                            continue
+                            
+                        # Get cache paths
+                        cache_paths = self.cache_manager.get_cache_paths(img_path)
+                        
+                        # Add to valid items
+                        chunk_items.append({
+                            'image_path': img_path,
+                            'bucket': bucket,
+                            'latent_cache': cache_paths['latent'],
+                            'text_cache': cache_paths['text'],
+                            'original_size': (height, width),
+                            'crop_top_left': (0, 0)
+                        })
+                        stats['valid'] += 1
+                        
+                except (IOError, OSError) as e:
+                    stats['errors'] += 1
+                    error_types['image_load_error'] += 1
+                    logger.debug(f"Error loading image {img_path}: {e}")
                     continue
                     
-                with Image.open(img_path) as img:
-                    img = img.convert('RGB')
-                    width, height = img.size
-                    bucket = self.bucket_manager.find_bucket(width, height)
-                    if bucket is None:
-                        logger.debug(f"No suitable bucket found for {img_path} ({width}x{height})")
-                        stats['skipped'] += 1
-                        continue
-                        
-                    cache_paths = self.cache_manager.get_cache_paths(img_path)
-                    
-                    chunk_items.append({
-                        'image_path': img_path,
-                        'bucket': bucket,
-                        'latent_cache': cache_paths['latent'],
-                        'text_cache': cache_paths['text'],
-                        'original_size': (height, width),
-                        'crop_top_left': (0, 0)
-                    })
-                    stats['valid'] += 1
-                    
             except Exception as e:
-                logger.error(f"Error processing {img_path}: {e}")
-                stats['skipped'] += 1
+                stats['errors'] += 1
+                error_types['other_error'] += 1
+                logger.error(f"Unexpected error processing {img_path}: {e}")
                 continue
         
-        chunk_time = time.time() - chunk_start
-        logger.debug(
-            f"Finished chunk {chunk_id}: {stats['valid']}/{len(image_files)} valid images "
-            f"({stats['skipped']} skipped) in {chunk_time:.1f}s "
-            f"({len(image_files)/chunk_time:.1f} img/s)"
-        )
+        stats['error_types'] = dict(error_types)
         return chunk_items, stats
 
     def __getitem__(self, idx: int) -> Dict:

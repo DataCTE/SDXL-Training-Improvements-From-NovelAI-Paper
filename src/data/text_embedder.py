@@ -4,6 +4,9 @@ from typing import Dict, List, Union, Optional
 import random
 import warnings
 from src.data.thread_config import get_optimal_cpu_threads
+import logging
+
+logger = logging.getLogger(__name__)
 
 def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: str, subfolder: str = "text_encoder"):
     """Load the correct text encoder class based on config."""
@@ -31,7 +34,9 @@ class TextEmbedder:
         pretrained_model_name_or_path: str,
         device: torch.device,
         max_length: int = 77,
-        dtype: torch.dtype = torch.float16
+        dtype: torch.dtype = torch.float16,
+        batch_size: int = 32,
+        enable_memory_efficient_attention: bool = True
     ):
         """Initialize SDXL text embedder.
         
@@ -40,21 +45,26 @@ class TextEmbedder:
             device: torch device
             max_length: max token length
             dtype: torch dtype for models
+            batch_size: batch size for text processing
+            enable_memory_efficient_attention: whether to use memory efficient attention
         """
         self.device = device
         self.max_length = max_length
         self.dtype = dtype
+        self.batch_size = batch_size
         
-        # Load tokenizers
+        # Load tokenizers with caching
         self.tokenizer_one = AutoTokenizer.from_pretrained(
             pretrained_model_name_or_path,
             subfolder="tokenizer",
-            use_fast=False
+            use_fast=True,  # Enable fast tokenizer
+            model_max_length=max_length
         )
         self.tokenizer_two = AutoTokenizer.from_pretrained(
             pretrained_model_name_or_path,
             subfolder="tokenizer_2",
-            use_fast=False
+            use_fast=True,  # Enable fast tokenizer
+            model_max_length=max_length
         )
 
         # Load text encoders
@@ -65,18 +75,35 @@ class TextEmbedder:
             pretrained_model_name_or_path,
             subfolder="text_encoder_2"
         )
-
+        
+        # Load and optimize encoders
         self.text_encoder_one = text_encoder_cls_one.from_pretrained(
             pretrained_model_name_or_path,
-            subfolder="text_encoder"
-        ).to(device).to(dtype)
+            subfolder="text_encoder",
+            torch_dtype=dtype,
+            low_cpu_mem_usage=True
+        ).to(device)
         
         self.text_encoder_two = text_encoder_cls_two.from_pretrained(
             pretrained_model_name_or_path,
-            subfolder="text_encoder_2"
-        ).to(device).to(dtype)
+            subfolder="text_encoder_2",
+            torch_dtype=dtype,
+            low_cpu_mem_usage=True
+        ).to(device)
 
-        # Freeze text encoders
+        # Enable memory efficient attention if available
+        if enable_memory_efficient_attention:
+            try:
+                from transformers.models.clip.modeling_clip import CLIPAttention
+                for encoder in [self.text_encoder_one, self.text_encoder_two]:
+                    for module in encoder.modules():
+                        if isinstance(module, CLIPAttention):
+                            module.enable_xformers_memory_efficient_attention()
+                logger.info("Enabled memory efficient attention for text encoders")
+            except ImportError:
+                logger.warning("xformers not available, using standard attention")
+
+        # Freeze text encoders and set to eval mode
         self.text_encoder_one.eval()
         self.text_encoder_two.eval()
         for param in self.text_encoder_one.parameters():
@@ -84,7 +111,62 @@ class TextEmbedder:
         for param in self.text_encoder_two.parameters():
             param.requires_grad = False
 
+        # Set optimal CPU threads for tokenization
         torch.set_num_threads(get_optimal_cpu_threads().num_threads)
+        
+        # Pre-allocate reusable tensors
+        self.attention_mask_buffer = torch.ones((batch_size, max_length), dtype=torch.long, device=device)
+        
+        logger.info(
+            f"Initialized TextEmbedder:\n"
+            f"- Device: {device}\n"
+            f"- Dtype: {dtype}\n"
+            f"- Batch size: {batch_size}\n"
+            f"- Max length: {max_length}"
+        )
+
+    @torch.no_grad()
+    def _process_batch(
+        self,
+        prompts: List[str],
+        tokenizer,
+        text_encoder,
+        start_idx: int,
+        end_idx: int
+    ) -> Dict[str, torch.Tensor]:
+        """Process a batch of prompts efficiently."""
+        batch_prompts = prompts[start_idx:end_idx]
+        
+        # Tokenize with padding
+        text_inputs = tokenizer(
+            batch_prompts,
+            padding="max_length",
+            max_length=self.max_length,
+            truncation=True,
+            return_tensors="pt",
+        )
+        
+        # Move to device efficiently
+        text_input_ids = text_inputs.input_ids.to(self.device, non_blocking=True)
+        attention_mask = text_inputs.attention_mask.to(self.device, non_blocking=True)
+        
+        # Process with mixed precision
+        with torch.cuda.amp.autocast(dtype=self.dtype):
+            prompt_embeds = text_encoder(
+                text_input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                return_dict=False
+            )
+        
+        # Extract and reshape embeddings
+        pooled_prompt_embeds = prompt_embeds[0]
+        prompt_embeds = prompt_embeds[-1][-2]
+        
+        return {
+            'prompt_embeds': prompt_embeds,
+            'pooled_prompt_embeds': pooled_prompt_embeds
+        }
 
     @torch.no_grad()
     def __call__(
@@ -92,7 +174,7 @@ class TextEmbedder:
         prompt: Union[str, List[str]],
         proportion_empty_prompts: float = 0.0
     ) -> Dict[str, torch.Tensor]:
-        """Generate text embeddings for SDXL.
+        """Generate text embeddings for SDXL with optimized batch processing.
         
         Args:
             prompt: Text prompt or list of prompts
@@ -104,7 +186,7 @@ class TextEmbedder:
         if isinstance(prompt, str):
             prompt = [prompt]
             
-        # Handle empty prompts for training
+        # Handle empty prompts efficiently
         prompts = []
         for text in prompt:
             if random.random() < proportion_empty_prompts:
@@ -112,56 +194,45 @@ class TextEmbedder:
             else:
                 prompts.append(text)
 
-        prompt_embeds_list = []
+        total_prompts = len(prompts)
+        all_prompt_embeds = []
+        all_pooled_embeds = []
         
-        # Get embeddings from each text encoder
-        for tokenizer, text_encoder in [(self.tokenizer_one, self.text_encoder_one), 
-                                      (self.tokenizer_two, self.text_encoder_two)]:
-            # Simply truncate without warnings
-            text_inputs = tokenizer(
-                prompts,
-                padding="max_length",
-                max_length=self.max_length,
-                truncation=True,
-                return_tensors="pt",
-            )
+        # Process in optimized batches
+        for start_idx in range(0, total_prompts, self.batch_size):
+            end_idx = min(start_idx + self.batch_size, total_prompts)
             
-            # Move input to GPU
-            text_input_ids = text_inputs.input_ids.to(self.device)
-            attention_mask = text_inputs.attention_mask.to(self.device)
+            # Process with both encoders
+            embeds_one = self._process_batch(prompts, self.tokenizer_one, self.text_encoder_one, start_idx, end_idx)
+            embeds_two = self._process_batch(prompts, self.tokenizer_two, self.text_encoder_two, start_idx, end_idx)
             
-            with torch.cuda.amp.autocast(dtype=self.dtype):
-                prompt_embeds = text_encoder(
-                    text_input_ids,
-                    attention_mask=attention_mask,
-                    output_hidden_states=True,
-                    return_dict=False
-                )
+            # Combine embeddings
+            prompt_embeds = torch.cat([
+                embeds_one['prompt_embeds'],
+                embeds_two['prompt_embeds']
+            ], dim=-1)
             
-            pooled_prompt_embeds = prompt_embeds[0]
-            prompt_embeds = prompt_embeds[-1][-2]
+            pooled_prompt_embeds = embeds_two['pooled_prompt_embeds']
             
-            bs_embed, seq_len, _ = prompt_embeds.shape
-            prompt_embeds = prompt_embeds.view(bs_embed, seq_len, -1)
-            prompt_embeds_list.append(prompt_embeds)
-            
-            last_pooled = pooled_prompt_embeds.view(bs_embed, -1)
-            
-        # Combine embeddings from both encoders
-        prompt_embeds = torch.concat(prompt_embeds_list, dim=-1)
+            all_prompt_embeds.append(prompt_embeds)
+            all_pooled_embeds.append(pooled_prompt_embeds)
+
+        # Combine all batches
+        prompt_embeds = torch.cat(all_prompt_embeds, dim=0)
+        pooled_prompt_embeds = torch.cat(all_pooled_embeds, dim=0)
         
         # Keep on GPU if needed
         if self.device.type == "cuda":
             return {
                 "prompt_embeds": prompt_embeds,
-                "pooled_prompt_embeds": last_pooled
+                "pooled_prompt_embeds": pooled_prompt_embeds
             }
         else:
             return {
                 "prompt_embeds": prompt_embeds.cpu(),
-                "pooled_prompt_embeds": last_pooled.cpu()
+                "pooled_prompt_embeds": pooled_prompt_embeds.cpu()
             }
 
     def encode_prompt_list(self, prompts: List[str], proportion_empty_prompts: float = 0.0):
-        """Batch process a list of prompts."""
+        """Batch process a list of prompts efficiently."""
         return self(prompts, proportion_empty_prompts)

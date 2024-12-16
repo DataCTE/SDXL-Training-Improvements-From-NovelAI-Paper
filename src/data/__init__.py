@@ -4,47 +4,47 @@ import multiprocessing
 import torch
 from typing import Dict
 from dataclasses import dataclass
-from .thread_config import get_optimal_cpu_threads, ThreadConfig, get_optimal_thread_config
-
-# Set multiprocessing start method
-try:
-    mp.set_start_method('spawn', force=True)
-except RuntimeError:
-    pass
-
-# Get thread configuration
-thread_config = get_optimal_thread_config()
-
-# Set global thread settings
-os.environ["OMP_NUM_THREADS"] = str(thread_config.num_threads)
-os.environ["MKL_NUM_THREADS"] = str(thread_config.num_threads)
-torch.set_num_threads(thread_config.num_threads)
-
-# Import components after setting thread config
-from .dataset import NovelAIDataset, NovelAIDatasetConfig
-from .text_embedder import TextEmbedder
+from .thread_config import get_optimal_cpu_threads
+from .utils import (
+    get_system_resources,
+    get_optimal_workers,
+    get_gpu_memory_usage,
+    create_thread_pool,
+    adjust_batch_size,
+    get_memory_usage_gb,
+    log_system_info,
+    calculate_chunk_size,
+    MemoryCache
+)
+from .bucket import ImageBucket
 from .tag_weighter import TagWeighter, TagWeightingConfig
-from .bucket import AspectRatioBucket, ImageBucket
+from .text_embedder import TextEmbedder
 from .image_processor import ImageProcessor, ImageProcessorConfig
 from .cache_manager import CacheManager
 from .batch_processor import BatchProcessor
+from .dataset import NovelAIDataset, NovelAIDatasetConfig
 from .sampler import AspectBatchSampler
 
 __all__ = [
-    'NovelAIDataset',
-    'NovelAIDatasetConfig',
-    'TextEmbedder',
+    'get_optimal_cpu_threads',
+    'get_system_resources',
+    'get_optimal_workers',
+    'get_gpu_memory_usage',
+    'create_thread_pool',
+    'adjust_batch_size',
+    'get_memory_usage_gb',
+    'log_system_info',
+    'calculate_chunk_size',
+    'MemoryCache',
+    'ImageBucket',
     'TagWeighter',
     'TagWeightingConfig',
-    'AspectRatioBucket',
-    'ImageBucket',
+    'TextEmbedder',
     'ImageProcessor',
     'ImageProcessorConfig',
     'CacheManager',
     'BatchProcessor',
-    'AspectBatchSampler',
-    'get_optimal_cpu_threads',
-    'get_optimal_thread_config',
-    'thread_config',
-    'ThreadConfig'
+    'NovelAIDataset',
+    'NovelAIDatasetConfig',
+    'AspectBatchSampler'
 ]

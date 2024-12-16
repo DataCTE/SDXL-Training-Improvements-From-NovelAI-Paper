@@ -1,10 +1,7 @@
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Dict, Union
-import math
-import numpy as np
+from typing import List, Dict, Optional, Any, Set, Tuple
 import logging
-from collections import Counter
-from src.data.thread_config import get_optimal_cpu_threads
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -13,7 +10,7 @@ class ImageBucket:
     """Bucket for images of similar aspect ratios."""
     width: int
     height: int
-    items: List = field(default_factory=list)
+    items: List[Any] = field(default_factory=list)
     
     def __post_init__(self):
         """Initialize derived properties."""
@@ -24,15 +21,29 @@ class ImageBucket:
             
         self.aspect_ratio = self.width / self.height
         self.resolution = self.width * self.height
-        self.area = self.resolution  # Alias for resolution
+        self.used_items = 0
         
-    def add_item(self, item) -> None:
+    def add_item(self, item: Any) -> None:
         """Add item to bucket."""
         self.items.append(item)
         
     def clear(self) -> None:
         """Clear all items from bucket."""
         self.items.clear()
+        self.used_items = 0
+        
+    def get_next_batch(self, batch_size: int) -> List[Any]:
+        """Get next batch of items up to batch_size."""
+        if self.used_items >= len(self.items):
+            return []
+        end_idx = min(self.used_items + batch_size, len(self.items))
+        batch = self.items[self.used_items:end_idx]
+        self.used_items = end_idx
+        return batch
+        
+    def remaining_items(self) -> int:
+        """Get number of remaining items."""
+        return len(self.items) - self.used_items
         
     def __len__(self) -> int:
         return len(self.items)
@@ -40,74 +51,51 @@ class ImageBucket:
     def __repr__(self) -> str:
         return f"ImageBucket({self.width}x{self.height}, {len(self)} items, ratio={self.aspect_ratio:.3f})"
 
-class AspectRatioBucket:
-    """SDXL aspect ratio bucketing system."""
+class BucketManager:
+    """Manager for creating and assigning image buckets."""
     
     def __init__(
         self,
-        max_image_size: Union[Tuple[int, int], int] = (768, 1024),
-        min_image_size: Union[Tuple[int, int], int] = (256, 256),
-        max_dim: int = None,
+        max_image_size: Tuple[int, int] = (1024, 1024),
+        min_image_size: Tuple[int, int] = (256, 256),
         bucket_step: int = 64,
         min_bucket_resolution: int = 65536,  # 256x256
-        max_bucket_resolution: int = None,  # Changed to None to indicate no upper limit
-        force_square_bucket: bool = False  # Changed default to False since we're keeping original sizes
+        max_aspect_ratio: float = 4.0,
+        bucket_tolerance: float = 0.2
     ):
-        """Initialize bucketing system.
-        
-        Args:
-            max_image_size: Maximum (width, height) for images or single max dimension (not enforced)
-            min_image_size: Minimum (width, height) for images or single min dimension
-            max_dim: Maximum single dimension (not enforced)
-            bucket_step: Step size for bucket dimensions
-            min_bucket_resolution: Minimum total pixels in a bucket
-            max_bucket_resolution: Maximum total pixels in a bucket (not enforced)
-            force_square_bucket: Whether to ensure a square bucket exists
-        """
-        # Convert single integers to tuples
-        if isinstance(max_image_size, int):
-            max_image_size = (max_image_size, max_image_size)
-        if isinstance(min_image_size, int):
-            min_image_size = (min_image_size, min_image_size)
-            
-        # Validate inputs
-        if not all(isinstance(x, int) and x > 0 for x in min_image_size):
-            raise ValueError(f"Invalid min_image_size: {min_image_size}")
-            
         self.max_width, self.max_height = max_image_size
         self.min_width, self.min_height = min_image_size
-        self.max_dim = max_dim
         self.bucket_step = bucket_step
         self.min_bucket_resolution = min_bucket_resolution
-        self.max_bucket_resolution = max_bucket_resolution
-        self.force_square_bucket = force_square_bucket
+        self.max_aspect_ratio = max_aspect_ratio
+        self.bucket_tolerance = bucket_tolerance
         
         # Initialize buckets
-        self.buckets: List[ImageBucket] = []
-        self._generate_buckets()
+        self.buckets: Dict[float, ImageBucket] = {}
+        self._create_buckets()
         
-        # Cache for aspect ratio lookup
-        self._aspect_ratios = np.array([b.aspect_ratio for b in self.buckets])
-        self._log_aspects = np.log(self._aspect_ratios)
-        
-        logger.info(f"Created {len(self.buckets)} buckets")
-        
+        logger.info(
+            f"Initialized BucketManager:\n"
+            f"- Size range: {min_image_size} to {max_image_size}\n"
+            f"- Bucket step: {bucket_step}\n"
+            f"- Total buckets: {len(self.buckets)}"
+        )
+    
     def _validate_dimensions(self, width: int, height: int) -> Tuple[int, int]:
         """Validate and adjust dimensions to constraints."""
         # Round to bucket step
         width = round(width / self.bucket_step) * self.bucket_step
         height = round(height / self.bucket_step) * self.bucket_step
         
-        # Only enforce minimum dimensions
+        # Enforce minimum dimensions
         width = max(width, self.min_width)
         height = max(height, self.min_height)
             
         return width, height
-
-    def _generate_buckets(self) -> None:
-        """Generate bucket resolutions following SDXL paper."""
+    
+    def _create_buckets(self) -> None:
+        """Generate bucket resolutions."""
         seen_resolutions = set()
-        logger.info("Starting bucket generation...")
         
         def add_bucket(width: int, height: int) -> None:
             """Helper to add bucket if valid."""
@@ -120,71 +108,57 @@ class AspectRatioBucket:
             if resolution < self.min_bucket_resolution:
                 return
                 
-            self.buckets.append(ImageBucket(width=width, height=height))
+            aspect = width / height
+            if aspect > self.max_aspect_ratio or aspect < (1/self.max_aspect_ratio):
+                return
+                
+            self.buckets[aspect] = ImageBucket(width=width, height=height)
             seen_resolutions.add((width, height))
-            logger.debug(f"Added bucket: {width}x{height} (ratio: {width/height:.2f})")
+            logger.debug(f"Added bucket: {width}x{height} (ratio: {aspect:.2f})")
         
-        # Generate width-first buckets starting from minimum dimensions
+        # Generate width-first buckets
         width = self.min_width
-        max_width = self.max_width * 2  # Extended range
-        while width <= max_width:
+        while width <= self.max_width:
             height = self.min_height
-            max_height = self.max_height * 2  # Extended range
-            while height <= max_height:
+            while height <= self.max_height:
                 add_bucket(width, height)
                 height += self.bucket_step
             width += self.bucket_step
             
-        # Sort buckets by aspect ratio for efficient lookup
-        self.buckets.sort(key=lambda x: x.aspect_ratio)
-        logger.info(f"Generated {len(self.buckets)} buckets starting from minimum resolution of {self.min_bucket_resolution} pixels")
-
+        logger.info(f"Created {len(self.buckets)} buckets")
+    
     def find_bucket(self, width: int, height: int) -> Optional[ImageBucket]:
-        """Find best fitting bucket for given image dimensions.
-        
-        Args:
-            width: Image width
-            height: Image height
-            
-        Returns:
-            Best matching ImageBucket or None if no suitable bucket found
-        """
-        try:
-            # Validate input
-            if width <= 0 or height <= 0:
-                raise ValueError(f"Invalid dimensions: {width}x{height}")
-                
-            image_aspect = width / height
-            log_image_aspect = np.log(image_aspect)
-            
-            # Find closest bucket in log space
-            idx = np.argmin(np.abs(self._log_aspects - log_image_aspect))
-            bucket = self.buckets[idx]
-            if len(bucket.items) % 1000 == 0 and len(bucket.items) > 0:
-                logger.info(f"Bucket {bucket.width}x{bucket.height} now has {len(bucket.items)} items")
-            return bucket
-            
-        except Exception as e:
-            logger.error(f"Error finding bucket for {width}x{height}: {e}")
+        """Find best bucket for given dimensions."""
+        if width <= 0 or height <= 0:
             return None
             
-    def get_stats(self) -> Dict:
-        """Get statistics about current bucket usage."""
-        stats = {
-            "total_buckets": len(self.buckets),
-            "total_images": sum(len(b) for b in self.buckets),
-            "bucket_sizes": [(b.width, b.height) for b in self.buckets],
-            "images_per_bucket": [len(b) for b in self.buckets],
-            "empty_buckets": sum(1 for b in self.buckets if len(b) == 0),
-            "aspect_ratios": [b.aspect_ratio for b in self.buckets]
-        }
-        return stats
+        # Calculate aspect ratio
+        aspect = width / height
+        if aspect > self.max_aspect_ratio or aspect < (1/self.max_aspect_ratio):
+            return None
+            
+        # Find closest bucket in log space
+        log_aspect = np.log(aspect)
+        bucket_aspects = np.array(list(self.buckets.keys()))
+        log_bucket_aspects = np.log(bucket_aspects)
         
-    def clear_buckets(self) -> None:
-        """Clear all items from all buckets."""
-        for bucket in self.buckets:
-            bucket.clear()
-
-    def _create_buckets(self):
-        # Use optimal chunk size for parallel operations
-        chunk_size = get_optimal_cpu_threads().chunk_size
+        # Find closest bucket within tolerance
+        diffs = np.abs(log_bucket_aspects - log_aspect)
+        min_idx = np.argmin(diffs)
+        if diffs[min_idx] <= self.bucket_tolerance:
+            return self.buckets[bucket_aspects[min_idx]]
+            
+        return None
+    
+    def get_stats(self) -> Dict:
+        """Get bucket statistics."""
+        return {
+            "total_buckets": len(self.buckets),
+            "aspect_ratios": sorted(self.buckets.keys()),
+            "items_per_bucket": {
+                aspect: len(bucket) for aspect, bucket in self.buckets.items()
+            },
+            "total_items": sum(len(b) for b in self.buckets.values()),
+            "max_bucket_size": max((len(b) for b in self.buckets.values()), default=0),
+            "min_bucket_size": min((len(b) for b in self.buckets.values()), default=0)
+        }

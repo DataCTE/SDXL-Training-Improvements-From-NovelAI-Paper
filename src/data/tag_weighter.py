@@ -251,6 +251,4 @@ class TagWeighter:
             'avg_weight': np.mean(list(self.tag_weights.values())) if self.tag_weights else None
         }
 
-    def compute_weights(self):
-        # Use optimal chunk size for numpy operations
-        chunk_size = get_optimal_cpu_threads().chunk_size
+
