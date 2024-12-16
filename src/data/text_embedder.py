@@ -5,7 +5,8 @@ import random
 import warnings
 from src.data.thread_config import get_optimal_cpu_threads
 import logging
-from src.data.utils import get_gpu_memory_usage
+from src.data.utils import get_gpu_memory_usage, calculate_optimal_batch_size
+import torch.amp  # Import the new amp module
 
 logger = logging.getLogger(__name__)
 
@@ -183,17 +184,15 @@ class TextEmbedder:
     def _calculate_optimal_batch_size(self) -> int:
         """Calculate optimal batch size based on available memory."""
         try:
-            with torch.cuda.amp.autocast():
-                # Test with small batch
-                test_batch = 4
-                sample_text = ["test prompt"] * test_batch
-                memory_per_item = get_gpu_memory_usage() / test_batch
-                
-                # Calculate max batch size
-                available_memory = torch.cuda.get_device_properties(0).total_memory * self.max_memory_usage
-                optimal_batch_size = int(available_memory / (memory_per_item * 3))  # Factor of 3 for safety
-                
-                return max(1, min(optimal_batch_size, 32))  # Cap at 32
+            if self.device.type == "cuda":
+                return calculate_optimal_batch_size(
+                    device=self.device,
+                    min_batch_size=1,
+                    max_batch_size=32,  # Keep original cap
+                    target_memory_usage=self.max_memory_usage,
+                    growth_factor=0.3  # Conservative growth factor for text embedding
+                )
+            return 8  # Default CPU batch size
         except Exception as e:
             logger.warning(f"Error calculating batch size: {e}, using default")
             return 8
@@ -223,8 +222,8 @@ class TextEmbedder:
         text_input_ids = text_inputs.input_ids.to(self.device, non_blocking=True)
         attention_mask = text_inputs.attention_mask.to(self.device, non_blocking=True)
         
-        # Process with mixed precision
-        with torch.cuda.amp.autocast(dtype=self.dtype):
+        # Use new autocast syntax
+        with torch.amp.autocast(device_type=self.device.type, dtype=self.dtype):
             prompt_embeds = text_encoder(
                 text_input_ids,
                 attention_mask=attention_mask,
