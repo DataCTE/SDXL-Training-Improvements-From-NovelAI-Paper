@@ -9,7 +9,7 @@ class ThreadConfig:
     chunk_size: int
     prefetch_factor: int
 
-def get_optimal_cpu_threads() -> ThreadConfig:
+def get_optimal_thread_config() -> ThreadConfig:
     """Calculate optimal thread configuration using 90% of CPU resources"""
     cpu_count = multiprocessing.cpu_count()
     num_threads = max(1, int(cpu_count * 0.9))
@@ -19,3 +19,6 @@ def get_optimal_cpu_threads() -> ThreadConfig:
         chunk_size=max(1, num_threads // 2),
         prefetch_factor=2
     )
+
+# Alias for backward compatibility
+get_optimal_cpu_threads = get_optimal_thread_config
