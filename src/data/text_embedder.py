@@ -28,6 +28,63 @@ def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: st
         else:
             raise ValueError(f"{model_class} is not supported.")
 
+def enable_clip_memory_efficient_attention(model: torch.nn.Module) -> bool:
+    """Enable memory efficient attention for CLIP models if possible."""
+    try:
+        import xformers
+        import xformers.ops
+        
+        def forward_memory_efficient(self, x, attention_mask=None):
+            """Memory efficient attention forward pass."""
+            h_ = self.heads
+            q = self.to_q(x)
+            k = self.to_k(x)
+            v = self.to_v(x)
+            
+            # Split heads
+            q = q.view(q.shape[0], -1, h_, q.shape[-1] // h_).transpose(1, 2)
+            k = k.view(k.shape[0], -1, h_, k.shape[-1] // h_).transpose(1, 2)
+            v = v.view(v.shape[0], -1, h_, v.shape[-1] // h_).transpose(1, 2)
+            
+            # Create attention mask
+            if attention_mask is not None:
+                attention_mask = attention_mask.view(attention_mask.shape[0], 1, attention_mask.shape[1], 1)
+                attention_mask = attention_mask.expand(-1, h_, -1, attention_mask.shape[-1])
+                attention_mask = (attention_mask < 0.5)
+            
+            # Apply memory efficient attention
+            out = xformers.ops.memory_efficient_attention(
+                q, k, v,
+                attn_bias=None,
+                p=0.0,
+                scale=self.scale,
+                mask=attention_mask
+            )
+            
+            # Merge heads
+            out = out.transpose(1, 2).contiguous()
+            out = out.view(out.shape[0], -1, h_ * out.shape[-1])
+            
+            return self.to_out(out)
+        
+        # Find and patch attention layers
+        found = False
+        for name, module in model.named_modules():
+            if "attn" in name.lower() and hasattr(module, "to_q"):
+                module.forward = forward_memory_efficient.__get__(module)
+                found = True
+                
+        if found:
+            logger.info("Enabled xformers memory efficient attention for CLIP model")
+            return True
+        else:
+            logger.warning("Could not find attention layers to optimize")
+            return False
+            
+    except ImportError:
+        logger.warning("xformers not available, using standard attention")
+        return False
+
 class TextEmbedder:
     def __init__(
         self,
@@ -93,15 +150,8 @@ class TextEmbedder:
 
         # Enable memory efficient attention if available
         if enable_memory_efficient_attention:
-            try:
-                from transformers.models.clip.modeling_clip import CLIPAttention
-                for encoder in [self.text_encoder_one, self.text_encoder_two]:
-                    for module in encoder.modules():
-                        if isinstance(module, CLIPAttention):
-                            module.enable_xformers_memory_efficient_attention()
-                logger.info("Enabled memory efficient attention for text encoders")
-            except ImportError:
-                logger.warning("xformers not available, using standard attention")
+            enable_clip_memory_efficient_attention(self.text_encoder_one)
+            enable_clip_memory_efficient_attention(self.text_encoder_two)
 
         # Freeze text encoders and set to eval mode
         self.text_encoder_one.eval()
