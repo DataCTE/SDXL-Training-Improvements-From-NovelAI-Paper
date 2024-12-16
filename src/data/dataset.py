@@ -81,7 +81,20 @@ class NovelAIDataset(Dataset):
         # Get model dtype from VAE
         self.dtype = next(vae.parameters()).dtype
 
-        # Initialize optimized components
+        # Validate bucket configuration first
+        self._validate_bucket_config()
+        
+        # Initialize bucket manager before other components
+        self.bucket_manager = BucketManager(
+            max_image_size=config.image_size,
+            min_image_size=config.min_size,
+            bucket_step=config.bucket_step,
+            min_bucket_resolution=config.min_bucket_size or (config.min_size[0] * config.min_size[1]),
+            max_aspect_ratio=config.max_aspect_ratio,
+            bucket_tolerance=config.bucket_tolerance
+        )
+
+        # Initialize optimized components after bucket_manager
         self.image_processor = ImageProcessor(
             ImageProcessorConfig(
                 dtype=self.dtype,
@@ -97,19 +110,6 @@ class NovelAIDataset(Dataset):
         self.cache_manager = CacheManager(
             cache_dir=config.cache_dir,
             max_workers=self.num_workers
-        )
-        
-        # Validate configuration
-        self._validate_bucket_config()
-        
-        # Initialize bucket manager
-        self.bucket_manager = BucketManager(
-            max_image_size=config.image_size,
-            min_image_size=config.min_size,
-            bucket_step=config.bucket_step,
-            min_bucket_resolution=config.min_size[0] * config.min_size[1],
-            max_aspect_ratio=config.max_aspect_ratio,
-            bucket_tolerance=config.bucket_tolerance
         )
         
         self.batch_processor = BatchProcessor(
