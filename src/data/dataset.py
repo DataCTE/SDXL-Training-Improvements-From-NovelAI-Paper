@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import os
 import glob
 from PIL import Image
+import asyncio
 
 from src.data.text_embedder import TextEmbedder
 from src.data.tag_weighter import TagWeighter
@@ -87,7 +88,7 @@ class NovelAIDataset(Dataset):
 
         # Process and cache data
         self.items = []
-        self._process_data(image_dirs)
+        asyncio.run(self._process_data(image_dirs))
         
         logger.info(f"Initialized dataset with {len(self)} samples in {len(self.bucket_manager.buckets)} buckets")
 

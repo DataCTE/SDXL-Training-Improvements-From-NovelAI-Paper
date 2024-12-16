@@ -2,22 +2,27 @@ import torch
 from transformers import AutoTokenizer, PretrainedConfig
 from typing import Dict, List, Union, Optional
 import random
+import warnings
 
 def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: str, subfolder: str = "text_encoder"):
     """Load the correct text encoder class based on config."""
-    text_encoder_config = PretrainedConfig.from_pretrained(
-        pretrained_model_name_or_path, subfolder=subfolder
-    )
-    model_class = text_encoder_config.architectures[0]
+    # Temporarily suppress the specific warning
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="You are using a model of type clip_text_model")
+        
+        text_encoder_config = PretrainedConfig.from_pretrained(
+            pretrained_model_name_or_path, subfolder=subfolder
+        )
+        model_class = text_encoder_config.architectures[0]
 
-    if model_class == "CLIPTextModel":
-        from transformers import CLIPTextModel
-        return CLIPTextModel
-    elif model_class == "CLIPTextModelWithProjection":
-        from transformers import CLIPTextModelWithProjection
-        return CLIPTextModelWithProjection
-    else:
-        raise ValueError(f"{model_class} is not supported.")
+        if model_class == "CLIPTextModel":
+            from transformers import CLIPTextModel
+            return CLIPTextModel
+        elif model_class == "CLIPTextModelWithProjection":
+            from transformers import CLIPTextModelWithProjection
+            return CLIPTextModelWithProjection
+        else:
+            raise ValueError(f"{model_class} is not supported.")
 
 class TextEmbedder:
     def __init__(
