@@ -15,6 +15,7 @@ from src.data.utils import (
     get_memory_usage_gb
 )
 from src.data.bucket import BucketManager
+from PIL import Image
 
 logger = logging.getLogger(__name__)
 
@@ -207,9 +208,55 @@ class AspectBatchSampler(Sampler[List[int]]):
         
         for idx in range(start_idx, end_idx):
             try:
-                # Get image dimensions from dataset
-                width = self.dataset.items[idx][1].width
-                height = self.dataset.items[idx][1].height
+                # Get image dimensions from dataset with better error handling
+                item = self.dataset.items[idx]
+                if not isinstance(item, (list, tuple)) or len(item) < 2:
+                    logger.error(f"Invalid item format for sample {idx}: {type(item)}")
+                    continue
+                    
+                image_info = item[1]
+                try:
+                    # Try different ways to get dimensions
+                    if isinstance(image_info, Image.Image):
+                        # Handle PIL Image
+                        width, height = image_info.size
+                    elif hasattr(image_info, 'size'):
+                        # Handle objects with size attribute (like PIL Image)
+                        width, height = image_info.size
+                    elif hasattr(image_info, 'width') and hasattr(image_info, 'height'):
+                        # Handle objects with width/height attributes
+                        width = image_info.width
+                        height = image_info.height
+                    elif isinstance(image_info, (list, tuple)) and len(image_info) >= 2:
+                        # Handle dimension tuples
+                        width, height = image_info[:2]
+                    elif isinstance(image_info, dict):
+                        # Handle dictionaries
+                        width = image_info.get('width') or image_info.get('size', [0, 0])[0]
+                        height = image_info.get('height') or image_info.get('size', [0, 0])[1]
+                    elif hasattr(image_info, 'shape'):
+                        # Handle numpy arrays or tensors
+                        if len(image_info.shape) == 3:
+                            height, width = image_info.shape[:2]
+                        elif len(image_info.shape) == 4:
+                            height, width = image_info.shape[2:]
+                        else:
+                            logger.error(f"Invalid shape for image tensor/array: {image_info.shape}")
+                            continue
+                    else:
+                        logger.error(f"Cannot extract dimensions from image_info type {type(image_info)} for sample {idx}")
+                        continue
+                except Exception as e:
+                    logger.error(f"Failed to extract dimensions for sample {idx}: {str(e)}")
+                    continue
+                
+                # Convert to integers
+                try:
+                    width = int(width)
+                    height = int(height)
+                except (TypeError, ValueError) as e:
+                    logger.error(f"Failed to convert dimensions to integers for sample {idx}: {str(e)}")
+                    continue
                 
                 if width <= 0 or height <= 0:
                     logger.warning(f"Invalid dimensions for sample {idx}: {width}x{height}")
@@ -233,7 +280,7 @@ class AspectBatchSampler(Sampler[List[int]]):
                     logger.debug(f"No suitable bucket found for sample {idx} (aspect {image_aspect:.2f})")
                 
             except Exception as e:
-                logger.error(f"Error processing sample {idx}: {str(e)}")
+                logger.error(f"Error processing sample {idx}: {str(e)}\nFull error: {e.__class__.__name__}")
                 continue
                 
         if not chunk_assignments:
