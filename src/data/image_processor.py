@@ -44,7 +44,7 @@ class ImageProcessor:
         self.executor = create_thread_pool(self.num_workers)
         
         # Pre-allocate reusable tensors on GPU
-        self.buffer_size = (32, 3, 1024, 1024)  # Adjustable based on max expected size
+        self.buffer_size = (32, 3, 8192, 8192)  # Adjustable based on max expected size
         self.tensor_buffer = torch.empty(self.buffer_size, 
                                       dtype=self.config.dtype, 
                                       device=self.config.device)
