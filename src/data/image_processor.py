@@ -13,6 +13,7 @@ from src.data.utils import (
     create_thread_pool,
     get_optimal_workers
 )
+from src.data.bucket import BucketManager
 
 logger = logging.getLogger(__name__)
 
