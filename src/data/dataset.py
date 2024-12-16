@@ -1,5 +1,5 @@
 # src/data/dataset.py
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, Union
 import torch
 from torch.utils.data import Dataset
 from pathlib import Path
@@ -32,8 +32,8 @@ logger = logging.getLogger(__name__)
 @dataclass
 class NovelAIDatasetConfig:
     """Configuration for NovelAI dataset."""
-    image_size: Tuple[int, int] = (1024, 1024)
-    min_size: Tuple[int, int] = (256, 256)
+    image_size: Union[Tuple[int, int], int] = (1024, 1024)
+    min_size: Union[Tuple[int, int], int] = (256, 256)
     max_dim: int = 1024
     bucket_step: int = 64
     min_bucket_size: int = 1
@@ -44,6 +44,13 @@ class NovelAIDatasetConfig:
     proportion_empty_prompts: float = 0.0
     batch_size: int = 32
     max_consecutive_batch_samples: int = 2
+    
+    def __post_init__(self):
+        """Convert single integers to tuples for sizes."""
+        if isinstance(self.image_size, int):
+            self.image_size = (self.image_size, self.image_size)
+        if isinstance(self.min_size, int):
+            self.min_size = (self.min_size, self.min_size)
 
 class NovelAIDataset(Dataset):
     def __init__(
