@@ -898,6 +898,35 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             collate_fn=NovelAIDiffusionV3Trainer.collate_fn  # Add the collate_fn
         )
 
+    @staticmethod
+    def _worker_init_fn(worker_id: int) -> None:
+        """Initialize worker with optimized settings.
+        
+        Args:
+            worker_id: ID of the worker process
+        """
+        # Set worker seed for reproducibility
+        worker_seed = torch.initial_seed() % 2**32
+        np.random.seed(worker_seed)
+        random.seed(worker_seed)
+        
+        # Set thread settings for worker
+        torch.set_num_threads(1)  # Limit threads per worker
+        
+        if torch.cuda.is_available():
+            # Pin memory for faster data transfer
+            torch.cuda.empty_cache()
+            
+            # Set device affinity if possible
+            try:
+                # Get number of GPUs
+                num_gpus = torch.cuda.device_count()
+                if num_gpus > 0:
+                    # Assign worker to GPU round-robin
+                    gpu_id = worker_id % num_gpus
+                    torch.cuda.set_device(gpu_id)
+            except Exception as e:
+                logger.warning(f"Could not set GPU affinity for worker {worker_id}: {e}")
     
 
     def save_checkpoint(self, path: str):
