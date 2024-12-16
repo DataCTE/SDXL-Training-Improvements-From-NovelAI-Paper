@@ -5,6 +5,7 @@ import numpy as np
 from pathlib import Path
 import json
 import logging
+from src.data import thread_config
 
 logger = logging.getLogger(__name__)
 
@@ -249,3 +250,7 @@ class TagWeighter:
             'max_weight': max(self.tag_weights.values()) if self.tag_weights else None,
             'avg_weight': np.mean(list(self.tag_weights.values())) if self.tag_weights else None
         }
+
+    def compute_weights(self):
+        # Use optimal chunk size for numpy operations
+        chunk_size = thread_config.chunk_size

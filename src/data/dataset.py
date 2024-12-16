@@ -19,6 +19,7 @@ from src.data.image_processor import ImageProcessor, ImageProcessorConfig
 from src.data.cache_manager import CacheManager
 from src.data.batch_processor import BatchProcessor
 from src.data.sampler import AspectBatchSampler
+from src.data import get_optimal_cpu_threads
 
 logger = logging.getLogger(__name__)
 
@@ -66,10 +67,10 @@ class NovelAIDataset(Dataset):
             )
         )
         
-        # Initialize parallel processing with optimal workers
-        self.num_workers = min(32, multiprocessing.cpu_count() * 2)
+        # Initialize parallel processing with 90% of CPU cores
+        self.num_workers = get_optimal_cpu_threads()
         
-        # Initialize cache manager with same worker count for consistency
+        # Initialize cache manager with same worker count
         self.cache_manager = CacheManager(
             cache_dir=config.cache_dir,
             max_workers=self.num_workers
@@ -99,7 +100,7 @@ class NovelAIDataset(Dataset):
         self.items = []
         self._parallel_process_data(image_dirs)
         
-        logger.info(f"Initialized dataset with {len(self)} samples in {len(self.bucket_manager.buckets)} buckets")
+        logger.info(f"Initialized dataset with {len(self)} samples in {len(self.bucket_manager.buckets)} buckets using {self.num_workers} CPU threads")
 
     def get_sampler(self, batch_size: Optional[int] = None, shuffle: bool = True, drop_last: bool = False) -> AspectBatchSampler:
         """Create an aspect-aware batch sampler for the dataset."""

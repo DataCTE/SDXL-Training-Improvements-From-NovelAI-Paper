@@ -9,6 +9,7 @@ import asyncio
 from src.data.cache_manager import CacheManager
 from src.data.text_embedder import TextEmbedder
 from src.data.image_processor import ImageProcessor
+from src.data import thread_config
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,7 @@ class BatchProcessor:
         self.vae = vae
         self.device = device
         self.batch_size = batch_size
+        self.chunk_size = thread_config.chunk_size
 
     @torch.no_grad()
     async def process_batch(

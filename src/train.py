@@ -21,6 +21,7 @@ import traceback
 import logging
 from src.training.vae_trainer import VAETrainer
 import multiprocessing
+from src.data import get_optimal_cpu_threads
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -356,8 +357,8 @@ def main():
     # Prepare for distributed training - optimizer removed since it's handled by trainer
     trainer, dataset = accelerator.prepare(trainer, dataset)
     
-    # Set optimal number of workers for data loading
-    config.data.num_workers = min(32, multiprocessing.cpu_count() * 2)
+    # Set optimal number of workers for data loading to 90% of CPU cores
+    config.data.num_workers = get_optimal_cpu_threads()
     
     # Create dataloader with optimized settings
     train_dataloader = trainer.create_dataloader(

@@ -3,6 +3,7 @@ from transformers import AutoTokenizer, PretrainedConfig
 from typing import Dict, List, Union, Optional
 import random
 import warnings
+from src.data import thread_config
 
 def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: str, subfolder: str = "text_encoder"):
     """Load the correct text encoder class based on config."""
@@ -82,6 +83,8 @@ class TextEmbedder:
             param.requires_grad = False
         for param in self.text_encoder_two.parameters():
             param.requires_grad = False
+
+        torch.set_num_threads(thread_config.num_threads)
 
     @torch.no_grad()
     def __call__(

@@ -4,6 +4,7 @@ import math
 import numpy as np
 import logging
 from collections import Counter
+from src.data import thread_config
 
 logger = logging.getLogger(__name__)
 
@@ -206,3 +207,7 @@ class AspectRatioBucket:
         """Clear all items from all buckets."""
         for bucket in self.buckets:
             bucket.clear()
+
+    def _create_buckets(self):
+        # Use optimal chunk size for parallel operations
+        chunk_size = thread_config.chunk_size
