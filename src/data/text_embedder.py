@@ -126,13 +126,17 @@ class TextEmbedder:
                 return_tensors="pt",
             )
             
+            # Move input to GPU
             text_input_ids = text_inputs.input_ids.to(self.device)
+            attention_mask = text_inputs.attention_mask.to(self.device)
             
-            prompt_embeds = text_encoder(
-                text_input_ids,
-                output_hidden_states=True,
-                return_dict=False
-            )
+            with torch.cuda.amp.autocast(dtype=self.dtype):
+                prompt_embeds = text_encoder(
+                    text_input_ids,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                    return_dict=False
+                )
             
             pooled_prompt_embeds = prompt_embeds[0]
             prompt_embeds = prompt_embeds[-1][-2]
@@ -146,10 +150,17 @@ class TextEmbedder:
         # Combine embeddings from both encoders
         prompt_embeds = torch.concat(prompt_embeds_list, dim=-1)
         
-        return {
-            "prompt_embeds": prompt_embeds.cpu(),
-            "pooled_prompt_embeds": last_pooled.cpu()
-        }
+        # Keep on GPU if needed
+        if self.device.type == "cuda":
+            return {
+                "prompt_embeds": prompt_embeds,
+                "pooled_prompt_embeds": last_pooled
+            }
+        else:
+            return {
+                "prompt_embeds": prompt_embeds.cpu(),
+                "pooled_prompt_embeds": last_pooled.cpu()
+            }
 
     def encode_prompt_list(self, prompts: List[str], proportion_empty_prompts: float = 0.0):
         """Batch process a list of prompts."""
