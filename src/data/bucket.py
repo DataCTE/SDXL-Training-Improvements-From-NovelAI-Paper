@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, Union
 import math
 import numpy as np
 import logging
@@ -44,8 +44,8 @@ class AspectRatioBucket:
     
     def __init__(
         self,
-        max_image_size: Tuple[int, int] = (768, 1024),
-        min_image_size: Tuple[int, int] = (256, 256),
+        max_image_size: Union[Tuple[int, int], int] = (768, 1024),
+        min_image_size: Union[Tuple[int, int], int] = (256, 256),
         max_dim: int = 1024,
         bucket_step: int = 64,
         min_bucket_resolution: int = 65536,  # 256x256
@@ -55,14 +55,20 @@ class AspectRatioBucket:
         """Initialize bucketing system.
         
         Args:
-            max_image_size: Maximum (width, height) for images
-            min_image_size: Minimum (width, height) for images
+            max_image_size: Maximum (width, height) for images or single max dimension
+            min_image_size: Minimum (width, height) for images or single min dimension
             max_dim: Maximum single dimension
             bucket_step: Step size for bucket dimensions
             min_bucket_resolution: Minimum total pixels in a bucket
             max_bucket_resolution: Maximum total pixels in a bucket
             force_square_bucket: Whether to ensure a square bucket exists
         """
+        # Convert single integers to tuples
+        if isinstance(max_image_size, int):
+            max_image_size = (max_image_size, max_image_size)
+        if isinstance(min_image_size, int):
+            min_image_size = (min_image_size, min_image_size)
+            
         # Validate inputs
         if not all(isinstance(x, int) and x > 0 for x in max_image_size):
             raise ValueError(f"Invalid max_image_size: {max_image_size}")
