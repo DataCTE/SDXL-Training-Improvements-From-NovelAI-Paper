@@ -5,7 +5,7 @@ from typing import Tuple, List
 from torchvision import transforms
 from dataclasses import dataclass
 import numpy as np
-from src.data import thread_config
+from src.data.thread_config import get_optimal_cpu_threads
 
 @dataclass
 class ImageProcessorConfig:
@@ -24,7 +24,7 @@ class ImageProcessor:
         self.tensor_buffer = torch.empty(self.buffer_size, 
                                        dtype=self.config.dtype, 
                                        device=self.config.device)
-        self.chunk_size = thread_config.chunk_size
+        self.chunk_size = get_optimal_cpu_threads()
 
     def _build_transform(self):
         return transforms.Compose([

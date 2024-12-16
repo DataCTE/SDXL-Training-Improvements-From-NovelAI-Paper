@@ -1,28 +1,10 @@
-# src/data/__init__.py
 import torch.multiprocessing as mp
 import os
 import multiprocessing
 import torch
 from typing import Dict
 from dataclasses import dataclass
-
-@dataclass
-class ThreadConfig:
-    """Global thread configuration"""
-    num_threads: int
-    chunk_size: int
-    prefetch_factor: int
-
-def get_optimal_thread_config() -> ThreadConfig:
-    """Calculate optimal thread configuration using 90% of CPU resources"""
-    cpu_count = multiprocessing.cpu_count()
-    num_threads = max(1, int(cpu_count * 0.9))
-    
-    return ThreadConfig(
-        num_threads=num_threads,
-        chunk_size=max(1, num_threads // 2),  # Optimal chunk size for parallel operations
-        prefetch_factor=2  # Number of batches to prefetch
-    )
+from .thread_config import get_optimal_cpu_threads, ThreadConfig, get_optimal_thread_config
 
 # Set multiprocessing start method
 try:
@@ -61,6 +43,8 @@ __all__ = [
     'CacheManager',
     'BatchProcessor',
     'AspectBatchSampler',
+    'get_optimal_cpu_threads',
     'get_optimal_thread_config',
-    'thread_config'
+    'thread_config',
+    'ThreadConfig'
 ]

@@ -4,7 +4,7 @@ import math
 import numpy as np
 import logging
 from collections import Counter
-from src.data import thread_config
+from src.data.thread_config import get_optimal_cpu_threads
 
 logger = logging.getLogger(__name__)
 

@@ -7,7 +7,7 @@ from collections import defaultdict
 import logging
 import math
 from dataclasses import dataclass
-from src.data import thread_config
+from src.data.thread_config import get_optimal_cpu_threads
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +62,7 @@ class AspectBatchSampler(Sampler[List[int]]):
         self.max_aspect_ratio = max_aspect_ratio
         self.min_bucket_length = min_bucket_length or batch_size
         self.max_consecutive_batch_samples = max_consecutive_batch_samples
-        self.chunk_size = thread_config.chunk_size
+        self.chunk_size = get_optimal_cpu_threads()
         
         # Initialize state
         self.buckets: Dict[float, BucketInfo] = {}
