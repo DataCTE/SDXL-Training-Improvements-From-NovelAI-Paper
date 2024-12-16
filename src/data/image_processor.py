@@ -1,7 +1,7 @@
 # src/data/image_processor.py
 import torch
 from PIL import Image
-from typing import Tuple, List
+from typing import Tuple, List, Optional
 from torchvision import transforms
 from dataclasses import dataclass
 import numpy as np
@@ -30,10 +30,10 @@ class ImageProcessorConfig:
     max_memory_usage: float = 0.9
 
 class ImageProcessor:
-    def __init__(self, config: ImageProcessorConfig):
-        """Initialize image processor with optimized settings."""
+    def __init__(self, config: ImageProcessorConfig, bucket_manager: Optional[BucketManager] = None):
+        """Initialize with optional bucket manager for resolution-aware processing."""
         self.config = config
-        self.transform = self._build_transform()
+        self.bucket_manager = bucket_manager
         
         # Initialize thread pool for parallel processing
         self.num_workers = min(
@@ -175,3 +175,13 @@ class ImageProcessor:
         
         # Combine all batches
         return torch.cat(latents_list, dim=0)
+
+    def _get_optimal_size(self, width: int, height: int) -> Tuple[int, int]:
+        """Get optimal size considering bucket constraints if available."""
+        if self.bucket_manager is not None:
+            bucket = self.bucket_manager.find_bucket(width, height)
+            if bucket is not None:
+                return bucket.width, bucket.height
+        
+        # Default sizing logic
+        return self._default_resize(width, height)

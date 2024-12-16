@@ -6,6 +6,8 @@ from pathlib import Path
 import json
 import logging
 from src.data.thread_config import get_optimal_cpu_threads
+from src.data.text_embedder import TextEmbedder
+from src.data.utils.system_utils import get_gpu_memory_usage, calculate_optimal_batch_size
 
 logger = logging.getLogger(__name__)
 
@@ -53,13 +55,10 @@ def parse_tags(text: str) -> List[str]:
     return tags
 
 class TagWeighter:
-    def __init__(self, config: TagWeightingConfig):
-        """Initialize TagWeighter.
-        
-        Args:
-            config: TagWeightingConfig instance
-        """
+    def __init__(self, config: TagWeightingConfig, text_embedder: Optional[TextEmbedder] = None):
+        """Initialize with optional text embedder for advanced features."""
         self.config = config
+        self.text_embedder = text_embedder
         
         # Initialize tracking state
         self.tag_counts: Dict[str, int] = {}
@@ -149,30 +148,20 @@ class TagWeighter:
             logger.error(f"Error computing weights: {e}")
             raise
 
-    def get_weight(self, text: str) -> float:
-        """Get average weight for all tags in text.
+    def get_weight(self, tags: List[str]) -> float:
+        """Get weight for tags with embeddings-based similarity if available."""
+        base_weight = self._calculate_base_weight(tags)
         
-        Args:
-            text: Text to get weight for
-            
-        Returns:
-            Average weight across all tags
-        """
-        if not self.config.enabled:
-            return self.config.default_weight
-            
-        tags = parse_tags(text)
-        if not tags:
-            return self.config.default_weight
-            
-        # Get weights for all tags
-        weights = [
-            self.tag_weights.get(tag, self.config.default_weight)
-            for tag in tags
-        ]
-        
-        # Return average weight
-        return sum(weights) / len(weights)
+        if self.text_embedder is not None:
+            # Use text embedder to calculate similarity-based adjustment
+            try:
+                embeddings = self.text_embedder.encode_prompt_list(tags)
+                similarity_factor = self._calculate_similarity_factor(embeddings)
+                return base_weight * similarity_factor
+            except Exception as e:
+                logger.warning(f"Error calculating embedding similarity: {e}")
+                
+        return base_weight
 
     def save_weights(self, path: str) -> None:
         """Save current state to file.
@@ -250,5 +239,22 @@ class TagWeighter:
             'max_weight': max(self.tag_weights.values()) if self.tag_weights else None,
             'avg_weight': np.mean(list(self.tag_weights.values())) if self.tag_weights else None
         }
+
+    def _calculate_optimal_batch_size(self) -> int:
+        """Calculate optimal batch size based on available memory."""
+        try:
+            if self.device.type == "cuda":
+                return calculate_optimal_batch_size(
+                    device=self.device,
+                    min_batch_size=1,
+                    max_batch_size=32,  # Cap at 32 as per original implementation
+                    target_memory_usage=self.max_memory_usage,
+                    growth_factor=0.3
+                )
+            else:
+                return 8  # Default CPU batch size
+        except Exception as e:
+            logger.warning(f"Error calculating batch size: {e}, using default")
+            return 8
 
 

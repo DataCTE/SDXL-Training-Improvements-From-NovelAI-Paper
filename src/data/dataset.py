@@ -75,7 +75,8 @@ class NovelAIDataset(Dataset):
             ImageProcessorConfig(
                 dtype=self.dtype,
                 device=device
-            )
+            ),
+            bucket_manager=self.bucket_manager
         )
         
         # Initialize parallel processing with optimal workers

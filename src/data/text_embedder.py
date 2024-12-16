@@ -5,6 +5,7 @@ import random
 import warnings
 from src.data.thread_config import get_optimal_cpu_threads
 import logging
+from src.data.utils import get_gpu_memory_usage
 
 logger = logging.getLogger(__name__)
 
@@ -167,6 +168,10 @@ class TextEmbedder:
         # Pre-allocate reusable tensors
         self.attention_mask_buffer = torch.ones((batch_size, max_length), dtype=torch.long, device=device)
         
+        # Coordinate memory usage with ImageProcessor
+        self.max_memory_usage = 0.9  # 90% GPU memory usage
+        self.batch_size = self._calculate_optimal_batch_size()
+        
         logger.info(
             f"Initialized TextEmbedder:\n"
             f"- Device: {device}\n"
@@ -174,6 +179,24 @@ class TextEmbedder:
             f"- Batch size: {batch_size}\n"
             f"- Max length: {max_length}"
         )
+
+    def _calculate_optimal_batch_size(self) -> int:
+        """Calculate optimal batch size based on available memory."""
+        try:
+            with torch.cuda.amp.autocast():
+                # Test with small batch
+                test_batch = 4
+                sample_text = ["test prompt"] * test_batch
+                memory_per_item = get_gpu_memory_usage() / test_batch
+                
+                # Calculate max batch size
+                available_memory = torch.cuda.get_device_properties(0).total_memory * self.max_memory_usage
+                optimal_batch_size = int(available_memory / (memory_per_item * 3))  # Factor of 3 for safety
+                
+                return max(1, min(optimal_batch_size, 32))  # Cap at 32
+        except Exception as e:
+            logger.warning(f"Error calculating batch size: {e}, using default")
+            return 8
 
     @torch.no_grad()
     def _process_batch(
