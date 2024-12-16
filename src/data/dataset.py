@@ -9,6 +9,8 @@ import os
 import glob
 from PIL import Image
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import multiprocessing
 
 from src.data.text_embedder import TextEmbedder
 from src.data.tag_weighter import TagWeighter
@@ -66,7 +68,7 @@ class NovelAIDataset(Dataset):
         
         self.cache_manager = CacheManager(
             cache_dir=config.cache_dir,
-            max_workers=4  # Adjust based on system
+            max_workers=10  # Adjust based on system
         )
         
         self.batch_processor = BatchProcessor(
@@ -86,9 +88,13 @@ class NovelAIDataset(Dataset):
             bucket_step=config.bucket_step
         )
 
-        # Process and cache data
+        # Initialize parallel processing
+        self.num_workers = min(32, multiprocessing.cpu_count() * 4)
+        self.executor = ThreadPoolExecutor(max_workers=self.num_workers)
+        
+        # Process data with parallel execution
         self.items = []
-        asyncio.run(self._process_data(image_dirs))
+        self._parallel_process_data(image_dirs)
         
         logger.info(f"Initialized dataset with {len(self)} samples in {len(self.bucket_manager.buckets)} buckets")
 
@@ -105,25 +111,35 @@ class NovelAIDataset(Dataset):
             max_consecutive_batch_samples=self.config.max_consecutive_batch_samples
         )
 
-    async def _process_data(self, image_dirs: List[str]) -> None:
-        """Process and cache dataset with optimized async batch processing."""
-        total_found = 0
-        total_processed = 0
-        
-        # Collect and validate all image paths first
+    def _parallel_process_data(self, image_dirs: List[str]):
+        """Process data using parallel execution."""
         image_files = []
         for image_dir in image_dirs:
-            logger.info(f"Processing directory: {image_dir}")
             for ext in ['*.jpg', '*.jpeg', '*.png', '*.webp']:
                 image_files.extend(glob.glob(os.path.join(image_dir, '**', ext), recursive=True))
+
+        # Process files in parallel chunks
+        chunk_size = max(1, len(image_files) // (self.num_workers * 4))
+        chunks = [image_files[i:i + chunk_size] for i in range(0, len(image_files), chunk_size)]
         
-        # Pre-filter and group by bucket
-        bucket_groups = {}
+        futures = []
+        for chunk in chunks:
+            future = self.executor.submit(self._process_chunk, chunk)
+            futures.append(future)
+            
+        # Collect results
+        for future in futures:
+            chunk_items = future.result()
+            self.items.extend(chunk_items)
+
+    def _process_chunk(self, image_files: List[str]) -> List[Dict]:
+        """Process a chunk of image files."""
+        chunk_items = []
         for img_path in image_files:
-            if not Path(img_path).with_suffix('.txt').exists():
-                continue
-                
             try:
+                if not Path(img_path).with_suffix('.txt').exists():
+                    continue
+                    
                 with Image.open(img_path) as img:
                     img = img.convert('RGB')
                     width, height = img.size
@@ -131,21 +147,9 @@ class NovelAIDataset(Dataset):
                     if bucket is None:
                         continue
                         
-                    bucket_key = (bucket.width, bucket.height)
-                    if bucket_key not in bucket_groups:
-                        bucket_groups[bucket_key] = []
-                        
                     cache_paths = self.cache_manager.get_cache_paths(img_path)
                     
-                    if self.config.use_caching and not cache_paths['latent'].exists():
-                        bucket_groups[bucket_key].append({
-                            'path': img_path,
-                            'bucket': bucket,
-                            'latent_cache': cache_paths['latent'],
-                            'text_cache': cache_paths['text']
-                        })
-                    
-                    self.items.append({
+                    chunk_items.append({
                         'image_path': img_path,
                         'bucket': bucket,
                         'latent_cache': cache_paths['latent'],
@@ -153,28 +157,12 @@ class NovelAIDataset(Dataset):
                         'original_size': (height, width),
                         'crop_top_left': (0, 0)
                     })
-                    total_found += 1
                     
             except Exception as e:
                 logger.error(f"Error processing {img_path}: {e}")
                 continue
-
-        # Process each bucket group with optimized batch processing
-        for bucket_size, items in bucket_groups.items():
-            logger.info(f"Processing bucket {bucket_size}: {len(items)} images")
-            
-            for i in range(0, len(items), self.config.batch_size):
-                batch_items = items[i:i + self.config.batch_size]
-                processed = await self.batch_processor.process_batch(
-                    batch_items=batch_items,
-                    width=bucket_size[0],
-                    height=bucket_size[1],
-                    proportion_empty_prompts=self.config.proportion_empty_prompts
-                )
-                total_processed += processed
-
-        logger.info(f"Total images found: {total_found}")
-        logger.info(f"Total images processed: {total_processed}")
+                
+        return chunk_items
 
     def __getitem__(self, idx: int) -> Dict:
         """Get dataset item with cached data."""

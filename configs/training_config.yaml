@@ -45,11 +45,7 @@ data:
   #   - "/path/to/dataset1"
   #   - "/path/to/dataset2"
   image_dirs: [
-        "/workspace/collage",
-        "/workspace/upscaled",
-        "/workspace/High-quality-photo10k",
-        "/workspace/LAION_220k_GPT4Vision_captions",
-        "/workspace/photo-concept-bucket/train"
+        "D:\Datasets\High-quality-photo10k"
     ]
   image_size: [1024, 1024]
   num_workers: 8

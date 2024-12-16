@@ -20,6 +20,7 @@ from pathlib import Path
 import traceback
 import logging
 from src.training.vae_trainer import VAETrainer
+import multiprocessing
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -355,13 +356,17 @@ def main():
     # Prepare for distributed training - optimizer removed since it's handled by trainer
     trainer, dataset = accelerator.prepare(trainer, dataset)
     
-    # Create dataloader with distributed sampler
+    # Set optimal number of workers for data loading
+    config.data.num_workers = min(32, multiprocessing.cpu_count() * 2)
+    
+    # Create dataloader with optimized settings
     train_dataloader = trainer.create_dataloader(
         dataset=dataset,
         batch_size=config.training.batch_size,
         num_workers=config.data.num_workers,
-        pin_memory=config.data.pin_memory,
-        persistent_workers=config.data.persistent_workers
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=2
     )
     
     # Training loop

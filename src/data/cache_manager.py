@@ -7,11 +7,12 @@ import asyncio
 import aiofiles
 import io
 from concurrent.futures import ThreadPoolExecutor
+import multiprocessing
 
 logger = logging.getLogger(__name__)
 
 class CacheManager:
-    def __init__(self, cache_dir: str, max_workers: int = 4):
+    def __init__(self, cache_dir: str, max_workers: Optional[int] = None):
         self.cache_dir = Path(cache_dir)
         self.latent_cache = self.cache_dir / "latents"
         self.text_cache = self.cache_dir / "text"
@@ -20,11 +21,13 @@ class CacheManager:
         for cache_dir in [self.latent_cache, self.text_cache]:
             cache_dir.mkdir(parents=True, exist_ok=True)
             
-        # Initialize thread pool for async operations
+        # Initialize thread pool with optimal number of workers
+        if max_workers is None:
+            max_workers = min(32, multiprocessing.cpu_count() * 4)
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         
-        # Memory cache for frequently accessed items
-        self.memory_cache: Dict[str, Any] = {}
+        # Memory cache with size limit
+        self.memory_cache = {}
         self.max_cache_items = 1000
 
     def get_cache_paths(self, image_path: str) -> Dict[str, Path]:
