@@ -11,6 +11,7 @@ from PIL import Image
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import multiprocessing
+import time
 
 from src.data.text_embedder import TextEmbedder
 from src.data.tag_weighter import TagWeighter
@@ -135,28 +136,55 @@ class NovelAIDataset(Dataset):
         
         futures = []
         for i, chunk in enumerate(chunks):
-            future = self.executor.submit(self._process_chunk, chunk)
+            future = self.executor.submit(self._process_chunk, chunk, i)
             futures.append(future)
+            logger.debug(f"Submitted chunk {i+1}/{len(chunks)} with {len(chunk)} images")
             
         # Collect results with progress tracking
         processed_files = 0
+        valid_files = 0
+        skipped_files = 0
+        start_time = time.time()
+        
         for future in futures:
-            chunk_items = future.result()
+            chunk_items, chunk_stats = future.result()
             self.items.extend(chunk_items)
-            processed_files += len(chunk_items)
+            processed_files += chunk_stats['total']
+            valid_files += chunk_stats['valid']
+            skipped_files += chunk_stats['skipped']
+            
             if processed_files % 1000 == 0:
-                logger.info(f"Processed {processed_files}/{total_files} images ({(processed_files/total_files)*100:.1f}%)")
+                elapsed = time.time() - start_time
+                rate = processed_files / elapsed
+                eta = (total_files - processed_files) / rate if rate > 0 else 0
+                logger.info(
+                    f"Progress: {processed_files}/{total_files} images "
+                    f"({(processed_files/total_files)*100:.1f}%) - "
+                    f"Valid: {valid_files} Skipped: {skipped_files} - "
+                    f"Rate: {rate:.1f} img/s - "
+                    f"ETA: {eta/60:.1f}min"
+                )
 
-        logger.info(f"Finished processing {len(self.items)} valid images out of {total_files} total files")
+        elapsed = time.time() - start_time
+        logger.info(
+            f"Finished processing {len(self.items)} valid images out of {total_files} total files "
+            f"({skipped_files} skipped) in {elapsed/60:.1f}min "
+            f"(avg rate: {total_files/elapsed:.1f} img/s)"
+        )
 
-    def _process_chunk(self, image_files: List[str]) -> List[Dict]:
+    def _process_chunk(self, image_files: List[str], chunk_id: int) -> Tuple[List[Dict], Dict[str, int]]:
         """Process a chunk of image files."""
         chunk_items = []
-        skipped = 0
+        stats = {'total': 0, 'valid': 0, 'skipped': 0}
+        
+        logger.debug(f"Starting chunk {chunk_id} with {len(image_files)} images")
+        chunk_start = time.time()
+        
         for img_path in image_files:
+            stats['total'] += 1
             try:
                 if not Path(img_path).with_suffix('.txt').exists():
-                    skipped += 1
+                    stats['skipped'] += 1
                     continue
                     
                 with Image.open(img_path) as img:
@@ -164,7 +192,8 @@ class NovelAIDataset(Dataset):
                     width, height = img.size
                     bucket = self.bucket_manager.find_bucket(width, height)
                     if bucket is None:
-                        skipped += 1
+                        logger.debug(f"No suitable bucket found for {img_path} ({width}x{height})")
+                        stats['skipped'] += 1
                         continue
                         
                     cache_paths = self.cache_manager.get_cache_paths(img_path)
@@ -177,15 +206,20 @@ class NovelAIDataset(Dataset):
                         'original_size': (height, width),
                         'crop_top_left': (0, 0)
                     })
+                    stats['valid'] += 1
                     
             except Exception as e:
                 logger.error(f"Error processing {img_path}: {e}")
-                skipped += 1
+                stats['skipped'] += 1
                 continue
-                
-        if skipped > 0:
-            logger.debug(f"Skipped {skipped} images in chunk")
-        return chunk_items
+        
+        chunk_time = time.time() - chunk_start
+        logger.debug(
+            f"Finished chunk {chunk_id}: {stats['valid']}/{len(image_files)} valid images "
+            f"({stats['skipped']} skipped) in {chunk_time:.1f}s "
+            f"({len(image_files)/chunk_time:.1f} img/s)"
+        )
+        return chunk_items, stats
 
     def __getitem__(self, idx: int) -> Dict:
         """Get dataset item with cached data."""
