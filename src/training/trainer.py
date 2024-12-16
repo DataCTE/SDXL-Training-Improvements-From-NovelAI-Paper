@@ -12,6 +12,7 @@ from tqdm.auto import tqdm
 import math
 from src.data.dataset import NovelAIDataset
 from src.data.sampler import AspectBatchSampler
+from src.data.thread_config import ThreadConfig
 import yaml
 from src.config.config import Config, VAEModelConfig
 import numpy as np
@@ -869,60 +870,34 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
     def create_dataloader(
         dataset: NovelAIDataset,
         batch_size: int,
-        num_workers: int = 4,
-        shuffle: bool = True,
+        num_workers: Union[int, ThreadConfig],
         pin_memory: bool = True,
         persistent_workers: bool = True,
-        prefetch_factor: int = 2,
+        prefetch_factor: int = 2
     ) -> DataLoader:
-        """Create optimized dataloader with efficient data loading."""
-        
-        # Create distributed sampler if using DDP
-        if torch.distributed.is_initialized():
-            sampler = torch.utils.data.distributed.DistributedSampler(
-                dataset,
-                shuffle=shuffle,
-                seed=42,
-                drop_last=True
-            )
-            batch_sampler = None  # Don't use batch_sampler with DistributedSampler
-        else:
-            sampler = None
-            # Use AspectBatchSampler to ensure consistent sizes within batches
-            batch_sampler = AspectBatchSampler(
-                dataset=dataset,
-                batch_size=batch_size,
-                shuffle=shuffle,
-                drop_last=True  # Drop last to ensure consistent batch sizes
-            )
+        """Create optimized dataloader."""
+        # Convert ThreadConfig to int if needed
+        if hasattr(num_workers, 'num_threads'):
+            num_workers = num_workers.num_threads
 
-        # Configure dataloader with optimized settings
-        return DataLoader(
-            dataset,
-            batch_size=batch_size if batch_sampler is None else 1,  # Only set batch_size if not using batch_sampler
-            sampler=sampler,
-            batch_sampler=batch_sampler,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            persistent_workers=persistent_workers,
-            prefetch_factor=prefetch_factor,
-            collate_fn=NovelAIDiffusionV3Trainer.collate_fn,
-            worker_init_fn=NovelAIDiffusionV3Trainer._worker_init_fn,
+        # Create sampler for distributed training
+        sampler = dataset.get_sampler(
+            batch_size=batch_size,
+            shuffle=True,
+            drop_last=True
         )
 
-    @staticmethod
-    def _worker_init_fn(worker_id: int) -> None:
-        """Initialize worker with optimized settings."""
-        # Set worker seed
-        worker_seed = torch.initial_seed() % 2**32
-        np.random.seed(worker_seed)
-        random.seed(worker_seed)
-        
-        # Pin memory for faster data transfer
-        torch.cuda.empty_cache()
-        
-        # Set thread settings for worker
-        torch.set_num_threads(1)
+        return DataLoader(
+            dataset,
+            batch_sampler=sampler,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers and num_workers > 0,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None,
+            worker_init_fn=NovelAIDiffusionV3Trainer._worker_init_fn  # Reference the static method through the class
+        )
+
+    
 
     def save_checkpoint(self, path: str):
         """Save checkpoint efficiently.
