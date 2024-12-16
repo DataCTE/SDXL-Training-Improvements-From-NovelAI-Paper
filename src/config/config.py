@@ -75,6 +75,16 @@ class DataConfig:
     vae_batch_size: int = 32
     vae_image_size: Tuple[int, int] = (256, 256)
     vae_validation_split: float = 0.1
+    
+    # Add missing bucketing and size configuration
+    min_size: int = 256  # Minimum image dimension
+    max_dim: int = 2048  # Maximum image dimension
+    bucket_step: int = 8  # Resolution step size for buckets
+    min_bucket_size: int = 16  # Minimum images per bucket
+    bucket_tolerance: float = 0.2  # Tolerance for bucket aspect ratios
+    max_aspect_ratio: float = 2.0  # Maximum allowed aspect ratio
+    use_caching: bool = True  # Enable latent caching
+    proportion_empty_prompts: float = 0.0  # Proportion of empty prompt training
 
 @dataclass
 class TagWeightingConfig:

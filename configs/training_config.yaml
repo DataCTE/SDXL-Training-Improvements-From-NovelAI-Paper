@@ -61,6 +61,16 @@ data:
   vae_batch_size: 32
   vae_image_size: [256, 256]
   vae_validation_split: 0.1
+  
+  # Add bucketing and size configuration
+  min_size: 256
+  max_dim: 2048
+  bucket_step: 8
+  min_bucket_size: 16
+  bucket_tolerance: 0.2
+  max_aspect_ratio: 2.0
+  use_caching: true
+  proportion_empty_prompts: 0.0
 
 # Tag weighting configuration
 tag_weighting:
