@@ -894,7 +894,8 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             pin_memory=pin_memory,
             persistent_workers=persistent_workers and num_workers > 0,
             prefetch_factor=prefetch_factor if num_workers > 0 else None,
-            worker_init_fn=NovelAIDiffusionV3Trainer._worker_init_fn  # Reference the static method through the class
+            worker_init_fn=NovelAIDiffusionV3Trainer._worker_init_fn,  # Reference the static method through the class
+            collate_fn=NovelAIDiffusionV3Trainer.collate_fn  # Add the collate_fn
         )
 
     
