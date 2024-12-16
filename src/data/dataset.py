@@ -66,9 +66,13 @@ class NovelAIDataset(Dataset):
             )
         )
         
+        # Initialize parallel processing with optimal workers
+        self.num_workers = min(32, multiprocessing.cpu_count() * 2)
+        
+        # Initialize cache manager with same worker count for consistency
         self.cache_manager = CacheManager(
             cache_dir=config.cache_dir,
-            max_workers=10  # Adjust based on system
+            max_workers=self.num_workers
         )
         
         self.batch_processor = BatchProcessor(
@@ -88,8 +92,7 @@ class NovelAIDataset(Dataset):
             bucket_step=config.bucket_step
         )
 
-        # Initialize parallel processing
-        self.num_workers = min(32, multiprocessing.cpu_count() * 4)
+        # Initialize thread pool executor
         self.executor = ThreadPoolExecutor(max_workers=self.num_workers)
         
         # Process data with parallel execution
