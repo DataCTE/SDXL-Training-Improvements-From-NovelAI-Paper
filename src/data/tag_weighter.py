@@ -29,33 +29,26 @@ class TagWeightingConfig:
         if self.update_frequency < 1:
             raise ValueError("update_frequency must be positive")
 
-def parse_tags(caption: str) -> List[str]:
-    """Extract and normalize tags from caption.
+def parse_tags(text: str) -> List[str]:
+    """Parse text into individual word tags.
     
     Args:
-        caption: Comma-separated string of tags
+        text: Input text/prompt
         
     Returns:
-        List of cleaned and normalized tags
+        List of individual word tags
     """
-    if not isinstance(caption, str):
-        raise ValueError(f"Caption must be a string, got {type(caption)}")
-        
-    # Split and clean tags
-    parts = caption.lower().split(',')
+    # Split text into words and clean each word
+    words = text.lower().split()
+    
+    # Clean and filter words
     tags = []
-    
-    for tag in parts:
-        tag = tag.strip()
-        # Skip empty tags
-        if not tag:
-            continue
-        # Basic validation
-        if len(tag) > 100:  # Arbitrary limit to catch errors
-            logger.warning(f"Skipping suspiciously long tag: {tag[:20]}...")
-            continue
-        tags.append(tag)
-    
+    for word in words:
+        # Remove punctuation and special characters
+        word = ''.join(c for c in word if c.isalnum() or c == '-')
+        if word and len(word) > 1:  # Keep words with at least 2 characters
+            tags.append(word)
+            
     return tags
 
 class TagWeighter:
@@ -80,17 +73,20 @@ class TagWeighter:
         
         logger.info(f"Initialized TagWeighter with config: {config}")
 
-    def update_frequencies(self, tags: List[str]) -> None:
-        """Update tag frequency counters.
+    def update_frequencies(self, text: str) -> None:
+        """Update tag frequency counters from full text.
         
         Args:
-            tags: List of tags from current sample
+            text: Full text/prompt to process
         """
         if not self.config.enabled:
             return
-        
+            
         try:
-            # Update counts
+            # Get tags from full text
+            tags = parse_tags(text)
+            
+            # Update counts for each tag
             for tag in tags:
                 if tag not in self.tag_counts:
                     self.tag_counts[tag] = 0
@@ -152,28 +148,30 @@ class TagWeighter:
             logger.error(f"Error computing weights: {e}")
             raise
 
-    def get_weight(self, tags: List[str]) -> float:
-        """Get combined weight for a set of tags.
+    def get_weight(self, text: str) -> float:
+        """Get average weight for all tags in text.
         
         Args:
-            tags: List of tags to get weight for
+            text: Text to get weight for
             
         Returns:
-            Combined weight for the tags
+            Average weight across all tags
         """
-        if not self.config.enabled or not tags:
+        if not self.config.enabled:
             return self.config.default_weight
             
-        try:
-            weights = [
-                self.tag_weights.get(tag, self.config.default_weight) 
-                for tag in tags
-            ]
-            return float(np.mean(weights))
-            
-        except Exception as e:
-            logger.error(f"Error getting weights: {e}")
+        tags = parse_tags(text)
+        if not tags:
             return self.config.default_weight
+            
+        # Get weights for all tags
+        weights = [
+            self.tag_weights.get(tag, self.config.default_weight)
+            for tag in tags
+        ]
+        
+        # Return average weight
+        return sum(weights) / len(weights)
 
     def save_weights(self, path: str) -> None:
         """Save current state to file.
