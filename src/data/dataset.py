@@ -93,80 +93,55 @@ class NovelAIDataset(Dataset):
         ])
 
     def _process_data(self, image_dirs: List[str]) -> None:
-        """Process and cache dataset with distributed awareness."""
+        """Process and cache dataset with optimized GPU batching."""
         total_found = 0
         total_processed = 0
+        batch_size = 32  # Adjust based on GPU memory
         
-        # Get distributed training info
-        if torch.distributed.is_initialized():
-            rank = torch.distributed.get_rank()
-            world_size = torch.distributed.get_world_size()
-        else:
-            rank = 0
-            world_size = 1
-
+        # Collect all valid image paths first
+        image_files = []
         for image_dir in image_dirs:
-            if rank == 0:
-                logger.info(f"Processing directory: {image_dir}")
-                
-            # Gather image files
-            image_files = []
+            logger.info(f"Processing directory: {image_dir}")
             for ext in ['*.jpg', '*.jpeg', '*.png', '*.webp']:
                 image_files.extend(glob.glob(os.path.join(image_dir, '**', ext), recursive=True))
-            image_files.sort()  # Ensure deterministic ordering
+        
+        # Pre-filter valid images with text files
+        valid_images = []
+        for img_path in image_files:
+            if Path(img_path).with_suffix('.txt').exists():
+                valid_images.append(img_path)
+        
+        total_found = len(valid_images)
+        
+        # Process in optimized batches
+        for i in tqdm(range(0, len(valid_images), batch_size), desc="Processing batches"):
+            batch_paths = valid_images[i:i + batch_size]
+            batch_images = []
+            batch_buckets = []
+            batch_latent_paths = []
+            batch_text_paths = []
             
-            # Distribute files across processes
-            per_rank = len(image_files) // world_size
-            start_idx = rank * per_rank
-            end_idx = start_idx + per_rank if rank < world_size - 1 else len(image_files)
-            rank_files = image_files[start_idx:end_idx]
-            
-            total_found += len(rank_files)
-            
-            # Process files
-            for img_path in tqdm(rank_files, desc=f"Processing images (rank {rank})", disable=rank != 0):
-                txt_path = Path(img_path).with_suffix('.txt')
-                if not txt_path.exists():
-                    continue
-                    
-                latent_cache_path = self.latent_cache / f"{Path(img_path).stem}.pt"
-                text_cache_path = self.text_cache / f"{Path(img_path).stem}.pt"
-                
+            # Prepare batch data
+            for img_path in batch_paths:
                 try:
                     with Image.open(img_path) as img:
                         img = img.convert('RGB')
                         width, height = img.size
                         
-                        # Get bucket
                         bucket = self.bucket_manager.find_bucket(width, height)
                         if bucket is None:
                             continue
                             
-                        # Cache latent if needed
+                        latent_cache_path = self.latent_cache / f"{Path(img_path).stem}.pt"
+                        text_cache_path = self.text_cache / f"{Path(img_path).stem}.pt"
+                        
+                        # Only process if caching is enabled and file doesn't exist
                         if self.config.use_caching and not latent_cache_path.exists():
                             processed_img = self._process_image(img, bucket)
-                            with torch.no_grad():
-                                latent = self.vae.encode(
-                                    processed_img.unsqueeze(0).to(device=self.device, dtype=self.dtype)
-                                ).latent_dist.sample()
-                                latent = latent * self.vae.config.scaling_factor
-                                torch.save(latent.cpu(), latent_cache_path)
-                        
-                        # Cache text embeddings if needed
-                        if self.config.use_caching and not text_cache_path.exists():
-                            with open(txt_path, 'r', encoding='utf-8') as f:
-                                caption = f.read().strip()
-                            
-                            text_embeds = self.text_embedder(
-                                caption,
-                                proportion_empty_prompts=self.config.proportion_empty_prompts
-                            )
-                            tags = parse_tags(caption)
-                            
-                            torch.save({
-                                'embeds': text_embeds,
-                                'tags': tags,
-                            }, text_cache_path)
+                            batch_images.append(processed_img)
+                            batch_buckets.append(bucket)
+                            batch_latent_paths.append(latent_cache_path)
+                            batch_text_paths.append(text_cache_path)
                         
                         # Store item info
                         self.items.append({
@@ -175,32 +150,57 @@ class NovelAIDataset(Dataset):
                             'latent_cache': latent_cache_path,
                             'text_cache': text_cache_path,
                             'original_size': (height, width),
-                            'crop_top_left': (0, 0)  # Will be set during training
+                            'crop_top_left': (0, 0)
                         })
                         total_processed += 1
                         
                 except Exception as e:
                     logger.error(f"Error processing {img_path}: {e}")
                     continue
-        
-        # Gather statistics across processes
-        if world_size > 1:
-            total_found = torch.tensor(total_found, device=self.device)
-            total_processed = torch.tensor(total_processed, device=self.device)
             
-            torch.distributed.all_reduce(total_found)
-            torch.distributed.all_reduce(total_processed)
-            
-            total_found = total_found.item()
-            total_processed = total_processed.item()
-        
-        if rank == 0:
-            logger.info(f"Total images found: {total_found}")
-            logger.info(f"Total images processed: {total_processed}")
-        
-        # Sync processes
-        if world_size > 1:
-            torch.distributed.barrier()
+            # Process VAE in batches if we have images to process
+            if batch_images:
+                # Stack images into single tensor
+                batch_tensor = torch.stack(batch_images).to(self.device)
+                
+                # Process through VAE efficiently
+                with torch.no_grad(), torch.cuda.amp.autocast():
+                    latents = self.vae.encode(batch_tensor).latent_dist.sample()
+                    latents = latents * self.vae.config.scaling_factor
+                
+                # Save latents efficiently
+                for latent, path in zip(latents, batch_latent_paths):
+                    torch.save(latent.cpu(), path)
+                
+                # Process text embeddings in same batch
+                text_batch = []
+                for img_path, text_path in zip(batch_paths, batch_text_paths):
+                    if not text_path.exists():
+                        with open(Path(img_path).with_suffix('.txt'), 'r', encoding='utf-8') as f:
+                            caption = f.read().strip()
+                        text_batch.append(caption)
+                
+                if text_batch:
+                    text_embeds = self.text_embedder.encode_prompt_list(
+                        text_batch,
+                        proportion_empty_prompts=self.config.proportion_empty_prompts
+                    )
+                    tags = [parse_tags(txt) for txt in text_batch]
+                    
+                    # Save text embeddings
+                    for i, path in enumerate(batch_text_paths):
+                        if not path.exists():
+                            torch.save({
+                                'embeds': text_embeds['prompt_embeds'][i],
+                                'tags': tags[i],
+                            }, path)
+                
+                # Clear GPU memory
+                del batch_tensor, latents
+                torch.cuda.empty_cache()
+
+        logger.info(f"Total images found: {total_found}")
+        logger.info(f"Total images processed: {total_processed}")
 
     def _process_image(self, img: Image.Image, bucket: ImageBucket) -> torch.Tensor:
         """Process image to match bucket size."""
