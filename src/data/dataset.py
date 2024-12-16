@@ -58,6 +58,9 @@ class NovelAIDataset(Dataset):
         self.text_embedder = text_embedder
         self.tag_weighter = tag_weighter
         self.vae = vae
+        
+        # Get model dtype from VAE
+        self.dtype = next(vae.parameters()).dtype
 
         # Setup cache directories
         self.cache_dir = Path(config.cache_dir)
@@ -86,6 +89,7 @@ class NovelAIDataset(Dataset):
         return transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize([0.5], [0.5]),
+            transforms.Lambda(lambda x: x.to(self.dtype))  # Convert to model dtype
         ])
 
     def _process_data(self, image_dirs: List[str]) -> None:
@@ -143,7 +147,7 @@ class NovelAIDataset(Dataset):
                             processed_img = self._process_image(img, bucket)
                             with torch.no_grad():
                                 latent = self.vae.encode(
-                                    processed_img.unsqueeze(0).to(self.device)
+                                    processed_img.unsqueeze(0).to(device=self.device, dtype=self.dtype)
                                 ).latent_dist.sample()
                                 latent = latent * self.vae.config.scaling_factor
                                 torch.save(latent.cpu(), latent_cache_path)
@@ -216,10 +220,10 @@ class NovelAIDataset(Dataset):
         
         img = img.crop((left, top, right, bottom))
         
-        # Apply transforms
+        # Apply transforms and ensure correct dtype
         img = self.transform(img)
         
-        return img
+        return img.to(self.dtype)
 
     def __getitem__(self, idx: int) -> Dict:
         """Get dataset item with cached data."""
