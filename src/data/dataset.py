@@ -34,7 +34,9 @@ class NovelAIDatasetConfig:
     """Configuration for NovelAI dataset."""
     image_size: Union[Tuple[int, int], int] = (8192, 8192)
     min_size: Union[Tuple[int, int], int] = (256, 256)
+    max_dim: Optional[int] = None  # Add this field
     bucket_step: int = 64
+    min_bucket_size: Optional[int] = None  # Add this field
     bucket_tolerance: float = 0.2
     max_aspect_ratio: float = 3.0
     cache_dir: str = "cache"
@@ -44,11 +46,20 @@ class NovelAIDatasetConfig:
     max_consecutive_batch_samples: int = 2
     
     def __post_init__(self):
-        """Convert single integers to tuples for sizes."""
+        """Convert single integers to tuples for sizes and validate."""
         if isinstance(self.image_size, int):
             self.image_size = (self.image_size, self.image_size)
         if isinstance(self.min_size, int):
             self.min_size = (self.min_size, self.min_size)
+            
+        # Handle max_dim if specified
+        if self.max_dim is not None:
+            self.image_size = (min(self.image_size[0], self.max_dim), 
+                             min(self.image_size[1], self.max_dim))
+            
+        # Set default min_bucket_size if not specified
+        if self.min_bucket_size is None:
+            self.min_bucket_size = self.min_size[0] * self.min_size[1]
 
 class NovelAIDataset(Dataset):
     def __init__(
