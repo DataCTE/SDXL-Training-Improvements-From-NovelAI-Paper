@@ -142,42 +142,58 @@ class AspectBatchSampler(Sampler[List[int]]):
 
     def _assign_samples_to_buckets(self) -> None:
         """Assign dataset samples to appropriate buckets efficiently."""
-        # Pre-calculate log aspect ratios for faster lookup
-        bucket_aspects = np.array(list(self.buckets.keys()))
-        log_bucket_aspects = np.log(bucket_aspects)
-        
-        # Process samples in parallel chunks
-        chunk_size = calculate_chunk_size(
-            total_items=len(self.dataset),
-            optimal_workers=self.num_workers
-        )
-        
-        futures = []
-        for start_idx in range(0, len(self.dataset), chunk_size):
-            end_idx = min(start_idx + chunk_size, len(self.dataset))
-            future = self.executor.submit(
-                self._process_sample_chunk,
-                start_idx, end_idx,
-                bucket_aspects,
-                log_bucket_aspects
+        try:
+            # Pre-calculate log aspect ratios for faster lookup
+            bucket_aspects = np.array(list(self.buckets.keys()))
+            if len(bucket_aspects) == 0:
+                raise ValueError("No buckets available")
+                
+            log_bucket_aspects = np.log(bucket_aspects)
+            
+            # Process samples in parallel chunks
+            chunk_size = calculate_chunk_size(
+                total_items=len(self.dataset),
+                optimal_workers=self.num_workers
             )
-            futures.append(future)
-        
-        # Collect results and assign to buckets
-        for future in futures:
-            chunk_assignments = future.result()
-            for aspect, indices in chunk_assignments.items():
-                if aspect in self.buckets:
-                    self.buckets[aspect].indices.extend(indices)
+            
+            futures = []
+            for start_idx in range(0, len(self.dataset), chunk_size):
+                end_idx = min(start_idx + chunk_size, len(self.dataset))
+                future = self.executor.submit(
+                    self._process_sample_chunk,
+                    start_idx, end_idx,
+                    bucket_aspects,
+                    log_bucket_aspects
+                )
+                futures.append(future)
+            
+            # Collect results and assign to buckets
+            total_assigned = 0
+            for future in futures:
+                try:
+                    chunk_assignments = future.result()
+                    for aspect, indices in chunk_assignments.items():
+                        if aspect in self.buckets:
+                            self.buckets[aspect].indices.extend(indices)
+                            total_assigned += len(indices)
+                except Exception as e:
+                    logger.error(f"Error processing chunk: {str(e)}")
                     
-        # Remove empty buckets
-        self.buckets = {
-            aspect: info for aspect, info in self.buckets.items()
-            if len(info.indices) >= self.min_bucket_length
-        }
-        
-        self.total_samples = sum(len(bucket.indices) for bucket in self.buckets.values())
-        logger.info(f"Assigned {self.total_samples} samples to {len(self.buckets)} buckets")
+            # Remove empty buckets
+            self.buckets = {
+                aspect: info for aspect, info in self.buckets.items()
+                if len(info.indices) >= self.min_bucket_length
+            }
+            
+            if total_assigned == 0:
+                raise ValueError("No samples were assigned to any buckets")
+                
+            self.total_samples = sum(len(bucket.indices) for bucket in self.buckets.values())
+            logger.info(f"Assigned {self.total_samples} samples to {len(self.buckets)} buckets")
+            
+        except Exception as e:
+            logger.error(f"Failed to assign samples to buckets: {str(e)}")
+            raise
 
     def _process_sample_chunk(
         self,
@@ -196,24 +212,34 @@ class AspectBatchSampler(Sampler[List[int]]):
                 height = self.dataset.items[idx][1].height
                 
                 if width <= 0 or height <= 0:
+                    logger.warning(f"Invalid dimensions for sample {idx}: {width}x{height}")
                     continue
                     
                 # Find closest bucket in log space
                 image_aspect = width / height
                 if image_aspect > self.max_aspect_ratio or image_aspect < (1/self.max_aspect_ratio):
+                    logger.debug(f"Aspect ratio {image_aspect:.2f} out of bounds for sample {idx}")
                     continue
                     
                 log_image_aspect = np.log(image_aspect)
-                bucket_idx = np.argmin(np.abs(log_bucket_aspects - log_image_aspect))
-                bucket_aspect = bucket_aspects[bucket_idx]
+                diffs = np.abs(log_bucket_aspects - log_image_aspect)
+                min_idx = np.argmin(diffs)
                 
-                chunk_assignments[bucket_aspect].append(idx)
+                # Check if within tolerance
+                if diffs[min_idx] <= self.bucket_tolerance:
+                    bucket_aspect = bucket_aspects[min_idx]
+                    chunk_assignments[bucket_aspect].append(idx)
+                else:
+                    logger.debug(f"No suitable bucket found for sample {idx} (aspect {image_aspect:.2f})")
                 
             except Exception as e:
-                logger.error(f"Error processing sample {idx}: {e}")
+                logger.error(f"Error processing sample {idx}: {str(e)}")
                 continue
                 
-        return chunk_assignments
+        if not chunk_assignments:
+            logger.warning(f"No valid assignments in chunk {start_idx}-{end_idx}")
+            
+        return dict(chunk_assignments)
 
     def _calculate_total_batches(self) -> int:
         """Calculate total number of batches efficiently."""

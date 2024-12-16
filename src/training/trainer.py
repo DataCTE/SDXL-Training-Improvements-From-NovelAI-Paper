@@ -16,6 +16,9 @@ import yaml
 from src.config.config import Config, VAEModelConfig
 import numpy as np
 import random
+import logging
+
+logger = logging.getLogger(__name__)
 
 def is_xformers_installed():
     """Check if xformers is available."""
