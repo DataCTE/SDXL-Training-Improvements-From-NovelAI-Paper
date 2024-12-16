@@ -68,7 +68,7 @@ class NovelAIDataset(Dataset):
         )
         
         # Initialize parallel processing with 90% of CPU cores
-        self.num_workers = get_optimal_cpu_threads()
+        self.num_workers = get_optimal_cpu_threads().num_threads
         
         # Initialize cache manager with same worker count
         self.cache_manager = CacheManager(

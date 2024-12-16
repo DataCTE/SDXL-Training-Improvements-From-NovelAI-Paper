@@ -210,4 +210,4 @@ class AspectRatioBucket:
 
     def _create_buckets(self):
         # Use optimal chunk size for parallel operations
-        chunk_size = thread_config.chunk_size
+        chunk_size = get_optimal_cpu_threads().chunk_size
