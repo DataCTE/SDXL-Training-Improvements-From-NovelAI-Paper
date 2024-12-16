@@ -8,45 +8,35 @@ import logging
 import math
 from dataclasses import dataclass, field
 import heapq
-from src.data.utils import (
-    get_optimal_workers,
-    create_thread_pool,
-    calculate_chunk_size,
-    get_memory_usage_gb
-)
-from src.data.bucket import BucketManager
-from PIL import Image
+from src.data.utils import get_memory_usage_gb
+from src.data.bucket import BucketManager, ImageBucket
 
 logger = logging.getLogger(__name__)
 
 @dataclass
 class BucketInfo:
     """Information about a bucket and its contents."""
-    indices: List[int]
-    width: int
-    height: int
-    aspect_ratio: float
-    total_samples: int = 0
+    indices: List[int] = field(default_factory=list)
+    bucket: Optional[ImageBucket] = None
     used_samples: int = field(default=0, init=False)
     
     def __post_init__(self):
         """Initialize derived properties."""
-        self.total_samples = len(self.indices)
         self.used_samples = 0
         
     def __len__(self) -> int:
-        return self.total_samples
+        return len(self.indices)
     
     def remaining_samples(self) -> int:
         """Get number of remaining samples."""
-        return self.total_samples - self.used_samples
+        return len(self.indices) - self.used_samples
     
     def get_next_batch(self, batch_size: int) -> List[int]:
         """Get next batch of indices efficiently."""
-        if self.used_samples >= self.total_samples:
+        if self.used_samples >= len(self.indices):
             return []
             
-        end_idx = min(self.used_samples + batch_size, self.total_samples)
+        end_idx = min(self.used_samples + batch_size, len(self.indices))
         batch = self.indices[self.used_samples:end_idx]
         self.used_samples = end_idx
         return batch
@@ -56,62 +46,35 @@ class AspectBatchSampler(Sampler[List[int]]):
     
     def __init__(
         self,
-        dataset,  # NovelAIDataset type hint removed to avoid circular import
+        dataset,  # NovelAIDataset
         batch_size: int,
-        max_image_size: Union[Tuple[int, int], int] = (768, 1024),
-        min_image_size: Union[Tuple[int, int], int] = (256, 256),
-        max_dim: Optional[int] = None,
-        bucket_step: int = 64,
-        min_bucket_resolution: int = 65536,  # 256x256
         shuffle: bool = True,
         drop_last: bool = False,
-        bucket_tolerance: float = 0.2,
-        max_aspect_ratio: float = 4.0,
-        min_bucket_length: Optional[int] = None,
         max_consecutive_batch_samples: int = 2,
-        num_workers: Optional[int] = None
+        min_bucket_length: int = 1
     ):
-        """Initialize the sampler with optimized settings."""
+        """Initialize using dataset's bucket information."""
         super().__init__(dataset)
         
-        # Convert single integers to tuples
-        if isinstance(max_image_size, int):
-            max_image_size = (max_image_size, max_image_size)
-        if isinstance(min_image_size, int):
-            min_image_size = (min_image_size, min_image_size)
-            
         self.dataset = dataset
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.drop_last = drop_last
-        self.bucket_tolerance = bucket_tolerance
-        self.max_aspect_ratio = max_aspect_ratio
-        self.min_bucket_length = min_bucket_length or batch_size
         self.max_consecutive_batch_samples = max_consecutive_batch_samples
+        self.min_bucket_length = min_bucket_length
         
-        # Initialize bucket manager
-        self.bucket_manager = BucketManager(
-            max_image_size=max_image_size,
-            min_image_size=min_image_size,
-            bucket_step=bucket_step,
-            min_bucket_resolution=min_bucket_resolution,
-            max_aspect_ratio=max_aspect_ratio,
-            bucket_tolerance=bucket_tolerance
-        )
-        
-        # Initialize thread pool for parallel processing
-        self.num_workers = num_workers or get_optimal_workers(memory_per_worker_gb=0.5)
-        self.executor = create_thread_pool(self.num_workers)
+        # Use dataset's bucket manager
+        self.bucket_manager = dataset.bucket_manager
         
         # Initialize state
-        self.buckets: Dict[float, BucketInfo] = {}
+        self.buckets: Dict[str, BucketInfo] = {}
         self.total_samples = 0
         self.epoch = 0
         self.rng = np.random.RandomState()
         
         # Pre-allocate reusable buffers
         self.bucket_heap = []
-        self.used_buckets: Set[float] = set()
+        self.used_buckets: Set[str] = set()
         
         # Create initial buckets and assign samples
         self._create_buckets()
@@ -124,65 +87,60 @@ class AspectBatchSampler(Sampler[List[int]]):
             f"Initialized sampler:\n"
             f"- Buckets: {len(self.buckets)}\n"
             f"- Total batches: {self.total_batches}\n"
-            f"- Workers: {self.num_workers}\n"
+            f"- Total samples: {self.total_samples}\n"
             f"- Memory usage: {get_memory_usage_gb():.1f}GB"
         )
 
+    def _get_bucket_key(self, bucket: ImageBucket) -> str:
+        """Get unique key for bucket based on resolution."""
+        key = f"{bucket.width}x{bucket.height}"
+        if not self.bucket_manager.validate_bucket_key(key):
+            raise ValueError(f"Invalid bucket dimensions: {key}")
+        return key
+
     def _create_buckets(self) -> None:
-        """Create buckets from bucket manager."""
-        # Convert bucket manager buckets to sampler buckets
-        for aspect, bucket in self.bucket_manager.buckets.items():
-            self.buckets[aspect] = BucketInfo(
-                indices=[],
-                width=bucket.width,
-                height=bucket.height,
-                aspect_ratio=aspect
-            )
+        """Create buckets using dataset's bucket information."""
+        bucket_mapping = self.bucket_manager.get_bucket_info()
         
-        logger.info(f"Created {len(self.buckets)} buckets")
+        # Create BucketInfo objects for each unique bucket
+        for item in self.dataset.items:
+            bucket = item.get('bucket')
+            if bucket is not None and isinstance(bucket, ImageBucket):
+                bucket_key = self._get_bucket_key(bucket)
+                if bucket_key not in self.buckets and bucket_key in bucket_mapping:
+                    self.buckets[bucket_key] = BucketInfo(bucket=bucket_mapping[bucket_key])
+        
+        if not self.buckets:
+            raise ValueError("No valid buckets could be created from dataset")
+            
+        logger.info(f"Created {len(self.buckets)} buckets from dataset")
 
     def _assign_samples_to_buckets(self) -> None:
-        """Assign dataset samples to appropriate buckets efficiently."""
+        """Assign dataset samples to appropriate buckets using existing bucket information."""
         try:
-            # Pre-calculate log aspect ratios for faster lookup
-            bucket_aspects = np.array(list(self.buckets.keys()))
-            if len(bucket_aspects) == 0:
-                raise ValueError("No buckets available")
-                
-            log_bucket_aspects = np.log(bucket_aspects)
-            
-            # Process samples in parallel chunks
-            chunk_size = calculate_chunk_size(
-                total_items=len(self.dataset),
-                optimal_workers=self.num_workers
-            )
-            
-            futures = []
-            for start_idx in range(0, len(self.dataset), chunk_size):
-                end_idx = min(start_idx + chunk_size, len(self.dataset))
-                future = self.executor.submit(
-                    self._process_sample_chunk,
-                    start_idx, end_idx,
-                    bucket_aspects,
-                    log_bucket_aspects
-                )
-                futures.append(future)
-            
-            # Collect results and assign to buckets
             total_assigned = 0
-            for future in futures:
+            
+            for idx, item in enumerate(self.dataset.items):
                 try:
-                    chunk_assignments = future.result()
-                    for aspect, indices in chunk_assignments.items():
-                        if aspect in self.buckets:
-                            self.buckets[aspect].indices.extend(indices)
-                            total_assigned += len(indices)
+                    bucket = item.get('bucket')
+                    if bucket is None or not isinstance(bucket, ImageBucket):
+                        logger.error(f"Invalid bucket information for sample {idx}")
+                        continue
+                        
+                    bucket_key = self._get_bucket_key(bucket)
+                    if bucket_key in self.buckets:
+                        self.buckets[bucket_key].indices.append(idx)
+                        total_assigned += 1
+                    else:
+                        logger.debug(f"No matching bucket for sample {idx} (resolution {bucket.width}x{bucket.height})")
+                        
                 except Exception as e:
-                    logger.error(f"Error processing chunk: {str(e)}")
+                    logger.error(f"Error assigning sample {idx}: {str(e)}")
+                    continue
                     
             # Remove empty buckets
             self.buckets = {
-                aspect: info for aspect, info in self.buckets.items()
+                key: info for key, info in self.buckets.items()
                 if len(info.indices) >= self.min_bucket_length
             }
             
@@ -195,98 +153,6 @@ class AspectBatchSampler(Sampler[List[int]]):
         except Exception as e:
             logger.error(f"Failed to assign samples to buckets: {str(e)}")
             raise
-
-    def _process_sample_chunk(
-        self,
-        start_idx: int,
-        end_idx: int,
-        bucket_aspects: np.ndarray,
-        log_bucket_aspects: np.ndarray
-    ) -> Dict[float, List[int]]:
-        """Process a chunk of samples for bucket assignment."""
-        chunk_assignments: DefaultDict[float, List[int]] = defaultdict(list)
-        
-        for idx in range(start_idx, end_idx):
-            try:
-                # Get image dimensions from dataset with better error handling
-                item = self.dataset.items[idx]
-                if not isinstance(item, (list, tuple)) or len(item) < 2:
-                    logger.error(f"Invalid item format for sample {idx}: {type(item)}")
-                    continue
-                    
-                image_info = item[1]
-                try:
-                    # Try different ways to get dimensions
-                    if isinstance(image_info, Image.Image):
-                        # Handle PIL Image
-                        width, height = image_info.size
-                    elif hasattr(image_info, 'size'):
-                        # Handle objects with size attribute (like PIL Image)
-                        width, height = image_info.size
-                    elif hasattr(image_info, 'width') and hasattr(image_info, 'height'):
-                        # Handle objects with width/height attributes
-                        width = image_info.width
-                        height = image_info.height
-                    elif isinstance(image_info, (list, tuple)) and len(image_info) >= 2:
-                        # Handle dimension tuples
-                        width, height = image_info[:2]
-                    elif isinstance(image_info, dict):
-                        # Handle dictionaries
-                        width = image_info.get('width') or image_info.get('size', [0, 0])[0]
-                        height = image_info.get('height') or image_info.get('size', [0, 0])[1]
-                    elif hasattr(image_info, 'shape'):
-                        # Handle numpy arrays or tensors
-                        if len(image_info.shape) == 3:
-                            height, width = image_info.shape[:2]
-                        elif len(image_info.shape) == 4:
-                            height, width = image_info.shape[2:]
-                        else:
-                            logger.error(f"Invalid shape for image tensor/array: {image_info.shape}")
-                            continue
-                    else:
-                        logger.error(f"Cannot extract dimensions from image_info type {type(image_info)} for sample {idx}")
-                        continue
-                except Exception as e:
-                    logger.error(f"Failed to extract dimensions for sample {idx}: {str(e)}")
-                    continue
-                
-                # Convert to integers
-                try:
-                    width = int(width)
-                    height = int(height)
-                except (TypeError, ValueError) as e:
-                    logger.error(f"Failed to convert dimensions to integers for sample {idx}: {str(e)}")
-                    continue
-                
-                if width <= 0 or height <= 0:
-                    logger.warning(f"Invalid dimensions for sample {idx}: {width}x{height}")
-                    continue
-                    
-                # Find closest bucket in log space
-                image_aspect = width / height
-                if image_aspect > self.max_aspect_ratio or image_aspect < (1/self.max_aspect_ratio):
-                    logger.debug(f"Aspect ratio {image_aspect:.2f} out of bounds for sample {idx}")
-                    continue
-                    
-                log_image_aspect = np.log(image_aspect)
-                diffs = np.abs(log_bucket_aspects - log_image_aspect)
-                min_idx = np.argmin(diffs)
-                
-                # Check if within tolerance
-                if diffs[min_idx] <= self.bucket_tolerance:
-                    bucket_aspect = bucket_aspects[min_idx]
-                    chunk_assignments[bucket_aspect].append(idx)
-                else:
-                    logger.debug(f"No suitable bucket found for sample {idx} (aspect {image_aspect:.2f})")
-                
-            except Exception as e:
-                logger.error(f"Error processing sample {idx}: {str(e)}\nFull error: {e.__class__.__name__}")
-                continue
-                
-        if not chunk_assignments:
-            logger.warning(f"No valid assignments in chunk {start_idx}-{end_idx}")
-            
-        return dict(chunk_assignments)
 
     def _calculate_total_batches(self) -> int:
         """Calculate total number of batches efficiently."""
@@ -317,8 +183,8 @@ class AspectBatchSampler(Sampler[List[int]]):
         
         # Initialize priority queue with bucket priorities
         self.bucket_heap = [
-            (-len(bucket), aspect)  # Negative length for max-heap
-            for aspect, bucket in self.buckets.items()
+            (-len(bucket), key)  # Negative length for max-heap
+            for key, bucket in self.buckets.items()
         ]
         heapq.heapify(self.bucket_heap)
         
@@ -327,33 +193,33 @@ class AspectBatchSampler(Sampler[List[int]]):
         
         while self.bucket_heap:
             # Get bucket with most remaining samples
-            _, aspect = heapq.heappop(self.bucket_heap)
-            bucket = self.buckets[aspect]
+            _, bucket_key = heapq.heappop(self.bucket_heap)
+            bucket = self.buckets[bucket_key]
             
             # Skip if bucket is depleted
             if bucket.remaining_samples() == 0:
                 continue
                 
             # Check consecutive sample limit
-            if consecutive_samples[aspect] >= self.max_consecutive_batch_samples:
+            if consecutive_samples[bucket_key] >= self.max_consecutive_batch_samples:
                 # Put back in heap with adjusted priority
-                heapq.heappush(self.bucket_heap, (-bucket.remaining_samples(), aspect))
+                heapq.heappush(self.bucket_heap, (-bucket.remaining_samples(), bucket_key))
                 continue
             
             # Get next batch
             batch = bucket.get_next_batch(self.batch_size)
             if batch:
                 all_batches.append(batch)
-                consecutive_samples[aspect] += 1
+                consecutive_samples[bucket_key] += 1
                 
                 # Reset other buckets' consecutive counts
-                for other_aspect in consecutive_samples:
-                    if other_aspect != aspect:
-                        consecutive_samples[other_aspect] = 0
+                for other_key in consecutive_samples:
+                    if other_key != bucket_key:
+                        consecutive_samples[other_key] = 0
                 
                 # Put back in heap if not depleted
                 if bucket.remaining_samples() > 0:
-                    heapq.heappush(self.bucket_heap, (-bucket.remaining_samples(), aspect))
+                    heapq.heappush(self.bucket_heap, (-bucket.remaining_samples(), bucket_key))
             
             # Handle final partial batch
             elif not self.drop_last and bucket.remaining_samples() > 0:

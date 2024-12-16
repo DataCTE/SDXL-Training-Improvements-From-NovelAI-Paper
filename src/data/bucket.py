@@ -56,7 +56,7 @@ class BucketManager:
     
     def __init__(
         self,
-        max_image_size: Tuple[int, int] = (1024, 1024),
+        max_image_size: Tuple[int, int] = (8192, 8192),
         min_image_size: Tuple[int, int] = (256, 256),
         bucket_step: int = 64,
         min_bucket_resolution: int = 65536,  # 256x256
@@ -90,11 +90,15 @@ class BucketManager:
         # Enforce minimum dimensions
         width = max(width, self.min_width)
         height = max(height, self.min_height)
+        
+        # Enforce maximum dimensions
+        width = min(width, self.max_width)
+        height = min(height, self.max_height)
             
         return width, height
     
     def _create_buckets(self) -> None:
-        """Generate bucket resolutions."""
+        """Generate bucket resolutions efficiently."""
         seen_resolutions = set()
         
         def add_bucket(width: int, height: int) -> None:
@@ -116,14 +120,31 @@ class BucketManager:
             seen_resolutions.add((width, height))
             logger.debug(f"Added bucket: {width}x{height} (ratio: {aspect:.2f})")
         
-        # Generate width-first buckets
-        width = self.min_width
-        while width <= self.max_width:
-            height = self.min_height
-            while height <= self.max_height:
-                add_bucket(width, height)
-                height += self.bucket_step
-            width += self.bucket_step
+        # Generate buckets more efficiently for large ranges
+        current_width = self.min_width
+        while current_width <= self.max_width:
+            current_height = self.min_height
+            while current_height <= self.max_height:
+                # Skip if resolution would be too large
+                if current_width * current_height > (8192 * 8192):
+                    break
+                    
+                add_bucket(current_width, current_height)
+                
+                # Use larger steps for higher resolutions to avoid too many buckets
+                if current_height >= 2048:
+                    current_height += self.bucket_step * 4
+                elif current_height >= 1024:
+                    current_height += self.bucket_step * 2
+                else:
+                    current_height += self.bucket_step
+                    
+            if current_width >= 2048:
+                current_width += self.bucket_step * 4
+            elif current_width >= 1024:
+                current_width += self.bucket_step * 2
+            else:
+                current_width += self.bucket_step
             
         logger.info(f"Created {len(self.buckets)} buckets")
     
@@ -131,6 +152,9 @@ class BucketManager:
         """Find best bucket for given dimensions."""
         if width <= 0 or height <= 0:
             return None
+            
+        # Validate and adjust dimensions
+        width, height = self._validate_dimensions(width, height)
             
         # Calculate aspect ratio
         aspect = width / height
@@ -162,3 +186,29 @@ class BucketManager:
             "max_bucket_size": max((len(b) for b in self.buckets.values()), default=0),
             "min_bucket_size": min((len(b) for b in self.buckets.values()), default=0)
         }
+    
+    def get_bucket_by_key(self, key: str) -> Optional[ImageBucket]:
+        """Get bucket by resolution key (e.g. '512x512')."""
+        width, height = map(int, key.split('x'))
+        aspect = width / height
+        return self.buckets.get(aspect)
+    
+    def get_bucket_info(self) -> Dict[str, ImageBucket]:
+        """Get mapping of resolution keys to buckets."""
+        return {
+            f"{bucket.width}x{bucket.height}": bucket 
+            for bucket in self.buckets.values()
+        }
+    
+    def validate_bucket_key(self, key: str) -> bool:
+        """Validate if a bucket key matches expected format and constraints."""
+        try:
+            width, height = map(int, key.split('x'))
+            if width <= 0 or height <= 0:
+                return False
+            aspect = width / height
+            return (aspect <= self.max_aspect_ratio and 
+                    aspect >= 1/self.max_aspect_ratio and
+                    width * height >= self.min_bucket_resolution)
+        except (ValueError, TypeError):
+            return False

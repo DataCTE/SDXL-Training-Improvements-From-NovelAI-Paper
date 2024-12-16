@@ -32,11 +32,9 @@ logger = logging.getLogger(__name__)
 @dataclass
 class NovelAIDatasetConfig:
     """Configuration for NovelAI dataset."""
-    image_size: Union[Tuple[int, int], int] = (1024, 1024)
+    image_size: Union[Tuple[int, int], int] = (8192, 8192)
     min_size: Union[Tuple[int, int], int] = (256, 256)
-    max_dim: int = 1024
     bucket_step: int = 64
-    min_bucket_size: int = 1
     bucket_tolerance: float = 0.2
     max_aspect_ratio: float = 3.0
     cache_dir: str = "cache"
@@ -89,6 +87,9 @@ class NovelAIDataset(Dataset):
             max_workers=self.num_workers
         )
         
+        # Validate configuration
+        self._validate_bucket_config()
+        
         # Initialize bucket manager
         self.bucket_manager = BucketManager(
             max_image_size=config.image_size,
@@ -117,22 +118,30 @@ class NovelAIDataset(Dataset):
             f"Bucket stats: {self.bucket_manager.get_stats()}"
         )
 
-    def get_sampler(self, batch_size: Optional[int] = None, shuffle: bool = True, drop_last: bool = False) -> AspectBatchSampler:
-        """Create an aspect-aware batch sampler for the dataset."""
+    def _validate_bucket_config(self) -> None:
+        """Validate bucket configuration parameters."""
+        if self.config.bucket_step <= 0:
+            raise ValueError(f"bucket_step must be positive, got {self.config.bucket_step}")
+        if self.config.max_aspect_ratio <= 1:
+            raise ValueError(f"max_aspect_ratio must be greater than 1, got {self.config.max_aspect_ratio}")
+        if self.config.bucket_tolerance <= 0:
+            raise ValueError(f"bucket_tolerance must be positive, got {self.config.bucket_tolerance}")
+
+    def get_sampler(
+        self, 
+        batch_size: Optional[int] = None, 
+        shuffle: bool = True, 
+        drop_last: bool = False,
+        min_bucket_length: int = 1
+    ) -> AspectBatchSampler:
+        """Create an aspect-aware batch sampler using dataset's bucket manager."""
         return AspectBatchSampler(
             dataset=self,
             batch_size=batch_size or self.config.batch_size,
-            max_image_size=self.config.image_size,
-            min_image_size=self.config.min_size,
-            max_dim=self.config.max_dim,
-            bucket_step=self.config.bucket_step,
-            min_bucket_resolution=self.config.min_size[0] * self.config.min_size[1],
             shuffle=shuffle,
             drop_last=drop_last,
-            bucket_tolerance=self.config.bucket_tolerance,
-            max_aspect_ratio=self.config.max_aspect_ratio,
-            min_bucket_length=self.config.min_bucket_size,
-            max_consecutive_batch_samples=self.config.max_consecutive_batch_samples
+            max_consecutive_batch_samples=self.config.max_consecutive_batch_samples,
+            min_bucket_length=min_bucket_length
         )
 
     def _parallel_process_data(self, image_dirs: List[str]):
