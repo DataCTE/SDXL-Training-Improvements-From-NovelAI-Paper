@@ -47,21 +47,21 @@ class AspectRatioBucket:
         self,
         max_image_size: Union[Tuple[int, int], int] = (768, 1024),
         min_image_size: Union[Tuple[int, int], int] = (256, 256),
-        max_dim: int = 1024,
+        max_dim: int = None,
         bucket_step: int = 64,
         min_bucket_resolution: int = 65536,  # 256x256
-        max_bucket_resolution: int = 1048576,  # 1024x1024
-        force_square_bucket: bool = True
+        max_bucket_resolution: int = None,  # Changed to None to indicate no upper limit
+        force_square_bucket: bool = False  # Changed default to False since we're keeping original sizes
     ):
         """Initialize bucketing system.
         
         Args:
-            max_image_size: Maximum (width, height) for images or single max dimension
+            max_image_size: Maximum (width, height) for images or single max dimension (not enforced)
             min_image_size: Minimum (width, height) for images or single min dimension
-            max_dim: Maximum single dimension
+            max_dim: Maximum single dimension (not enforced)
             bucket_step: Step size for bucket dimensions
             min_bucket_resolution: Minimum total pixels in a bucket
-            max_bucket_resolution: Maximum total pixels in a bucket
+            max_bucket_resolution: Maximum total pixels in a bucket (not enforced)
             force_square_bucket: Whether to ensure a square bucket exists
         """
         # Convert single integers to tuples
@@ -71,14 +71,8 @@ class AspectRatioBucket:
             min_image_size = (min_image_size, min_image_size)
             
         # Validate inputs
-        if not all(isinstance(x, int) and x > 0 for x in max_image_size):
-            raise ValueError(f"Invalid max_image_size: {max_image_size}")
         if not all(isinstance(x, int) and x > 0 for x in min_image_size):
             raise ValueError(f"Invalid min_image_size: {min_image_size}")
-        if max_dim <= 0 or not isinstance(max_dim, int):
-            raise ValueError(f"Invalid max_dim: {max_dim}")
-        if bucket_step <= 0 or not isinstance(bucket_step, int):
-            raise ValueError(f"Invalid bucket_step: {bucket_step}")
             
         self.max_width, self.max_height = max_image_size
         self.min_width, self.min_height = min_image_size
@@ -104,66 +98,46 @@ class AspectRatioBucket:
         width = round(width / self.bucket_step) * self.bucket_step
         height = round(height / self.bucket_step) * self.bucket_step
         
-        # Clamp to min/max
-        width = max(min(width, self.max_width), self.min_width)
-        height = max(min(height, self.max_height), self.min_height)
-        
-        # Ensure max dimension constraint
-        if width > self.max_dim:
-            height = int(height * (self.max_dim / width))
-            width = self.max_dim
-        if height > self.max_dim:
-            width = int(width * (self.max_dim / height))
-            height = self.max_dim
+        # Only enforce minimum dimensions
+        width = max(width, self.min_width)
+        height = max(height, self.min_height)
             
         return width, height
 
     def _generate_buckets(self) -> None:
         """Generate bucket resolutions following SDXL paper."""
         seen_resolutions = set()
+        logger.info("Starting bucket generation...")
         
         def add_bucket(width: int, height: int) -> None:
             """Helper to add bucket if valid."""
             width, height = self._validate_dimensions(width, height)
             resolution = width * height
             
-            # Skip if we've seen this resolution or it's outside bounds
+            # Skip if we've seen this resolution or it's below minimum
             if (width, height) in seen_resolutions:
                 return
             if resolution < self.min_bucket_resolution:
                 return
-            if resolution > self.max_bucket_resolution:
-                return
                 
             self.buckets.append(ImageBucket(width=width, height=height))
             seen_resolutions.add((width, height))
+            logger.debug(f"Added bucket: {width}x{height} (ratio: {width/height:.2f})")
         
-        # Generate width-first buckets
+        # Generate width-first buckets starting from minimum dimensions
         width = self.min_width
-        while width <= self.max_dim:
-            height = min(
-                self.max_dim,
-                math.floor(self.max_width * self.max_height / width)
-            )
-            add_bucket(width, height)
+        max_width = self.max_width * 2  # Extended range
+        while width <= max_width:
+            height = self.min_height
+            max_height = self.max_height * 2  # Extended range
+            while height <= max_height:
+                add_bucket(width, height)
+                height += self.bucket_step
             width += self.bucket_step
-            
-        # Generate height-first buckets
-        height = self.min_height
-        while height <= self.max_dim:
-            width = min(
-                self.max_dim,
-                math.floor(self.max_width * self.max_height / height)
-            )
-            add_bucket(width, height)
-            height += self.bucket_step
-            
-        # Add square bucket if requested
-        if self.force_square_bucket:
-            add_bucket(1024, 1024)
             
         # Sort buckets by aspect ratio for efficient lookup
         self.buckets.sort(key=lambda x: x.aspect_ratio)
+        logger.info(f"Generated {len(self.buckets)} buckets starting from minimum resolution of {self.min_bucket_resolution} pixels")
 
     def find_bucket(self, width: int, height: int) -> Optional[ImageBucket]:
         """Find best fitting bucket for given image dimensions.
@@ -185,7 +159,10 @@ class AspectRatioBucket:
             
             # Find closest bucket in log space
             idx = np.argmin(np.abs(self._log_aspects - log_image_aspect))
-            return self.buckets[idx]
+            bucket = self.buckets[idx]
+            if len(bucket.items) % 1000 == 0 and len(bucket.items) > 0:
+                logger.info(f"Bucket {bucket.width}x{bucket.height} now has {len(bucket.items)} items")
+            return bucket
             
         except Exception as e:
             logger.error(f"Error finding bucket for {width}x{height}: {e}")

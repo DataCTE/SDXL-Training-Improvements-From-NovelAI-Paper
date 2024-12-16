@@ -119,29 +119,44 @@ class NovelAIDataset(Dataset):
         """Process data using parallel execution."""
         image_files = []
         for image_dir in image_dirs:
+            logger.info(f"Scanning directory: {image_dir}")
             for ext in ['*.jpg', '*.jpeg', '*.png', '*.webp']:
-                image_files.extend(glob.glob(os.path.join(image_dir, '**', ext), recursive=True))
+                files = glob.glob(os.path.join(image_dir, '**', ext), recursive=True)
+                image_files.extend(files)
+                logger.info(f"Found {len(files)} {ext} files in {image_dir}")
+
+        total_files = len(image_files)
+        logger.info(f"Processing {total_files} images using {self.num_workers} workers")
 
         # Process files in parallel chunks
         chunk_size = max(1, len(image_files) // (self.num_workers * 4))
         chunks = [image_files[i:i + chunk_size] for i in range(0, len(image_files), chunk_size)]
+        logger.info(f"Split into {len(chunks)} chunks of ~{chunk_size} images each")
         
         futures = []
-        for chunk in chunks:
+        for i, chunk in enumerate(chunks):
             future = self.executor.submit(self._process_chunk, chunk)
             futures.append(future)
             
-        # Collect results
+        # Collect results with progress tracking
+        processed_files = 0
         for future in futures:
             chunk_items = future.result()
             self.items.extend(chunk_items)
+            processed_files += len(chunk_items)
+            if processed_files % 1000 == 0:
+                logger.info(f"Processed {processed_files}/{total_files} images ({(processed_files/total_files)*100:.1f}%)")
+
+        logger.info(f"Finished processing {len(self.items)} valid images out of {total_files} total files")
 
     def _process_chunk(self, image_files: List[str]) -> List[Dict]:
         """Process a chunk of image files."""
         chunk_items = []
+        skipped = 0
         for img_path in image_files:
             try:
                 if not Path(img_path).with_suffix('.txt').exists():
+                    skipped += 1
                     continue
                     
                 with Image.open(img_path) as img:
@@ -149,6 +164,7 @@ class NovelAIDataset(Dataset):
                     width, height = img.size
                     bucket = self.bucket_manager.find_bucket(width, height)
                     if bucket is None:
+                        skipped += 1
                         continue
                         
                     cache_paths = self.cache_manager.get_cache_paths(img_path)
@@ -164,8 +180,11 @@ class NovelAIDataset(Dataset):
                     
             except Exception as e:
                 logger.error(f"Error processing {img_path}: {e}")
+                skipped += 1
                 continue
                 
+        if skipped > 0:
+            logger.debug(f"Skipped {skipped} images in chunk")
         return chunk_items
 
     def __getitem__(self, idx: int) -> Dict:

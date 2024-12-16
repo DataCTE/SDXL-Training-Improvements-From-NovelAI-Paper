@@ -40,33 +40,46 @@ class CacheManager:
 
     async def save_latent_async(self, path: Path, latent: torch.Tensor):
         """Asynchronously save latent tensor."""
-        buffer = io.BytesIO()
-        await asyncio.get_event_loop().run_in_executor(
-            self.executor, torch.save, latent.cpu(), buffer
-        )
-        
-        async with aiofiles.open(path, 'wb') as f:
-            await f.write(buffer.getvalue())
+        try:
+            buffer = io.BytesIO()
+            await asyncio.get_event_loop().run_in_executor(
+                self.executor, torch.save, latent.cpu(), buffer
+            )
             
-        # Update memory cache
-        cache_key = str(path)
-        self.memory_cache[cache_key] = latent
-        self._cleanup_cache()
+            async with aiofiles.open(path, 'wb') as f:
+                await f.write(buffer.getvalue())
+                
+            # Update memory cache
+            cache_key = str(path)
+            self.memory_cache[cache_key] = latent
+            self._cleanup_cache()
+            
+            if len(self.memory_cache) % 1000 == 0:
+                logger.info(f"Cached {len(self.memory_cache)} items in memory")
+                
+        except Exception as e:
+            logger.error(f"Error saving latent to {path}: {e}")
+            raise
 
     async def save_text_data_async(self, path: Path, data: Dict[str, Any]):
         """Asynchronously save text embedding data."""
-        buffer = io.BytesIO()
-        await asyncio.get_event_loop().run_in_executor(
-            self.executor, torch.save, data, buffer
-        )
-        
-        async with aiofiles.open(path, 'wb') as f:
-            await f.write(buffer.getvalue())
+        try:
+            buffer = io.BytesIO()
+            await asyncio.get_event_loop().run_in_executor(
+                self.executor, torch.save, data, buffer
+            )
             
-        # Update memory cache
-        cache_key = str(path)
-        self.memory_cache[cache_key] = data
-        self._cleanup_cache()
+            async with aiofiles.open(path, 'wb') as f:
+                await f.write(buffer.getvalue())
+                
+            # Update memory cache
+            cache_key = str(path)
+            self.memory_cache[cache_key] = data
+            self._cleanup_cache()
+            
+        except Exception as e:
+            logger.error(f"Error saving text data to {path}: {e}")
+            raise
 
     def load_latent(self, path: Path) -> torch.Tensor:
         """Load latent tensor with memory caching."""
@@ -95,5 +108,7 @@ class CacheManager:
         if len(self.memory_cache) > self.max_cache_items:
             # Remove oldest items
             remove_keys = list(self.memory_cache.keys())[:-self.max_cache_items]
+            num_removed = len(remove_keys)
             for key in remove_keys:
                 del self.memory_cache[key]
+            logger.info(f"Cleaned up cache: removed {num_removed} items, {len(self.memory_cache)} items remaining")
