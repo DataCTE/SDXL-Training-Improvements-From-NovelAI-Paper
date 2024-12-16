@@ -31,6 +31,9 @@ from src.training.trainer import NovelAIDiffusionV3Trainer
 from utils.transforms import get_transform
 from adamw_bf16 import AdamWBF16
 from src.config.config import Config
+from data.text_embedder import TextEmbedder
+from data.tag_weighter import TagWeighter, TagWeightingConfig
+from data.dataset import NovelAIDatasetConfig
 
 def setup_accelerator(config: Config) -> Accelerator:
     """Setup accelerator with proper configuration"""
@@ -310,12 +313,35 @@ def main():
     # Setup dataset using validated directories
     dataset = NovelAIDataset(
         image_dirs=valid_dirs,
-        transform=get_transform(),
-        device=device,
+        text_embedder=TextEmbedder(
+            pretrained_model_name_or_path=config.model.pretrained_model_name,
+            device=device,
+            dtype=torch.bfloat16
+        ),
+        tag_weighter=TagWeighter(
+            config=TagWeightingConfig(
+                min_weight=config.tag_weighting.min_weight,
+                max_weight=config.tag_weighting.max_weight,
+                default_weight=config.tag_weighting.default_weight,
+                enabled=config.tag_weighting.enabled,
+                update_frequency=config.tag_weighting.update_frequency,
+                smoothing_factor=config.tag_weighting.smoothing_factor
+            )
+        ),
         vae=vae,
-        cache_dir=config.data.cache_dir,
-        text_cache_dir=config.data.text_cache_dir,
-        config=config
+        config=NovelAIDatasetConfig(
+            image_size=config.data.image_size,
+            min_size=config.data.min_size,
+            max_dim=config.data.max_dim,
+            bucket_step=config.data.bucket_step,
+            min_bucket_size=config.data.min_bucket_size,
+            bucket_tolerance=config.data.bucket_tolerance,
+            max_aspect_ratio=config.data.max_aspect_ratio,
+            cache_dir=config.data.cache_dir,
+            use_caching=config.data.use_caching,
+            proportion_empty_prompts=config.data.proportion_empty_prompts
+        ),
+        device=device
     )
     
     # Prepare for distributed training - optimizer removed since it's handled by trainer
