@@ -141,7 +141,7 @@ def process_in_chunks(
     process_fn: Callable[[List[T]], Tuple[List[Any], Dict[str, int]]],
     num_workers: int,
     progress_interval: float = 5.0
-) -> Tuple[List[Any], Dict[str, int]]:
+) -> Tuple[List[Any], Dict[str, Any]]:
     """Process items in chunks with parallel execution."""
     chunks = [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
     stats = create_progress_stats(len(items))
@@ -157,6 +157,11 @@ def process_in_chunks(
             try:
                 chunk_results, chunk_stats = future.result()
                 results.extend(chunk_results)
+                
+                # Update error types
+                if 'error_types' in chunk_stats:
+                    for error_type, count in chunk_stats['error_types'].items():
+                        stats.error_types[error_type] = stats.error_types.get(error_type, 0) + count
                 
                 update_progress_stats(
                     stats,

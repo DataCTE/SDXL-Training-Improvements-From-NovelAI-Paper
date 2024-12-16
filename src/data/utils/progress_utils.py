@@ -1,6 +1,6 @@
 import time
 import logging
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
@@ -15,6 +15,7 @@ class ProgressStats:
     last_log_time: float = field(default_factory=time.time)
     last_memory_check: float = field(default_factory=time.time)
     memory_usage_gb: float = 0.0
+    error_types: Dict[str, int] = field(default_factory=dict)
     
     @property
     def elapsed(self) -> float:
@@ -52,6 +53,20 @@ class ProgressStats:
             self.last_memory_check = current_time
             return True
         return False
+        
+    def get_stats(self) -> Dict[str, Any]:
+        """Get current statistics."""
+        return {
+            'total_items': self.total_items,
+            'processed_items': self.processed_items,
+            'failed_items': self.failed_items,
+            'elapsed_seconds': self.elapsed,
+            'progress': self.progress,
+            'rate': self.rate,
+            'eta_seconds': self.eta_seconds,
+            'memory_usage_gb': self.memory_usage_gb,
+            'error_types': self.error_types
+        }
 
 def format_time(seconds: float) -> str:
     """Format time in seconds to human readable string."""
