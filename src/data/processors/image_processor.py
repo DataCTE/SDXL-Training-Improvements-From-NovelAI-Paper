@@ -12,18 +12,12 @@ import gc
 
 # Internal imports from utils
 from src.data.processors.utils.system_utils import get_gpu_memory_usage, get_optimal_workers, create_thread_pool
-from src.data.processors.utils.batch_utils import adjust_batch_size
 from src.data.processors.utils.image_utils import load_and_validate_image, resize_image, get_image_stats
 from src.data.processors.utils.image.vae_encoder import VAEEncoder, VAEEncoderConfig
-from src.data.processors.utils.progress_utils import (
-    create_progress_tracker,
-    update_tracker,
-    log_progress
-)
+
 
 # Internal imports from processors
 from src.data.processors.bucket import BucketManager
-from src.data.processors.cache_manager import CacheManager
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +88,7 @@ class ImageProcessor:
 
     def _calculate_initial_buffer_size(self) -> Tuple[int, int, int, int]:
         """Calculate initial buffer size based on bucket manager if available."""
-        if self.bucket_manager is not None:
+        if self.bucket_manager is not None and len(self.bucket_manager.buckets) > 0:
             # Use largest bucket dimensions
             max_bucket = max(
                 self.bucket_manager.buckets.values(),
@@ -106,7 +100,15 @@ class ImageProcessor:
                 max_bucket.width,
                 max_bucket.height
             )
-        return (32, 3, 2048, 2048)  # Default size
+            
+        # Fallback to default size if no buckets available
+        logger.warning("No buckets available, using default buffer size")
+        return (
+            32,  # Initial batch size
+            3,   # RGB channels
+            self.config.max_image_size[0],  # Use max size from config
+            self.config.max_image_size[1]
+        )
 
     def _allocate_tensor_buffer(self) -> torch.Tensor:
         """Allocate tensor buffer with memory optimization."""
