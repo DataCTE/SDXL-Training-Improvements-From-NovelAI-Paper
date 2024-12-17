@@ -294,10 +294,13 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             logger.info(f"Final model device: {final_model_device}")
             logger.info(f"Final model dtype: {final_model_dtype}")
             
-            # Compare device types instead of exact string match
-            if final_model_device.type != self.device.type:
-                logger.error(f"Model device type mismatch: expected {self.device.type}, got {final_model_device.type}")
-                raise RuntimeError("Model failed to move to correct device type")
+            # Compare device types and indices
+            if final_model_device.type != self.device.type or (
+                self.device.type == 'cuda' and 
+                final_model_device.index != self.device.index if self.device.index is not None else final_model_device.index != 0
+            ):
+                logger.error(f"Model device mismatch: expected {self.device}, got {final_model_device}")
+                raise RuntimeError(f"Model failed to move to correct device (expected {self.device}, got {final_model_device})")
             if final_model_dtype != self.model_dtype:
                 logger.error(f"Model dtype mismatch: expected {self.model_dtype}, got {final_model_dtype}")
                 raise RuntimeError("Model failed to convert to correct dtype")
