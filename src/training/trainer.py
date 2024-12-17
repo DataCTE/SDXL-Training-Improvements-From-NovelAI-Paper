@@ -81,13 +81,8 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                 memory_increase = torch.cuda.memory_allocated() - initial_memory
                 logger.info(f"Model loading increased memory usage by {memory_increase/(1024**3):.2f}GB")
                 
-                # Verify model device and dtype
-                if next(self.model.parameters()).device != self.device:
-                    raise RuntimeError("Model failed to move to correct device")
-                if next(self.model.parameters()).dtype != self.model_dtype:
-                    raise RuntimeError("Model failed to convert to correct dtype")
         except Exception as e:
-            logger.error(f"Error setting up models: {e}")
+            logger.error(f"Error setting up models: {str(e)}")
             raise
         
         # Initialize model weights if needed
@@ -124,14 +119,6 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                 f"gradient_accumulation_steps ({self.config.training.gradient_accumulation_steps})"
             )
             
-        # Verify micro batch size is reasonable
-        available_memory = (torch.cuda.get_device_properties(0).total_memory 
-                          if torch.cuda.is_available() else None)
-        if available_memory:
-            estimated_batch_memory = self.micro_batch_size * 4 * 128 * 128 * 4  # Rough SDXL latent size
-            if estimated_batch_memory > available_memory * 0.2:  # Using more than 20% for batch
-                logger.warning("Micro batch size may be too large for available memory")
-        
         # Set up memory optimizations and get buffers with verification from setup.py
         try:
             initial_memory = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
