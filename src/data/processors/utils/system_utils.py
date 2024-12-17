@@ -12,6 +12,14 @@ import time
 
 logger = logging.getLogger(__name__)
 
+class CacheValue:
+    """Wrapper class for cache values to enable weak references."""
+    def __init__(self, value: Any):
+        self.value = value
+
+    def __repr__(self):
+        return f"CacheValue({self.value})"
+
 @dataclass
 class SystemResources:
     """System resource information."""
@@ -163,10 +171,10 @@ class MemoryCache:
         """Get item from cache."""
         self._auto_cleanup()
         try:
-            value = self.cache.get(key)
-            if value is not None:
+            cached = self.cache.get(key)
+            if cached is not None:
                 self.hits += 1
-                return value
+                return cached.value
         except KeyError:
             pass
         self.misses += 1
@@ -176,7 +184,12 @@ class MemoryCache:
         """Set item in cache with automatic cleanup."""
         self._auto_cleanup()
         try:
-            self.cache[key] = value
+            # Wrap value in CacheValue if it's a dict or other non-referenceable type
+            if isinstance(value, (dict, list, set, tuple)):
+                cache_value = CacheValue(value)
+            else:
+                cache_value = value
+            self.cache[key] = cache_value
             self._cleanup_if_needed()
         except Exception as e:
             logger.warning(f"Failed to cache item: {e}")
