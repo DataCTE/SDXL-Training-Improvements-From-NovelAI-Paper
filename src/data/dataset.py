@@ -6,6 +6,8 @@ from pathlib import Path
 import logging
 from PIL import Image
 import time
+import asyncio
+from tqdm import tqdm
 
 # Internal imports from data package
 from src.data.text_embedder import TextEmbedder
@@ -122,7 +124,7 @@ class NovelAIDataset(Dataset):
 
         # Process data and initialize items
         self.items = []
-        self._process_data(image_dirs)
+        asyncio.run(self._process_data(image_dirs))
         
         # Enhanced logging with system resource information
         logger.info(
@@ -142,7 +144,7 @@ class NovelAIDataset(Dataset):
             f"Bucket stats: {self.bucket_manager.get_stats()}"
         )
 
-    def _process_data(self, image_dirs: List[str]) -> None:
+    async def _process_data(self, image_dirs: List[str]) -> None:
         """Process data and assign to buckets efficiently."""
         stats = create_progress_stats(0)
         
@@ -172,7 +174,7 @@ class NovelAIDataset(Dataset):
                 min_chunk_size=100
             )
             
-            def process_chunk(chunk_files: List[str], chunk_id: int) -> Tuple[List[Dict], Dict[str, int]]:
+            async def process_chunk(chunk_files: List[str], chunk_id: int) -> Tuple[List[Dict], Dict[str, int]]:
                 chunk_items = []
                 chunk_stats = {'total': 0, 'errors': 0, 'error_types': {}, 'skipped': 0}
                 logger.debug(f"Processing chunk {chunk_id} with {len(chunk_files)} files")
@@ -206,17 +208,10 @@ class NovelAIDataset(Dataset):
                             chunk_stats['total'] += 1
                             continue
                             
-                        # Process uncached images as before...
-                        # Load and validate image
-                        img = load_and_validate_image(
-                            img_path,
-                            min_size=self.config.min_image_size,
-                            max_size=self.config.max_image_size
-                        )
-                        
+                        # Process uncached images
+                        img = load_and_validate_image(img_path)
                         if img is None:
-                            chunk_stats['error_types']['invalid_image'] = \
-                                chunk_stats['error_types'].get('invalid_image', 0) + 1
+                            chunk_stats['error_types']['invalid_image'] += 1
                             chunk_stats['errors'] += 1
                             continue
                         
@@ -245,7 +240,16 @@ class NovelAIDataset(Dataset):
                         # Get cache paths
                         cache_paths = self.cache_manager.get_cache_paths(img_path)
                         
-                        # Add to items
+                        # Generate and cache latents
+                        pixel_values = self.image_processor.preprocess(img)
+                        latents = self.image_processor.encode_vae(self.vae, pixel_values)
+                        await self.cache_manager.save_latent_async(cache_paths['latent'], latents)
+
+                        # Generate and cache text embeddings
+                        text_data = self.text_embedder.encode_text(img_path)
+                        await self.cache_manager.save_text_data_async(cache_paths['text'], text_data)
+
+                        # Add to items as before
                         chunk_items.append({
                             'image_path': img_path,
                             'width': img_stats['width'],
@@ -265,25 +269,37 @@ class NovelAIDataset(Dataset):
                 
                 return chunk_items, chunk_stats
             
-            # Process chunks in parallel
-            processed_items, final_stats = process_in_chunks(
+            # Process chunks in parallel with async support
+            pbar = tqdm(
+                total=len(image_files),
+                desc="Processing images",
+                unit="img",
+                dynamic_ncols=True,
+                position=0
+            )
+            
+            processed_items, final_stats = await process_in_chunks(
                 items=image_files,
                 chunk_size=chunk_size,
                 process_fn=process_chunk,
                 num_workers=get_optimal_workers(),
-                progress_interval=5.0
+                progress_interval=0.1,
+                progress_callback=lambda n: pbar.update(n)
             )
+            pbar.close()
             
             # Update items list
             self.items = processed_items
             
             # Log final statistics
             logger.info(
-                f"Data processing complete:\n"
+                f"\nData processing complete:\n"
                 f"- Total files: {len(image_files)}\n"
                 f"- Valid items: {len(self.items)}\n"
                 f"- Success rate: {len(self.items)/len(image_files)*100:.1f}%\n"
                 f"- Processing time: {format_time(final_stats['elapsed_seconds'])}\n"
+                f"- Cache hits: {final_stats.get('cache_hits', 0)}\n"
+                f"- Cache misses: {final_stats.get('cache_misses', 0)}\n"
                 f"- Error types:\n" + "\n".join(
                     f"  - {k}: {v}" for k, v in final_stats['error_types'].items()
                 )

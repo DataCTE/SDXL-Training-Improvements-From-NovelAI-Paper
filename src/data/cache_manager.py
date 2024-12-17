@@ -104,10 +104,6 @@ class CacheManager:
     async def save_text_data_async(self, path: Path, data: Dict[str, Any]):
         """Asynchronously save text embedding data with validation."""
         try:
-            # Validate data
-            if not isinstance(data, dict):
-                raise ValueError(f"Expected dict, got {type(data)}")
-                
             # Create parent directory if needed
             path.parent.mkdir(parents=True, exist_ok=True)
             
