@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List, Tuple, Optional, Literal
+from typing import List, Tuple, Optional, Literal, Union
 import yaml
 
 
@@ -142,17 +142,33 @@ class PathsConfig:
 @dataclass
 class NovelAIDatasetConfig:
     """Configuration for NovelAI dataset."""
-    image_size: Tuple[int, int] = (1024, 1024)
-    min_size: int = 256
-    max_dim: int = 8192
-    bucket_step: int = 8
-    min_bucket_size: int = 16
+    image_size: Union[Tuple[int, int], int] = (8192, 8192)
+    min_size: Union[Tuple[int, int], int] = (256, 256)
+    max_dim: Optional[int] = None
+    bucket_step: int = 64
+    min_bucket_size: Optional[int] = None
     bucket_tolerance: float = 0.2
-    max_aspect_ratio: float = 2.0
-    cache_dir: str = "latent_cache"
+    max_aspect_ratio: float = 3.0
+    cache_dir: str = "cache"
     text_cache_dir: str = "text_cache"
     use_caching: bool = True
     proportion_empty_prompts: float = 0.0
+    
+    def __post_init__(self):
+        """Convert single integers to tuples for sizes and validate."""
+        if isinstance(self.image_size, int):
+            self.image_size = (self.image_size, self.image_size)
+        if isinstance(self.min_size, int):
+            self.min_size = (self.min_size, self.min_size)
+            
+        # Handle max_dim if specified
+        if self.max_dim is not None:
+            self.image_size = (min(self.image_size[0], self.max_dim), 
+                             min(self.image_size[1], self.max_dim))
+            
+        # Set default min_bucket_size if not specified
+        if self.min_bucket_size is None:
+            self.min_bucket_size = self.min_size[0] * self.min_size[1]
 
 @dataclass
 class Config:
