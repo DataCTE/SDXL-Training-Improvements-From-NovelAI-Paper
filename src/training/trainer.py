@@ -127,26 +127,27 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             self.optimizer = torch.optim.AdamW(
                 self.model.parameters(),
                 lr=self.config.training.learning_rate,
-                betas=self.config.training.adam_betas,
+                betas=self.config.training.optimizer_betas,
                 weight_decay=self.config.training.weight_decay,
-                eps=self.config.training.adam_epsilon
+                eps=self.config.training.optimizer_eps
             )
             
             # Create scheduler if needed
-            if self.config.training.lr_scheduler == "cosine":
-                self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                    self.optimizer,
-                    T_max=self.config.training.max_train_steps
-                )
-            elif self.config.training.lr_scheduler == "linear":
-                self.lr_scheduler = torch.optim.lr_scheduler.LinearLR(
-                    self.optimizer,
-                    start_factor=1.0,
-                    end_factor=0.1,
-                    total_iters=self.config.training.max_train_steps
-                )
-            else:
-                self.lr_scheduler = None
+            if hasattr(self.config.training, 'lr_scheduler'):
+                if self.config.training.lr_scheduler == "cosine":
+                    self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                        self.optimizer,
+                        T_max=self.config.training.max_train_steps
+                    )
+                elif self.config.training.lr_scheduler == "linear":
+                    self.lr_scheduler = torch.optim.lr_scheduler.LinearLR(
+                        self.optimizer,
+                        start_factor=1.0,
+                        end_factor=0.1,
+                        total_iters=self.config.training.max_train_steps
+                    )
+                else:
+                    self.lr_scheduler = None
                 
         except Exception as e:
             logger.error(f"Error setting up optimizer: {e}")
