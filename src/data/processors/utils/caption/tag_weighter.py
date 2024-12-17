@@ -3,11 +3,12 @@ import torch.nn.functional as F
 from typing import Dict, List, Optional, Tuple, Union
 import logging
 from dataclasses import dataclass
-from collections import defaultdict, WeakValueDictionary
+from collections import defaultdict
 import numpy as np
 import re
 import gc
 from src.config.config import TagWeighterConfig
+from weakref import WeakValueDictionary
 
 logger = logging.getLogger(__name__)
 
