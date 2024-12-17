@@ -19,6 +19,8 @@ import numpy as np
 import random
 import logging
 import sys
+import time
+import traceback
 
 logger = logging.getLogger(__name__)
 
@@ -563,206 +565,344 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         self,
         batch: Dict[str, Union[torch.Tensor, Dict[str, torch.Tensor]]],
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
-        """Execute optimized training step.
-        
-        Args:
-            batch: Training batch
+        """Execute optimized training step with comprehensive error handling."""
+        try:
+            # Track memory usage before step
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+                start_mem = torch.cuda.memory_allocated() / 1024**2
+
+            step_start = time.time()
             
-        Returns:
-            Tuple of (total_loss, model_input, predictions, timesteps, avg_loss)
-        """
-        with torch.autocast(device_type='cuda', dtype=self.model_dtype):
-            # Get and validate inputs
-            model_input = batch["model_input"].to(
-                device=self.device,
-                dtype=self.model_dtype,
-                memory_format=torch.channels_last if self.config.system.channels_last else torch.contiguous_format,
-                non_blocking=True
-            )
-            
-            # Process inputs efficiently
-            tag_weights = batch["tag_weights"].to(self.device, non_blocking=True)
-            text_embeds = batch["text_embeds"]
-            encoder_hidden_states = text_embeds["text_embeds"].to(self.device, non_blocking=True)
-            pooled_embeds = text_embeds["pooled_text_embeds"].to(self.device, non_blocking=True)
-            
-            # Initialize prediction tensor with correct memory format
-            total_v_pred = torch.empty_like(
-                model_input,
-                memory_format=torch.channels_last if self.config.system.channels_last else torch.contiguous_format
-            )
-            
-            # Clear gradients efficiently
-            self.optimizer.zero_grad(set_to_none=True)
-            
-            total_loss = 0.0
-            running_loss = 0.0
-            
-            # Process in micro-batches
-            for i in range(self.config.training.gradient_accumulation_steps):
-                start_idx = i * self.micro_batch_size
-                end_idx = start_idx + self.micro_batch_size
+            with torch.autocast(device_type='cuda', dtype=self.model_dtype):
+                try:
+                    # Get and validate inputs
+                    model_input = batch["model_input"].to(
+                        device=self.device,
+                        dtype=self.model_dtype,
+                        memory_format=torch.channels_last if self.config.system.channels_last else torch.contiguous_format,
+                        non_blocking=True
+                    )
+                except KeyError as e:
+                    logger.error(f"Missing key in batch: {e}")
+                    raise
+                except RuntimeError as e:
+                    logger.error(f"Error moving model input to device: {e}")
+                    raise
                 
-                micro_batch = {
-                    'latents': model_input[start_idx:end_idx],
-                    'encoder_states': encoder_hidden_states[start_idx:end_idx],
-                    'pooled': pooled_embeds[start_idx:end_idx],
-                    'tag_weights': tag_weights[start_idx:end_idx],
-                }
+                try:
+                    # Process inputs efficiently
+                    tag_weights = batch["tag_weights"].to(self.device, non_blocking=True)
+                    text_embeds = batch["text_embeds"]
+                    encoder_hidden_states = text_embeds["text_embeds"].to(self.device, non_blocking=True)
+                    pooled_embeds = text_embeds["pooled_text_embeds"].to(self.device, non_blocking=True)
+                except KeyError as e:
+                    logger.error(f"Missing embedding key in batch: {e}")
+                    raise
+                except RuntimeError as e:
+                    logger.error(f"Error processing embeddings: {e}")
+                    raise
                 
-                # Generate noise efficiently
-                noise = self._generate_noise(micro_batch['latents'].shape)
+                # Initialize prediction tensor with correct memory format
+                try:
+                    total_v_pred = torch.empty_like(
+                        model_input,
+                        memory_format=torch.channels_last if self.config.system.channels_last else torch.contiguous_format
+                    )
+                except RuntimeError as e:
+                    logger.error(f"Error creating prediction tensor: {e}")
+                    raise
                 
-                # Sample timesteps
-                timesteps = torch.randint(
-                    0, self.num_timesteps, (self.micro_batch_size,),
-                    device=self.device
-                )
+                # Clear gradients efficiently
+                self.optimizer.zero_grad(set_to_none=True)
                 
-                # Get sigmas and add noise
-                sigmas = self.scheduler.sigmas[timesteps].to(dtype=self.model_dtype)
-                noisy_latents = micro_batch['latents'] + sigmas[:, None, None, None] * noise
+                total_loss = 0.0
+                running_loss = 0.0
                 
-                # Scale input
-                if self.config.training.prediction_type == "v_prediction":
-                    scaled_input = self.c_in[timesteps].to(dtype=self.model_dtype)[:, None, None, None] * noisy_latents
-                else:
-                    scaled_input = noisy_latents
+                # Process in micro-batches
+                for i in range(self.config.training.gradient_accumulation_steps):
+                    micro_batch_start = time.time()
+                    start_idx = i * self.micro_batch_size
+                    end_idx = start_idx + self.micro_batch_size
                     
-                # Get time embeddings
-                time_ids = self._get_add_time_ids(
-                    original_sizes=batch["original_sizes"][start_idx:end_idx],
-                    crops_coords_top_lefts=batch["crop_top_lefts"][start_idx:end_idx],
-                    target_sizes=batch["target_sizes"][start_idx:end_idx],
-                    batch_size=self.micro_batch_size
-                )
+                    try:
+                        micro_batch = {
+                            'latents': model_input[start_idx:end_idx],
+                            'encoder_states': encoder_hidden_states[start_idx:end_idx],
+                            'pooled': pooled_embeds[start_idx:end_idx],
+                            'tag_weights': tag_weights[start_idx:end_idx],
+                        }
+                        
+                        # Generate noise efficiently
+                        noise = self._generate_noise(micro_batch['latents'].shape)
+                        
+                        # Sample timesteps
+                        timesteps = torch.randint(
+                            0, self.num_timesteps, (self.micro_batch_size,),
+                            device=self.device
+                        )
+                        
+                        # Get sigmas and add noise
+                        sigmas = self.scheduler.sigmas[timesteps].to(dtype=self.model_dtype)
+                        noisy_latents = micro_batch['latents'] + sigmas[:, None, None, None] * noise
+                        
+                        # Scale input
+                        if self.config.training.prediction_type == "v_prediction":
+                            scaled_input = self.c_in[timesteps].to(dtype=self.model_dtype)[:, None, None, None] * noisy_latents
+                        else:
+                            scaled_input = noisy_latents
+                            
+                        # Get time embeddings
+                        time_ids = self._get_add_time_ids(
+                            original_sizes=batch["original_sizes"][start_idx:end_idx],
+                            crops_coords_top_lefts=batch["crop_top_lefts"][start_idx:end_idx],
+                            target_sizes=batch["target_sizes"][start_idx:end_idx],
+                            batch_size=self.micro_batch_size
+                        )
+                        
+                        # Run model forward pass
+                        model_pred = self.model(
+                            scaled_input,
+                            timesteps,
+                            encoder_hidden_states=micro_batch['encoder_states'],
+                            added_cond_kwargs={
+                                "text_embeds": micro_batch['pooled'],
+                                "time_ids": time_ids
+                            },
+                            return_dict=False
+                        )[0]
+                        
+                        # Get target
+                        target = noise if self.config.training.prediction_type == "epsilon" else (
+                            self.c_skip[timesteps].to(dtype=self.model_dtype)[:, None, None, None] * micro_batch['latents'] +
+                            self.c_out[timesteps].to(dtype=self.model_dtype)[:, None, None, None] * noise
+                        )
+                        
+                        # Compute loss
+                        loss = self.compute_loss(
+                            model_pred, 
+                            target,
+                            timesteps,
+                            micro_batch['tag_weights']
+                        ) / self.config.training.gradient_accumulation_steps
+                        
+                        # Backward pass
+                        self.accelerator.backward(loss)
+                        
+                        # Update metrics
+                        loss_value = loss.item()
+                        total_loss += loss_value
+                        running_loss += loss_value
+                        
+                        # Store predictions
+                        total_v_pred[start_idx:end_idx] = model_pred.detach()
+                        
+                        # Log micro-batch metrics
+                        if self.accelerator.is_main_process:
+                            micro_batch_time = time.time() - micro_batch_start
+                            logger.debug(
+                                f"Micro-batch {i+1}/{self.config.training.gradient_accumulation_steps} - "
+                                f"Loss: {loss_value:.4f}, Time: {micro_batch_time:.2f}s"
+                            )
                 
-                # Run model forward pass
-                model_pred = self.model(
-                    scaled_input,
-                    timesteps,
-                    encoder_hidden_states=micro_batch['encoder_states'],
-                    added_cond_kwargs={
-                        "text_embeds": micro_batch['pooled'],
-                        "time_ids": time_ids
-                    },
-                    return_dict=False
-                )[0]
+                    except RuntimeError as e:
+                        if "out of memory" in str(e):
+                            logger.error(f"OOM in micro-batch {i+1}: {e}")
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            raise
+                        logger.error(f"Error in micro-batch {i+1}: {e}")
+                        raise
                 
-                # Get target
-                target = noise if self.config.training.prediction_type == "epsilon" else (
-                    self.c_skip[timesteps].to(dtype=self.model_dtype)[:, None, None, None] * micro_batch['latents'] +
-                    self.c_out[timesteps].to(dtype=self.model_dtype)[:, None, None, None] * noise
-                )
+                    # Log metrics if main process
+                    if self.accelerator.is_main_process and self.global_step % self.config.training.log_steps == 0:
+                        self._log_training_step(loss_value, running_loss, i, micro_batch['tag_weights'])
                 
-                # Compute loss
-                loss = self.compute_loss(
-                    model_pred, 
-                    target,
-                    timesteps,
-                    micro_batch['tag_weights']
-                ) / self.config.training.gradient_accumulation_steps
+                # Apply gradient clipping
+                if self.config.training.max_grad_norm is not None:
+                    try:
+                        self.accelerator.clip_grad_norm_(
+                            self.model.parameters(),
+                            self.config.training.max_grad_norm
+                        )
+                    except RuntimeError as e:
+                        logger.error(f"Error during gradient clipping: {e}")
+                        raise
                 
-                # Backward pass
-                self.accelerator.backward(loss)
+                # Update params
+                try:
+                    self.optimizer.step()
+                    if self.lr_scheduler is not None:
+                        self.lr_scheduler.step()
+                except RuntimeError as e:
+                    logger.error(f"Error during optimizer step: {e}")
+                    raise
                 
-                # Update metrics
-                loss_value = loss.item()
-                total_loss += loss_value
-                running_loss += loss_value
+                avg_loss = running_loss / self.config.training.gradient_accumulation_steps
                 
-                # Store predictions
-                total_v_pred[start_idx:end_idx] = model_pred.detach()
+                # Log step completion metrics
+                if self.accelerator.is_main_process:
+                    step_time = time.time() - step_start
+                    if torch.cuda.is_available():
+                        peak_mem = torch.cuda.max_memory_allocated() / 1024**2
+                        mem_diff = peak_mem - start_mem
+                        logger.info(
+                            f"Step completed - "
+                            f"Avg Loss: {avg_loss:.4f}, "
+                            f"Time: {step_time:.2f}s, "
+                            f"Peak Memory: {peak_mem:.0f}MB "
+                            f"(+{mem_diff:.0f}MB)"
+                        )
                 
-                # Log metrics if main process
-                if self.accelerator.is_main_process and self.global_step % self.config.training.log_steps == 0:
-                    self._log_training_step(loss_value, running_loss, i, micro_batch['tag_weights'])
+                return total_loss, model_input, total_v_pred, timesteps, avg_loss
             
-            # Apply gradient clipping
-            if self.config.training.max_grad_norm is not None:
-                self.accelerator.clip_grad_norm_(
-                    self.model.parameters(),
-                    self.config.training.max_grad_norm
-                )
-            
-            # Update params
-            self.optimizer.step()
-            if self.lr_scheduler is not None:
-                self.lr_scheduler.step()
-            
-            avg_loss = running_loss / self.config.training.gradient_accumulation_steps
-            
-            return total_loss, model_input, total_v_pred, timesteps, avg_loss
+        except Exception as e:
+            logger.error(f"Unexpected error in training step: {str(e)}")
+            logger.error(f"Stack trace: {traceback.format_exc()}")
+            raise
 
     def train_epoch(
         self,
         epoch: int,
         train_dataloader: torch.utils.data.DataLoader
     ) -> float:
-        """Train for one epoch
-        
-        Args:
-            epoch: Current epoch number
-            train_dataloader: DataLoader for training data
-            
-        Returns:
-            Average loss for the epoch
-            
-        Raises:
-            ValueError: If no training data is available
-        """
+        """Train for one epoch with improved error handling and monitoring."""
         if len(train_dataloader) == 0:
-            raise ValueError(
-                "No training data available. Please ensure image_dirs contains valid paths with images."
-            )
+            raise ValueError("No training data available")
 
         self.current_epoch = epoch
         self.model.train()
         
         total_loss = 0.0
         num_batches = len(train_dataloader)
+        last_logging_time = time.time()
         
-        # Use tqdm for progress tracking
+        # Initialize progress bar with more informative metrics
         progress_bar = tqdm(
             train_dataloader,
             desc=f"Epoch {epoch}",
-            disable=not self.accelerator.is_main_process
+            disable=not self.accelerator.is_main_process,
+            dynamic_ncols=True  # Adapt to terminal width
         )
-        
-        for batch in progress_bar:
-            loss, _, _, _, avg_batch_loss = self.training_step(
-                batch
+
+        try:
+            for batch_idx, batch in enumerate(progress_bar):
+                # Add batch processing timing
+                batch_start = time.time()
+                
+                # Validate batch data
+                if not isinstance(batch, dict) or "model_input" not in batch:
+                    logger.error(f"Invalid batch format at index {batch_idx}")
+                    continue
+                    
+                try:
+                    # Process batch with timing
+                    with torch.cuda.amp.autocast(enabled=self.config.system.mixed_precision != "no"):
+                        loss, _, _, _, avg_batch_loss = self.training_step(batch)
+                    
+                    total_loss += avg_batch_loss
+                    
+                    # Update progress more frequently
+                    if batch_idx % 10 == 0:  # Update every 10 batches
+                        progress_bar.set_postfix({
+                            'loss': f'{avg_batch_loss:.4f}',
+                            'avg_loss': f'{total_loss/(batch_idx+1):.4f}',
+                            'lr': f'{self.optimizer.param_groups[0]["lr"]:.2e}',
+                            'batch_time': f'{(time.time() - batch_start):.2f}s'
+                        })
+                    
+                    # Periodic logging
+                    current_time = time.time()
+                    if current_time - last_logging_time > self.config.training.log_interval:
+                        if self.accelerator.is_main_process:
+                            # Log detailed metrics
+                            self._log_detailed_metrics(
+                                batch_idx, 
+                                num_batches,
+                                avg_batch_loss, 
+                                total_loss/(batch_idx+1),
+                                current_time - batch_start
+                            )
+                        last_logging_time = current_time
+                    
+                    # Memory management
+                    if batch_idx % 100 == 0:  # Every 100 batches
+                        torch.cuda.empty_cache()
+                        
+                except RuntimeError as e:
+                    if "out of memory" in str(e):
+                        logger.error(f"OOM error in batch {batch_idx}. Attempting recovery...")
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        continue
+                    else:
+                        raise e
+                
+                self.global_step += 1
+                
+                # Save checkpoint if needed
+                if self.global_step % self.config.training.save_steps == 0:
+                    self._save_checkpoint(batch_idx, avg_batch_loss)
+                    
+        except Exception as e:
+            logger.error(f"Error during training: {str(e)}")
+            raise e
+        finally:
+            progress_bar.close()
+            
+        return total_loss / num_batches
+
+    def _log_detailed_metrics(self, batch_idx, num_batches, batch_loss, avg_loss, batch_time):
+        """Log detailed training metrics."""
+        try:
+            # Calculate progress percentage
+            progress = (batch_idx + 1) / num_batches * 100
+            
+            # Get memory stats
+            if torch.cuda.is_available():
+                memory_allocated = torch.cuda.memory_allocated() / 1024**2  # MB
+                memory_reserved = torch.cuda.memory_reserved() / 1024**2    # MB
+            else:
+                memory_allocated = 0
+                memory_reserved = 0
+                
+            # Log metrics
+            logger.info(
+                f"Progress: {progress:.1f}% | "
+                f"Batch: {batch_idx}/{num_batches} | "
+                f"Loss: {batch_loss:.4f} | "
+                f"Avg Loss: {avg_loss:.4f} | "
+                f"LR: {self.optimizer.param_groups[0]['lr']:.2e} | "
+                f"Batch Time: {batch_time:.2f}s | "
+                f"Memory Used: {memory_allocated:.0f}MB / {memory_reserved:.0f}MB"
             )
             
-            total_loss += avg_batch_loss
-            
-            # Update progress bar
-            progress_bar.set_postfix({
-                'loss': f'{avg_batch_loss:.4f}',
-                'avg_loss': f'{total_loss/(progress_bar.n+1):.4f}'
-            })
-            
-            # Log metrics if main process
-            if self.accelerator.is_main_process and self.global_step % self.config.training.log_steps == 0:
+            # Log to wandb if enabled
+            if self.config.training.use_wandb and self.accelerator.is_main_process:
                 wandb.log({
-                    'loss/batch': avg_batch_loss,
-                    'loss/average': total_loss/(progress_bar.n+1),
-                    'epoch': self.current_epoch,
-                    'step': self.global_step,
+                    "train/batch_loss": batch_loss,
+                    "train/avg_loss": avg_loss,
+                    "train/learning_rate": self.optimizer.param_groups[0]["lr"],
+                    "train/batch_time": batch_time,
+                    "train/memory_used": memory_allocated,
+                    "train/memory_reserved": memory_reserved,
+                    "train/progress": progress
                 }, step=self.global_step)
-            
-            self.global_step += 1
-            
-            # Save checkpoint if needed
-            if self.global_step % self.config.training.save_steps == 0:
-                checkpoint_path = os.path.join(
-                    self.config.paths.checkpoints_dir,
-                    f"checkpoint_{self.global_step:06d}.pt"
-                )
-                self.save_checkpoint(checkpoint_path)
-        
-        progress_bar.close()
-        return total_loss / num_batches
+                
+        except Exception as e:
+            logger.warning(f"Error logging metrics: {str(e)}")
+
+    def _save_checkpoint(self, batch_idx, loss):
+        """Save training checkpoint with error handling."""
+        try:
+            checkpoint_path = os.path.join(
+                self.config.paths.checkpoints_dir,
+                f"checkpoint_{self.global_step:06d}.pt"
+            )
+            self.save_checkpoint(checkpoint_path)
+            logger.info(f"Saved checkpoint at step {self.global_step} (batch {batch_idx}, loss: {loss:.4f})")
+        except Exception as e:
+            logger.error(f"Error saving checkpoint: {str(e)}")
 
     @staticmethod
     def collate_fn(batch: List[Tuple]) -> Dict[str, Union[torch.Tensor, Dict[str, torch.Tensor], List[Tuple[int, int]]]]:
