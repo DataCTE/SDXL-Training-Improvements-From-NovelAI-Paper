@@ -63,7 +63,7 @@ class VAEEncoder:
 
     @torch.no_grad()
     def encode_batch(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        """Encode a batch of images through VAE.
+        """Encode images through VAE one at a time to minimize memory usage.
         
         Args:
             pixel_values: Tensor of shape (batch_size, channels, height, width)
@@ -74,34 +74,30 @@ class VAEEncoder:
         batch_size = pixel_values.shape[0]
         latents_list = []
         
-        # Process in smaller batches to manage memory
-        for i in range(0, batch_size, self.config.vae_batch_size):
+        # Process one image at a time
+        for i in range(batch_size):
             try:
-                batch_slice = slice(i, min(i + self.config.vae_batch_size, batch_size))
-                current_batch = pixel_values[batch_slice]
+                # Get single image
+                current_image = pixel_values[i:i+1]
                 
                 with torch.cuda.amp.autocast(dtype=self.config.dtype):
-                    latents = self.vae.encode(current_batch).latent_dist.sample()
+                    latents = self.vae.encode(current_image).latent_dist.sample()
                     latents = latents * self.vae.config.scaling_factor
                     latents_list.append(latents)
+                    
+                # Clear cache after each image
+                torch.cuda.empty_cache()
                 
             except RuntimeError as e:
-                if "out of memory" in str(e):
-                    # Reduce batch size and retry
-                    self.config.vae_batch_size = adjust_batch_size(
-                        current_batch_size=self.config.vae_batch_size,
-                        max_batch_size=32,
-                        min_batch_size=1,
-                        current_memory_usage=get_gpu_memory_usage(self.config.device),
-                        max_memory_usage=self.config.max_memory_usage
-                    )
-                    logger.warning(f"GPU OOM, reducing VAE batch size to {self.config.vae_batch_size}")
-                    torch.cuda.empty_cache()
-                    # Retry with smaller batch size
-                    return self.encode_batch(pixel_values)
-                raise
+                logger.error(f"Error encoding image {i}: {str(e)[:200]}...")
+                # Return empty tensor of correct shape for failed image
+                latents_list.append(torch.zeros(
+                    (1, 4, current_image.shape[2]//8, current_image.shape[3]//8),
+                    dtype=self.config.dtype,
+                    device=self.config.device
+                ))
         
-        # Combine all batches
+        # Combine all latents
         return torch.cat(latents_list, dim=0)
 
     async def encode_image(self, image_tensor: torch.Tensor) -> Optional[torch.Tensor]:
