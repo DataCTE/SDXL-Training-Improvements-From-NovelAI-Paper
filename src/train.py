@@ -56,9 +56,7 @@ def train(config_path: str):
         
         logger.info(f"\nSystem config:")
         logger.info(f"- Enable xformers: {config.system.enable_xformers}")
-        logger.info(f"- Channels last: {config.system.channels_last}")
         logger.info(f"- Gradient checkpointing: {config.system.gradient_checkpointing}")
-        logger.info(f"- Memory efficient attention: {config.system.memory_efficient_attention}")
         logger.info(f"- Mixed precision: {config.system.mixed_precision}")
         
         # Validate required directories exist
@@ -136,7 +134,11 @@ def train(config_path: str):
         )
         
         if not all(optimization_states.values()):
-            logger.warning("Some memory optimizations failed to apply")
+            logger.warning("Some memory optimizations failed to apply:")
+            for opt, state in optimization_states.items():
+                if not state:
+                    logger.warning(f"- Failed to enable {opt}")
+            logger.warning("Training will continue but may be less efficient")
         
         # Create trainer
         trainer = NovelAIDiffusionV3Trainer(

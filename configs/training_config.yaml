@@ -88,35 +88,11 @@ scoring:
 
 # System configuration
 system:
-  enable_xformers: true
-  channels_last: true
-  gradient_checkpointing: true
-  cudnn_benchmark: true
-  disable_debug_apis: true
-  compile_model: false
-  
-  # Memory settings
-  memory_efficient_attention: true
-  allow_tf32: true
-  allow_fp16: true
-  memory_fraction: 0.95  # Maximum GPU memory fraction to use
-  
-  # Basic optimization settings
-  mixed_precision: "bf16"
-  gradient_accumulation_steps: 4
-  
-  # Single GPU mode
-  distributed_training: false
-  backend: "nccl"
-  use_fsdp: true
-  cpu_offload: false
-  full_shard: true
-  sync_batch_norm: true
-  min_num_params_per_shard: 1000000  # 1M parameters per shard
-  forward_prefetch: true
-  backward_prefetch: true
-  limit_all_gathers: true
-  find_unused_parameters: false
+  # Essential settings only
+  enable_xformers: true  # Memory-efficient attention
+  gradient_checkpointing: true  # Essential for SDXL
+  mixed_precision: "bf16"  # Essential for training
+  gradient_accumulation_steps: 4  # Essential for training
 
 # Paths configuration
 paths:

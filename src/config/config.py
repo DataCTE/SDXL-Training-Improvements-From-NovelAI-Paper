@@ -108,37 +108,24 @@ class ScoringConfig:
 
 @dataclass
 class SystemConfig:
-    enable_xformers: bool = True
-    channels_last: bool = True
-    gradient_checkpointing: bool = True
-    cudnn_benchmark: bool = True
-    disable_debug_apis: bool = True
-    compile_model: bool = False  # Disable model compilation by default
-    
-    # Memory settings
-    memory_efficient_attention: bool = True
-    allow_tf32: bool = True
-    allow_fp16: bool = True
-    memory_fraction: float = 0.95  # Maximum GPU memory fraction to use
-    
-    # Basic optimization settings
-    mixed_precision: str = "bf16"
-    gradient_accumulation_steps: int = 4
-    
-    # Single GPU mode
-    distributed_training: bool = False
+    # Essential settings
+    enable_xformers: bool = True  # Only memory optimization we'll keep
+    gradient_checkpointing: bool = True  # Essential for SDXL
+    mixed_precision: str = "bf16"  # Essential for training
+    gradient_accumulation_steps: int = 4  # Essential for training
     
     def __init__(self, **kwargs):
         """Initialize with support for legacy fields."""
-        # List of legacy fields to ignore
-        legacy_fields = {
-            'num_gpu_workers', 'backend', 'use_fsdp', 'cpu_offload', 'full_shard',
-            'sync_batch_norm', 'min_num_params_per_shard', 'forward_prefetch',
-            'backward_prefetch', 'limit_all_gathers', 'find_unused_parameters'
+        # List of fields we want to keep
+        valid_fields = {
+            'enable_xformers',
+            'gradient_checkpointing',
+            'mixed_precision',
+            'gradient_accumulation_steps'
         }
         
-        # Filter out legacy fields
-        valid_kwargs = {k: v for k, v in kwargs.items() if k not in legacy_fields}
+        # Filter to only keep essential fields
+        valid_kwargs = {k: v for k, v in kwargs.items() if k in valid_fields}
         
         # Set attributes
         for key, value in valid_kwargs.items():

@@ -21,290 +21,33 @@ def setup_memory_optimizations(
     batch_size: int,
     micro_batch_size: int
 ) -> Dict[str, Any]:
-    """Optimize memory usage with SDXL-specific techniques.
-    Each optimization has error checking and fallbacks.
-    """
+    """Setup essential memory optimizations for SDXL."""
     try:
-        # Force garbage collection before setup
-        try:
-            gc.collect()
-            torch.cuda.empty_cache()
-            if torch.cuda.is_available():
-                # Verify cleanup worked
-                initial_memory = torch.cuda.memory_allocated()
-                gc.collect()
-                torch.cuda.empty_cache()
-                if torch.cuda.memory_allocated() >= initial_memory:
-                    logger.warning("Memory cleanup may not be working effectively")
-        except Exception as e:
-            logger.warning(f"Memory cleanup failed: {e}")
+        # Basic cleanup
+        gc.collect()
+        torch.cuda.empty_cache()
         
-        # Configure model memory format with verification
-        try:
-            if hasattr(model, 'conv_in') and hasattr(model.conv_in, 'weight'):
-                for param in model.parameters():
-                    if param.dim() == 4:  # Only convert 4D tensors (NCHW format)
-                        param.data = param.data.contiguous(memory_format=torch.channels_last)
-                model = model.to(memory_format=torch.channels_last)
-        except Exception as e:
-            logger.warning(f"Memory format optimization failed: {e}")
-        
-        # Enable memory efficient attention with verification
+        # Enable xformers if available
         if config.system.enable_xformers and is_xformers_installed():
             try:
-                # First try xformers
                 model.enable_xformers_memory_efficient_attention()
                 logger.info("Enabled xformers memory efficient attention")
             except Exception as e:
-                logger.warning(f"Failed to enable xformers: {e}, falling back to default attention")
-                try:
-                    # Try to enable memory efficient attention without xformers
-                    model.set_use_memory_efficient_attention(True, True)  # enable flash attention as fallback
-                    logger.info("Enabled flash attention as fallback")
-                except Exception as e2:
-                    logger.warning(f"Failed to enable default memory efficient attention: {e2}")
+                logger.warning(f"Failed to enable xformers: {e}")
         
-        # Enable gradient checkpointing with verification
+        # Enable gradient checkpointing
         if config.system.gradient_checkpointing:
             try:
                 model.enable_gradient_checkpointing()
-                # Verify gradient checkpointing is enabled
-                checkpointing_enabled = False
-                for module in model.modules():
-                    if hasattr(module, 'gradient_checkpointing'):
-                        if module.gradient_checkpointing:
-                            checkpointing_enabled = True
-                            break
-                if not checkpointing_enabled:
-                    logger.warning("Gradient checkpointing may not be enabled")
-                else:
-                    logger.info("Verified gradient checkpointing is enabled")
+                logger.info("Enabled gradient checkpointing")
             except Exception as e:
                 logger.warning(f"Failed to enable gradient checkpointing: {e}")
         
-        # Configure CUDA optimizations with verification
-        if torch.cuda.is_available():
-            try:
-                # Store original settings
-                original_tf32 = torch.backends.cuda.matmul.allow_tf32
-                original_cudnn_tf32 = torch.backends.cudnn.allow_tf32
-                original_benchmark = torch.backends.cudnn.benchmark
-                
-                # Apply optimizations
-                torch.backends.cuda.matmul.allow_tf32 = True
-                torch.backends.cudnn.allow_tf32 = True
-                if config.system.cudnn_benchmark:
-                    torch.backends.cudnn.benchmark = True
-                
-                # Verify settings changed
-                if not torch.backends.cuda.matmul.allow_tf32 or not torch.backends.cudnn.allow_tf32:
-                    logger.warning("TF32 optimizations may not be enabled")
-                if config.system.cudnn_benchmark and not torch.backends.cudnn.benchmark:
-                    logger.warning("cuDNN benchmark may not be enabled")
-                
-                # Try to set memory fraction
-                try:
-                    torch.cuda.set_per_process_memory_fraction(0.95)
-                    # Verify it worked
-                    allocated = torch.cuda.memory_allocated()
-                    max_allowed = torch.cuda.get_device_properties(0).total_memory * 0.95
-                    if allocated > max_allowed:
-                        logger.warning("Memory fraction limit may not be working")
-                except Exception as e:
-                    logger.warning(f"Failed to set memory fraction: {e}")
-                    
-            except Exception as e:
-                logger.warning(f"Failed to configure CUDA optimizations: {e}")
-                # Try to restore original settings
-                try:
-                    torch.backends.cuda.matmul.allow_tf32 = original_tf32
-                    torch.backends.cudnn.allow_tf32 = original_cudnn_tf32
-                    torch.backends.cudnn.benchmark = original_benchmark
-                except:
-                    pass
-        
-        # Get memory format for buffers
-        memory_format = (torch.channels_last 
-                        if config.system.channels_last 
-                        else torch.contiguous_format)
-        
-        # Pre-allocate buffers with verification
-        buffers = {}
-        try:
-            # Helper to verify tensor properties
-            def verify_tensor(name: str, tensor: torch.Tensor, expected_size: tuple, 
-                            expected_dtype: torch.dtype, expected_device: torch.device):
-                if tensor.size() != expected_size:
-                    logger.warning(f"{name} size mismatch: got {tensor.size()}, expected {expected_size}")
-                if tensor.dtype != expected_dtype:
-                    logger.warning(f"{name} dtype mismatch: got {tensor.dtype}, expected {expected_dtype}")
-                    # Convert to expected dtype if needed
-                    tensor = tensor.to(dtype=expected_dtype)
-                if tensor.device.type != expected_device.type or (
-                    expected_device.type == 'cuda' and 
-                    tensor.device.index != (expected_device.index if expected_device.index is not None else 0)
-                ):
-                    logger.warning(f"{name} device mismatch: got {tensor.device}, expected {expected_device}")
-                    # Move to correct device if needed
-                    tensor = tensor.to(device=expected_device)
-                # Ensure contiguity
-                if not tensor.is_contiguous():
-                    tensor = tensor.contiguous()
-                return tensor
-            
-            # Allocate and verify each buffer
-            try:
-                noise_template = verify_tensor(
-                    "noise_template",
-                    torch.empty(
-                        (batch_size, 4, 128, 128),  # SDXL latent size
-                        device=device,
-                        dtype=torch.bfloat16,
-                        memory_format=memory_format
-                    ).contiguous(),
-                    (batch_size, 4, 128, 128),
-                    torch.bfloat16,
-                    device
-                )
-                buffers['noise_template'] = noise_template
-            except Exception as e:
-                logger.error(f"Failed to allocate noise template: {e}")
-                raise
-            
-            try:
-                grad_norm_buffer = verify_tensor(
-                    "grad_norm_buffer",
-                    torch.zeros(len(list(model.parameters())), device=device, dtype=torch.bfloat16),
-                    (len(list(model.parameters())),),
-                    torch.bfloat16,
-                    device
-                )
-                buffers['grad_norm_buffer'] = grad_norm_buffer
-            except Exception as e:
-                logger.error(f"Failed to allocate grad norm buffer: {e}")
-                raise
-            
-            # Calculate latent dimensions
-            max_height, max_width = config.data.image_size
-            vae_scale_factor = 8
-            max_latent_height = max(max_height // vae_scale_factor, 128)
-            max_latent_width = max(max_width // vae_scale_factor, 128)
-            
-            try:
-                noise_buffer = verify_tensor(
-                    "noise_buffer",
-                    torch.empty(
-                        (micro_batch_size, 4, max_latent_height, max_latent_width),
-                        device=device,
-                        dtype=torch.bfloat16,
-                        memory_format=memory_format
-                    ).contiguous(),
-                    (micro_batch_size, 4, max_latent_height, max_latent_width),
-                    torch.bfloat16,
-                    device
-                )
-                buffers['noise_buffer'] = noise_buffer
-            except Exception as e:
-                logger.error(f"Failed to allocate noise buffer: {e}")
-                raise
-            
-            try:
-                latent_buffer = verify_tensor(
-                    "latent_buffer",
-                    torch.empty_like(noise_buffer, memory_format=memory_format).contiguous(),
-                    noise_buffer.size(),
-                    noise_buffer.dtype,
-                    device
-                )
-                buffers['latent_buffer'] = latent_buffer
-            except Exception as e:
-                logger.error(f"Failed to allocate latent buffer: {e}")
-                raise
-            
-            try:
-                timestep_buffer = verify_tensor(
-                    "timestep_buffer",
-                    torch.empty((micro_batch_size,), device=device, dtype=torch.long).contiguous(),
-                    (micro_batch_size,),
-                    torch.long,
-                    device
-                )
-                buffers['timestep_buffer'] = timestep_buffer
-            except Exception as e:
-                logger.error(f"Failed to allocate timestep buffer: {e}")
-                raise
-            
-            if config.training.snr_gamma is not None:
-                try:
-                    snr_weight_buffer = verify_tensor(
-                        "snr_weight_buffer",
-                        torch.empty((micro_batch_size,), device=device, dtype=torch.bfloat16).contiguous(),
-                        (micro_batch_size,),
-                        torch.bfloat16,
-                        device
-                    )
-                    buffers['snr_weight_buffer'] = snr_weight_buffer
-                except Exception as e:
-                    logger.error(f"Failed to allocate SNR weight buffer: {e}")
-                    raise
-            
-        except Exception as e:
-            logger.error(f"Failed to allocate buffers: {e}")
-            # Try to free any partially allocated buffers
-            for buffer in buffers.values():
-                try:
-                    del buffer
-                except:
-                    pass
-            torch.cuda.empty_cache()
-            raise
-        
-        # Final verification
-        try:
-            # Test basic operations on buffers
-            for name, buffer in buffers.items():
-                if buffer is not None:
-                    try:
-                        # Try basic operations
-                        buffer.zero_()
-                        if buffer.dtype.is_floating_point:
-                            buffer.uniform_()
-                    except Exception as e:
-                        logger.warning(f"Buffer {name} may not be usable: {e}")
-            
-            # Verify model can still do a basic forward pass
-            try:
-                # Create dummy inputs for UNet forward pass
-                dummy_input = torch.randn(1, model.config.in_channels, 64, 64, device=device)
-                dummy_timestep = torch.tensor([0], device=device)
-                dummy_encoder_hidden_states = torch.randn(1, 77, model.config.cross_attention_dim, device=device)
-                
-                # Perform forward pass with all required arguments
-                model(
-                    dummy_input,
-                    timestep=dummy_timestep,
-                    encoder_hidden_states=dummy_encoder_hidden_states
-                )
-            except Exception as e:
-                logger.warning(f"Model forward pass verification failed: {e}")
-                
-        except Exception as e:
-            logger.warning(f"Final verification failed: {e}")
-        
-        return {
-            'model': model,
-            **buffers
-        }
+        return {'model': model}
 
     except Exception as e:
-        logger.error(f"Fatal error in memory optimizations: {str(e)}")
+        logger.error(f"Error in memory optimizations: {str(e)}")
         logger.error(f"Stack trace: {traceback.format_exc()}")
-        # Emergency cleanup
-        try:
-            gc.collect()
-            torch.cuda.empty_cache()
-        except:
-            pass
         raise
 
 def setup_distributed():
@@ -356,26 +99,10 @@ def verify_memory_optimizations(
     device: torch.device,
     logger: logging.Logger
 ) -> Dict[str, bool]:
-    """Verify memory optimizations are still active."""
+    """Verify essential memory optimizations are active."""
     optimization_states = {}
     
     try:
-        # Verify memory format
-        if config.system.channels_last:
-            # Check if any 4D parameter is in channels_last format
-            format_ok = False
-            for param in model.parameters():
-                if param.dim() == 4:
-                    try:
-                        if param.is_contiguous(memory_format=torch.channels_last):
-                            format_ok = True
-                            break
-                    except Exception:
-                        continue
-            if not format_ok:
-                logger.warning("channels_last memory format was lost")
-            optimization_states['channels_last'] = format_ok
-            
         # Verify xformers if enabled
         if config.system.enable_xformers and is_xformers_installed():
             has_xformers = False
@@ -385,7 +112,7 @@ def verify_memory_optimizations(
                         has_xformers = True
                         break
             if not has_xformers:
-                logger.warning("xformers attention was disabled")
+                logger.warning("xformers attention was not enabled")
             optimization_states['xformers'] = has_xformers
             
         # Verify gradient checkpointing
@@ -397,21 +124,8 @@ def verify_memory_optimizations(
                         checkpointing_enabled = True
                         break
             if not checkpointing_enabled:
-                logger.warning("Gradient checkpointing was disabled")
+                logger.warning("Gradient checkpointing was not enabled")
             optimization_states['gradient_checkpointing'] = checkpointing_enabled
-            
-        # Verify CUDA optimizations
-        if torch.cuda.is_available():
-            tf32_ok = torch.backends.cuda.matmul.allow_tf32 and torch.backends.cudnn.allow_tf32
-            if not tf32_ok:
-                logger.warning("TF32 optimizations were disabled")
-            optimization_states['tf32'] = tf32_ok
-            
-            if config.system.cudnn_benchmark:
-                benchmark_ok = torch.backends.cudnn.benchmark
-                if not benchmark_ok:
-                    logger.warning("cuDNN benchmark was disabled")
-                optimization_states['cudnn_benchmark'] = benchmark_ok
                 
     except Exception as e:
         logger.warning(f"Error verifying memory optimizations: {e}")

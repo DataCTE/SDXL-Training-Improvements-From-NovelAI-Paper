@@ -56,15 +56,7 @@ def create_training_ui():
         save_interval: int,
         resume_checkpoint: str = None,
         unet_path: str = None,
-        enable_wandb: bool = True,
-        # Distributed training options
-        distributed_training: bool = True,
-        backend: str = "nccl",
-        use_fsdp: bool = True,
-        cpu_offload: bool = False,
-        full_shard: bool = True,
-        sync_batch_norm: bool = True,
-        min_num_params_per_shard: int = int(1e6),
+        enable_wandb: bool = True
     ):
         # Create experiment name
         experiment_name = f"sdxl-train-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -106,25 +98,11 @@ def create_training_ui():
                 "experiment_name": experiment_name
             },
             "system": {
-                "enable_xformers": True,
-                "channels_last": True,
-                "gradient_checkpointing": True,
-                "cudnn_benchmark": True,
-                "disable_debug_apis": True,
-                "mixed_precision": mixed_precision,
-                "gradient_accumulation_steps": gradient_accumulation_steps,
-                # Distributed training settings
-                "distributed_training": distributed_training,
-                "backend": backend,
-                "use_fsdp": use_fsdp,
-                "cpu_offload": cpu_offload,
-                "full_shard": full_shard,
-                "sync_batch_norm": sync_batch_norm,
-                "min_num_params_per_shard": min_num_params_per_shard,
-                "forward_prefetch": True,
-                "backward_prefetch": True,
-                "limit_all_gathers": True,
-                "find_unused_parameters": False
+                # Essential settings only
+                "enable_xformers": True,  # Memory-efficient attention
+                "gradient_checkpointing": True,  # Essential for SDXL
+                "mixed_precision": mixed_precision,  # Essential for training
+                "gradient_accumulation_steps": gradient_accumulation_steps  # Essential for training
             }
         }
 
@@ -218,49 +196,6 @@ def create_training_ui():
                 )
                 enable_wandb = gr.Checkbox(label="Enable W&B Logging", value=True)
                 
-            # Add distributed training options
-            with gr.Tab("Distributed Training"):
-                with gr.Row():
-                    distributed_training = gr.Checkbox(
-                        label="Enable Distributed Training",
-                        value=True
-                    )
-                    backend = gr.Dropdown(
-                        label="Backend",
-                        choices=["nccl", "gloo"],
-                        value="nccl"
-                    )
-                    
-                with gr.Row():
-                    use_fsdp = gr.Checkbox(
-                        label="Use FSDP",
-                        value=True,
-                        info="Use Fully Sharded Data Parallel instead of DDP"
-                    )
-                    cpu_offload = gr.Checkbox(
-                        label="CPU Offload",
-                        value=False,
-                        info="Offload parameters to CPU to save GPU memory"
-                    )
-                    
-                with gr.Row():
-                    full_shard = gr.Checkbox(
-                        label="Full Sharding",
-                        value=True,
-                        info="Use full parameter sharding strategy"
-                    )
-                    sync_batch_norm = gr.Checkbox(
-                        label="Sync BatchNorm",
-                        value=True,
-                        info="Synchronize BatchNorm across devices"
-                    )
-                    
-                min_num_params = gr.Number(
-                    label="Min Params per Shard",
-                    value=1e6,
-                    info="Minimum number of parameters per GPU for FSDP"
-                )
-
         with gr.Tab("Training Metrics"):
             with gr.Row():
                 loss_plot = gr.Plot(label="Training Loss")
@@ -292,15 +227,7 @@ def create_training_ui():
                 save_interval,
                 resume_checkpoint,
                 unet_path,
-                enable_wandb,
-                # Add distributed training inputs
-                distributed_training,
-                backend,
-                use_fsdp,
-                cpu_offload,
-                full_shard,
-                sync_batch_norm,
-                min_num_params
+                enable_wandb
             ],
             outputs=[output, loss_plot, lr_plot]
         )
