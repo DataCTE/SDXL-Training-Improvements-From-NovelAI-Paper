@@ -5,9 +5,10 @@ import torch
 from src.data import NovelAIDataset, NovelAIDatasetConfig
 from src.training.trainer import NovelAIDiffusionV3Trainer
 from src.utils.model.model import setup_model
-from src.config.config import Config
+from src.config.config import Config, TagWeighterConfig
 from src.utils.system.setup import verify_memory_optimizations, setup_memory_optimizations
 from src.utils.logging.metrics import setup_logging, log_system_info, cleanup_logging
+from src.data.processors.utils.caption.tag_weighter import TagWeighter, parse_tags
 import gc
 import traceback
 from src.config.arg_parser import parse_args
@@ -132,7 +133,10 @@ def train(config_path: str):
                     logger.warning(f"- Failed to enable {opt}")
             logger.warning("Training will continue but may be less efficient")
         
-        # Create dataset config
+        # Initialize tag weighter with config
+        tag_weighter = TagWeighter(config=config.tag_weighting)
+        
+        # Create dataset config with tag weighter
         dataset_config = NovelAIDatasetConfig(
             image_size=config.data.image_size,
             max_image_size=config.data.max_image_size,
@@ -147,7 +151,7 @@ def train(config_path: str):
             text_cache_dir=config.data.text_cache_dir,
             use_caching=config.data.use_caching,
             proportion_empty_prompts=config.data.proportion_empty_prompts,
-            max_consecutive_batch_samples=2,  # Fixed value as per dataset implementation
+            max_consecutive_batch_samples=2,
             model_name=config.model.pretrained_model_name,
             tag_weighting=config.tag_weighting,
             max_token_length=config.data.max_token_length
@@ -158,7 +162,8 @@ def train(config_path: str):
             image_dirs=config.data.image_dirs,
             config=dataset_config,
             vae=vae,
-            device=device
+            device=device,
+            tag_weighter=tag_weighter
         )
         
         if len(dataset) == 0:
