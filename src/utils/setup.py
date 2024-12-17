@@ -560,6 +560,10 @@ def verify_scheduler_parameters(
     warnings = []
     
     try:
+        # Normalize device specification
+        if device.type == 'cuda' and device.index is None:
+            device = torch.device('cuda:0')
+            
         # Verify required parameters exist
         required_params = [
             'scheduler', 'alphas', 'betas', 'alphas_cumprod',
@@ -587,8 +591,8 @@ def verify_scheduler_parameters(
                 param_states[name] = False
                 continue
                 
-            # Device check - don't fail on device mismatch, we can fix this
-            if param.device != device:
+            # Device check - compare device strings to handle cuda vs cuda:0
+            if str(param.device) != str(device):
                 warnings.append(f"Scheduler parameter {name} is on wrong device: {param.device} vs {device}")
                 try:
                     # Try to move parameter to correct device
