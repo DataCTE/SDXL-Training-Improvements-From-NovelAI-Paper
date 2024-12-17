@@ -33,7 +33,12 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         super().__init__()
         
         # Load and validate config
-        self.config = Config.load(config_path)
+        try:
+            self.config = Config.from_yaml(config_path)
+            logger.info(f"Successfully loaded config from {config_path}")
+        except Exception as e:
+            logger.error(f"Failed to load config from {config_path}: {str(e)}")
+            raise
         
         # Setup device
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
