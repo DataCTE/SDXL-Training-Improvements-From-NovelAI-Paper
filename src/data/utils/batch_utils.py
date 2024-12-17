@@ -174,3 +174,19 @@ def process_in_chunks(
         return results, stats.get_stats()
 
     return asyncio.run(_process_chunks())
+
+async def process_in_chunks_sync(
+    items: List[Any],
+    chunk_size: int,
+    process_fn: Callable,
+    num_workers: int,
+    **kwargs
+) -> Tuple[List[Any], Dict[str, Any]]:
+    """Synchronous wrapper for process_in_chunks."""
+    return await process_in_chunks(
+        items=items,
+        chunk_size=chunk_size,
+        process_fn=process_fn,
+        num_workers=num_workers,
+        **kwargs
+    )
