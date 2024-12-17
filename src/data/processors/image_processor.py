@@ -212,19 +212,18 @@ class ImageProcessor:
                 # Process images
                 sub_processed = []
                 for img in sub_batch:
-                    tensor = self._process_single_image(img, width, height)
-                    sub_processed.append(tensor)
+                    # Process single image
+                    tensor = await self.process_image(img)
+                    if tensor is not None:
+                        sub_processed.append(tensor)
                     # Clear original image reference
                     del img
                 
                 if sub_processed:
+                    # Stack tensors if we have any successful results
                     batch_tensor = torch.stack(sub_processed)
                     # Clear individual tensors after stacking
                     del sub_processed
-                    
-                    if self.vae_encoder is not None:
-                        with torch.cuda.amp.autocast(dtype=self.config.dtype):
-                            batch_tensor = self.vae_encoder.encode_image(batch_tensor)
                     
                     # Move to CPU immediately and append
                     for tensor in batch_tensor:
@@ -235,11 +234,11 @@ class ImageProcessor:
                     del batch_tensor
                     torch.cuda.empty_cache()
                     gc.collect()
-                    await asyncio.sleep(0.01)
+                    await asyncio.sleep(0.01)  # Give other tasks a chance to run
                 
             except Exception as e:
                 logger.error(f"Error processing sub-batch: {e}")
-                # Create zero tensors on CPU directly
+                # Create zero tensors on CPU directly for failed items
                 for _ in range(len(sub_batch)):
                     processed_tensors.append(
                         torch.zeros((4, height//8, width//8), 

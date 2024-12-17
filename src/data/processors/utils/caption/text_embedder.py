@@ -377,3 +377,28 @@ class TextEmbedder:
                 gc.collect()
             except:
                 pass
+
+    async def process_text(
+        self, 
+        text: str, 
+        tags: List[str]
+    ) -> Optional[Dict[str, Any]]:
+        """Process text and tags asynchronously."""
+        try:
+            # Generate embeddings for the text
+            embeddings = self.__call__([text], proportion_empty_prompts=0.0)
+            
+            if not isinstance(embeddings, dict) or 'prompt_embeds' not in embeddings:
+                logger.error("Failed to generate embeddings")
+                return None
+                
+            # Return combined data
+            return {
+                'embeds': embeddings['prompt_embeds'][0],
+                'pooled_embeds': embeddings['pooled_prompt_embeds'][0],
+                'tags': tags
+            }
+            
+        except Exception as e:
+            logger.error(f"Error processing text: {str(e)[:200]}...")
+            return None
