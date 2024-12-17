@@ -270,8 +270,8 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             logger.info(f"Current model device: {current_model_device}")
             logger.info(f"Current VAE device: {current_vae_device}")
             
-            # Only move if needed
-            if current_model_device != self.device:
+            # Only move if needed - use device type comparison
+            if current_model_device.type != self.device.type:
                 logger.info(f"Moving model from {current_model_device} to {self.device}")
                 try:
                     self.model = self.model.to(device=self.device, dtype=self.model_dtype)
@@ -284,7 +284,7 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                 logger.info(f"Converting model dtype to {self.model_dtype}")
                 self.model = self.model.to(dtype=self.model_dtype)
                 
-            if current_vae_device != self.device:
+            if current_vae_device.type != self.device.type:
                 logger.info(f"Moving VAE from {current_vae_device} to {self.device}")
                 try:
                     self.vae = self.vae.to(device=self.device, dtype=self.model_dtype)
@@ -307,9 +307,10 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             logger.info(f"Final model device: {final_model_device}")
             logger.info(f"Final model dtype: {final_model_dtype}")
             
-            if final_model_device != self.device:
-                logger.error(f"Model device mismatch: expected {self.device}, got {final_model_device}")
-                raise RuntimeError("Model failed to move to correct device")
+            # Compare device types instead of exact string match
+            if final_model_device.type != self.device.type:
+                logger.error(f"Model device type mismatch: expected {self.device.type}, got {final_model_device.type}")
+                raise RuntimeError("Model failed to move to correct device type")
             if final_model_dtype != self.model_dtype:
                 logger.error(f"Model dtype mismatch: expected {self.model_dtype}, got {final_model_dtype}")
                 raise RuntimeError("Model failed to convert to correct dtype")
