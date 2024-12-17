@@ -177,13 +177,14 @@ class NovelAIDataset(Dataset):
             async def process_chunk(chunk_files: List[str], chunk_id: int) -> Tuple[List[Dict], Dict[str, int]]:
                 chunk_items = []
                 chunk_stats = {'total': 0, 'errors': 0, 'error_types': {}, 'skipped': 0}
-                logger.debug(f"Processing chunk {chunk_id} with {len(chunk_files)} files")
+                logger.info(f"Starting chunk {chunk_id} ({len(chunk_files)} files)")
                 
                 for img_path in chunk_files:
                     try:
                         # Check if cache exists
                         cache_paths = self.cache_manager.get_cache_paths(img_path)
                         if all(path.exists() for path in cache_paths.values()):
+                            logger.debug(f"Using cached data for {Path(img_path).name}")
                             # Add to items without processing
                             img = Image.open(img_path)
                             width, height = img.size
@@ -191,6 +192,7 @@ class NovelAIDataset(Dataset):
                             
                             bucket = self.bucket_manager.find_bucket(width, height)
                             if bucket is None:
+                                logger.warning(f"No bucket found for {Path(img_path).name} ({width}x{height})")
                                 chunk_stats['error_types']['no_bucket'] = \
                                     chunk_stats['error_types'].get('no_bucket', 0) + 1
                                 chunk_stats['errors'] += 1
@@ -206,11 +208,14 @@ class NovelAIDataset(Dataset):
                             })
                             chunk_stats['skipped'] += 1
                             chunk_stats['total'] += 1
+                            logger.debug(f"Added cached item {Path(img_path).name} to bucket {bucket.width}x{bucket.height}")
                             continue
                             
                         # Process uncached images
+                        logger.debug(f"Processing new image {Path(img_path).name}")
                         img = load_and_validate_image(img_path)
                         if img is None:
+                            logger.warning(f"Invalid image: {Path(img_path).name}")
                             chunk_stats['error_types']['invalid_image'] += 1
                             chunk_stats['errors'] += 1
                             continue
@@ -248,6 +253,7 @@ class NovelAIDataset(Dataset):
                         # Generate and cache text embeddings
                         text_data = self.text_embedder.encode_text(img_path)
                         await self.cache_manager.save_text_data_async(cache_paths['text'], text_data)
+                        logger.debug(f"Successfully processed and cached {Path(img_path).name}")
 
                         # Add to items as before
                         chunk_items.append({
@@ -261,12 +267,14 @@ class NovelAIDataset(Dataset):
                         chunk_stats['total'] += 1
                         
                     except Exception as e:
-                        logger.error(f"Error processing {img_path}: {e}")
+                        logger.error(f"Error processing {Path(img_path).name}: {str(e)[:200]}...")
                         chunk_stats['error_types']['exception'] = \
                             chunk_stats['error_types'].get('exception', 0) + 1
                         chunk_stats['errors'] += 1
                         continue
                 
+                logger.info(f"Completed chunk {chunk_id}: {chunk_stats['total']} processed, "
+                           f"{chunk_stats['skipped']} cached, {chunk_stats['errors']} errors")
                 return chunk_items, chunk_stats
             
             # Process chunks in parallel with async support
@@ -275,8 +283,18 @@ class NovelAIDataset(Dataset):
                 desc="Processing images",
                 unit="img",
                 dynamic_ncols=True,
-                position=0
+                position=0,
+                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'
             )
+            
+            def update_progress(n: int, stats: Dict[str, Any]) -> None:
+                pbar.set_postfix({
+                    'cached': stats.get('skipped', 0),
+                    'errors': stats.get('errors', 0),
+                    'cache_hits': stats.get('cache_hits', 0),
+                    'processing': stats.get('total', 0)
+                }, refresh=True)
+                pbar.update(n)
             
             processed_items, final_stats = await process_in_chunks(
                 items=image_files,
@@ -284,9 +302,18 @@ class NovelAIDataset(Dataset):
                 process_fn=process_chunk,
                 num_workers=get_optimal_workers(),
                 progress_interval=0.1,
-                progress_callback=lambda n: pbar.update(n)
+                progress_callback=lambda n, stats: update_progress(n, stats)
             )
-            pbar.close()
+            
+            # Print chunk completion status
+            logger.info(
+                f"\nChunk processing status:\n"
+                f"- Processed: {final_stats['total']}\n"
+                f"- Cached: {final_stats.get('skipped', 0)}\n"
+                f"- Errors: {final_stats['errors']}\n"
+                f"- Cache hits: {final_stats.get('cache_hits', 0)}\n"
+                f"- Cache misses: {final_stats.get('cache_misses', 0)}"
+            )
             
             # Update items list
             self.items = processed_items
