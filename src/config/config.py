@@ -145,10 +145,11 @@ class PathsConfig:
 class NovelAIDatasetConfig:
     """Configuration for NovelAI dataset."""
     image_size: Union[Tuple[int, int], int] = (8192, 8192)
-    min_size: Union[Tuple[int, int], int] = (256, 256)
+    min_image_size: Union[Tuple[int, int], int] = (256, 256)
     max_dim: Optional[int] = None
     max_image_size: Optional[Tuple[int, int]] = (8192, 8192)
     bucket_step: int = 64
+    min_bucket_resolution: Optional[int] = None
     min_bucket_size: Optional[int] = None
     bucket_tolerance: float = 0.2
     max_aspect_ratio: float = 3.0
@@ -165,8 +166,8 @@ class NovelAIDatasetConfig:
         """Convert single integers to tuples for sizes and validate."""
         if isinstance(self.image_size, int):
             self.image_size = (self.image_size, self.image_size)
-        if isinstance(self.min_size, int):
-            self.min_size = (self.min_size, self.min_size)
+        if isinstance(self.min_image_size, int):
+            self.min_image_size = (self.min_image_size, self.min_image_size)
         if self.max_image_size is None:
             self.max_image_size = self.image_size
             
@@ -179,7 +180,11 @@ class NovelAIDatasetConfig:
             
         # Set default min_bucket_size if not specified
         if self.min_bucket_size is None:
-            self.min_bucket_size = self.min_size[0] * self.min_size[1]
+            self.min_bucket_size = self.min_image_size[0] * self.min_image_size[1]
+            
+        # Set default min_bucket_resolution if not specified
+        if self.min_bucket_resolution is None:
+            self.min_bucket_resolution = min(self.min_image_size)
 
 @dataclass
 class Config:

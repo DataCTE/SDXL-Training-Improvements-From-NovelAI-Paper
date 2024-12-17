@@ -142,10 +142,11 @@ def train(config_path: str):
         dataset_config = NovelAIDatasetConfig(
             image_size=tuple(config.data.image_size),
             max_image_size=tuple(config.data.max_image_size) if hasattr(config.data, 'max_image_size') else None,
-            min_size=tuple(config.data.min_size) if isinstance(config.data.min_size, (list, tuple)) else config.data.min_size,
+            min_image_size=tuple(config.data.min_size) if isinstance(config.data.min_size, (list, tuple)) else config.data.min_size,
             max_dim=config.data.max_dim,
             bucket_step=config.data.bucket_step,
             min_bucket_size=config.data.min_bucket_size,
+            min_bucket_resolution=config.data.min_size if isinstance(config.data.min_size, int) else min(config.data.min_size),
             bucket_tolerance=config.data.bucket_tolerance,
             max_aspect_ratio=config.data.max_aspect_ratio,
             cache_dir=config.data.cache_dir,
