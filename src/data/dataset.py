@@ -231,17 +231,24 @@ class NovelAIDataset(Dataset):
                 device=self.device
             )
             
+            # Add a counter variable before processing
+            total_processed = 0
+
             # Process files in batches
             processed_items, stats = await self.batch_processor.process_dataset(
                 items=image_files,
-                progress_callback=lambda n, chunk_stats: log_progress(
-                    tracker,
-                    prefix="Dataset Processing: ",
-                    extra_stats={
-                        **chunk_stats,
-                        'total_processed': tracker.processed + n
-                    }
-                ) if tracker.should_log() else None
+                progress_callback=lambda n, chunk_stats: (
+                    # Update our counter
+                    (lambda: globals().update({'total_processed': total_processed + n}))(),
+                    log_progress(
+                        tracker,
+                        prefix="Dataset Processing: ",
+                        extra_stats={
+                            **chunk_stats,
+                            'total_processed': total_processed + n
+                        }
+                    ) if tracker.should_log() else None
+                )
             )
             
             # Store processed items
