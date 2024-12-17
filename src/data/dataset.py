@@ -122,9 +122,16 @@ class NovelAIDataset(Dataset):
             name="DatasetBatchProcessor"
         )
 
+        # Create event loop if needed
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
         # Process data and initialize items
         self.items = []
-        asyncio.run(self._process_data(image_dirs))
+        loop.run_until_complete(self._process_data(image_dirs))
         
         # Enhanced logging with system resource information
         logger.info(

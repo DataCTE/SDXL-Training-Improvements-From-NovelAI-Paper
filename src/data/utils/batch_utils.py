@@ -147,7 +147,7 @@ def create_tensor_buffer(
         device=device
     )
 
-def process_in_chunks(
+async def process_in_chunks(
     items: List[T],
     chunk_size: int,
     process_fn: Callable[[List[T]], Tuple[List[Any], Dict[str, int]]],
@@ -158,22 +158,19 @@ def process_in_chunks(
     stats = create_progress_stats(len(items))
     results = []
 
-    async def _process_chunks():
-        for chunk_id, chunk in enumerate(chunks):
-            try:
-                chunk_results, chunk_stats = await process_fn(chunk, chunk_id)
-                results.extend(chunk_results)
-                
-                # Update stats and progress
-                if progress_callback:
-                    progress_callback(len(chunk), chunk_stats)
-            except Exception as e:
-                logger.error(f"Error processing chunk {chunk_id}: {e}")
-                update_progress_stats(stats, failed=len(chunk))
-                
-        return results, stats.get_stats()
-
-    return asyncio.run(_process_chunks())
+    for chunk_id, chunk in enumerate(chunks):
+        try:
+            chunk_results, chunk_stats = await process_fn(chunk, chunk_id)
+            results.extend(chunk_results)
+            
+            # Update stats and progress
+            if progress_callback:
+                progress_callback(len(chunk), chunk_stats)
+        except Exception as e:
+            logger.error(f"Error processing chunk {chunk_id}: {e}")
+            update_progress_stats(stats, failed=len(chunk))
+            
+    return results, stats.get_stats()
 
 async def process_in_chunks_sync(
     items: List[Any],
