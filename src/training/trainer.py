@@ -22,13 +22,14 @@ import sys
 import time
 import traceback
 from src.utils.model import initialize_model_weights
-from src.utils.setup import setup_memory_optimizations
+from src.utils.setup import setup_memory_optimizations, verify_memory_optimizations, verify_buffer_states, verify_scheduler_parameters, check_memory_status
 from src.training.scheduler import configure_noise_scheduler, get_karras_scalings
 from src.utils.model import create_unet, create_vae, is_xformers_installed
 from src.utils.metrics import compute_grad_norm, log_metrics
 from src.utils.noise import generate_noise
 from src.utils.embeddings import get_add_time_ids
 from src.utils.checkpoints import save_checkpoint
+import gc
 
 logger = logging.getLogger(__name__)
 
@@ -69,17 +70,51 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         self.model = model or create_unet(self.config, self.model_dtype)
         self.vae = vae or create_vae(self.model_dtype)
         
-        # Move models to device and set dtype
-        self._setup_models()
+        # Validate model architectures
+        self._validate_model_architecture()
+        
+        # Move models to device and set dtype with verification
+        try:
+            initial_memory = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
+            self._setup_models()
+            if torch.cuda.is_available():
+                memory_increase = torch.cuda.memory_allocated() - initial_memory
+                logger.info(f"Model loading increased memory usage by {memory_increase/(1024**3):.2f}GB")
+                
+                # Verify model device and dtype
+                if next(self.model.parameters()).device != self.device:
+                    raise RuntimeError("Model failed to move to correct device")
+                if next(self.model.parameters()).dtype != self.model_dtype:
+                    raise RuntimeError("Model failed to convert to correct dtype")
+        except Exception as e:
+            logger.error(f"Error setting up models: {e}")
+            raise
         
         # Initialize model weights if needed
         if model is None:
             initialize_model_weights(self.model)
         
-        # Configure optimizer with proper parameters
-        self._setup_optimizer()
+        # Configure optimizer with proper parameters and verification
+        try:
+            self._setup_optimizer()
+            
+            # Verify optimizer state
+            if not hasattr(self.optimizer, 'state'):
+                raise RuntimeError("Optimizer initialization failed")
+            
+            # Verify parameter groups
+            if len(self.optimizer.param_groups) == 0:
+                raise RuntimeError("No parameter groups in optimizer")
+                
+            # Verify learning rate
+            if any(group['lr'] != self.config.training.learning_rate for group in self.optimizer.param_groups):
+                raise RuntimeError("Learning rate mismatch in optimizer")
+                
+        except Exception as e:
+            logger.error(f"Error setting up optimizer: {e}")
+            raise
         
-        # Calculate micro batch size for gradient accumulation
+        # Calculate and verify micro batch size
         batch_size = self.config.training.batch_size
         self.micro_batch_size = batch_size // self.config.training.gradient_accumulation_steps
         
@@ -88,42 +123,108 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                 f"Batch size ({batch_size}) must be divisible by "
                 f"gradient_accumulation_steps ({self.config.training.gradient_accumulation_steps})"
             )
+            
+        # Verify micro batch size is reasonable
+        available_memory = (torch.cuda.get_device_properties(0).total_memory 
+                          if torch.cuda.is_available() else None)
+        if available_memory:
+            estimated_batch_memory = self.micro_batch_size * 4 * 128 * 128 * 4  # Rough SDXL latent size
+            if estimated_batch_memory > available_memory * 0.2:  # Using more than 20% for batch
+                logger.warning("Micro batch size may be too large for available memory")
         
-        # Set up memory optimizations and get buffers
-        memory_buffers = setup_memory_optimizations(
-            model=self.model,
-            config=self.config,
-            device=self.device,
-            batch_size=batch_size,
-            micro_batch_size=self.micro_batch_size
-        )
+        # Set up memory optimizations and get buffers with verification from setup.py
+        try:
+            initial_memory = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
+            
+            memory_buffers = setup_memory_optimizations(
+                model=self.model,
+                config=self.config,
+                device=self.device,
+                batch_size=batch_size,
+                micro_batch_size=self.micro_batch_size
+            )
+            
+            if torch.cuda.is_available():
+                memory_increase = torch.cuda.memory_allocated() - initial_memory
+                logger.info(f"Memory optimization setup increased memory by {memory_increase/(1024**3):.2f}GB")
+            
+            # Verify buffer states using setup.py function
+            buffer_states = verify_buffer_states(
+                buffers=memory_buffers,
+                micro_batch_size=self.micro_batch_size,
+                model_dtype=self.model_dtype,
+                device=self.device,
+                logger=logger
+            )
+            
+            if not all(buffer_states.values()):
+                logger.error("Some buffers are invalid")
+                raise RuntimeError("Invalid buffer states")
+            
+            # Unpack memory buffers
+            self.noise_template = memory_buffers['noise_template']
+            self.grad_norm_buffer = memory_buffers['grad_norm_buffer']
+            self.noise_buffer = memory_buffers['noise_buffer']
+            self.latent_buffer = memory_buffers['latent_buffer']
+            self.timestep_buffer = memory_buffers['timestep_buffer']
+            self.snr_weight_buffer = memory_buffers.get('snr_weight_buffer')
+                
+        except Exception as e:
+            logger.error(f"Error setting up memory optimizations: {e}")
+            # Try emergency cleanup
+            try:
+                gc.collect()
+                torch.cuda.empty_cache()
+            except:
+                pass
+            raise
         
-        # Unpack memory buffers
-        self.noise_template = memory_buffers['noise_template']
-        self.grad_norm_buffer = memory_buffers['grad_norm_buffer']
-        self.noise_buffer = memory_buffers['noise_buffer']
-        self.latent_buffer = memory_buffers['latent_buffer']
-        self.timestep_buffer = memory_buffers['timestep_buffer']
-        self.snr_weight_buffer = memory_buffers['snr_weight_buffer']
-        
-        # Configure noise scheduler and get parameters
-        scheduler_params = configure_noise_scheduler(self.config, self.device)
-        
-        # Unpack scheduler parameters
-        self.scheduler = scheduler_params['scheduler']
-        self.alphas = scheduler_params['alphas']
-        self.betas = scheduler_params['betas']
-        self.alphas_cumprod = scheduler_params['alphas_cumprod']
-        self.sigmas = scheduler_params['sigmas']
-        self.snr_values = scheduler_params['snr_values']
-        self.snr_weights = scheduler_params['snr_weights']
-        self.c_skip = scheduler_params['c_skip']
-        self.c_out = scheduler_params['c_out']
-        self.c_in = scheduler_params['c_in']
+        # Configure noise scheduler and get parameters with verification
+        try:
+            scheduler_params = configure_noise_scheduler(self.config, self.device)
+            
+            # Verify scheduler parameters using setup.py function
+            param_states = verify_scheduler_parameters(
+                scheduler_params=scheduler_params,
+                device=self.device,
+                logger=logger
+            )
+            
+            if not all(param_states.values()):
+                logger.error("Some scheduler parameters are invalid")
+                raise RuntimeError("Invalid scheduler parameters")
+            
+            # Unpack scheduler parameters
+            self.scheduler = scheduler_params['scheduler']
+            self.alphas = scheduler_params['alphas']
+            self.betas = scheduler_params['betas']
+            self.alphas_cumprod = scheduler_params['alphas_cumprod']
+            self.sigmas = scheduler_params['sigmas']
+            self.snr_values = scheduler_params['snr_values']
+            self.snr_weights = scheduler_params['snr_weights']
+            self.c_skip = scheduler_params['c_skip']
+            self.c_out = scheduler_params['c_out']
+            self.c_in = scheduler_params['c_in']
+                
+        except Exception as e:
+            logger.error(f"Error configuring scheduler: {e}")
+            raise
         
         # Initialize training state
         self._initialize_training_state()
-
+        
+        # Final memory check using setup.py function
+        if torch.cuda.is_available():
+            memory_stats = check_memory_status(
+                initial_memory=torch.cuda.memory_allocated() / (1024**3),
+                device=self.device,
+                logger=logger
+            )
+            
+            if 'leak' in memory_stats:
+                logger.warning(f"Memory leak detected during initialization: {memory_stats['leak']:.2f}GB")
+            else:
+                logger.info(f"Final GPU memory usage: {memory_stats.get('current', 0):.2f}GB")
 
     def _get_accelerator_kwargs(self):
         """Get additional kwargs for accelerator setup."""
@@ -192,74 +293,6 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         
         # Create learning rate scheduler
         self.lr_scheduler = None  # Renamed from self.scheduler to self.lr_scheduler
-
-    def _initialize_buffers(self):
-        """Initialize reusable buffers for training.
-        
-        Pre-allocates:
-        1. Micro batch size
-        2. Noise buffers
-        3. Latent buffers
-        4. Timestep buffers
-        5. SNR weight buffers
-        """
-        # Calculate micro batch size for gradient accumulation
-        batch_size = self.config.training.batch_size
-        self.micro_batch_size = batch_size // self.config.training.gradient_accumulation_steps
-        
-        if batch_size % self.config.training.gradient_accumulation_steps != 0:
-            raise ValueError(
-                f"Batch size ({batch_size}) must be divisible by "
-                f"gradient_accumulation_steps ({self.config.training.gradient_accumulation_steps})"
-            )
-        
-        # Get memory format based on config
-        memory_format = (torch.channels_last 
-                        if self.config.system.channels_last 
-                        else torch.contiguous_format)
-        
-        # Get maximum bucket dimensions
-        max_height, max_width = self.config.data.image_size
-        vae_scale_factor = 8  # SDXL VAE downscales by 8
-        max_latent_height = max_height // vae_scale_factor
-        max_latent_width = max_width // vae_scale_factor
-        
-        # Pre-allocate noise buffer for maximum possible size
-        self.noise_buffer = torch.empty(
-            (self.micro_batch_size, 4, max_latent_height, max_latent_width),
-            device=self.device,
-            dtype=self.model_dtype,
-            memory_format=memory_format
-        )
-        
-        # Pre-allocate latent buffer
-        self.latent_buffer = torch.empty_like(
-            self.noise_buffer,
-            memory_format=memory_format
-        )
-        
-        # Pre-allocate timestep buffer
-        self.timestep_buffer = torch.empty(
-            (self.micro_batch_size,),
-            device=self.device,
-            dtype=torch.long
-        )
-        
-        # Pre-allocate SNR weight buffer if using SNR weighting
-        if self.config.training.snr_gamma is not None:
-            self.snr_weight_buffer = torch.empty(
-                (self.micro_batch_size,),
-                device=self.device,
-                dtype=self.model_dtype
-            )
-        
-        # Pre-allocate gradient norm buffer
-        num_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        self.grad_norm_buffer = torch.zeros(
-            num_params,
-            device=self.device,
-            dtype=self.model_dtype
-        )
 
     def _initialize_training_state(self):
         """Initialize training state variables.
@@ -357,8 +390,39 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             if torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats()
                 start_mem = torch.cuda.memory_allocated() / 1024**2
-
+            
             step_start = time.time()
+            
+            # Re-verify memory optimizations are still active using setup.py functions
+            optimization_states = verify_memory_optimizations(
+                model=self.model,
+                config=self.config,
+                device=self.device,
+                logger=logger
+            )
+            
+            # Take action if optimizations were lost
+            if not all(optimization_states.values()):
+                logger.warning("Some memory optimizations were lost - attempting to restore")
+                try:
+                    memory_buffers = setup_memory_optimizations(
+                        model=self.model,
+                        config=self.config,
+                        device=self.device,
+                        batch_size=self.config.training.batch_size,
+                        micro_batch_size=self.micro_batch_size
+                    )
+                    # Re-verify after restore attempt
+                    optimization_states = verify_memory_optimizations(
+                        model=self.model,
+                        config=self.config,
+                        device=self.device,
+                        logger=logger
+                    )
+                    if not all(optimization_states.values()):
+                        logger.error("Failed to restore memory optimizations")
+                except Exception as e:
+                    logger.error(f"Error restoring optimizations: {e}")
             
             with torch.autocast(device_type='cuda', dtype=self.model_dtype):
                 try:
@@ -388,7 +452,7 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                 except RuntimeError as e:
                     logger.error(f"Error processing embeddings: {e}")
                     raise
-                
+
                 # Initialize prediction tensor with correct memory format
                 try:
                     total_v_pred = torch.empty_like(
@@ -412,6 +476,46 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                     end_idx = start_idx + self.micro_batch_size
                     
                     try:
+                        # Verify buffer states using setup.py function
+                        buffer_states = verify_buffer_states(
+                            buffers={
+                                'noise_buffer': self.noise_buffer,
+                                'latent_buffer': self.latent_buffer,
+                                'timestep_buffer': self.timestep_buffer,
+                                'noise_template': self.noise_template,
+                                'grad_norm_buffer': self.grad_norm_buffer,
+                                **(({'snr_weight_buffer': self.snr_weight_buffer} 
+                                   if self.snr_weight_buffer is not None else {}))
+                            },
+                            micro_batch_size=self.micro_batch_size,
+                            model_dtype=self.model_dtype,
+                            device=self.device,
+                            logger=logger
+                        )
+                        
+                        # Take action if buffers are invalid
+                        if not all(buffer_states.values()):
+                            logger.warning("Some buffers are invalid - attempting to restore")
+                            try:
+                                memory_buffers = setup_memory_optimizations(
+                                    model=self.model,
+                                    config=self.config,
+                                    device=self.device,
+                                    batch_size=self.config.training.batch_size,
+                                    micro_batch_size=self.micro_batch_size
+                                )
+                                # Update buffer references
+                                self.noise_buffer = memory_buffers['noise_buffer']
+                                self.latent_buffer = memory_buffers['latent_buffer']
+                                self.timestep_buffer = memory_buffers['timestep_buffer']
+                                self.noise_template = memory_buffers['noise_template']
+                                self.grad_norm_buffer = memory_buffers['grad_norm_buffer']
+                                if 'snr_weight_buffer' in memory_buffers:
+                                    self.snr_weight_buffer = memory_buffers['snr_weight_buffer']
+                            except Exception as e:
+                                logger.error(f"Error restoring buffers: {e}")
+                                raise
+                            
                         micro_batch = {
                             'latents': model_input[start_idx:end_idx],
                             'encoder_states': encoder_hidden_states[start_idx:end_idx],
@@ -419,8 +523,9 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                             'tag_weights': tag_weights[start_idx:end_idx],
                         }
                         
-                        # Generate noise efficiently
-                        noise = self._generate_noise(micro_batch['latents'].shape)
+                        # Generate noise efficiently using pre-allocated buffer
+                        self.noise_buffer.normal_()
+                        noise = self.noise_buffer[:micro_batch['latents'].shape[0]]
                         
                         # Sample timesteps
                         timesteps = torch.randint(
@@ -428,9 +533,11 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                             device=self.device
                         )
                         
-                        # Get sigmas and add noise
+                        # Get sigmas and add noise using pre-allocated buffer
                         sigmas = self.scheduler.sigmas[timesteps].to(dtype=self.model_dtype)
-                        noisy_latents = micro_batch['latents'] + sigmas[:, None, None, None] * noise
+                        self.latent_buffer.copy_(micro_batch['latents'])
+                        self.latent_buffer.addcmul_(sigmas[:, None, None, None], noise)
+                        noisy_latents = self.latent_buffer[:micro_batch['latents'].shape[0]]
                         
                         # Scale input
                         if self.config.training.prediction_type == "v_prediction":
@@ -472,8 +579,21 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                             micro_batch['tag_weights']
                         ) / self.config.training.gradient_accumulation_steps
                         
-                        # Backward pass
-                        self.accelerator.backward(loss)
+                        # Backward pass with memory tracking
+                        try:
+                            if torch.cuda.is_available():
+                                torch.cuda.reset_peak_memory_stats()
+                            self.accelerator.backward(loss)
+                            if torch.cuda.is_available():
+                                backward_peak = torch.cuda.max_memory_allocated() / 1024**2
+                                if backward_peak > start_mem * 2:  # More than 2x increase
+                                    logger.warning(f"High memory usage in backward pass: {backward_peak:.0f}MB")
+                        except RuntimeError as e:
+                            if "out of memory" in str(e):
+                                logger.error(f"OOM in backward pass: {e}")
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+                            raise
                         
                         # Update metrics
                         loss_value = loss.item()
@@ -490,7 +610,7 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                                 f"Micro-batch {i+1}/{self.config.training.gradient_accumulation_steps} - "
                                 f"Loss: {loss_value:.4f}, Time: {micro_batch_time:.2f}s"
                             )
-                
+                            
                     except RuntimeError as e:
                         if "out of memory" in str(e):
                             logger.error(f"OOM in micro-batch {i+1}: {e}")
@@ -507,10 +627,26 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                 # Apply gradient clipping
                 if self.config.training.max_grad_norm is not None:
                     try:
+                        # Track gradient norms
+                        grad_norm = 0.0
+                        for param in self.model.parameters():
+                            if param.grad is not None:
+                                grad_norm = max(grad_norm, param.grad.norm().item())
+                                
                         self.accelerator.clip_grad_norm_(
                             self.model.parameters(),
                             self.config.training.max_grad_norm
                         )
+                        
+                        # Verify clipping worked
+                        clipped_grad_norm = 0.0
+                        for param in self.model.parameters():
+                            if param.grad is not None:
+                                clipped_grad_norm = max(clipped_grad_norm, param.grad.norm().item())
+                                
+                        if clipped_grad_norm > self.config.training.max_grad_norm * 1.1:  # 10% tolerance
+                            logger.warning(f"Gradient clipping may not be working: {clipped_grad_norm:.2f} > {self.config.training.max_grad_norm}")
+                            
                     except RuntimeError as e:
                         logger.error(f"Error during gradient clipping: {e}")
                         raise
@@ -523,13 +659,19 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                 except RuntimeError as e:
                     logger.error(f"Error during optimizer step: {e}")
                     raise
-                
+
                 avg_loss = running_loss / self.config.training.gradient_accumulation_steps
                 
-                # Log step completion metrics
+                # Log step completion metrics and check memory using setup.py function
                 if self.accelerator.is_main_process:
                     step_time = time.time() - step_start
                     if torch.cuda.is_available():
+                        memory_stats = check_memory_status(
+                            initial_memory=start_mem / 1024,  # Convert MB to GB
+                            device=self.device,
+                            logger=logger
+                        )
+                        
                         peak_mem = torch.cuda.max_memory_allocated() / 1024**2
                         mem_diff = peak_mem - start_mem
                         logger.info(
@@ -539,12 +681,22 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                             f"Peak Memory: {peak_mem:.0f}MB "
                             f"(+{mem_diff:.0f}MB)"
                         )
+                        
+                        # Log any memory leaks detected
+                        if 'leak' in memory_stats:
+                            logger.warning(f"Memory leak detected: {memory_stats['leak']:.2f}GB")
                 
                 return total_loss, model_input, total_v_pred, timesteps, avg_loss
             
         except Exception as e:
             logger.error(f"Unexpected error in training step: {str(e)}")
             logger.error(f"Stack trace: {traceback.format_exc()}")
+            # Emergency cleanup
+            try:
+                gc.collect()
+                torch.cuda.empty_cache()
+            except:
+                pass
             raise
 
     def train_epoch(
