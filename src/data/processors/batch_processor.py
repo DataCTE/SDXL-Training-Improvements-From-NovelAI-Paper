@@ -228,14 +228,6 @@ class BatchProcessor(GenericBatchProcessor):
         # Update tracker
         update_tracker(tracker, processed=n)
         
-        # Log progress if needed
-        if tracker.should_log():
-            log_progress(
-                tracker,
-                prefix="Processing - ",
-                extra_stats=extra_stats
-            )
-        
         # Call progress callback if provided
         if progress_callback is not None:
             try:
