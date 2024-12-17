@@ -48,7 +48,7 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         self.model = model
         if self.model is None:
             self.model = UNet2DConditionModel.from_pretrained(
-                self.config.model.pretrained_model_name_or_path,
+                self.config.model.pretrained_model_name,
                 subfolder="unet"
             )
         self.model.to(self.device)
@@ -346,12 +346,17 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             'epoch_loss': total_loss / num_batches
         }, step_type="epoch")
 
-    def save_checkpoint(self) -> None:
-        """Save model checkpoint."""
+    def save_checkpoint(self, checkpoints_dir: str, epoch: int) -> None:
+        """Save model checkpoint.
+        
+        Args:
+            checkpoints_dir: Directory to save checkpoints
+            epoch: Current epoch number
+        """
         try:
             checkpoint_path = os.path.join(
-                self.config.paths.checkpoints_dir,
-                f"checkpoint_{self.global_step:06d}.pt"
+                checkpoints_dir,
+                f"checkpoint_epoch_{epoch:03d}_step_{self.global_step:06d}.pt"
             )
             
             # Save checkpoint
@@ -360,7 +365,8 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                 'optimizer_state_dict': self.optimizer.state_dict(),
                 'scheduler_state_dict': self.lr_scheduler.state_dict() if self.lr_scheduler else None,
                 'global_step': self.global_step,
-                'current_epoch': self.current_epoch
+                'current_epoch': self.current_epoch,
+                'epoch': epoch
             }, checkpoint_path)
             
             logger.info(f"Saved checkpoint: {checkpoint_path}")

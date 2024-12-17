@@ -50,6 +50,7 @@ class TrainingConfig:
     max_train_steps: Optional[int] = None
     warmup_steps: int = 0
     
+    # Prediction settings
     prediction_type: Literal["v_prediction", "epsilon"] = "v_prediction"
     timestep_bias_strategy: Literal["none", "earlier", "later", "range"] = "none"
     timestep_bias_multiplier: float = 1.0
@@ -61,8 +62,8 @@ class TrainingConfig:
     early_stopping_patience: int = 5
     early_stopping_threshold: float = 0.01
     
-    # Add wandb configuration that was missing
-    use_wandb: bool = False
+    # Wandb settings
+    use_wandb: bool = True
     wandb_project: str = "sdxl-training"
     wandb_run_name: Optional[str] = None
     wandb_tags: List[str] = field(default_factory=list)
@@ -72,25 +73,46 @@ class DataConfig:
     image_dirs: List[str]
     image_size: Tuple[int, int] = (1024, 1024)
     max_image_size: Tuple[int, int] = (8192, 8192)
-    num_workers: int = 8
-    pin_memory: bool = True
-    persistent_workers: bool = True
-    shuffle: bool = True
+    min_image_size: Union[Tuple[int, int], int] = (256, 256)
+    max_dim: int = 8192
+    bucket_step: int = 8
+    min_bucket_size: int = 16
+    min_bucket_resolution: Optional[int] = None
+    bucket_tolerance: float = 0.2
+    max_aspect_ratio: float = 2.0
+    
+    # Cache settings
     cache_dir: str = "latent_cache"
     text_cache_dir: str = "text_cache"
+    use_caching: bool = True
+    
+    # VAE settings
     vae_batch_size: int = 32
     vae_image_size: Tuple[int, int] = (256, 256)
     vae_validation_split: float = 0.1
     
-    # Add missing bucketing and size configuration
-    min_size: int = 256  # Minimum image dimension
-    max_dim: int = 8192  # Maximum image dimension
-    bucket_step: int = 8  # Resolution step size for buckets
-    min_bucket_size: int = 16  # Minimum images per bucket
-    bucket_tolerance: float = 0.2  # Tolerance for bucket aspect ratios
-    max_aspect_ratio: float = 2.0  # Maximum allowed aspect ratio
-    use_caching: bool = True  # Enable latent caching
-    proportion_empty_prompts: float = 0.0  # Proportion of empty prompt training
+    # DataLoader settings
+    num_workers: int = 8
+    pin_memory: bool = True
+    persistent_workers: bool = True
+    shuffle: bool = True
+    proportion_empty_prompts: float = 0.0
+
+    def __post_init__(self):
+        """Convert and validate configuration."""
+        # Convert image sizes to tuples if needed
+        if isinstance(self.image_size, (list, tuple)):
+            self.image_size = tuple(self.image_size)
+        if isinstance(self.max_image_size, (list, tuple)):
+            self.max_image_size = tuple(self.max_image_size)
+        if isinstance(self.min_image_size, (list, tuple)):
+            self.min_image_size = tuple(self.min_image_size)
+        elif isinstance(self.min_image_size, int):
+            self.min_image_size = (self.min_image_size, self.min_image_size)
+            
+        # Set min_bucket_resolution if not specified
+        if self.min_bucket_resolution is None:
+            self.min_bucket_resolution = min(self.min_image_size)
 
 @dataclass
 class TagWeightingConfig:
@@ -144,75 +166,84 @@ class PathsConfig:
 @dataclass
 class NovelAIDatasetConfig:
     """Configuration for NovelAI dataset."""
-    image_size: Union[Tuple[int, int], int] = (8192, 8192)
+    # Image size settings
+    image_size: Tuple[int, int] = (1024, 1024)
+    max_image_size: Tuple[int, int] = (8192, 8192)
     min_image_size: Union[Tuple[int, int], int] = (256, 256)
-    max_dim: Optional[int] = None
-    max_image_size: Optional[Tuple[int, int]] = (8192, 8192)
-    bucket_step: int = 64
+    max_dim: int = 8192
+    
+    # Bucket settings
+    bucket_step: int = 8
+    min_bucket_size: int = 16
     min_bucket_resolution: Optional[int] = None
-    min_bucket_size: Optional[int] = None
     bucket_tolerance: float = 0.2
-    max_aspect_ratio: float = 3.0
+    max_aspect_ratio: float = 2.0
+    
+    # Cache settings
     cache_dir: str = "cache"
     text_cache_dir: str = "text_cache"
     use_caching: bool = True
+    
+    # Dataset settings
     proportion_empty_prompts: float = 0.0
-    
-    # Add batch-related fields
-    batch_size: int = 32
     max_consecutive_batch_samples: int = 2
-    
+
     def __post_init__(self):
-        """Convert single integers to tuples for sizes and validate."""
-        if isinstance(self.image_size, int):
-            self.image_size = (self.image_size, self.image_size)
-        if isinstance(self.min_image_size, int):
+        """Convert and validate configuration."""
+        # Convert image sizes to tuples if needed
+        if isinstance(self.image_size, (list, tuple)):
+            self.image_size = tuple(self.image_size)
+        if isinstance(self.max_image_size, (list, tuple)):
+            self.max_image_size = tuple(self.max_image_size)
+        if isinstance(self.min_image_size, (list, tuple)):
+            self.min_image_size = tuple(self.min_image_size)
+        elif isinstance(self.min_image_size, int):
             self.min_image_size = (self.min_image_size, self.min_image_size)
-        if self.max_image_size is None:
-            self.max_image_size = self.image_size
             
-        # Handle max_dim if specified
-        if self.max_dim is not None:
-            self.image_size = (min(self.image_size[0], self.max_dim), 
-                             min(self.image_size[1], self.max_dim))
-            self.max_image_size = (min(self.max_image_size[0], self.max_dim),
-                                 min(self.max_image_size[1], self.max_dim))
-            
-        # Set default min_bucket_size if not specified
-        if self.min_bucket_size is None:
-            self.min_bucket_size = self.min_image_size[0] * self.min_image_size[1]
-            
-        # Set default min_bucket_resolution if not specified
+        # Set min_bucket_resolution if not specified
         if self.min_bucket_resolution is None:
             self.min_bucket_resolution = min(self.min_image_size)
 
 @dataclass
 class Config:
+    model: ModelConfig
+    training: TrainingConfig
     data: DataConfig
-    model: ModelConfig = field(default_factory=ModelConfig)
-    training: TrainingConfig = field(default_factory=TrainingConfig)
-    tag_weighting: TagWeightingConfig = field(default_factory=TagWeightingConfig)
-    scoring: ScoringConfig = field(default_factory=ScoringConfig)
-    system: SystemConfig = field(default_factory=SystemConfig)
-    paths: PathsConfig = field(default_factory=PathsConfig)
-    
+    tag_weighting: TagWeightingConfig
+    scoring: ScoringConfig
+    system: SystemConfig
+    paths: PathsConfig
+
     @classmethod
     def from_yaml(cls, path: str) -> 'Config':
-        with open(path, 'r') as f:
-            config_dict = yaml.safe_load(f)
+        """Load configuration from YAML file with improved error handling."""
+        try:
+            with open(path, 'r') as f:
+                config_dict = yaml.safe_load(f)
             
-        if 'model' in config_dict and 'vae' in config_dict['model']:
-            config_dict['model']['vae'] = VAEModelConfig(**config_dict['model']['vae'])
+            # Validate required sections
+            required_sections = ['model', 'training', 'data', 'tag_weighting', 
+                               'scoring', 'system', 'paths']
+            missing_sections = [s for s in required_sections if s not in config_dict]
+            if missing_sections:
+                raise ValueError(f"Missing required config sections: {missing_sections}")
             
-        return cls(
-            model=ModelConfig(**config_dict['model']),
-            training=TrainingConfig(**config_dict['training']),
-            data=DataConfig(**config_dict['data']),
-            tag_weighting=TagWeightingConfig(**config_dict['tag_weighting']),
-            scoring=ScoringConfig(**config_dict['scoring']),
-            system=SystemConfig(**config_dict['system']),
-            paths=PathsConfig(**config_dict['paths'])
-        )
+            # Handle VAE config if present
+            if 'vae' in config_dict.get('model', {}):
+                config_dict['model']['vae'] = VAEModelConfig(**config_dict['model']['vae'])
+            
+            # Create config instance with proper type conversion
+            return cls(
+                model=ModelConfig(**config_dict['model']),
+                training=TrainingConfig(**config_dict['training']),
+                data=DataConfig(**config_dict['data']),
+                tag_weighting=TagWeightingConfig(**config_dict['tag_weighting']),
+                scoring=ScoringConfig(**config_dict['scoring']),
+                system=SystemConfig(**config_dict['system']),
+                paths=PathsConfig(**config_dict['paths'])
+            )
+        except Exception as e:
+            raise ValueError(f"Error loading config from {path}: {str(e)}") from e
 
     def get_vae_config(self) -> VAEModelConfig:
         """Helper method to easily access VAE config"""

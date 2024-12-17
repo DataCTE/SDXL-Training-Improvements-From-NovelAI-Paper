@@ -38,7 +38,7 @@ def train(config_path: str):
         logger.info("Validating configuration...")
         logger.info(f"Data config:")
         logger.info(f"- Image size: {config.data.image_size}")
-        logger.info(f"- Min size: {config.data.min_size}")
+        logger.info(f"- Min size: {config.data.min_image_size}")
         logger.info(f"- Max dim: {config.data.max_dim}")
         logger.info(f"- Bucket step: {config.data.bucket_step}")
         logger.info(f"- Min bucket size: {config.data.min_bucket_size}")
@@ -80,7 +80,21 @@ def train(config_path: str):
             logger.info(f"Found image directory: {img_dir}")
         
         # Validate model paths
-        if not os.path.exists(config.model.pretrained_model_name) and not config.model.pretrained_model_name.startswith(("stabilityai/", "runwayml/", "CompVis/")):
+        def is_valid_model_name(name: str) -> bool:
+            """Validate model name or path."""
+            if os.path.exists(name):
+                return True
+            valid_prefixes = (
+                "stabilityai/",
+                "runwayml/",
+                "CompVis/",
+                "madebyollin/",
+                "openai/",
+                "facebook/"
+            )
+            return any(name.startswith(prefix) for prefix in valid_prefixes)
+
+        if not is_valid_model_name(config.model.pretrained_model_name):
             logger.warning(f"Model path may not be valid: {config.model.pretrained_model_name}")
         
         # Validate numeric parameters
@@ -140,13 +154,13 @@ def train(config_path: str):
         
         # Create dataset with text embedder and tag weighter
         dataset_config = NovelAIDatasetConfig(
-            image_size=tuple(config.data.image_size),
-            max_image_size=tuple(config.data.max_image_size) if hasattr(config.data, 'max_image_size') else None,
-            min_image_size=tuple(config.data.min_size) if isinstance(config.data.min_size, (list, tuple)) else config.data.min_size,
+            image_size=config.data.image_size,
+            max_image_size=config.data.max_image_size,
+            min_image_size=config.data.min_image_size,
             max_dim=config.data.max_dim,
             bucket_step=config.data.bucket_step,
             min_bucket_size=config.data.min_bucket_size,
-            min_bucket_resolution=config.data.min_size if isinstance(config.data.min_size, int) else min(config.data.min_size),
+            min_bucket_resolution=config.data.min_bucket_resolution,
             bucket_tolerance=config.data.bucket_tolerance,
             max_aspect_ratio=config.data.max_aspect_ratio,
             cache_dir=config.data.cache_dir,
@@ -158,7 +172,7 @@ def train(config_path: str):
         )
         
         dataset = NovelAIDataset(
-            image_dirs=valid_dirs,
+            image_dirs=config.data.image_dirs,
             text_embedder=TextEmbedder(
                 pretrained_model_name_or_path=config.model.pretrained_model_name,
                 device=device,

@@ -50,38 +50,38 @@ training:
 
 # Data configuration
 data:
-  # List of directories containing training images
-  # Example:
-  # image_dirs: 
-  #   - "/path/to/dataset1"
-  #   - "/path/to/dataset2"
   image_dirs: [
-        "/workspace/collage",
-        "/workspace/upscaled",
-        "/workspace/High-quality-photo10k",
-        "/workspace/LAION_220k_GPT4Vision_captions",
-        "/workspace/photo-concept-bucket/train"
-    ]
+    "/workspace/collage",
+    "/workspace/upscaled",
+    "/workspace/High-quality-photo10k",
+    "/workspace/LAION_220k_GPT4Vision_captions",
+    "/workspace/photo-concept-bucket/train"
+  ]
   image_size: [1024, 1024]
   max_image_size: [8192, 8192]
-  num_workers: 8
-  pin_memory: true
-  persistent_workers: true
-  shuffle: true
+  min_image_size: [256, 256]
+  max_dim: 8192
+  bucket_step: 8
+  min_bucket_size: 16
+  min_bucket_resolution: null
+  bucket_tolerance: 0.2
+  max_aspect_ratio: 2.0
+  
+  # Cache settings
   cache_dir: "latent_cache"
   text_cache_dir: "text_cache"
+  use_caching: true
+  
+  # VAE settings
   vae_batch_size: 32
   vae_image_size: [256, 256]
   vae_validation_split: 0.1
   
-  # Add bucketing and size configuration
-  min_size: 256
-  max_dim: 8192
-  bucket_step: 8
-  min_bucket_size: 16
-  bucket_tolerance: 0.2
-  max_aspect_ratio: 2.0
-  use_caching: true
+  # DataLoader settings
+  num_workers: 8
+  pin_memory: true
+  persistent_workers: true
+  shuffle: true
   proportion_empty_prompts: 0.0
 
 # Tag weighting configuration

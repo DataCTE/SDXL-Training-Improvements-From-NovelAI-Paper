@@ -75,8 +75,7 @@ class NovelAIDataset(Dataset):
             text_embedder=text_embedder,
             vae=vae,
             device=device,
-            batch_size=config.batch_size,
-            prefetch_factor=thread_config.prefetch_factor,
+            max_consecutive_batch_samples=config.max_consecutive_batch_samples,
             num_workers=thread_config.num_threads
         )
 
