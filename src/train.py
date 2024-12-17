@@ -3,19 +3,23 @@ import logging
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data import DataLoader
 import wandb
 from pathlib import Path
 from src.data.dataset import NovelAIDataset
+from src.data.sampler import AspectBatchSampler
 from src.training.trainer import NovelAIDiffusionV3Trainer
 from src.utils.model import setup_model
 from src.config.config import Config
-from src.utils.setup import setup_distributed
+from src.utils.setup import setup_distributed, setup_memory_optimizations, verify_memory_optimizations
+from src.utils.metrics import log_system_info
 import gc
+import traceback
 
 logger = logging.getLogger(__name__)
 
 def train(config_path: str):
-    """Main training function."""
+    """Main training function with improved setup and error handling."""
     try:
         # Load config
         config = Config.from_yaml(config_path)
@@ -28,6 +32,10 @@ def train(config_path: str):
         else:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             is_main_process = True
+
+        # Log system information
+        if is_main_process:
+            log_system_info()
         
         # Initialize wandb if enabled
         if config.training.use_wandb and is_main_process:
@@ -37,16 +45,26 @@ def train(config_path: str):
                 config=config.to_dict()
             )
         
-        # Setup models
+        # Setup models with verification
+        logger.info("Setting up models...")
         unet, vae = setup_model(None, device, config)
+        
+        # Apply memory optimizations and verify
+        optimization_states = verify_memory_optimizations(
+            model=unet,
+            config=config,
+            device=device,
+            logger=logger
+        )
+        
+        if not all(optimization_states.values()):
+            logger.warning("Some memory optimizations failed to apply")
         
         # Convert models to DDP if using distributed training
         if config.system.distributed:
-            # Convert batch norm to sync batch norm for distributed training
             unet = torch.nn.SyncBatchNorm.convert_sync_batchnorm(unet)
             vae = torch.nn.SyncBatchNorm.convert_sync_batchnorm(vae)
             
-            # Wrap models in DDP
             unet = DistributedDataParallel(
                 unet,
                 device_ids=[dist.get_rank()],
@@ -68,17 +86,38 @@ def train(config_path: str):
             device=device
         )
         
-        # Create dataset
+        # Create dataset and dataloader
         dataset = NovelAIDataset(
             config=config,
             device=device
         )
         
+        # Create sampler
+        sampler = AspectBatchSampler(
+            dataset=dataset,
+            batch_size=config.training.batch_size,
+            drop_last=True,
+            shuffle=True
+        )
+        
+        # Create dataloader
+        dataloader = DataLoader(
+            dataset,
+            batch_sampler=sampler,
+            num_workers=config.system.num_workers,
+            pin_memory=True,
+            collate_fn=trainer.collate_fn
+        )
+        
+        # Assign dataloader to trainer
+        trainer.dataloader = dataloader
+        
         # Train
         logger.info("Starting training...")
         for epoch in range(config.training.num_epochs):
             if config.system.distributed:
-                dataset.sampler.set_epoch(epoch)
+                sampler.set_epoch(epoch)
+            
             trainer.train_epoch(epoch)
             
             # Save checkpoint on main process
@@ -93,6 +132,7 @@ def train(config_path: str):
             
     except Exception as e:
         logger.error(f"Training failed: {str(e)}")
+        logger.error(f"Stack trace: {traceback.format_exc()}")
         raise
     finally:
         # Cleanup
@@ -100,8 +140,10 @@ def train(config_path: str):
         torch.cuda.empty_cache()
         
 if __name__ == "__main__":
-    import sys
-    if len(sys.argv) != 2:
-        print("Usage: python train.py <config_path>")
-        sys.exit(1)
-    train(sys.argv[1])
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Train SDXL model')
+    parser.add_argument('--config', type=str, required=True, help='Path to config file')
+    
+    args = parser.parse_args()
+    train(args.config)
