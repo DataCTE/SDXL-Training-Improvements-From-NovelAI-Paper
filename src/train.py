@@ -54,13 +54,16 @@ def train(config_path: str):
         if is_main_process:
             log_system_info()
         
-        # Initialize wandb if enabled
-        if config.training.use_wandb and is_main_process:
-            wandb.init(
-                project=config.training.wandb_project,
-                name=config.training.wandb_run_name,
-                config=config.to_dict()
-            )
+        # Initialize wandb if enabled and configured
+        if hasattr(config.training, 'use_wandb') and config.training.use_wandb and is_main_process:
+            if not hasattr(config.training, 'wandb_project'):
+                logger.warning("Wandb enabled but project name not configured. Disabling wandb.")
+            else:
+                wandb.init(
+                    project=config.training.wandb_project,
+                    name=config.training.wandb_run_name,
+                    config=config.to_dict()
+                )
 
         # Validate directories
         valid_dirs, total_images = validate_directories(config)

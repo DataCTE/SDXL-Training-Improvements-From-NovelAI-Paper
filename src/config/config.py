@@ -61,6 +61,12 @@ class TrainingConfig:
     # Early stopping parameters
     early_stopping_patience: Optional[int] = 5
     early_stopping_threshold: float = 0.01
+    
+    # Add wandb configuration
+    use_wandb: bool = False
+    wandb_project: str = "sdxl-training"
+    wandb_run_name: Optional[str] = None
+    wandb_tags: List[str] = field(default_factory=list)
 
 @dataclass
 class DataConfig:
