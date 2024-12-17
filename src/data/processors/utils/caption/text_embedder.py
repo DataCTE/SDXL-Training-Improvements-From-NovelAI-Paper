@@ -11,9 +11,10 @@ from src.data.processors.utils.batch_utils import (
     calculate_optimal_batch_size,
 )
 from src.data.processors.utils.progress_utils import (
-    create_progress_stats,
-    update_progress_stats,
-    log_progress
+    create_progress_tracker,
+    update_tracker,
+    log_progress,
+    ProgressStats
 )
 
 # Internal imports from processors
@@ -280,7 +281,7 @@ class TextEmbedder:
                 prompts.append(text)
 
         total_prompts = len(prompts)
-        stats = create_progress_stats(total_prompts)
+        stats = create_progress_tracker(total_prompts)
         all_prompt_embeds = []
         all_pooled_embeds = []
         
@@ -319,7 +320,7 @@ class TextEmbedder:
                 all_pooled_embeds.append(pooled_prompt_embeds)
                 
                 # Update progress
-                update_progress_stats(stats, len(batch_prompts))
+                update_tracker(stats, len(batch_prompts))
                 if stats.should_log():
                     log_progress(stats, prefix="Text Processing: ")
                     
