@@ -197,23 +197,16 @@ def configure_model_memory_format(
     model: Union[torch.nn.Module, DistributedDataParallel, FullyShardedDataParallel],
     config: Config
 ) -> Union[torch.nn.Module, DistributedDataParallel, FullyShardedDataParallel]:
-    """Configure model memory format and optimizations.
-    
-    Args:
-        model: Model to configure
-        config: Configuration object
-        
-    Returns:
-        Configured model
-        
-    Raises:
-        RuntimeError: If memory format configuration fails
-    """
+    """Configure model memory format and optimizations."""
     try:
         # Set memory format if configured
         if config.system.channels_last:
             if not isinstance(model, (torch.nn.parallel.DistributedDataParallel, 
                                     torch.distributed.fsdp.FullyShardedDataParallel)):
+                # Convert model to channels last format
+                for param in model.parameters():
+                    if param.dim() == 4:  # Only convert 4D tensors (NCHW format)
+                        param.data = param.data.to(memory_format=torch.channels_last)
                 model = model.to(memory_format=torch.channels_last)
             
         # Enable gradient checkpointing if configured

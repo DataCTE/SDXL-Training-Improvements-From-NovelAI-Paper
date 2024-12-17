@@ -42,31 +42,25 @@ def setup_memory_optimizations(
         # Configure model memory format with verification
         try:
             if hasattr(model, 'conv_in') and hasattr(model.conv_in, 'weight'):
-                original_format = model.conv_in.weight.data.memory_format
-                model = configure_model_memory_format(model, config)
-                # Verify memory format changed if it should have
-                if config.system.channels_last:
-                    if model.conv_in.weight.data.memory_format == original_format:
-                        logger.warning("channels_last memory format may not have been applied")
+                for param in model.parameters():
+                    if param.dim() == 4:  # Only convert 4D tensors (NCHW format)
+                        param.data = param.data.to(memory_format=torch.channels_last)
+                model = model.to(memory_format=torch.channels_last)
         except Exception as e:
             logger.warning(f"Memory format optimization failed: {e}")
         
         # Enable memory efficient attention with verification
         if config.system.enable_xformers and is_xformers_installed():
             try:
-                # Store original forward function
-                original_forward = model.forward
+                # First try xformers
                 model.enable_xformers_memory_efficient_attention()
-                # Verify the forward function changed
-                if model.forward == original_forward:
-                    logger.warning("xformers attention may not have been applied")
-                else:
-                    logger.info("Verified xformers memory efficient attention")
+                logger.info("Enabled xformers memory efficient attention")
             except Exception as e:
                 logger.warning(f"Failed to enable xformers: {e}, falling back to default attention")
                 try:
                     # Try to enable memory efficient attention without xformers
-                    model.set_use_memory_efficient_attention(True)
+                    model.set_use_memory_efficient_attention(True, True)  # enable flash attention as fallback
+                    logger.info("Enabled flash attention as fallback")
                 except Exception as e2:
                     logger.warning(f"Failed to enable default memory efficient attention: {e2}")
         
