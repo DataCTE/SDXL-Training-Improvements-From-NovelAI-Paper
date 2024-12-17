@@ -67,6 +67,10 @@ class ProgressStats:
             'memory_usage_gb': self.memory_usage_gb,
             'error_types': self.error_types
         }
+    
+    def get(self, key: str, default: Any = None) -> Any:
+        """Get statistic by key name."""
+        return self.get_stats().get(key, default)
 
 def format_time(seconds: float) -> str:
     """Format time in seconds to human readable string."""

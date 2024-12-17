@@ -8,6 +8,7 @@ from pathlib import Path
 from src.data.processors.utils.caption.text_embedder import TextEmbedder
 from src.data.processors.utils.caption.tag_weighter import parse_tags, TagWeighter
 from src.data.processors.utils.system_utils import get_optimal_workers, create_thread_pool
+from src.data.processors.utils.progress_utils import create_progress_stats, update_progress_stats, log_progress
 
 logger = logging.getLogger(__name__)
 
@@ -55,26 +56,33 @@ class TextProcessor:
         """
         try:
             # Parse tags
-            tags = parse_tags(text)
+            tag_dict = parse_tags(text)
             
             # Update tag frequencies if weighter is available
             if self.tag_weighter is not None:
-                await asyncio.to_thread(
-                    self.tag_weighter.update_frequencies,
-                    text
-                )
+                for tag_class, tags in tag_dict.items():
+                    for tag in tags:
+                        self.tag_weighter.update_frequencies(tag_class, tag)
             
             # Process text embeddings
-            text_data = await self.text_embedder.process_text(text, tags)
+            text_data = await self.text_embedder.process_text(text, list(tag_dict.values()))
             
             # Add tag weights if available
             if self.tag_weighter is not None:
-                text_data['tag_weights'] = await asyncio.to_thread(
-                    self.tag_weighter.get_weight,
-                    tags
-                )
+                weights = []
+                for tag_class, tags in tag_dict.items():
+                    for tag in tags:
+                        weight = self.tag_weighter.get_tag_weight(tag_class, tag)
+                        weights.append(weight)
+                
+                if weights:
+                    text_data['tag_weights'] = torch.tensor(
+                        weights, 
+                        device=self.device, 
+                        dtype=torch.float32
+                    )
             
-            return text_data, tags
+            return text_data, list(tag_dict.values())
             
         except Exception as e:
             logger.error(f"Error processing text: {str(e)[:200]}...")
@@ -122,6 +130,9 @@ class TextProcessor:
         """
         results = []
         
+        # Create progress stats
+        stats = create_progress_stats(len(texts))
+        
         # Process in batches
         for i in range(0, len(texts), batch_size):
             batch = texts[i:i + batch_size]
@@ -130,8 +141,20 @@ class TextProcessor:
             tasks = [self.process_text(text) for text in batch]
             batch_results = await asyncio.gather(*tasks)
             
-            # Filter out failed results
-            results.extend([r for r in batch_results if r[0] is not None])
+            # Filter out failed results and update stats
+            successful_results = []
+            for result in batch_results:
+                if result[0] is not None:
+                    successful_results.append(result)
+                    update_progress_stats(stats, processed=1)
+                else:
+                    update_progress_stats(stats, failed=1)
+            
+            results.extend(successful_results)
+            
+            # Log progress
+            if stats.should_log():
+                log_progress(stats, prefix="Processing texts: ")
             
         return results
 
