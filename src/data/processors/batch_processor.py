@@ -291,6 +291,9 @@ class BatchProcessor(GenericBatchProcessor):
                     for item in sub_batch:
                         cached = await cache_manager.get_cached_item(item['image_path'])
                         if cached:
+                            # Ensure cached tensors are moved to CPU
+                            if 'processed_image' in cached and cached['processed_image'].device.type != 'cpu':
+                                cached['processed_image'] = cached['processed_image'].cpu()
                             cached_items.append({**item, **cached})
                             update_tracker(tracker, processed=1, cache_hits=1)
                         else:
@@ -319,6 +322,10 @@ class BatchProcessor(GenericBatchProcessor):
                         )
                         
                         if img_tensor and text_result:
+                            # Move tensors to CPU before caching
+                            if isinstance(img_tensor[0], torch.Tensor):
+                                img_tensor[0] = img_tensor[0].cpu()
+                            
                             processed_item = {
                                 **item,
                                 'processed_image': img_tensor[0],
@@ -333,7 +340,8 @@ class BatchProcessor(GenericBatchProcessor):
                             processed_items.append(processed_item)
                             update_tracker(tracker, processed=1)
                             
-                            # Clear memory
+                            # Explicitly clear references and CUDA cache
+                            del img
                             del img_tensor
                             torch.cuda.empty_cache()
                             await asyncio.sleep(0.01)
@@ -341,6 +349,10 @@ class BatchProcessor(GenericBatchProcessor):
                     except Exception as e:
                         logger.error(f"Error processing item {item['image_path']}: {e}")
                         update_tracker(tracker, failed=1, error_type=type(e).__name__)
+                
+                # Clear CUDA cache after each sub-batch
+                torch.cuda.empty_cache()
+                await asyncio.sleep(0.01)
 
             return processed_items, tracker.get_stats()
 

@@ -6,6 +6,7 @@ import logging
 import asyncio
 import aiofiles
 import io
+import gc
 
 # Internal imports from utils
 from src.data.processors.utils.system_utils import create_thread_pool, get_memory_usage_gb, MemoryCache
@@ -33,7 +34,7 @@ class CacheManager:
             
         # Initialize thread pool and memory cache
         self.executor = create_thread_pool(max_workers)
-        self.memory_cache = MemoryCache(max_items=1000)
+        self.memory_cache = MemoryCache(max_items=100)  # Reduced from 1000 to prevent memory buildup
         
         # Stats
         self.total_saved = 0
@@ -70,12 +71,17 @@ class CacheManager:
     async def save_latent_async(self, path: Path, tensor: torch.Tensor) -> None:
         """Save latent tensor to disk immediately."""
         try:
-            # Ensure tensor is on CPU
+            # Ensure tensor is on CPU and detached
             if tensor.device.type != 'cpu':
-                tensor = tensor.cpu()
+                tensor = tensor.detach().cpu()
             
             # Save tensor directly without buffering
             torch.save(tensor, path, pickle_protocol=4)
+            
+            # Clear reference and force garbage collection
+            del tensor
+            gc.collect()
+            torch.cuda.empty_cache()
             
         except Exception as e:
             logger.error(f"Error saving latent to {path}: {e}")
@@ -83,13 +89,20 @@ class CacheManager:
     async def save_text_data_async(self, path: Path, data: Dict) -> None:
         """Save text data to disk immediately."""
         try:
-            # Convert any tensors to CPU
+            # Convert any tensors to CPU and detach
+            cpu_data = {}
             for key, value in data.items():
                 if isinstance(value, torch.Tensor):
-                    data[key] = value.cpu()
+                    cpu_data[key] = value.detach().cpu()
+                else:
+                    cpu_data[key] = value
             
             # Save data directly without buffering
-            torch.save(data, path, pickle_protocol=4)
+            torch.save(cpu_data, path, pickle_protocol=4)
+            
+            # Clear references
+            del cpu_data
+            gc.collect()
             
         except Exception as e:
             logger.error(f"Error saving text data to {path}: {e}")
@@ -100,7 +113,7 @@ class CacheManager:
         data = self.memory_cache.get(str(path))
         if data is not None:
             self.cache_hits += 1
-            return data
+            return data.cpu()  # Always return CPU tensor
             
         try:
             if not path.exists():
@@ -110,8 +123,11 @@ class CacheManager:
             if not isinstance(data, torch.Tensor):
                 raise ValueError(f"Expected tensor, got {type(data)}")
                 
+            # Store CPU tensor in cache
+            data = data.cpu()
             self.memory_cache.set(str(path), data)
             self.cache_misses += 1
+            
             return data
             
         except Exception as e:
@@ -122,15 +138,52 @@ class CacheManager:
         """Load text embedding data with memory caching."""
         data = self.memory_cache.get(str(path))
         if data is not None:
-            return data
+            return self._ensure_cpu_tensors(data)
             
         try:
             data = torch.load(path)
+            # Ensure all tensors are on CPU
+            data = self._ensure_cpu_tensors(data)
             self.memory_cache.set(str(path), data)
             return data
         except Exception as e:
             logger.error(f"Error loading text data from {path}: {e}")
             raise
+
+    def _ensure_cpu_tensors(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Ensure all tensors in dictionary are on CPU."""
+        result = {}
+        for key, value in data.items():
+            if isinstance(value, torch.Tensor):
+                result[key] = value.cpu()
+            elif isinstance(value, dict):
+                result[key] = self._ensure_cpu_tensors(value)
+            else:
+                result[key] = value
+        return result
+
+    async def cleanup(self):
+        """Clean up resources and clear caches."""
+        try:
+            # Clear memory cache
+            self.memory_cache.clear()
+            
+            # Clear CUDA cache
+            torch.cuda.empty_cache()
+            
+            # Force garbage collection
+            gc.collect()
+            
+            logger.info("Successfully cleaned up cache manager resources")
+            
+        except Exception as e:
+            logger.error(f"Error during cache cleanup: {e}")
+
+    def clear_memory_cache(self):
+        """Clear the in-memory cache and force garbage collection."""
+        self.memory_cache.clear()
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def get_stats(self) -> Dict[str, Any]:
         """Get detailed cache statistics."""
