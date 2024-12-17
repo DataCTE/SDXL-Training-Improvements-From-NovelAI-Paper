@@ -95,7 +95,7 @@ class BatchProcessor(GenericBatchProcessor):
                 load_and_validate_image,
                 img_path,
                 min_size=(256, 256),  # Minimum size for processing
-                max_size=(8192, 8192)  # Maximum size supported
+                max_size=(2048, 2048)  # Maximum size supported
             )
         except Exception as e:
             logger.error(f"Error loading image {image_path}: {str(e)[:200]}...")

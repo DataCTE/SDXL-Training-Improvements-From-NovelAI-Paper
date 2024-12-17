@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 def load_and_validate_image(
     path: str,
     min_size: Tuple[int, int] = (32, 32),
-    max_size: Tuple[int, int] = (8192, 8192),
+    max_size: Tuple[int, int] = (2048, 2048),
     required_modes: Tuple[str, ...] = ('RGB', 'RGBA')
 ) -> Optional[Image.Image]:
     """Load and validate an image file."""

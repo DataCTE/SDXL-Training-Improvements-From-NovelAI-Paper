@@ -73,9 +73,9 @@ class TrainingConfig:
 class DataConfig:
     image_dirs: List[str]
     image_size: Tuple[int, int] = (1024, 1024)
-    max_image_size: Tuple[int, int] = (8192, 8192)
+    max_image_size: Tuple[int, int] = (2048, 2048)
     min_image_size: Union[Tuple[int, int], int] = (256, 256)
-    max_dim: int = 8192
+    max_dim: int = 2048
     bucket_step: int = 8
     min_bucket_size: int = 16
     min_bucket_resolution: Optional[int] = None
@@ -178,9 +178,9 @@ class NovelAIDatasetConfig:
     
     # Optional parameters with defaults after
     image_size: Tuple[int, int] = (1024, 1024)
-    max_image_size: Tuple[int, int] = (8192, 8192)
+    max_image_size: Tuple[int, int] = (2048, 2048)
     min_image_size: Union[Tuple[int, int], int] = (256, 256)
-    max_dim: int = 8192
+    max_dim: int = 2048
     
     # Bucket settings
     bucket_step: int = 8

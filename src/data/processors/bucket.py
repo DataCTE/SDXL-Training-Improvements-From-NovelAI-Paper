@@ -59,7 +59,7 @@ class BucketManager:
     
     def __init__(
         self,
-        max_image_size: Tuple[int, int] = (8192, 8192),
+        max_image_size: Tuple[int, int] = (2048, 2048),
         min_image_size: Tuple[int, int] = (256, 256),
         bucket_step: int = 64,
         min_bucket_resolution: int = 65536,  # 256x256
@@ -135,7 +135,7 @@ class BucketManager:
             current_height = self.min_height
             while current_height <= self.max_height:
                 # Skip if resolution would be too large
-                if current_width * current_height > (8192 * 8192):
+                if current_width * current_height > (2048 * 2048):
                     break
                     
                 add_bucket(current_width, current_height)

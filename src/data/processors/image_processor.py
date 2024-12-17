@@ -37,7 +37,7 @@ class ImageProcessorConfig:
     num_workers: int = 4
     prefetch_factor: int = 2
     max_memory_usage: float = 0.9
-    max_image_size: Tuple[int, int] = (8192, 8192)
+    max_image_size: Tuple[int, int] = (2048, 2048)
     min_image_size: Tuple[int, int] = (256, 256)
 
 class ImageProcessor:
@@ -104,7 +104,7 @@ class ImageProcessor:
                 max_bucket.width,
                 max_bucket.height
             )
-        return (32, 3, 8192, 8192)  # Default size
+        return (32, 3, 2048, 2048)  # Default size
 
     def _allocate_tensor_buffer(self) -> torch.Tensor:
         """Allocate tensor buffer with memory optimization."""
