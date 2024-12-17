@@ -58,7 +58,7 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         # Configure memory format
         configure_model_memory_format(
             model=self.model,
-            channels_last=self.config.system.channels_last
+            config=self.config
         )
         
         # Setup memory optimizations
