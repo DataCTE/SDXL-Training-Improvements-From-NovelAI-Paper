@@ -7,6 +7,7 @@ import psutil
 from pathlib import Path
 from typing import Dict, Any, Optional
 import traceback
+from src.config.config import Config
 
 logger = logging.getLogger(__name__)
 
