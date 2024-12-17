@@ -14,7 +14,8 @@ logger = logging.getLogger(__name__)
 
 # Import project components
 from src.data.dataset import NovelAIDataset
-from src.training.trainer import NovelAIDiffusionV3Trainer, VAETrainer
+from src.training.trainer import NovelAIDiffusionV3Trainer
+from src.training.vae_trainer import VAETrainer
 from src.data.text_embedder import TextEmbedder
 from src.data.tag_weighter import TagWeighter, TagWeightingConfig
 from src.data.dataset import NovelAIDatasetConfig
