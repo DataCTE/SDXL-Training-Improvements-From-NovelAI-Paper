@@ -7,8 +7,6 @@ import time
 import traceback
 
 # Internal imports from utils
-from src.data.processors.utils.system_utils import get_optimal_workers, create_thread_pool
-from src.data.processors.utils.batch_utils import BatchConfig
 from src.data.processors.utils.progress_utils import (
     create_progress_stats,
     update_progress_stats,
@@ -19,7 +17,7 @@ from src.data.processors.utils.progress_utils import (
 # Internal imports from processors
 from src.data.processors.bucket import BucketManager
 from src.data.processors.utils.thread_config import get_optimal_thread_config
-from src.data.processors.batch_processor import BatchProcessor
+from src.data.processors.text_processor import BatchProcessor
 
 logger = logging.getLogger(__name__)
 

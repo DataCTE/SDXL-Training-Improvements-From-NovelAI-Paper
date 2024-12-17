@@ -5,7 +5,6 @@ from concurrent.futures import ThreadPoolExecutor
 import time
 from .system_utils import get_gpu_memory_usage, get_memory_usage_gb, adjust_batch_size
 from .progress_utils import ProgressStats, create_progress_stats, update_progress_stats, log_progress
-import asyncio
 from src.config.config import BatchConfig
 
 logger = logging.getLogger(__name__)

@@ -2,12 +2,8 @@
 from typing import List, Optional, Dict, Any, Tuple
 import torch
 from torch.utils.data import Dataset
-from pathlib import Path
 import logging
-from PIL import Image
-import time
-import asyncio
-from tqdm import tqdm
+
 
 # Internal imports from processors
 from .processors.text_processor import TextProcessor

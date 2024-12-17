@@ -3,7 +3,7 @@ import psutil
 import logging
 from typing import Optional, Dict, Any, Tuple
 from concurrent.futures import ThreadPoolExecutor
-from src.data.processors.thread_config import get_optimal_cpu_threads
+from src.data.processors.utils.thread_config import get_optimal_cpu_threads
 from dataclasses import dataclass
 from pathlib import Path
 
