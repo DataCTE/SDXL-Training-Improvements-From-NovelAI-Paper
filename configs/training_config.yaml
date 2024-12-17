@@ -76,7 +76,7 @@ data:
   
   # Add bucketing and size configuration
   min_size: 256
-  max_dim: 2048
+  max_dim: 8192
   bucket_step: 8
   min_bucket_size: 16
   bucket_tolerance: 0.2

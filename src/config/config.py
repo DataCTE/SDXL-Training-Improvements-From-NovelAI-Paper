@@ -71,6 +71,7 @@ class TrainingConfig:
 class DataConfig:
     image_dirs: List[str]
     image_size: Tuple[int, int] = (1024, 1024)
+    max_image_size: Tuple[int, int] = (8192, 8192)
     num_workers: int = 8
     pin_memory: bool = True
     persistent_workers: bool = True

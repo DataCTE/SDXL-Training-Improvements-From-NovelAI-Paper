@@ -25,6 +25,8 @@ logger = logging.getLogger(__name__)
 
 def train(config_path: str):
     """Main training function with improved setup and error handling."""
+    is_main_process = True  # Move this to the top of the function
+    
     try:
         # Parse arguments first
         args = parse_args()
@@ -95,8 +97,7 @@ def train(config_path: str):
         
         # Set device
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        is_main_process = True  # Always True for single GPU
-
+        
         # Configure logging and wandb
         setup_logging(config, config.paths.logs_dir, is_main_process)
         
