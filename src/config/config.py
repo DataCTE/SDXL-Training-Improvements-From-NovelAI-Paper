@@ -146,6 +146,7 @@ class NovelAIDatasetConfig:
     image_size: Union[Tuple[int, int], int] = (8192, 8192)
     min_size: Union[Tuple[int, int], int] = (256, 256)
     max_dim: Optional[int] = None
+    max_image_size: Optional[Tuple[int, int]] = (8192, 8192)
     bucket_step: int = 64
     min_bucket_size: Optional[int] = None
     bucket_tolerance: float = 0.2
@@ -165,11 +166,15 @@ class NovelAIDatasetConfig:
             self.image_size = (self.image_size, self.image_size)
         if isinstance(self.min_size, int):
             self.min_size = (self.min_size, self.min_size)
+        if self.max_image_size is None:
+            self.max_image_size = self.image_size
             
         # Handle max_dim if specified
         if self.max_dim is not None:
             self.image_size = (min(self.image_size[0], self.max_dim), 
                              min(self.image_size[1], self.max_dim))
+            self.max_image_size = (min(self.max_image_size[0], self.max_dim),
+                                 min(self.max_image_size[1], self.max_dim))
             
         # Set default min_bucket_size if not specified
         if self.min_bucket_size is None:
