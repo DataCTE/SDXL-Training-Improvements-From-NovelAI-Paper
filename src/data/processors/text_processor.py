@@ -149,10 +149,9 @@ class TextProcessor:
 
     async def process_text_file(
         self,
-        text_path: Path,
-        cache_manager: Optional[CacheManager] = None
+        text_path: Path
     ) -> Optional[Tuple[Dict[str, Any], List[str]]]:
-        """Process text from a file with immediate caching."""
+        """Process text from a file without caching."""
         try:
             if not text_path.exists():
                 logger.error(f"Text file not found: {text_path}")
@@ -166,27 +165,14 @@ class TextProcessor:
             # Process text and tags
             text_data, tags = await self.process_text(text)
             
-            if text_data is not None and cache_manager is not None:
-                # Move tensors to CPU for caching
+            if text_data is not None:
+                # Move tensors to CPU
                 if 'embeds' in text_data:
                     text_data['embeds'] = text_data['embeds'].cpu()
                 if 'pooled_embeds' in text_data:
                     text_data['pooled_embeds'] = text_data['pooled_embeds'].cpu()
                 if 'tag_weights' in text_data:
                     text_data['tag_weights'] = text_data['tag_weights'].cpu()
-                
-                # Create cache item
-                cache_item = {
-                    'text_path': str(text_path),
-                    'text_data': text_data,
-                    'tags': tags
-                }
-                
-                # Cache immediately
-                await cache_manager.cache_batch_items([cache_item])
-                
-                # Clear GPU cache
-                torch.cuda.empty_cache()
             
             return text_data, tags
             

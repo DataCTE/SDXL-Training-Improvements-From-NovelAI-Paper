@@ -67,73 +67,32 @@ class CacheManager:
                 
         return paths
 
-    async def save_latent_async(self, path: Path, tensor: torch.Tensor):
-        """Asynchronously save latent tensor with validation."""
+    async def save_latent_async(self, path: Path, tensor: torch.Tensor) -> None:
+        """Save latent tensor to disk immediately."""
         try:
-            # Validate tensor
-            if not isinstance(tensor, torch.Tensor):
-                raise ValueError(f"Expected tensor, got {type(tensor)}")
-                
-            # Create parent directory if needed
-            path.parent.mkdir(parents=True, exist_ok=True)
+            # Ensure tensor is on CPU
+            if tensor.device.type != 'cpu':
+                tensor = tensor.cpu()
             
-            # Save to temporary file first
-            temp_path = path.with_suffix('.tmp')
-            buffer = io.BytesIO()
-            
-            await asyncio.get_event_loop().run_in_executor(
-                self.executor, torch.save, tensor, buffer
-            )
-            
-            async with aiofiles.open(temp_path, 'wb') as f:
-                await f.write(buffer.getvalue())
-                
-            # Atomic rename
-            temp_path.rename(path)
-            
-            # Update memory cache
-            self.memory_cache.set(str(path), tensor)
-            self.total_saved += 1
-            
-            logger.debug(f"Successfully saved latent to {path}")
+            # Save tensor directly without buffering
+            torch.save(tensor, path, pickle_protocol=4)
             
         except Exception as e:
             logger.error(f"Error saving latent to {path}: {e}")
-            if temp_path.exists():
-                temp_path.unlink()
-            raise
 
-    async def save_text_data_async(self, path: Path, data: Dict[str, Any]):
-        """Asynchronously save text embedding data with validation."""
+    async def save_text_data_async(self, path: Path, data: Dict) -> None:
+        """Save text data to disk immediately."""
         try:
-            # Create parent directory if needed
-            path.parent.mkdir(parents=True, exist_ok=True)
+            # Convert any tensors to CPU
+            for key, value in data.items():
+                if isinstance(value, torch.Tensor):
+                    data[key] = value.cpu()
             
-            # Save to temporary file first
-            temp_path = path.with_suffix('.tmp')
-            buffer = io.BytesIO()
-            
-            await asyncio.get_event_loop().run_in_executor(
-                self.executor, torch.save, data, buffer
-            )
-            
-            async with aiofiles.open(temp_path, 'wb') as f:
-                await f.write(buffer.getvalue())
-                
-            # Atomic rename
-            temp_path.rename(path)
-            
-            # Update memory cache
-            self.memory_cache.set(str(path), data)
-            self.total_saved += 1
-            
-            logger.debug(f"Successfully saved text data to {path}")
+            # Save data directly without buffering
+            torch.save(data, path, pickle_protocol=4)
             
         except Exception as e:
             logger.error(f"Error saving text data to {path}: {e}")
-            if temp_path.exists():
-                temp_path.unlink()
-            raise
 
     def load_latent(self, path: Path) -> torch.Tensor:
         """Load latent tensor with memory caching and validation."""
@@ -228,12 +187,7 @@ class CacheManager:
             return None
 
     async def cache_item(self, image_path: str, item: Dict[str, Any]) -> None:
-        """Cache both latent and text data for an item asynchronously.
-        
-        Args:
-            image_path: Path to the image file
-            item: Dictionary containing processed data
-        """
+        """Cache both latent and text data for an item asynchronously."""
         if not self.use_caching:
             return
             
@@ -241,20 +195,32 @@ class CacheManager:
             # Get cache paths
             cache_paths = self.get_cache_paths(image_path)
             
-            # Prepare text data with tag weights if available
-            text_data = item['text_data']
-            if 'tag_weights' in item:
-                text_data['tag_weights'] = item['tag_weights']
+            # Save latent immediately
+            if 'processed_image' in item:
+                await self.save_latent_async(
+                    cache_paths['latent'],
+                    item['processed_image']
+                )
             
-            # Save latent and text data concurrently
-            await asyncio.gather(
-                self.save_latent_async(cache_paths['latent'], item['processed_image']),
-                self.save_text_data_async(cache_paths['text'], text_data)
-            )
+            # Save text data immediately
+            if 'text_data' in item:
+                text_data = item['text_data']
+                if 'tag_weights' in item:
+                    text_data['tag_weights'] = item['tag_weights']
+                await self.save_text_data_async(
+                    cache_paths['text'],
+                    text_data
+                )
             
+            # Update cache stats
+            self.total_saved += 1
+            
+            # Clear memory cache periodically
+            if self.total_saved % 100 == 0:
+                self.memory_cache.clear()
+                
         except Exception as e:
             logger.error(f"Error caching item {image_path}: {e}")
-            # Continue processing even if caching fails
 
     async def cache_batch_items(self, items: List[Dict[str, Any]]) -> None:
         """Cache a batch of items immediately after processing."""

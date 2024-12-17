@@ -190,10 +190,9 @@ class ImageProcessor:
         self, 
         images: List[Image.Image], 
         width: int, 
-        height: int,
-        cache_manager: Optional[CacheManager] = None
+        height: int
     ) -> List[torch.Tensor]:
-        """Process a batch of images with immediate caching."""
+        """Process a batch of images without caching."""
         batch_size = len(images)
         if batch_size == 0:
             return []
@@ -201,7 +200,7 @@ class ImageProcessor:
         processed_tensors = []
         
         # Process in smaller sub-batches
-        sub_batch_size = min(4, batch_size)  # Process max 4 images at once
+        sub_batch_size = min(4, batch_size)
         
         for i in range(0, batch_size, sub_batch_size):
             sub_batch = images[i:i + sub_batch_size]
@@ -210,28 +209,26 @@ class ImageProcessor:
                 # Process images
                 sub_processed = []
                 for img in sub_batch:
-                    tensor = await self._process_single_image(img, width, height)
+                    tensor = self._process_single_image(img, width, height)
                     sub_processed.append(tensor)
                 
-                # Stack tensors
                 if sub_processed:
                     batch_tensor = torch.stack(sub_processed)
                     
-                    # Encode through VAE if available
                     if self.vae_encoder is not None:
-                        batch_tensor = await self.vae_encoder.encode_image(batch_tensor)
+                        with torch.cuda.amp.autocast(dtype=self.config.dtype):
+                            batch_tensor = self.vae_encoder.encode_image(batch_tensor)
                     
                     # Move to CPU immediately and append
                     for tensor in batch_tensor:
                         processed_tensors.append(tensor.cpu())
-                        
-                    # Clear GPU memory
+                    
                     del batch_tensor
                     torch.cuda.empty_cache()
+                    await asyncio.sleep(0.01)
                 
             except Exception as e:
                 logger.error(f"Error processing sub-batch: {e}")
-                # Add empty tensors for failed items
                 for _ in range(len(sub_batch)):
                     processed_tensors.append(
                         torch.zeros((4, height//8, width//8), 

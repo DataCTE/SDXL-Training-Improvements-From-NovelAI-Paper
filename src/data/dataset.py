@@ -210,7 +210,7 @@ class NovelAIDataset(Dataset):
         )
 
     async def _process_data(self, image_dirs: List[str]) -> None:
-        """Process all data files asynchronously with progress tracking and immediate caching."""
+        """Process all data files asynchronously with progress tracking."""
         try:
             # Create initial progress tracker
             tracker = create_progress_tracker(0, device=self.device)
@@ -239,7 +239,7 @@ class NovelAIDataset(Dataset):
                 # Create batch items
                 batch_items = [{'image_path': f} for f in batch_files]
                 
-                # Process batch
+                # Process batch using BatchProcessor (which handles caching)
                 batch_processed, stats = await self.batch_processor.process_batch(
                     batch_items=batch_items,
                     width=self.config.image_size[0],
@@ -255,7 +255,7 @@ class NovelAIDataset(Dataset):
                     for error_type, count in stats.get('error_types', {}).items():
                         update_tracker(tracker, failed=count, error_type=error_type)
                 
-                # Log progress
+                # Log progress periodically
                 if tracker.should_log():
                     extra_stats = {
                         'processed': len(processed_items),

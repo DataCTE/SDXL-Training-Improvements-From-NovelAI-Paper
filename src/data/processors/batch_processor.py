@@ -269,7 +269,7 @@ class BatchProcessor(GenericBatchProcessor):
         height: int,
         cache_manager: Optional[CacheManager] = None
     ) -> Tuple[List[Dict], Dict[str, Any]]:
-        """Process a batch of items with immediate caching."""
+        """Process a batch of items with centralized caching."""
         try:
             tracker = create_progress_tracker(
                 total_items=len(batch_items),
@@ -279,76 +279,68 @@ class BatchProcessor(GenericBatchProcessor):
             
             processed_items = []
             
-            # Process in very small sub-batches for better memory management
+            # Process in very small sub-batches
             sub_batch_size = min(4, self.batch_size)
             for i in range(0, len(batch_items), sub_batch_size):
                 sub_batch = batch_items[i:i + sub_batch_size]
                 
-                # Load and validate images
-                images = []
-                valid_items = []
-                for item in sub_batch:
-                    try:
-                        img = await self._load_and_validate_image(item['image_path'])
-                        if img is not None:
-                            images.append(img)
-                            valid_items.append(item)
-                            update_tracker(tracker, processed=1)
+                # Check cache first if enabled
+                if cache_manager is not None:
+                    cached_items = []
+                    uncached_items = []
+                    for item in sub_batch:
+                        cached = await cache_manager.get_cached_item(item['image_path'])
+                        if cached:
+                            cached_items.append({**item, **cached})
+                            update_tracker(tracker, processed=1, cache_hits=1)
                         else:
-                            update_tracker(tracker, failed=1, error_type='invalid_image')
-                    except Exception as e:
-                        logger.error(f"Error loading image {item['image_path']}: {e}")
-                        update_tracker(tracker, failed=1, error_type=type(e).__name__)
-
-                if not images:
+                            uncached_items.append(item)
+                            update_tracker(tracker, cache_misses=1)
+                    
+                    processed_items.extend(cached_items)
+                    sub_batch = uncached_items
+                
+                if not sub_batch:
                     continue
 
-                try:
-                    # Process images and text concurrently
-                    image_future = self.image_processor.process_batch(
-                        images, width, height, cache_manager=cache_manager
-                    )
-                    text_futures = [
-                        self.text_processor.process_text_file(
-                            Path(item['image_path']).with_suffix('.txt'),
-                            cache_manager=cache_manager
+                # Process uncached items
+                for item in sub_batch:
+                    try:
+                        # Load and validate image
+                        img = await self._load_and_validate_image(item['image_path'])
+                        if img is None:
+                            update_tracker(tracker, failed=1, error_type='invalid_image')
+                            continue
+
+                        # Process image and text
+                        img_tensor = await self.image_processor.process_batch([img], width, height)
+                        text_result = await self.text_processor.process_text_file(
+                            Path(item['image_path']).with_suffix('.txt')
                         )
-                        for item in valid_items
-                    ]
-                    
-                    # Wait for all processing to complete
-                    processed_images, text_results = await asyncio.gather(
-                        image_future,
-                        asyncio.gather(*text_futures)
-                    )
-                    
-                    # Process results and cache immediately
-                    for item, img_tensor, text_result in zip(valid_items, processed_images, text_results):
-                        if img_tensor is not None and text_result is not None:
+                        
+                        if img_tensor and text_result:
                             processed_item = {
                                 **item,
-                                'processed_image': img_tensor,  # Already on CPU
+                                'processed_image': img_tensor[0],
                                 'text_data': text_result[0],
                                 'tags': text_result[1]
                             }
                             
-                            # Cache immediately
+                            # Single point of caching
                             if cache_manager is not None:
-                                await cache_manager.cache_batch_items([processed_item])
-                                
+                                await cache_manager.cache_item(item['image_path'], processed_item)
+                            
                             processed_items.append(processed_item)
-                    
-                    # Clear memory after each sub-batch
-                    del processed_images
-                    torch.cuda.empty_cache()
-                    
-                    # Add small delay to allow memory to clear
-                    await asyncio.sleep(0.1)
-
-                except Exception as e:
-                    logger.error(f"Error processing sub-batch: {e}")
-                    update_tracker(tracker, failed=len(images), error_type='batch_processing_error')
-                    continue
+                            update_tracker(tracker, processed=1)
+                            
+                            # Clear memory
+                            del img_tensor
+                            torch.cuda.empty_cache()
+                            await asyncio.sleep(0.01)
+                            
+                    except Exception as e:
+                        logger.error(f"Error processing item {item['image_path']}: {e}")
+                        update_tracker(tracker, failed=1, error_type=type(e).__name__)
 
             return processed_items, tracker.get_stats()
 
