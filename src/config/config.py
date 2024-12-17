@@ -91,7 +91,7 @@ class DataConfig:
     max_token_length: int = 77  # Default CLIP token length
     
     # VAE settings
-    vae_batch_size: int = 32
+    vae_batch_size: int = 8
     vae_image_size: Tuple[int, int] = (256, 256)
     vae_validation_split: float = 0.1
     
