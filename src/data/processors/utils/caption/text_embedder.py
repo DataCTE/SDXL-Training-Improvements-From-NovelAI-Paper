@@ -349,10 +349,6 @@ class TextEmbedder:
                 "pooled_prompt_embeds": pooled_prompt_embeds.cpu()
             }
 
-    def encode_prompt_list(self, prompts: List[str], proportion_empty_prompts: float = 0.0):
-        """Batch process a list of prompts efficiently."""
-        return self(prompts, proportion_empty_prompts)
-
     async def process_text(self, text: str, tags: List[str]) -> Optional[Dict[str, Any]]:
         """Process text and tags asynchronously.
         
@@ -366,8 +362,8 @@ class TextEmbedder:
         try:
             # Process text through embedder
             embeddings = await asyncio.to_thread(
-                self.__call__,
-                text,
+                self.encode_prompt_list,
+                [text],
                 proportion_empty_prompts=0.0
             )
             
@@ -376,11 +372,78 @@ class TextEmbedder:
                 
             # Return combined data
             return {
-                'embeds': embeddings['prompt_embeds'],
-                'pooled_embeds': embeddings['pooled_prompt_embeds'],
+                'embeds': embeddings['prompt_embeds'][0],  # Take first item since we only processed one text
+                'pooled_embeds': embeddings['pooled_prompt_embeds'][0],
                 'tags': tags
             }
             
         except Exception as e:
             logger.error(f"Error processing text: {str(e)[:200]}...")
             return None
+
+    @torch.no_grad()
+    async def process_batch(
+        self,
+        texts: List[str],
+        batch_size: Optional[int] = None
+    ) -> List[Dict[str, torch.Tensor]]:
+        """Process a batch of texts asynchronously.
+        
+        Args:
+            texts: List of texts to process
+            batch_size: Optional batch size override
+            
+        Returns:
+            List of dictionaries containing embeddings
+        """
+        if not texts:
+            return []
+            
+        batch_size = batch_size or self.batch_size
+        results = []
+        
+        # Process in batches
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+            try:
+                # Process batch through embedder
+                embeddings = await asyncio.to_thread(
+                    self.encode_prompt_list,
+                    batch,
+                    proportion_empty_prompts=0.0
+                )
+                
+                if embeddings is not None:
+                    # Split batch results
+                    for j in range(len(batch)):
+                        results.append({
+                            'prompt_embeds': embeddings['prompt_embeds'][j],
+                            'pooled_prompt_embeds': embeddings['pooled_prompt_embeds'][j]
+                        })
+                        
+            except Exception as e:
+                logger.error(f"Error processing batch: {str(e)[:200]}...")
+                # Fill failed batch items with None
+                results.extend([None] * len(batch))
+                
+        return results
+
+    async def cleanup(self):
+        """Clean up resources."""
+        try:
+            # Clear CUDA cache if using GPU
+            if self.device.type == 'cuda':
+                torch.cuda.empty_cache()
+                
+            logger.info("Successfully cleaned up text embedder resources")
+            
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
+
+    def encode_prompt_list(self, prompts: List[str], proportion_empty_prompts: float = 0.0) -> Dict[str, torch.Tensor]:
+        """Synchronous batch processing of prompts.
+        
+        This is a synchronous version of text processing that should be called through asyncio.to_thread
+        when used in async context.
+        """
+        return self(prompts, proportion_empty_prompts)

@@ -72,6 +72,83 @@ class TagWeighter:
         
         logger.info(f"Initialized TagWeighter with config: {config}")
 
+    def _calculate_base_weight(self, tags: List[str]) -> float:
+        """Calculate base weight for a list of tags.
+        
+        Args:
+            tags: List of tags to calculate weight for
+            
+        Returns:
+            Combined weight for the tags
+        """
+        if not self.config.enabled or not tags:
+            return self.config.default_weight
+            
+        try:
+            # Get weights for each tag
+            weights = [
+                self.tag_weights.get(tag, self.config.default_weight)
+                for tag in tags
+            ]
+            
+            if not weights:
+                return self.config.default_weight
+                
+            # Use geometric mean for combining weights
+            # This prevents extreme values when combining many tags
+            weights = np.array(weights)
+            combined_weight = float(np.exp(np.mean(np.log(weights))))
+            
+            # Clip final weight to bounds
+            return float(np.clip(
+                combined_weight,
+                self.config.min_weight,
+                self.config.max_weight
+            ))
+            
+        except Exception as e:
+            logger.error(f"Error calculating base weight: {e}")
+            return self.config.default_weight
+
+    def _calculate_similarity_factor(self, embeddings: Dict[str, torch.Tensor]) -> float:
+        """Calculate similarity-based adjustment factor.
+        
+        Args:
+            embeddings: Text embeddings from text_embedder
+            
+        Returns:
+            Similarity factor to adjust base weight
+        """
+        try:
+            # Get embeddings
+            prompt_embeds = embeddings.get('prompt_embeds')
+            if prompt_embeds is None:
+                return 1.0
+                
+            # Calculate cosine similarity between embeddings
+            similarities = torch.nn.functional.cosine_similarity(
+                prompt_embeds.unsqueeze(1),
+                prompt_embeds.unsqueeze(0)
+            )
+            
+            # Average similarity excluding self-similarity
+            mask = ~torch.eye(similarities.shape[0], dtype=torch.bool, device=similarities.device)
+            avg_similarity = similarities[mask].mean().item()
+            
+            # Convert to adjustment factor
+            # Higher similarity -> lower weight to avoid redundancy
+            similarity_factor = 1.0 - (avg_similarity * 0.5)  # Scale factor of 0.5
+            
+            return float(np.clip(
+                similarity_factor,
+                0.5,  # Don't reduce weight by more than half
+                1.5   # Don't increase weight by more than 50%
+            ))
+            
+        except Exception as e:
+            logger.warning(f"Error calculating similarity factor: {e}")
+            return 1.0
+
     def update_frequencies(self, text: str) -> None:
         """Update tag frequency counters from full text.
         
