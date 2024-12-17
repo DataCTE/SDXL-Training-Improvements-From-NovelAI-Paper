@@ -556,6 +556,8 @@ def verify_scheduler_parameters(
     Returns dict of parameter states that can be checked by trainer.
     """
     param_states = {}
+    critical_errors = []
+    warnings = []
     
     try:
         # Verify required parameters exist
@@ -567,38 +569,59 @@ def verify_scheduler_parameters(
         
         missing_params = [p for p in required_params if p not in scheduler_params]
         if missing_params:
-            logger.warning(f"Missing scheduler parameters: {missing_params}")
+            critical_errors.append(f"Missing scheduler parameters: {missing_params}")
             param_states['missing_params'] = missing_params
             
         # Verify parameter properties
         for name, param in scheduler_params.items():
+            param_states[name] = True  # Start optimistic
+            
             if name == 'scheduler':
                 if not isinstance(param, DDPMScheduler):
-                    logger.warning("Invalid scheduler type")
+                    critical_errors.append("Invalid scheduler type")
                     param_states['scheduler_type'] = False
                 continue
                 
             if not isinstance(param, torch.Tensor):
-                logger.warning(f"Scheduler parameter {name} is not a tensor")
-                param_states[f'{name}_type'] = False
+                critical_errors.append(f"Scheduler parameter {name} is not a tensor")
+                param_states[name] = False
                 continue
                 
+            # Device check - don't fail on device mismatch, we can fix this
             if param.device != device:
-                logger.warning(f"Scheduler parameter {name} is on wrong device")
-                param_states[f'{name}_device'] = False
-                continue
+                warnings.append(f"Scheduler parameter {name} is on wrong device: {param.device} vs {device}")
+                try:
+                    # Try to move parameter to correct device
+                    scheduler_params[name] = param.to(device=device)
+                    logger.info(f"Moved scheduler parameter {name} to device {device}")
+                except Exception as e:
+                    logger.error(f"Failed to move parameter {name} to device {device}: {e}")
+                    critical_errors.append(f"Failed to move parameter {name} to correct device")
+                    param_states[name] = False
                 
-            # All checks passed for this parameter
-            param_states[name] = True
-            
         # Verify scheduler configuration
         if scheduler_params['scheduler'].num_train_timesteps != len(scheduler_params['sigmas']):
-            logger.warning("Scheduler timesteps mismatch")
+            critical_errors.append("Scheduler timesteps mismatch")
             param_states['timesteps_match'] = False
             
+        # Log warnings
+        for warning in warnings:
+            logger.warning(warning)
+            
+        # Log critical errors
+        if critical_errors:
+            for error in critical_errors:
+                logger.error(error)
+            param_states['critical_errors'] = critical_errors
+            
+        # Only consider parameters invalid if there are critical errors
+        param_states['valid'] = len(critical_errors) == 0
+            
     except Exception as e:
-        logger.warning(f"Error verifying scheduler parameters: {e}")
+        logger.error(f"Error verifying scheduler parameters: {e}")
+        logger.error(f"Stack trace: {traceback.format_exc()}")
         param_states['error'] = str(e)
+        param_states['valid'] = False
         
     return param_states
 

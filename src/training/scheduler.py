@@ -142,6 +142,19 @@ def configure_noise_scheduler(config: Config, device: torch.device) -> Dict[str,
         try:
             sigmas = get_sigmas(config, device)
             params = get_scheduler_parameters(sigmas, config, device)
+            
+            # Move all parameters to the correct device
+            for key, value in params.items():
+                if isinstance(value, torch.Tensor):
+                    params[key] = value.to(device=device)
+                    logger.info(f"Moved scheduler parameter {key} to device {device}")
+            
+            # Verify all parameters are on correct device
+            for key, value in params.items():
+                if isinstance(value, torch.Tensor):
+                    if value.device != device:
+                        raise RuntimeError(f"Failed to move scheduler parameter {key} to device {device}")
+                    
         except Exception as e:
             logger.error("Failed to generate scheduler parameters")
             raise
@@ -153,6 +166,17 @@ def configure_noise_scheduler(config: Config, device: torch.device) -> Dict[str,
             scheduler.alphas_cumprod = params['alphas_cumprod']
             scheduler.sigmas = sigmas
             scheduler.init_noise_sigma = sigmas.max()
+            
+            # Verify scheduler parameters
+            if not isinstance(scheduler.alphas, torch.Tensor) or scheduler.alphas.device != device:
+                raise RuntimeError(f"Scheduler alphas not on correct device: {scheduler.alphas.device} vs {device}")
+            if not isinstance(scheduler.betas, torch.Tensor) or scheduler.betas.device != device:
+                raise RuntimeError(f"Scheduler betas not on correct device: {scheduler.betas.device} vs {device}")
+            if not isinstance(scheduler.alphas_cumprod, torch.Tensor) or scheduler.alphas_cumprod.device != device:
+                raise RuntimeError(f"Scheduler alphas_cumprod not on correct device: {scheduler.alphas_cumprod.device} vs {device}")
+            if not isinstance(scheduler.sigmas, torch.Tensor) or scheduler.sigmas.device != device:
+                raise RuntimeError(f"Scheduler sigmas not on correct device: {scheduler.sigmas.device} vs {device}")
+                
         except Exception as e:
             logger.error(f"Failed to update scheduler parameters: {str(e)}")
             raise
