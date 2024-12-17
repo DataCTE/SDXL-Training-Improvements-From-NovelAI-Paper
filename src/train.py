@@ -114,8 +114,8 @@ def train(config_path: str):
         
         # Create dataset with text embedder and tag weighter
         dataset_config = NovelAIDatasetConfig(
-            image_size=config.data.image_size,
-            min_size=config.data.min_size,
+            image_size=tuple(config.data.image_size),
+            min_size=tuple(config.data.min_size) if isinstance(config.data.min_size, (list, tuple)) else config.data.min_size,
             max_dim=config.data.max_dim,
             bucket_step=config.data.bucket_step,
             min_bucket_size=config.data.min_bucket_size,
