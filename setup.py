@@ -1,4 +1,5 @@
 from setuptools import setup, find_packages
+from src.utils.model import create_unet, create_vae
 
 setup(
     name="sdxl-training-improvements",

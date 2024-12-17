@@ -1,0 +1,214 @@
+import torch
+import os
+import logging
+from diffusers import UNet2DConditionModel, AutoencoderKL
+from safetensors.torch import load_file
+from src.config.config import Config
+import math
+import traceback
+from typing import Optional, Union
+from torch.nn.parallel import DistributedDataParallel
+from torch.distributed.fsdp import FullyShardedDataParallel
+
+logger = logging.getLogger(__name__)
+
+def is_xformers_installed():
+    """Check if xformers is available."""
+    try:
+        import xformers
+        import xformers.ops
+        return True
+    except ImportError:
+        return False
+
+def create_unet(config: Config, model_dtype: torch.dtype) -> UNet2DConditionModel:
+    """Create and configure UNet model.
+    
+    Args:
+        config: Configuration object
+        model_dtype: Model data type
+        
+    Returns:
+        UNet2DConditionModel: Configured UNet model
+    """
+    try:
+        # Create UNet with SDXL architecture
+        unet = UNet2DConditionModel.from_pretrained(
+            config.model.pretrained_model_name,
+            subfolder="unet",
+            torch_dtype=model_dtype
+        )
+        
+        # Apply memory optimizations
+        unet = configure_model_memory_format(unet, config)
+        
+        return unet
+        
+    except Exception as e:
+        logger.error(f"Failed to create UNet: {str(e)}")
+        logger.error(f"Stack trace: {traceback.format_exc()}")
+        raise
+
+def create_vae(model_dtype: torch.dtype) -> AutoencoderKL:
+    """Create and configure VAE model.
+    
+    Args:
+        model_dtype: Model data type
+        
+    Returns:
+        AutoencoderKL: Configured VAE model
+    """
+    try:
+        # Load pretrained VAE directly
+        vae = AutoencoderKL.from_pretrained(
+            "madebyollin/sdxl-vae-fp16-fix",
+            torch_dtype=model_dtype
+        )
+        
+        # Freeze VAE parameters
+        vae.requires_grad_(False)
+        vae.eval()
+        
+        return vae
+    except Exception as e:
+        logger.error(f"Failed to create VAE: {str(e)}")
+        logger.error(f"Stack trace: {traceback.format_exc()}")
+        raise
+
+def setup_model(
+    args,
+    device: torch.device,
+    config: Config
+) -> tuple[UNet2DConditionModel, AutoencoderKL]:
+    """Setup UNet and VAE models with error handling."""
+    try:
+        pretrained_model_name = config.model.pretrained_model_name
+        
+        logger.info("Loading VAE...")
+        if args.train_vae and args.vae_path:
+            logger.info(f"Loading VAE from: {args.vae_path}")
+            vae = AutoencoderKL.from_pretrained(
+                args.vae_path,
+                torch_dtype=torch.bfloat16,
+                use_safetensors=True
+            ).to(device)
+        else:
+            vae = AutoencoderKL.from_pretrained(
+                pretrained_model_name,
+                subfolder="vae",
+                torch_dtype=torch.bfloat16
+            ).to(device)
+            
+        if not args.train_vae:
+            vae.eval()
+            vae.requires_grad_(False)
+        
+        logger.info("Loading UNet...")
+        if args.resume_from_checkpoint:
+            logger.info(f"Loading UNet from checkpoint: {args.resume_from_checkpoint}")
+            unet = UNet2DConditionModel.from_pretrained(
+                args.resume_from_checkpoint,
+                subfolder="unet",
+                torch_dtype=torch.bfloat16,
+                use_safetensors=True
+            ).to(device)
+        elif args.unet_path:
+            logger.info(f"Loading UNet weights from: {args.unet_path}")
+            unet_dir = os.path.dirname(args.unet_path)
+            config_path = os.path.join(unet_dir, "config.json")
+            
+            if os.path.exists(config_path):
+                unet = UNet2DConditionModel.from_pretrained(
+                    unet_dir,
+                    torch_dtype=torch.bfloat16,
+                    use_safetensors=True
+                ).to(device)
+            else:
+                unet = UNet2DConditionModel.from_pretrained(
+                    pretrained_model_name,
+                    subfolder="unet",
+                    torch_dtype=torch.bfloat16,
+                ).to(device)
+                state_dict = load_file(args.unet_path)
+                unet.load_state_dict(state_dict)
+        else:
+            logger.info("Loading fresh UNet from pretrained model")
+            unet = UNet2DConditionModel.from_pretrained(
+                pretrained_model_name,
+                subfolder="unet",
+                torch_dtype=torch.bfloat16,
+                use_safetensors=True
+            ).to(device)
+        
+        return unet, vae
+
+    except Exception as e:
+        logger.error(f"Failed to setup models: {str(e)}")
+        logger.error(f"Stack trace: {traceback.format_exc()}")
+        raise
+
+def initialize_model_weights(model: torch.nn.Module):
+    """Initialize model weights using improved techniques."""
+    def _init_weights(module):
+        if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
+            # Initialize attention layer weights with scaled normal distribution
+            if "attn" in module._get_name().lower():
+                scale = 1 / math.sqrt(module.in_features if hasattr(module, "in_features") else module.in_channels)
+                torch.nn.init.normal_(module.weight, mean=0.0, std=scale)
+            else:
+                # Standard initialization for other layers
+                torch.nn.init.kaiming_normal_(module.weight, a=0, mode='fan_in', nonlinearity='leaky_relu')
+            
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        
+        elif isinstance(module, torch.nn.Embedding):
+            # Initialize time embeddings
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    
+    # Apply initialization
+    model.apply(_init_weights)
+    
+    # Zero initialize the output projection
+    if hasattr(model, "conv_out"):
+        torch.nn.init.zeros_(model.conv_out.weight)
+        if model.conv_out.bias is not None:
+            torch.nn.init.zeros_(model.conv_out.bias)
+
+def configure_model_memory_format(
+    model: Union[torch.nn.Module, DistributedDataParallel, FullyShardedDataParallel],
+    config: Config
+) -> Union[torch.nn.Module, DistributedDataParallel, FullyShardedDataParallel]:
+    """Configure model memory format and optimizations.
+    
+    Args:
+        model: Model to configure
+        config: Configuration object
+        
+    Returns:
+        Configured model
+        
+    Raises:
+        RuntimeError: If memory format configuration fails
+    """
+    try:
+        # Set memory format if configured
+        if config.system.channels_last:
+            if not isinstance(model, (torch.nn.parallel.DistributedDataParallel, 
+                                    torch.distributed.fsdp.FullyShardedDataParallel)):
+                model = model.to(memory_format=torch.channels_last)
+            
+        # Enable gradient checkpointing if configured
+        if config.system.gradient_checkpointing:
+            model.enable_gradient_checkpointing()
+            
+        # Enable xformers if available and configured
+        if config.system.enable_xformers and is_xformers_installed():
+            model.enable_xformers_memory_efficient_attention()
+            
+        return model
+        
+    except Exception as e:
+        logger.error(f"Failed to configure model memory format: {str(e)}")
+        logger.error(f"Stack trace: {traceback.format_exc()}")
+        raise

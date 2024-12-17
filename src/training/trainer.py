@@ -6,7 +6,7 @@ from accelerate import Accelerator
 from diffusers import UNet2DConditionModel, AutoencoderKL, DDPMScheduler
 import wandb
 import os
-from typing import Dict, Tuple, Optional, List, Union
+from typing import Dict, Tuple, Optional, List, Union, Any
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 import math
@@ -21,17 +21,16 @@ import logging
 import sys
 import time
 import traceback
+from src.utils.model import initialize_model_weights
+from src.utils.setup import setup_memory_optimizations
+from src.training.scheduler import configure_noise_scheduler, get_karras_scalings
+from src.utils.model import create_unet, create_vae, is_xformers_installed
+from src.utils.metrics import compute_grad_norm, log_metrics
+from src.utils.noise import generate_noise
+from src.utils.embeddings import get_add_time_ids
+from src.utils.checkpoints import save_checkpoint
 
 logger = logging.getLogger(__name__)
-
-def is_xformers_installed():
-    """Check if xformers is available."""
-    try:
-        import xformers
-        import xformers.ops
-        return True
-    except ImportError:
-        return False
 
 class NovelAIDiffusionV3Trainer(torch.nn.Module):
     def __init__(
@@ -53,9 +52,6 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._set_precision()
         
-        # Configure noise scheduler with device and precision set
-        self.configure_noise_scheduler()
-        
         # Initialize accelerator with proper configuration
         self.accelerator = accelerator or Accelerator(
             mixed_precision=self.config.system.mixed_precision,
@@ -70,15 +66,15 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         self.device = self.accelerator.device
         
         # Initialize models with proper validation
-        self.model = model or self._create_unet()
-        self.vae = vae or self._create_vae()
+        self.model = model or create_unet(self.config, self.model_dtype)
+        self.vae = vae or create_vae(self.model_dtype)
         
         # Move models to device and set dtype
         self._setup_models()
         
         # Initialize model weights if needed
         if model is None:
-            self._initialize_model_weights()
+            initialize_model_weights(self.model)
         
         # Set up distributed training
         if self.config.system.use_fsdp:
@@ -87,11 +83,47 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         # Configure optimizer with proper parameters
         self._setup_optimizer()
         
-        # Set up caching and memory optimizations
-        self._setup_memory_optimizations()
+        # Calculate micro batch size for gradient accumulation
+        batch_size = self.config.training.batch_size
+        self.micro_batch_size = batch_size // self.config.training.gradient_accumulation_steps
         
-        # Pre-compute buffers
-        self._initialize_buffers()
+        if batch_size % self.config.training.gradient_accumulation_steps != 0:
+            raise ValueError(
+                f"Batch size ({batch_size}) must be divisible by "
+                f"gradient_accumulation_steps ({self.config.training.gradient_accumulation_steps})"
+            )
+        
+        # Set up memory optimizations and get buffers
+        memory_buffers = setup_memory_optimizations(
+            model=self.model,
+            config=self.config,
+            device=self.device,
+            batch_size=batch_size,
+            micro_batch_size=self.micro_batch_size
+        )
+        
+        # Unpack memory buffers
+        self.noise_template = memory_buffers['noise_template']
+        self.grad_norm_buffer = memory_buffers['grad_norm_buffer']
+        self.noise_buffer = memory_buffers['noise_buffer']
+        self.latent_buffer = memory_buffers['latent_buffer']
+        self.timestep_buffer = memory_buffers['timestep_buffer']
+        self.snr_weight_buffer = memory_buffers['snr_weight_buffer']
+        
+        # Configure noise scheduler and get parameters
+        scheduler_params = configure_noise_scheduler(self.config, self.device)
+        
+        # Unpack scheduler parameters
+        self.scheduler = scheduler_params['scheduler']
+        self.alphas = scheduler_params['alphas']
+        self.betas = scheduler_params['betas']
+        self.alphas_cumprod = scheduler_params['alphas_cumprod']
+        self.sigmas = scheduler_params['sigmas']
+        self.snr_values = scheduler_params['snr_values']
+        self.snr_weights = scheduler_params['snr_weights']
+        self.c_skip = scheduler_params['c_skip']
+        self.c_out = scheduler_params['c_out']
+        self.c_in = scheduler_params['c_in']
         
         # Initialize training state
         self._initialize_training_state()
@@ -146,226 +178,6 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         if self.vae.config.latent_channels != 4:
             raise ValueError("VAE must have 4 latent channels")
 
-    def _create_unet(self) -> UNet2DConditionModel:
-        """Create and configure UNet model.
-        
-        Returns:
-            UNet2DConditionModel: Configured UNet model
-        """
-        # Create UNet with SDXL architecture
-        unet = UNet2DConditionModel.from_pretrained(
-            self.config.model.pretrained_model_name,
-            subfolder="unet",
-            torch_dtype=self.model_dtype
-        )
-        
-        # Enable memory efficient attention if configured
-        if self.config.system.enable_xformers and is_xformers_installed():
-            unet.enable_xformers_memory_efficient_attention()
-        
-        # Enable gradient checkpointing if configured
-        if self.config.system.gradient_checkpointing:
-            unet.enable_gradient_checkpointing()
-        
-        return unet
-
-    def _create_vae(self) -> AutoencoderKL:
-        """Create and configure VAE model.
-        
-        Returns:
-            AutoencoderKL: Configured VAE model
-        """
-        # Load pretrained VAE directly
-        vae = AutoencoderKL.from_pretrained(
-            "madebyollin/sdxl-vae-fp16-fix",
-            torch_dtype=self.model_dtype
-        )
-        
-        # Freeze VAE parameters
-        vae.requires_grad_(False)
-        vae.eval()
-        
-        return vae
-
-    def _initialize_model_weights(self):
-        """Initialize model weights using improved techniques.
-        
-        Implements weight initialization as described in the NovelAI technical report:
-        1. Scaled initialization for attention layers
-        2. Proper initialization for time embedding
-        3. Zero initialization for output projection
-        """
-        def _init_weights(module):
-            if isinstance(module, (nn.Linear, nn.Conv2d)):
-                # Initialize attention layer weights with scaled normal distribution
-                if "attn" in module._get_name().lower():
-                    scale = 1 / math.sqrt(module.in_features if hasattr(module, "in_features") else module.in_channels)
-                    nn.init.normal_(module.weight, mean=0.0, std=scale)
-                else:
-                    # Standard initialization for other layers
-                    nn.init.kaiming_normal_(module.weight, a=0, mode='fan_in', nonlinearity='leaky_relu')
-                
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            
-            elif isinstance(module, nn.Embedding):
-                # Initialize time embeddings
-                nn.init.normal_(module.weight, mean=0.0, std=0.02)
-        
-        # Apply initialization
-        self.model.apply(_init_weights)
-        
-        # Zero initialize the output projection
-        if hasattr(self.model, "conv_out"):
-            nn.init.zeros_(self.model.conv_out.weight)
-            if self.model.conv_out.bias is not None:
-                nn.init.zeros_(self.model.conv_out.bias)
-
-    def _setup_distributed(self):
-        """Setup distributed training components"""
-        # Import here to avoid circular imports
-        from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-        from torch.distributed.fsdp import (
-            MixedPrecision,
-            BackwardPrefetch,
-            CPUOffload,
-            ShardingStrategy,
-        )
-        from functools import partial
-
-        if dist.is_initialized():
-            # Create a proper size-based auto wrap policy function
-            auto_wrap_policy = partial(
-                size_based_auto_wrap_policy,
-                min_num_params=self.config.system.min_num_params_per_shard,
-            )
-
-            # Configure mixed precision policy
-            mixed_precision_policy = MixedPrecision(
-                param_dtype=self.model_dtype,
-                reduce_dtype=self.model_dtype,
-                buffer_dtype=self.model_dtype,
-            )
-
-            # Configure sharding strategy
-            sharding_strategy = (ShardingStrategy.FULL_SHARD 
-                               if self.config.system.full_shard 
-                               else ShardingStrategy.SHARD_GRAD_OP)
-
-            # Apply FSDP wrapping to the model
-            if hasattr(self, 'model'):
-                self.model = FSDP(
-                    self.model,
-                    auto_wrap_policy=auto_wrap_policy,
-                    device_id=torch.cuda.current_device(),
-                    mixed_precision=mixed_precision_policy,
-                    sharding_strategy=sharding_strategy,
-                    backward_prefetch=BackwardPrefetch.BACKWARD_PRE if self.config.system.backward_prefetch else None,
-                    cpu_offload=CPUOffload(offload_params=True) if self.config.system.cpu_offload else None,
-                    forward_prefetch=self.config.system.forward_prefetch,
-                    limit_all_gathers=self.config.system.limit_all_gathers,
-                )
-
-            # Enable gradient checkpointing if configured
-            if self.config.system.gradient_checkpointing:
-                self.model.enable_gradient_checkpointing()
-
-            # Initialize process group if not already done
-            if not torch.distributed.is_initialized():
-                torch.distributed.init_process_group(
-                    backend=self.config.system.backend,
-                    init_method='env://'
-                )
-                
-            # Set device to current GPU
-            torch.cuda.set_device(torch.cuda.current_device())
-
-            # Optimize CUDA operations
-            torch.backends.cudnn.benchmark = self.config.system.cudnn_benchmark
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-
-            # Sync batch norm if configured
-            if self.config.system.sync_batch_norm:
-                self.model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.model)
-
-    def _setup_memory_optimizations(self):
-        """Optimize memory usage with NovelAI's techniques.
-        
-        Implements several memory optimization techniques:
-        1. Channels last memory format for tensors
-        2. Gradient checkpointing
-        3. Efficient attention implementation
-        4. Pre-allocated buffers
-        """
-        # Set memory format if configured
-        if self.config.system.channels_last:
-            # Check if model is wrapped in DDP or FSDP
-            if not isinstance(self.model, (torch.nn.parallel.DistributedDataParallel, 
-                                         torch.distributed.fsdp.FullyShardedDataParallel)):
-                try:
-                    # Convert model to channels_last format
-                    self.model = self.model.to(memory_format=torch.channels_last)
-                except Exception as e:
-                    print(f"Warning: Failed to convert model to channels_last format: {e}")
-                    # Continue without channels_last if conversion fails
-                    pass
-            
-        # Enable gradient checkpointing if configured
-        if self.config.system.gradient_checkpointing:
-            try:
-                self.model.enable_gradient_checkpointing()
-            except Exception as e:
-                print(f"Warning: Failed to enable gradient checkpointing: {e}")
-            
-        # Enable xformers if available and configured
-        if self.config.system.enable_xformers and is_xformers_installed():
-            try:
-                self.model.enable_xformers_memory_efficient_attention()
-            except Exception as e:
-                print(f"Warning: Failed to enable xformers: {e}")
-            
-        # Pre-allocate reusable buffers with appropriate memory format
-        memory_format = (torch.channels_last 
-                        if self.config.system.channels_last 
-                        else torch.contiguous_format)
-        
-        # Create noise template with correct memory format
-        try:
-            self.noise_template = torch.empty(
-                (self.config.training.batch_size, 4, 64, 64),  # Standard latent size
-                device=self.device,
-                dtype=self.model_dtype,
-                memory_format=memory_format
-            )
-        except Exception as e:
-            print(f"Warning: Failed to create noise template with specified format: {e}")
-            # Fallback to default memory format
-            self.noise_template = torch.empty(
-                (self.config.training.batch_size, 4, 64, 64),
-                device=self.device,
-                dtype=self.model_dtype
-            )
-        
-        # Pre-allocate gradient norm buffer (1D tensor, memory format doesn't matter)
-        self.grad_norm_buffer = torch.zeros(
-            len(list(self.model.parameters())), 
-            device=self.device
-        )
-        
-        # Enable TF32 for better performance if CUDA is available
-        if torch.cuda.is_available():
-            try:
-                torch.backends.cuda.matmul.allow_tf32 = True
-                torch.backends.cudnn.allow_tf32 = True
-                
-                # Optimize CUDA operations
-                if self.config.system.cudnn_benchmark:
-                    torch.backends.cudnn.benchmark = True
-            except Exception as e:
-                print(f"Warning: Failed to configure CUDA optimizations: {e}")
-
     def _setup_optimizer(self):
         """Configure optimizer with proper parameters."""
         # Get optimizer parameters from config
@@ -375,9 +187,9 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             'eps': self.config.training.optimizer_eps,
             'weight_decay': self.config.training.weight_decay
         }
-        
+        from adamw_bf16 import AdamWBF16
         # Create AdamW optimizer
-        self.optimizer = torch.optim.AdamW(
+        self.optimizer = AdamWBF16(
             self.model.parameters(),
             **optimizer_params
         )
@@ -515,51 +327,42 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         timesteps: torch.Tensor,
         weights: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Compute weighted loss with SNR weighting.
-        
-        Args:
-            model_pred: Model prediction
-            target: Target tensor (noise or velocity)
-            timesteps: Timestep indices
-            weights: Optional sample weights
-            
-        Returns:
-            Total weighted loss
-        """
-        # Basic MSE in float32 for stability
-        loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
-        
-        # Average over non-batch dimensions
-        loss = loss.mean(dim=list(range(1, len(loss.shape))))
-        
-        # Apply SNR weights if enabled
-        if self.config.training.snr_gamma is not None:
-            snr_weights = self.compute_snr_weight(timesteps)
-            loss = loss * snr_weights.to(loss.device)
-        
-        # Apply sample weights if provided
-        if weights is not None:
-            loss = loss * weights
-        
-        return loss.mean()
+        """Compute weighted loss with error handling."""
+        try:
+            # Validate inputs
+            if not isinstance(model_pred, torch.Tensor):
+                raise ValueError("model_pred must be a tensor")
+            if not isinstance(target, torch.Tensor):
+                raise ValueError("target must be a tensor")
+            if model_pred.shape != target.shape:
+                raise ValueError(f"Shape mismatch: model_pred {model_pred.shape} vs target {target.shape}")
 
-    def _log_training_step(
-        self,
-        loss_value: float,
-        running_loss: float,
-        step: int,
-        tag_weights: torch.Tensor
-    ):
-        """Log training metrics."""
-        wandb.log({
-            'loss/step': loss_value,
-            'loss/running_avg': running_loss / (step + 1),
-            'learning_rate': self.optimizer.param_groups[0]['lr'],
-            'global_step': self.global_step,
-            'tag_weights/mean': tag_weights.mean().item(),
-            'tag_weights/min': tag_weights.min().item(),
-            'tag_weights/max': tag_weights.max().item()
-        }, step=self.global_step)
+            # Basic MSE in float32 for stability
+            loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
+            
+            # Average over non-batch dimensions
+            loss = loss.mean(dim=list(range(1, len(loss.shape))))
+            
+            # Apply SNR weights if enabled
+            if self.config.training.snr_gamma is not None:
+                snr_weights = self.compute_snr_weight(timesteps)
+                if snr_weights is not None:
+                    loss = loss * snr_weights.to(loss.device)
+            
+            # Apply sample weights if provided
+            if weights is not None:
+                if weights.shape != loss.shape:
+                    raise ValueError(f"Weight shape {weights.shape} doesn't match loss shape {loss.shape}")
+                loss = loss * weights
+            
+            return loss.mean()
+
+        except Exception as e:
+            logger.error(f"Error in compute_loss: {str(e)}")
+            logger.error(f"Stack trace: {traceback.format_exc()}")
+            raise
+
+
 
     def training_step(
         self,
@@ -852,170 +655,161 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             
         return total_loss / num_batches
 
-    def _log_detailed_metrics(self, batch_idx, num_batches, batch_loss, avg_loss, batch_time):
-        """Log detailed training metrics."""
-        try:
-            # Calculate progress percentage
-            progress = (batch_idx + 1) / num_batches * 100
-            
-            # Get memory stats
-            if torch.cuda.is_available():
-                memory_allocated = torch.cuda.memory_allocated() / 1024**2  # MB
-                memory_reserved = torch.cuda.memory_reserved() / 1024**2    # MB
-            else:
-                memory_allocated = 0
-                memory_reserved = 0
-                
-            # Log metrics
-            logger.info(
-                f"Progress: {progress:.1f}% | "
-                f"Batch: {batch_idx}/{num_batches} | "
-                f"Loss: {batch_loss:.4f} | "
-                f"Avg Loss: {avg_loss:.4f} | "
-                f"LR: {self.optimizer.param_groups[0]['lr']:.2e} | "
-                f"Batch Time: {batch_time:.2f}s | "
-                f"Memory Used: {memory_allocated:.0f}MB / {memory_reserved:.0f}MB"
-            )
-            
-            # Log to wandb if enabled
-            if self.config.training.use_wandb and self.accelerator.is_main_process:
-                wandb.log({
-                    "train/batch_loss": batch_loss,
-                    "train/avg_loss": avg_loss,
-                    "train/learning_rate": self.optimizer.param_groups[0]["lr"],
-                    "train/batch_time": batch_time,
-                    "train/memory_used": memory_allocated,
-                    "train/memory_reserved": memory_reserved,
-                    "train/progress": progress
-                }, step=self.global_step)
-                
-        except Exception as e:
-            logger.warning(f"Error logging metrics: {str(e)}")
 
-    def _save_checkpoint(self, batch_idx, loss):
-        """Save training checkpoint with error handling."""
-        try:
-            checkpoint_path = os.path.join(
-                self.config.paths.checkpoints_dir,
-                f"checkpoint_{self.global_step:06d}.pt"
-            )
-            self.save_checkpoint(checkpoint_path)
-            logger.info(f"Saved checkpoint at step {self.global_step} (batch {batch_idx}, loss: {loss:.4f})")
-        except Exception as e:
-            logger.error(f"Error saving checkpoint: {str(e)}")
 
     @staticmethod
     def collate_fn(batch: List[Tuple]) -> Dict[str, Union[torch.Tensor, Dict[str, torch.Tensor], List[Tuple[int, int]]]]:
-        """Efficiently collate batch data with optimal padding and dimension handling.
-        
-        Args:
-            batch: List of (image, text_embeds, tag_weight) tuples
-            
-        Returns:
-            Dictionary containing batched and processed data
-        """
-        # Unpack batch efficiently
-        images, text_embeds_dicts, tag_weights = [], [], []
-        for img, txt, w in batch:
-            images.append(img)
-            text_embeds_dicts.append(txt)
-            tag_weights.append(w)
+        """Efficiently collate batch data with optimal padding and dimension handling."""
+        try:
+            # Validate input batch
+            if not batch:
+                raise ValueError("Empty batch received")
+            if not all(len(item) == 3 for item in batch):
+                raise ValueError("Each batch item must contain (image, text_embeds, tag_weight)")
 
-        # Pre-compute dimensions once
-        vae_scale_factor = 8
-        max_res = 1024
-        shapes = torch.tensor([[img.shape[1], img.shape[2]] for img in images])
-        max_height, max_width = shapes.max(0)[0].tolist()
-        
-        # Prepare storage with pre-allocated lists
-        target_sizes = []
-        padded_images = []
-        original_sizes = []
-        crop_top_lefts = []
-        
-        # Process each image efficiently
-        for img, (h, w) in zip(images, shapes):
-            # Convert to pixel space once
-            orig_height = h * vae_scale_factor
-            orig_width = w * vae_scale_factor
-            original_sizes.append((orig_height, orig_width))
-            
-            # Calculate target size efficiently
-            aspect_ratio = w / h
-            if aspect_ratio >= 1:
-                target_height = min(max_res, orig_height)
-                target_width = min(max_res, int(target_height * aspect_ratio))
-            else:
-                target_width = min(max_res, orig_width)
-                target_height = min(max_res, int(target_width / aspect_ratio))
-            
-            # Ensure dimensions are multiples of 8 using bit operations
-            target_height = target_height & ~7  # Equivalent to - (target_height % 8)
-            target_width = target_width & ~7
-            target_sizes.append((target_height, target_width))
-            
-            # Calculate crops efficiently
-            vae_target_h = target_height // vae_scale_factor
-            vae_target_w = target_width // vae_scale_factor
-            crop_top = ((h - vae_target_h) // 2) * vae_scale_factor
-            crop_left = ((w - vae_target_w) // 2) * vae_scale_factor
-            crop_top_lefts.append((max(0, crop_top), max(0, crop_left)))
-            
-            # Optimize padding
-            if h != max_height or w != max_width:
-                pad_h = max_height - h
-                pad_w = max_width - w
-                padding = [0, pad_w, 0, pad_h]  # Left, Right, Top, Bottom
-                padded = F.pad(img, padding, mode='constant', value=0)
-                padded_images.append(padded)
-            else:
-                padded_images.append(img)
+            # Unpack batch efficiently
+            try:
+                images, text_embeds_dicts, tag_weights = [], [], []
+                for i, (img, txt, w) in enumerate(batch):
+                    if not isinstance(img, torch.Tensor):
+                        raise TypeError(f"Image at index {i} is not a tensor")
+                    if not isinstance(txt, dict):
+                        raise TypeError(f"Text embeddings at index {i} is not a dictionary")
+                    if not isinstance(w, torch.Tensor):
+                        raise TypeError(f"Tag weight at index {i} is not a tensor")
+                    
+                    images.append(img)
+                    text_embeds_dicts.append(txt)
+                    tag_weights.append(w)
+            except Exception as e:
+                logger.error(f"Error unpacking batch: {str(e)}")
+                raise
 
-        # Stack tensors efficiently
-        stacked_images = torch.stack(padded_images, dim=0)
-        tag_weights = torch.stack(tag_weights, dim=0)
-        
-        # Process embeddings with dimension checks
-        def process_embeddings(embeds_list: List[torch.Tensor]) -> torch.Tensor:
-            stacked = torch.stack(embeds_list, dim=0)
-            if stacked.dim() == 4:
-                stacked = stacked.squeeze(1)
-            elif stacked.dim() == 3 and stacked.size(1) == 1:
-                stacked = stacked.squeeze(1)
-            return stacked
-        
-        # Get embeddings efficiently
-        base_embeds = process_embeddings([d["base_text_embeds"] for d in text_embeds_dicts])
-        large_embeds = process_embeddings([d["large_text_embeds"] for d in text_embeds_dicts])
-        large_pooled = process_embeddings([d["large_pooled_embeds"] for d in text_embeds_dicts])
-        
-        # Create embeddings dict without redundant storage
-        text_embeds_dict = {
-            "text_embeds": large_embeds,  # Main text embeddings
-            "pooled_text_embeds": large_pooled,  # Main pooled embeddings
-            "text_embeds_large": large_embeds,  # Reference to main
-            "pooled_text_embeds_large": large_pooled,  # Reference to main
-            "text_embeds_small": base_embeds,
-            "pooled_text_embeds_small": None,  # Not used in SDXL
-        }
-        
-        return {
-            "model_input": stacked_images,
-            "text_embeds": text_embeds_dict,
-            "tag_weights": tag_weights,
-            "original_sizes": original_sizes,
-            "crop_top_lefts": crop_top_lefts,
-            "target_sizes": target_sizes
-        }
+            # Pre-compute dimensions once
+            try:
+                vae_scale_factor = 8
+                max_res = 1024
+                shapes = torch.tensor([[img.shape[1], img.shape[2]] for img in images])
+                max_height, max_width = shapes.max(0)[0].tolist()
+            except Exception as e:
+                logger.error(f"Error computing image dimensions: {str(e)}")
+                raise
+
+            # Prepare storage with pre-allocated lists
+            target_sizes = []
+            padded_images = []
+            original_sizes = []
+            crop_top_lefts = []
+
+            # Process each image efficiently
+            try:
+                for i, (img, (h, w)) in enumerate(zip(images, shapes)):
+                    try:
+                        # Convert to pixel space once
+                        orig_height = h * vae_scale_factor
+                        orig_width = w * vae_scale_factor
+                        original_sizes.append((orig_height, orig_width))
+
+                        # Calculate target size efficiently
+                        aspect_ratio = w / h
+                        if aspect_ratio >= 1:
+                            target_height = min(max_res, orig_height)
+                            target_width = min(max_res, int(target_height * aspect_ratio))
+                        else:
+                            target_width = min(max_res, orig_width)
+                            target_height = min(max_res, int(target_width / aspect_ratio))
+
+                        # Ensure dimensions are multiples of 8 using bit operations
+                        target_height = target_height & ~7
+                        target_width = target_width & ~7
+                        target_sizes.append((target_height, target_width))
+
+                        # Calculate crops efficiently
+                        vae_target_h = target_height // vae_scale_factor
+                        vae_target_w = target_width // vae_scale_factor
+                        crop_top = ((h - vae_target_h) // 2) * vae_scale_factor
+                        crop_left = ((w - vae_target_w) // 2) * vae_scale_factor
+                        crop_top_lefts.append((max(0, crop_top), max(0, crop_left)))
+
+                        # Optimize padding
+                        if h != max_height or w != max_width:
+                            pad_h = max_height - h
+                            pad_w = max_width - w
+                            padding = [0, pad_w, 0, pad_h]  # Left, Right, Top, Bottom
+                            padded = F.pad(img, padding, mode='constant', value=0)
+                            padded_images.append(padded)
+                        else:
+                            padded_images.append(img)
+                    except Exception as e:
+                        logger.error(f"Error processing image {i}: {str(e)}")
+                        raise
+            except Exception as e:
+                logger.error("Error in image processing loop")
+                raise
+
+            # Stack tensors efficiently
+            try:
+                stacked_images = torch.stack(padded_images, dim=0)
+                tag_weights = torch.stack(tag_weights, dim=0)
+            except Exception as e:
+                logger.error(f"Error stacking tensors: {str(e)}")
+                raise
+
+            # Process embeddings
+            try:
+                def process_embeddings(embeds_list: List[torch.Tensor], name: str) -> torch.Tensor:
+                    try:
+                        stacked = torch.stack(embeds_list, dim=0)
+                        if stacked.dim() == 4:
+                            stacked = stacked.squeeze(1)
+                        elif stacked.dim() == 3 and stacked.size(1) == 1:
+                            stacked = stacked.squeeze(1)
+                        return stacked
+                    except Exception as e:
+                        logger.error(f"Error processing {name} embeddings: {str(e)}")
+                        raise
+
+                # Get embeddings efficiently
+                base_embeds = process_embeddings([d["base_text_embeds"] for d in text_embeds_dicts], "base")
+                large_embeds = process_embeddings([d["large_text_embeds"] for d in text_embeds_dicts], "large")
+                large_pooled = process_embeddings([d["large_pooled_embeds"] for d in text_embeds_dicts], "pooled")
+
+            except KeyError as e:
+                logger.error(f"Missing key in text embeddings dictionary: {str(e)}")
+                raise
+            except Exception as e:
+                logger.error(f"Error processing embeddings: {str(e)}")
+                raise
+
+            # Create embeddings dict without redundant storage
+            text_embeds_dict = {
+                "text_embeds": large_embeds,
+                "pooled_text_embeds": large_pooled,
+                "text_embeds_large": large_embeds,
+                "pooled_text_embeds_large": large_pooled,
+                "text_embeds_small": base_embeds,
+                "pooled_text_embeds_small": None,
+            }
+
+            return {
+                "model_input": stacked_images,
+                "text_embeds": text_embeds_dict,
+                "tag_weights": tag_weights,
+                "original_sizes": original_sizes,
+                "crop_top_lefts": crop_top_lefts,
+                "target_sizes": target_sizes
+            }
+
+        except Exception as e:
+            logger.error(f"Fatal error in collate_fn: {str(e)}")
+            logger.error(f"Stack trace: {traceback.format_exc()}")
+            raise
     
     @staticmethod
     def create_dataloader(
         dataset: NovelAIDataset,
         batch_size: int,
-        num_workers: Union[int, ThreadConfig],
         pin_memory: bool = True,
-        persistent_workers: bool = True,
-        prefetch_factor: int = 2
     ) -> DataLoader:
         """Create optimized dataloader."""
         # Create sampler for distributed training
@@ -1033,304 +827,107 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             collate_fn=NovelAIDiffusionV3Trainer.collate_fn
         )
 
-    def save_checkpoint(self, path: str):
-        """Save checkpoint efficiently.
-        
-        Args:
-            path: Path to save checkpoint to
-        """
-        if not dist.is_initialized() or dist.get_rank() == 0:  # Only save on main process
-            # Create directory if it doesn't exist
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            
-            checkpoint = {
-                'model': self.model.state_dict(),
-                'optimizer': self.optimizer.state_dict(),
-                'scheduler': self.scheduler.state_dict(),
-                'config': self.config,
-                'step': self.global_step,
-                'epoch': self.current_epoch,
-            }
-            
-            # Save in half precision for smaller file size
-            for k, v in checkpoint['model'].items():
-                if v.dtype in [torch.float32, torch.float64]:
-                    checkpoint['model'][k] = v.half()
-                    
-            # Save atomically
-            tmp_path = path + ".tmp"
-            torch.save(checkpoint, tmp_path)
-            os.replace(tmp_path, path)  # Atomic operation
-
     
+    def _save_checkpoint(self, batch_idx, loss):
+        """Internal method to save checkpoint during training."""
+        try:
+            checkpoint_path = os.path.join(
+                self.config.paths.checkpoints_dir,
+                f"checkpoint_{self.global_step:06d}.pt"
+            )
+            save_checkpoint(
+                path=checkpoint_path,
+                model=self.model,
+                optimizer=self.optimizer,
+                scheduler=self.lr_scheduler,
+                config=self.config,
+                global_step=self.global_step,
+                current_epoch=self.current_epoch
+            )
+            logger.info(f"Saved checkpoint at step {self.global_step} (batch {batch_idx}, loss: {loss:.4f})")
+        except Exception as e:
+            logger.error(f"Error saving checkpoint: {str(e)}")
+
+    def save_checkpoint(self, save_dir: str, epoch: int):
+        """Public method to save checkpoint at epoch end."""
+        try:
+            checkpoint_path = os.path.join(
+                save_dir,
+                f"checkpoint_epoch_{epoch:04d}.pt"
+            )
+            save_checkpoint(
+                path=checkpoint_path,
+                model=self.model,
+                optimizer=self.optimizer,
+                scheduler=self.lr_scheduler,
+                config=self.config,
+                global_step=self.global_step,
+                current_epoch=epoch
+            )
+            logger.info(f"Saved checkpoint for epoch {epoch}")
+        except Exception as e:
+            logger.error(f"Error saving checkpoint: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
 
     def prepare_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Prepare hidden states for SDXL UNet processing.
-        
-        Args:
-            hidden_states: Text embeddings tensor of shape (batch_size, seq_len, hidden_size)
-                or (batch_size, 1, seq_len, hidden_size)
+        """Prepare hidden states with error handling."""
+        try:
+            # Validate input dimensions
+            if hidden_states.dim() not in [3, 4]:
+                raise ValueError(f"Expected hidden states to have 3 or 4 dimensions, got {hidden_states.dim()}")
             
-        Returns:
-            torch.Tensor: Processed hidden states ready for UNet
-        
-        Raises:
-            ValueError: If input tensor has incorrect number of dimensions
-        """
-        # Validate input dimensions
-        if hidden_states.dim() not in [3, 4]:
-            raise ValueError(f"Expected hidden states to have 3 or 4 dimensions, got {hidden_states.dim()}")
-        
-        # Get shape information
-        if hidden_states.dim() == 4:
-            batch_size, _, seq_len, hidden_size = hidden_states.shape
-            hidden_states = hidden_states.reshape(batch_size, seq_len, hidden_size)
-        else:
-            batch_size, seq_len, hidden_size = hidden_states.shape
-        
-        # Project to cross attention dim if needed
-        if hasattr(self, 'hidden_proj'):
-            # Validate projection matrix shape
-            expected_shape = (self.model.config.cross_attention_dim, hidden_size)
-            actual_shape = self.hidden_proj.weight.shape
-            if actual_shape != expected_shape:
-                raise ValueError(f"Projection matrix must have shape {expected_shape}, got {actual_shape}")
+            # Get shape information
+            if hidden_states.dim() == 4:
+                batch_size, _, seq_len, hidden_size = hidden_states.shape
+                hidden_states = hidden_states.reshape(batch_size, seq_len, hidden_size)
+            else:
+                batch_size, seq_len, hidden_size = hidden_states.shape
             
-            # Project efficiently
-            hidden_states = hidden_states.reshape(-1, hidden_size)  # Flatten to (batch_size * seq_len, hidden_size)
-            hidden_states = self.hidden_proj(hidden_states)  # Project to cross attention dim
-            hidden_states = hidden_states.view(batch_size, seq_len, -1)  # Restore batch dimension
-        else:
-            # Initialize projection layer if it doesn't exist
-            self.hidden_proj = nn.Linear(
-                hidden_size,
-                self.model.config.cross_attention_dim,
-                bias=False
-            ).to(device=self.device, dtype=self.model_dtype)
-            
-            # Initialize weights
-            with torch.no_grad():
-                # Initialize to identity matrix for the overlapping dimensions
-                min_dim = min(hidden_size, self.model.config.cross_attention_dim)
-                self.hidden_proj.weight[:min_dim, :min_dim].copy_(torch.eye(min_dim))
+            # Project to cross attention dim if needed
+            if hasattr(self, 'hidden_proj'):
+                # Validate projection matrix shape
+                expected_shape = (self.model.config.cross_attention_dim, hidden_size)
+                actual_shape = self.hidden_proj.weight.shape
+                if actual_shape != expected_shape:
+                    raise ValueError(f"Projection matrix must have shape {expected_shape}, got {actual_shape}")
                 
-                # Zero-initialize the rest
-                if self.hidden_proj.weight.shape[0] > min_dim:
-                    nn.init.zeros_(self.hidden_proj.weight[min_dim:, :])
-                if self.hidden_proj.weight.shape[1] > min_dim:
-                    nn.init.zeros_(self.hidden_proj.weight[:, min_dim:])
+                # Project efficiently
+                hidden_states = hidden_states.reshape(-1, hidden_size)  # Flatten
+                hidden_states = self.hidden_proj(hidden_states)  # Project
+                hidden_states = hidden_states.view(batch_size, seq_len, -1)  # Restore
+            else:
+                # Initialize projection layer if needed
+                self._initialize_hidden_proj(hidden_size)
+                hidden_states = self._project_hidden_states(hidden_states, batch_size, seq_len)
             
-            # Project the hidden states
-            hidden_states = hidden_states.reshape(-1, hidden_size)  # Flatten to (batch_size * seq_len, hidden_size)
-            hidden_states = self.hidden_proj(hidden_states)  # Project to cross attention dim
-            hidden_states = hidden_states.view(batch_size, seq_len, -1)  # Restore batch dimension
-            
-            # Freeze the projection layer
-            for param in self.hidden_proj.parameters():
-                param.requires_grad = False
-        
-        return hidden_states
+            return hidden_states
+
+        except Exception as e:
+            logger.error(f"Error in prepare_hidden_states: {str(e)}")
+            logger.error(f"Input tensor shape: {hidden_states.shape}")
+            logger.error(f"Stack trace: {traceback.format_exc()}")
+            raise
     
     def compute_grad_norm(self) -> float:
-        """Compute gradient norm using pre-allocated buffer.
-        
-        Returns:
-            float: The gradient norm
-        """
-        # Reset buffer
-        self.grad_norm_buffer.zero_()
-        
-        # Compute norms for each parameter's gradient
-        for i, p in enumerate(self.model.parameters()):
-            if p.grad is not None:
-                self.grad_norm_buffer[i] = p.grad.data.norm(2).item()
-        
-        # Compute total norm
-        return torch.sqrt(torch.sum(self.grad_norm_buffer * self.grad_norm_buffer)).item()
-
-    def _precompute_snr_weights(self, alphas: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
-        """Pre-compute SNR weights for all possible timesteps.
-        
-        Args:
-            alphas: Alpha values from noise scheduler
-            timesteps: Timestep indices
-            
-        Returns:
-            torch.Tensor: SNR weights clamped by min_snr_gamma
-        """
-        # Get parameters from config
-        min_snr_gamma = self.config.model.min_snr_gamma
-        sigma_data = self.config.model.sigma_data
-        
-        # Get alpha values for timesteps
-        alpha_t = alphas[timesteps]
-        
-        # Compute signal and noise variances
-        sigma_signal = sigma_data * alpha_t.sqrt()
-        sigma_noise = sigma_data * (1 - alpha_t).sqrt()
-        
-        # Compute SNR = (sigma_signal/sigma_noise)^2
-        snr = (sigma_signal / sigma_noise).square()
-        
-        # Clamp SNR values using min_snr_gamma
-        min_snr = torch.tensor(min_snr_gamma, device=self.device)
-        return torch.minimum(snr, min_snr).float()
+        return compute_grad_norm(self.model, self.grad_norm_buffer)
 
     def _generate_noise(self, shape: Tuple[int, ...]) -> torch.Tensor:
-        """Generate noise using pre-allocated template.
-        
-        Args:
-            shape: Shape of noise tensor to generate
-            
-        Returns:
-            torch.Tensor: Generated noise tensor
-        """
-        return torch.randn(
-            shape,
-            device=self.device,
-            dtype=self.model_dtype,
-            generator=None,
-            layout=self.noise_template.layout
-        )
+        return generate_noise(shape, self.device, self.model_dtype, self.noise_template)
     
-    def get_karras_scalings(self, timestep_indices: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Get Karras noise schedule scalings for given timesteps.
-        
-        Args:
-            timestep_indices: Timestep indices
-            
-        Returns:
-            Tuple containing:
-            - c_skip: Skip connection scaling
-            - c_out: Output scaling
-            - c_in: Input scaling
-        """
-        # Get sigmas for timesteps
-        sigmas = self.scheduler.sigmas[timestep_indices]
-        
-        # Compute scaling factors
-        c_skip = 1 / (sigmas**2 + 1).sqrt()
-        c_out = -sigmas / (sigmas**2 + 1).sqrt()
-        c_in = 1 / (sigmas**2 + 1).sqrt()
-        
-        return c_skip, c_out, c_in
-
-    @torch.no_grad()
-    def get_velocity(self, latents: torch.Tensor, noise: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
-        """Compute the v_prediction target.
-        
-        Args:
-            latents: Input latent tensor
-            noise: Noise tensor
-            timesteps: Timestep indices
-            
-        Returns:
-            torch.Tensor: Velocity prediction
-        """
-        return self.scheduler.get_velocity(latents, noise, timesteps)
-
-    def get_sigmas(self) -> torch.Tensor:
-        """Generate noise schedule for ZTSNR with optimized scaling.
-        
-        Uses a modified ramp function to ensure:
-        1. First step has σ = σ_min (0.002)
-        2. Last step has σ = σ_max (20000) as practical infinity
-        3. Intermediate steps follow power-law scaling with ρ=7
-        
-        Returns:
-            torch.Tensor: Noise schedule sigmas of shape [num_timesteps]
-        """
-        # Get parameters from config
-        num_timesteps = self.config.model.num_timesteps
-        sigma_min = self.config.model.sigma_min
-        sigma_max = self.config.model.sigma_max
-        rho = self.config.model.rho
-        
-        # Generate ramp on device directly
-        ramp = torch.linspace(0, 1, num_timesteps, device=self.device)
-        
-        # Compute inverse rho values
-        min_inv_rho = sigma_min ** (1/rho)
-        max_inv_rho = sigma_max ** (1/rho)
-        
-        # Generate full schedule with vectorized operations
-        sigmas = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** rho
-        
-        # Ensure exact values at endpoints
-        sigmas[0] = sigma_min  # First step
-        sigmas[-1] = sigma_max  # ZTSNR step
-        
-        return sigmas
-
-    def get_snr(self, timesteps: torch.Tensor) -> torch.Tensor:
-        """Compute Signal-to-Noise Ratio for given timesteps.
-        
-        Args:
-            timesteps: Timestep indices
-            
-        Returns:
-            torch.Tensor: SNR values
-        """
-        # Get sigma_data from config
-        sigma_data = self.config.model.sigma_data
-        
-        # Get alphas for timesteps
-        alphas = self.scheduler.alphas_cumprod[timesteps]
-        
-        # Compute signal and noise variances
-        sigma_signal = sigma_data * alphas.sqrt()
-        sigma_noise = sigma_data * (1 - alphas).sqrt()
-        
-        # Compute SNR = (sigma_signal/sigma_noise)^2
-        snr = (sigma_signal / sigma_noise).square()
-        
-        return snr
-
-    def get_minsnr_weights(self, timesteps: torch.Tensor) -> torch.Tensor:
-        """Get pre-computed SNR weights for given timesteps."""
-        return self.snr_weights[timesteps]
-
-    def configure_noise_scheduler(self):
-        """Configure noise scheduler with Karras schedule and pre-compute training parameters."""
-        # Initialize scheduler first with config values
-        self.scheduler = DDPMScheduler(
-            num_train_timesteps=self.config.model.num_timesteps,
-            beta_schedule="squaredcos_cap_v2",
-            prediction_type=self.config.training.prediction_type,
-            clip_sample=False,
-            thresholding=False
+    def _get_add_time_ids(self, original_sizes, crops_coords_top_lefts, target_sizes, batch_size) -> torch.Tensor:
+        return get_add_time_ids(
+            original_sizes, crops_coords_top_lefts, target_sizes, batch_size,
+            self.model_dtype, self.device
         )
-        
-        # Generate Karras noise schedule with ZTSNR
-        sigmas = self.get_sigmas()  # Implements σ_max ≈ ∞ for ZTSNR
-        
-        # Pre-compute all noise schedule parameters
-        self.alphas = 1 / (sigmas**2 + 1)
-        self.betas = 1 - self.alphas
-        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
-        
-        # Update scheduler with our pre-computed values
-        self.scheduler.alphas = self.alphas 
-        self.scheduler.betas = self.betas
-        self.scheduler.alphas_cumprod = self.alphas_cumprod
-        self.scheduler.sigmas = sigmas
-        self.scheduler.init_noise_sigma = sigmas.max()
-        
-        # Pre-compute SNR values and weights for MinSNR
-        self.snr_values = 1 / (sigmas ** 2)
-        if self.config.training.snr_gamma is not None:
-            self.snr_weights = torch.minimum(
-                self.snr_values,
-                torch.tensor(self.config.training.snr_gamma, device=self.device)
-            ).float()
-        
-        # Pre-compute scaling factors based on prediction type
-        if self.config.training.prediction_type == "v_prediction":
-            self.c_skip = 1 / (sigmas**2 + 1).sqrt()
-            self.c_out = -sigmas / (sigmas**2 + 1).sqrt()
-            self.c_in = 1 / (sigmas**2 + 1).sqrt()
-        else:  # epsilon prediction
-            self.c_skip = self.alphas_cumprod.sqrt()
-            self.c_out = (1 - self.alphas_cumprod).sqrt()
-            self.c_in = torch.ones_like(sigmas)
+
+    def log_metrics(self, metrics: Dict[str, Any], step_type: str = "step"):
+        log_metrics(
+            metrics, self.global_step, self.accelerator.is_main_process,
+            self.config.training.use_wandb, step_type
+        )
+
+    def get_karras_scalings(self, timestep_indices: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Get Karras noise schedule scalings for given timesteps."""
+        return get_karras_scalings(self.sigmas, timestep_indices)
 

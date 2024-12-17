@@ -289,19 +289,46 @@ class VAETrainer:
             )
         })
 
-    def save_checkpoint(self, path: str):
-        """Save checkpoint efficiently"""
-        # Save in fp16 for smaller file size
-        state_dict = self.vae.state_dict()
-        for k, v in state_dict.items():
-            state_dict[k] = v.half()
+    def save_checkpoint(self, save_dir: str, epoch: int):
+        """Save checkpoint at epoch end."""
+        try:
+            # Save VAE model
+            checkpoint_path = os.path.join(
+                save_dir,
+                f"checkpoint_epoch_{epoch:04d}.pt"
+            )
             
-        torch.save({
-            'model': state_dict,
-            'optimizer': self.optimizer.state_dict(),
-            'scaler': self.scaler.state_dict(),
-            'step': self.global_step
-        }, path)
+            checkpoint = {
+                'model': self.vae.state_dict(),
+                'optimizer': self.optimizer.state_dict(),
+                'scheduler': self.lr_scheduler.state_dict() if self.lr_scheduler else None,
+                'scaler': self.scaler.state_dict(),
+                'config': self.config,
+                'step': self.global_step,
+                'epoch': epoch
+            }
+            
+            # Save discriminator state if present
+            if self.discriminator:
+                checkpoint['discriminator'] = self.discriminator.state_dict()
+                checkpoint['disc_optimizer'] = self.disc_optimizer.state_dict()
+                
+            # Save in half precision for smaller file size
+            for k, v in checkpoint['model'].items():
+                if v.dtype in [torch.float32, torch.float64]:
+                    checkpoint['model'][k] = v.half()
+                    
+            # Save atomically
+            tmp_path = checkpoint_path + ".tmp"
+            torch.save(checkpoint, tmp_path)
+            os.replace(tmp_path, checkpoint_path)
+            
+            logger.info(f"Saved VAE checkpoint for epoch {epoch}")
+            
+        except Exception as e:
+            logger.error(f"Error saving VAE checkpoint: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
 
     def load_checkpoint(self, checkpoint_dir: str):
         """Load VAE checkpoint"""
