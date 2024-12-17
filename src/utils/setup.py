@@ -307,6 +307,15 @@ def setup_distributed():
         if not dist.is_available():
             logger.warning("torch.distributed not available, distributed training disabled")
             return False
+
+        # Check for required environment variables
+        required_env_vars = ["RANK", "WORLD_SIZE", "LOCAL_RANK", "MASTER_ADDR", "MASTER_PORT"]
+        missing_vars = [var for var in required_env_vars if not os.environ.get(var)]
+        
+        if missing_vars:
+            logger.warning(f"Distributed training environment variables missing: {missing_vars}")
+            logger.warning("Distributed training disabled")
+            return False
             
         if not dist.is_initialized():
             logger.info("Initializing distributed training...")
@@ -323,7 +332,8 @@ def setup_distributed():
             
     except Exception as e:
         logger.error(f"Failed to setup distributed training: {str(e)}")
-        raise
+        logger.warning("Falling back to single GPU training")
+        return False
 
 def cleanup_distributed():
     """Cleanup distributed training resources."""

@@ -34,9 +34,15 @@ def train(config_path: str):
         
         # Setup distributed training if enabled
         if config.system.distributed_training:
-            setup_distributed()
-            device = torch.device(f"cuda:{dist.get_rank()}")
-            is_main_process = dist.get_rank() == 0
+            is_distributed = setup_distributed()
+            if is_distributed:
+                device = torch.device(f"cuda:{dist.get_rank()}")
+                is_main_process = dist.get_rank() == 0
+            else:
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                is_main_process = True
+                # Update config to reflect non-distributed mode
+                config.system.distributed_training = False
         else:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             is_main_process = True
