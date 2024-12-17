@@ -7,6 +7,7 @@ import warnings
 import logging
 import torch.amp
 import asyncio
+from weakref import WeakValueDictionary
 from src.data.processors.utils.batch_utils import (
     process_in_chunks,
     calculate_optimal_batch_size,

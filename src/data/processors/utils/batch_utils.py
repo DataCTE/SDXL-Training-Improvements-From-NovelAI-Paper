@@ -12,7 +12,7 @@ from .progress_utils import (
 )
 from src.config.config import BatchConfig
 import gc
-from collections import WeakValueDictionary
+from weakref import WeakValueDictionary
 
 logger = logging.getLogger(__name__)
 
