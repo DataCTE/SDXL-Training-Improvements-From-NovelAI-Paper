@@ -869,27 +869,6 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         }
     
     @staticmethod
-    def _worker_init_fn(worker_id: int) -> None:
-        """Initialize worker with optimized settings."""
-        # Set worker seed for reproducibility
-        worker_seed = torch.initial_seed() % 2**32
-        np.random.seed(worker_seed)
-        random.seed(worker_seed)
-        
-        # Set thread settings for worker
-        torch.set_num_threads(1)
-        
-        if torch.cuda.is_available():
-            # Clear CUDA cache
-            torch.cuda.empty_cache()
-            
-            # Set device to GPU 0
-            try:
-                torch.cuda.set_device(0)  # Always use first GPU
-            except Exception as e:
-                logger.warning(f"Could not set GPU device for worker {worker_id}: {e}")
-                
-    @staticmethod
     def create_dataloader(
         dataset: NovelAIDataset,
         batch_size: int,
@@ -899,10 +878,6 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         prefetch_factor: int = 2
     ) -> DataLoader:
         """Create optimized dataloader."""
-        # Convert ThreadConfig to int if needed
-        if hasattr(num_workers, 'num_threads'):
-            num_workers = num_workers.num_threads
-
         # Create sampler for distributed training
         sampler = dataset.get_sampler(
             batch_size=batch_size,
@@ -910,25 +885,12 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             drop_last=True
         )
 
-        # Use 'fork' on Linux for better compatibility
-        mp_context = None
-        if sys.platform == 'linux':
-            try:
-                import multiprocessing as mp
-                mp_context = mp.get_context('fork')
-            except:
-                pass
-
         return DataLoader(
             dataset,
             batch_sampler=sampler,
-            num_workers=num_workers,
+            num_workers=0,  # Force single process
             pin_memory=pin_memory,
-            persistent_workers=persistent_workers and num_workers > 0,
-            prefetch_factor=prefetch_factor if num_workers > 0 else None,
-            worker_init_fn=NovelAIDiffusionV3Trainer._worker_init_fn,
-            collate_fn=NovelAIDiffusionV3Trainer.collate_fn,
-            multiprocessing_context=mp_context
+            collate_fn=NovelAIDiffusionV3Trainer.collate_fn
         )
 
     def save_checkpoint(self, path: str):
