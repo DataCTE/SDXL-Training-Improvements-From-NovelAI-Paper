@@ -32,20 +32,9 @@ def train(config_path: str):
         # Load config
         config = Config.from_yaml(args.config)
         
-        # Setup distributed training if enabled
-        if config.system.distributed_training:
-            is_distributed = setup_distributed()
-            if is_distributed:
-                device = torch.device(f"cuda:{dist.get_rank()}")
-                is_main_process = dist.get_rank() == 0
-            else:
-                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                is_main_process = True
-                # Update config to reflect non-distributed mode
-                config.system.distributed_training = False
-        else:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            is_main_process = True
+        # Set device
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        is_main_process = True  # Always True for single GPU
 
         # Configure logging
         setup_logging(config.paths.logs_dir, is_main_process)
@@ -54,7 +43,7 @@ def train(config_path: str):
         if is_main_process:
             log_system_info()
         
-        # Initialize wandb if enabled and configured
+        # Initialize wandb if enabled
         if hasattr(config.training, 'use_wandb') and config.training.use_wandb and is_main_process:
             if not hasattr(config.training, 'wandb_project'):
                 logger.warning("Wandb enabled but project name not configured. Disabling wandb.")
@@ -71,7 +60,7 @@ def train(config_path: str):
             logger.info(f"Found {total_images} valid images across {len(valid_dirs)} directories")
         config.data.image_dirs = valid_dirs
         
-        # Setup models with verification using args
+        # Setup models
         logger.info("Setting up models...")
         unet, vae = setup_model(args, device, config)
         
@@ -85,24 +74,6 @@ def train(config_path: str):
         
         if not all(optimization_states.values()):
             logger.warning("Some memory optimizations failed to apply")
-        
-        # Convert models to DDP if using distributed training
-        if config.system.distributed_training:
-            unet = torch.nn.SyncBatchNorm.convert_sync_batchnorm(unet)
-            vae = torch.nn.SyncBatchNorm.convert_sync_batchnorm(vae)
-            
-            unet = DistributedDataParallel(
-                unet,
-                device_ids=[dist.get_rank()],
-                output_device=dist.get_rank(),
-                find_unused_parameters=False
-            )
-            vae = DistributedDataParallel(
-                vae,
-                device_ids=[dist.get_rank()],
-                output_device=dist.get_rank(),
-                find_unused_parameters=False
-            )
         
         # Create trainer
         trainer = NovelAIDiffusionV3Trainer(
@@ -159,8 +130,9 @@ def train(config_path: str):
         dataloader = DataLoader(
             dataset,
             batch_sampler=sampler,
-            num_workers=config.system.num_workers,
-            pin_memory=True,
+            num_workers=config.data.num_workers,
+            pin_memory=config.data.pin_memory,
+            persistent_workers=config.data.persistent_workers,
             collate_fn=trainer.collate_fn
         )
         
@@ -170,12 +142,9 @@ def train(config_path: str):
         # Train
         logger.info("Starting training...")
         for epoch in range(config.training.num_epochs):
-            if config.system.distributed_training:
-                sampler.set_epoch(epoch)
-            
             trainer.train_epoch(epoch)
             
-            # Save checkpoint on main process
+            # Save checkpoint
             if is_main_process:
                 trainer.save_checkpoint(config.paths.checkpoints_dir, epoch)
         

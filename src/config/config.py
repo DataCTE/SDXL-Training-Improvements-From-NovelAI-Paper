@@ -113,23 +113,20 @@ class SystemConfig:
     gradient_checkpointing: bool = True
     cudnn_benchmark: bool = True
     disable_debug_apis: bool = True
-    compile_model: bool = True
-    num_gpu_workers: Optional[int] = None
+    compile_model: bool = False  # Disable model compilation by default
     
-    # Distributed training settings
-    distributed_training: bool = True
-    backend: str = "nccl"
-    use_fsdp: bool = True
-    cpu_offload: bool = False
-    full_shard: bool = True
+    # Memory settings
+    memory_efficient_attention: bool = True
+    allow_tf32: bool = True
+    allow_fp16: bool = True
+    memory_fraction: float = 0.95  # Maximum GPU memory fraction to use
+    
+    # Basic optimization settings
     mixed_precision: str = "bf16"
     gradient_accumulation_steps: int = 4
-    find_unused_parameters: bool = False
-    sync_batch_norm: bool = True
-    min_num_params_per_shard: int = 1_000_000
-    forward_prefetch: bool = True
-    backward_prefetch: bool = True
-    limit_all_gathers: bool = True
+    
+    # Remove distributed training settings for now
+    distributed_training: bool = False
 
 @dataclass
 class PathsConfig:
