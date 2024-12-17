@@ -308,8 +308,8 @@ class NovelAIDataset(Dataset):
                 )
             )
             
-            # Update items list
-            self.items = processed_items
+            # Update items list - use processed_items directly
+            self.items = processed_items  # Changed from final_stats['processed_items']
             
             # Log final statistics
             logger.info(

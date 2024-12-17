@@ -220,7 +220,8 @@ async def process_in_chunks(
         'cache_hits': 0,
         'cache_misses': 0,
         'error_types': {},
-        'elapsed_seconds': 0
+        'elapsed_seconds': 0,
+        'processed_items': []
     }
     
     start_time = time.time()
@@ -230,8 +231,9 @@ async def process_in_chunks(
             # Process chunk and await result
             chunk_results, chunk_stats = await process_fn(chunk, chunk_id)
             
-            # Extend results
+            # Store results
             all_results.extend(chunk_results)
+            final_stats['processed_items'].extend(chunk_results)
             
             # Update stats
             for key in ['total', 'errors', 'skipped', 'cache_hits', 'cache_misses']:
