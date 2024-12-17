@@ -349,33 +349,6 @@ class TextEmbedder:
                 "pooled_prompt_embeds": pooled_prompt_embeds.cpu()
             }
 
-    async def process_text(self, text: str, tags: List[str]) -> Optional[Dict[str, Any]]:
-        """Process text and tags asynchronously."""
-        try:
-            # Use asyncio.get_event_loop().run_in_executor for CPU-bound operations
-            loop = asyncio.get_event_loop()
-            embeddings = await loop.run_in_executor(
-                None,
-                self.encode_prompt_list,
-                [text],
-                0.0  # proportion_empty_prompts
-            )
-            
-            if embeddings is None:
-                logger.error("Failed to generate embeddings")
-                return None
-                
-            # Return combined data
-            return {
-                'embeds': embeddings['prompt_embeds'][0],
-                'pooled_embeds': embeddings['pooled_prompt_embeds'][0],
-                'tags': tags
-            }
-            
-        except Exception as e:
-            logger.error(f"Error processing text: {str(e)[:200]}...")
-            return None
-
     @torch.no_grad()
     async def process_batch(
         self,
@@ -393,13 +366,10 @@ class TextEmbedder:
         for i in range(0, len(texts), batch_size):
             batch = texts[i:i + batch_size]
             try:
-                # Use asyncio.get_event_loop().run_in_executor for CPU-bound operations
-                loop = asyncio.get_event_loop()
-                embeddings = await loop.run_in_executor(
-                    None,
-                    self.encode_prompt_list,
+                # Use sync version directly since we're already in an async context
+                embeddings = self.encode_prompt_list_sync(
                     batch,
-                    0.0  # proportion_empty_prompts
+                    proportion_empty_prompts=0.0
                 )
                 
                 if embeddings is not None:
@@ -420,31 +390,24 @@ class TextEmbedder:
                 
         return results
 
-    async def cleanup(self):
-        """Clean up resources."""
-        try:
-            # Clear CUDA cache if using GPU
-            if self.device.type == 'cuda':
-                torch.cuda.empty_cache()
-                
-            logger.info("Successfully cleaned up text embedder resources")
-            
-        except Exception as e:
-            logger.error(f"Error during cleanup: {e}")
-
-    async def encode_prompt_list(self, prompts: List[str], proportion_empty_prompts: float = 0.0) -> Optional[Dict[str, torch.Tensor]]:
+    async def encode_prompt_list(
+        self, 
+        prompts: List[str], 
+        proportion_empty_prompts: float = 0.0
+    ) -> Optional[Dict[str, torch.Tensor]]:
         """Asynchronous batch processing of prompts."""
         try:
             if not prompts:
                 logger.warning("Empty prompt list provided")
                 return None
                 
-            # Process batch through embedder
-            embeddings = await self.process_batch([prompts], proportion_empty_prompts=proportion_empty_prompts)
-            if embeddings and len(embeddings) > 0:
+            # Use sync version since we're handling async context here
+            embeddings = self.encode_prompt_list_sync(prompts, proportion_empty_prompts)
+            
+            if embeddings is not None:
                 return {
-                    'prompt_embeds': embeddings[0]['prompt_embeds'],
-                    'pooled_prompt_embeds': embeddings[0]['pooled_prompt_embeds']
+                    'prompt_embeds': embeddings['prompt_embeds'],
+                    'pooled_prompt_embeds': embeddings['pooled_prompt_embeds']
                 }
             return None
             
@@ -452,13 +415,18 @@ class TextEmbedder:
             logger.error(f"Error in encode_prompt_list: {str(e)[:200]}...")
             return None
 
-    def encode_prompt_list_sync(self, prompts: List[str], proportion_empty_prompts: float = 0.0) -> Optional[Dict[str, torch.Tensor]]:
+    def encode_prompt_list_sync(
+        self, 
+        prompts: List[str], 
+        proportion_empty_prompts: float = 0.0
+    ) -> Optional[Dict[str, torch.Tensor]]:
         """Synchronous version of encode_prompt_list for non-async contexts."""
         try:
             if not prompts:
                 logger.warning("Empty prompt list provided")
                 return None
                 
+            # Call the main processing method directly
             result = self(prompts, proportion_empty_prompts)
             
             # Validate result structure
@@ -471,3 +439,43 @@ class TextEmbedder:
         except Exception as e:
             logger.error(f"Error in encode_prompt_list_sync: {str(e)[:200]}...")
             return None
+
+    async def process_text(
+        self, 
+        text: str, 
+        tags: List[str]
+    ) -> Optional[Dict[str, Any]]:
+        """Process text and tags asynchronously."""
+        try:
+            # Use sync version since we're in async context
+            embeddings = self.encode_prompt_list_sync(
+                [text],
+                proportion_empty_prompts=0.0
+            )
+            
+            if embeddings is None:
+                logger.error("Failed to generate embeddings")
+                return None
+                
+            # Return combined data
+            return {
+                'embeds': embeddings['prompt_embeds'][0],
+                'pooled_embeds': embeddings['pooled_prompt_embeds'][0],
+                'tags': tags
+            }
+            
+        except Exception as e:
+            logger.error(f"Error processing text: {str(e)[:200]}...")
+            return None
+
+    async def cleanup(self):
+        """Clean up resources."""
+        try:
+            # Clear CUDA cache if using GPU
+            if self.device.type == 'cuda':
+                torch.cuda.empty_cache()
+                
+            logger.info("Successfully cleaned up text embedder resources")
+            
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
