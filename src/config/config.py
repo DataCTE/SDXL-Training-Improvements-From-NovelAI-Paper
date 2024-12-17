@@ -125,8 +125,24 @@ class SystemConfig:
     mixed_precision: str = "bf16"
     gradient_accumulation_steps: int = 4
     
-    # Remove distributed training settings for now
+    # Single GPU mode
     distributed_training: bool = False
+    
+    def __init__(self, **kwargs):
+        """Initialize with support for legacy fields."""
+        # List of legacy fields to ignore
+        legacy_fields = {
+            'num_gpu_workers', 'backend', 'use_fsdp', 'cpu_offload', 'full_shard',
+            'sync_batch_norm', 'min_num_params_per_shard', 'forward_prefetch',
+            'backward_prefetch', 'limit_all_gathers', 'find_unused_parameters'
+        }
+        
+        # Filter out legacy fields
+        valid_kwargs = {k: v for k, v in kwargs.items() if k not in legacy_fields}
+        
+        # Set attributes
+        for key, value in valid_kwargs.items():
+            setattr(self, key, value)
 
 @dataclass
 class PathsConfig:
