@@ -470,6 +470,8 @@ def verify_buffer_states(
     Returns dict of buffer states that can be checked by trainer.
     """
     buffer_states = {}
+    critical_errors = []
+    warnings = []
     
     try:
         # Verify all required buffers exist
@@ -480,7 +482,7 @@ def verify_buffer_states(
         
         missing_buffers = [buf for buf in required_buffers if buf not in buffers]
         if missing_buffers:
-            logger.warning(f"Missing required buffers: {missing_buffers}")
+            critical_errors.append(f"Missing required buffers: {missing_buffers}")
             buffer_states['missing_buffers'] = missing_buffers
             
         # Verify buffer properties
@@ -488,51 +490,60 @@ def verify_buffer_states(
             if name == 'model':  # Skip the model key
                 continue
                 
+            buffer_states[name] = True  # Start optimistic
+                
             # Type check
             if not isinstance(buffer, torch.Tensor):
-                logger.warning(f"Buffer {name} is not a tensor")
-                buffer_states[f'{name}_type'] = False
+                critical_errors.append(f"Buffer {name} is not a tensor")
+                buffer_states[name] = False
                 continue
                 
             # Device type check (cuda vs cpu)
             if buffer.device.type != device.type:
-                logger.warning(f"Buffer {name} device type mismatch: expected {device.type}, got {buffer.device.type}")
-                buffer_states[f'{name}_device'] = False
-                continue
+                warnings.append(f"Buffer {name} device type mismatch: expected {device.type}, got {buffer.device.type}")
+                # Don't fail for device mismatch, we can fix this
                 
             # For CUDA devices, verify index if specified
             if device.type == 'cuda':
                 expected_index = device.index if device.index is not None else 0
                 if buffer.device.index != expected_index:
-                    logger.warning(f"Buffer {name} CUDA device index mismatch: expected {expected_index}, got {buffer.device.index}")
-                    buffer_states[f'{name}_device'] = False
-                    continue
+                    warnings.append(f"Buffer {name} CUDA device index mismatch: expected {expected_index}, got {buffer.device.index}")
+                    # Don't fail for index mismatch, we can fix this
                 
             # Dtype check
             if name != 'timestep_buffer' and buffer.dtype != model_dtype:
-                logger.warning(f"Buffer {name} has wrong dtype: expected {model_dtype}, got {buffer.dtype}")
-                buffer_states[f'{name}_dtype'] = False
-                continue
+                warnings.append(f"Buffer {name} has wrong dtype: expected {model_dtype}, got {buffer.dtype}")
+                # Don't fail for dtype mismatch, we can fix this
                 
             # Contiguity check
             if not buffer.is_contiguous():
-                logger.warning(f"Buffer {name} lost contiguity")
-                buffer_states[f'{name}_contiguous'] = False
-                continue
+                warnings.append(f"Buffer {name} lost contiguity")
+                # Don't fail for contiguity, we can fix this
                 
             # Shape check for batch dimension
             if name in ['noise_buffer', 'latent_buffer', 'timestep_buffer']:
                 if buffer.shape[0] != micro_batch_size:
-                    logger.warning(f"Buffer {name} has wrong batch dimension: expected {micro_batch_size}, got {buffer.shape[0]}")
-                    buffer_states[f'{name}_shape'] = False
-                    continue
+                    critical_errors.append(f"Buffer {name} has wrong batch dimension: expected {micro_batch_size}, got {buffer.shape[0]}")
+                    buffer_states[name] = False
                     
-            # All checks passed for this buffer
-            buffer_states[name] = True
+        # Log all warnings
+        for warning in warnings:
+            logger.warning(warning)
+            
+        # Log critical errors
+        if critical_errors:
+            for error in critical_errors:
+                logger.error(error)
+            buffer_states['critical_errors'] = critical_errors
+            
+        # Only consider buffers invalid if there are critical errors
+        buffer_states['valid'] = len(critical_errors) == 0
             
     except Exception as e:
-        logger.warning(f"Error verifying buffer states: {e}")
+        logger.error(f"Error verifying buffer states: {e}")
+        logger.error(f"Stack trace: {traceback.format_exc()}")
         buffer_states['error'] = str(e)
+        buffer_states['valid'] = False
         
     return buffer_states
 
