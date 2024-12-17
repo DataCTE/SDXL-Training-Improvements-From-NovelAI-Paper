@@ -160,7 +160,7 @@ def train(config_path: str):
             proportion_empty_prompts=config.data.proportion_empty_prompts,
             max_consecutive_batch_samples=2,
             model_name=config.model.pretrained_model_name,
-            tag_weighting=tag_weighter_config,  # Pass the proper tag weighter config
+            tag_weighting=config.tag_weighting,  # Pass tag weighting config
             max_token_length=config.data.max_token_length
         )
         
@@ -169,8 +169,7 @@ def train(config_path: str):
             image_dirs=config.data.image_dirs,
             config=dataset_config,
             vae=vae,
-            device=device,
-            tag_weighter=tag_weighter  # Pass the initialized tag weighter
+            device=device
         )
         
         if len(dataset) == 0:
