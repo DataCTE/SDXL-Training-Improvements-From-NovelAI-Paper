@@ -11,14 +11,23 @@ from src.data.utils import create_thread_pool, MemoryCache, get_memory_usage_gb
 logger = logging.getLogger(__name__)
 
 class CacheManager:
-    def __init__(self, cache_dir: str, max_workers: Optional[int] = None):
+    def __init__(self, cache_dir: str, max_workers: Optional[int] = None, use_caching: bool = True):
+        """Initialize cache manager.
+        
+        Args:
+            cache_dir: Directory for cache files
+            max_workers: Maximum number of worker threads
+            use_caching: Whether to enable caching
+        """
         self.cache_dir = Path(cache_dir)
+        self.use_caching = use_caching
         self.latent_cache = self.cache_dir / "latents"
         self.text_cache = self.cache_dir / "text"
         
-        # Create cache directories
-        for cache_dir in [self.latent_cache, self.text_cache]:
-            cache_dir.mkdir(parents=True, exist_ok=True)
+        # Create cache directories if caching is enabled
+        if self.use_caching:
+            for cache_dir in [self.latent_cache, self.text_cache]:
+                cache_dir.mkdir(parents=True, exist_ok=True)
             
         # Initialize thread pool and memory cache
         self.executor = create_thread_pool(max_workers)
@@ -33,7 +42,8 @@ class CacheManager:
             f"Initialized cache manager:\n"
             f"- Cache dir: {self.cache_dir}\n"
             f"- Workers: {self.executor._max_workers}\n"
-            f"- Memory cache size: {self.memory_cache.max_items}"
+            f"- Memory cache size: {self.memory_cache.max_items}\n"
+            f"- Caching enabled: {self.use_caching}"
         )
 
     def get_cache_paths(self, image_path: str) -> Dict[str, Path]:
