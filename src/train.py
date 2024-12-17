@@ -167,7 +167,6 @@ def train(config_path: str):
             text_cache_dir=config.data.text_cache_dir,
             use_caching=config.data.use_caching,
             proportion_empty_prompts=config.data.proportion_empty_prompts,
-            batch_size=config.training.batch_size,
             max_consecutive_batch_samples=2
         )
         
@@ -189,7 +188,7 @@ def train(config_path: str):
         if len(dataset) == 0:
             raise ValueError("Dataset contains no valid samples after initialization")
         
-        # Create sampler
+        # Create sampler with batch size from training config
         sampler = AspectBatchSampler(
             dataset=dataset,
             batch_size=config.training.batch_size,
@@ -197,7 +196,7 @@ def train(config_path: str):
             shuffle=True
         )
         
-        # Create dataloader
+        # Create dataloader with data config settings
         dataloader = DataLoader(
             dataset,
             batch_sampler=sampler,

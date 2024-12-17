@@ -32,6 +32,17 @@ class AspectBatchSampler(Sampler[List[int]]):
         thread_config = get_optimal_thread_config()
         self.prefetch_factor = prefetch_factor or thread_config.prefetch_factor
         
+        # Initialize batch processor
+        self.batch_processor = BatchProcessor(
+            image_processor=dataset.image_processor,
+            cache_manager=dataset.cache_manager,
+            text_embedder=dataset.text_embedder,
+            vae=dataset.vae,
+            device=dataset.device,
+            batch_size=batch_size,
+            prefetch_factor=self.prefetch_factor
+        )
+        
         # Validate inputs
         if batch_size < 1:
             raise ValueError(f"Batch size must be positive, got {batch_size}")
@@ -174,13 +185,45 @@ class AspectBatchSampler(Sampler[List[int]]):
                         for idx in batch
                     ]
                     
-                    yield batch
+                    # Process batch using BatchProcessor
+                    try:
+                        import asyncio
+                        processed_count = asyncio.run(self.batch_processor.process_batch(
+                            batch_items=batch_items,
+                            width=width,
+                            height=height
+                        ))
+                        
+                        if processed_count > 0:
+                            yield batch
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing batch: {str(e)}")
+                        logger.error(traceback.format_exc())
                     
                 elif not self.drop_last and bucket.remaining_samples() > 0:
                     # Handle final partial batch
                     final_batch = bucket.get_next_batch(bucket.remaining_samples())
                     if final_batch:
-                        yield final_batch
+                        # Process final batch
+                        batch_items = [
+                            {**self.dataset.items[idx], 'width': width, 'height': height}
+                            for idx in final_batch
+                        ]
+                        try:
+                            processed_count = asyncio.run(self.batch_processor.process_batch(
+                                batch_items=batch_items,
+                                width=width,
+                                height=height
+                            ))
+                            
+                            if processed_count > 0:
+                                yield final_batch
+                                
+                        except Exception as e:
+                            logger.error(f"Error processing final batch: {str(e)}")
+                            logger.error(traceback.format_exc())
+                            
                     active_buckets.remove(selected_key)
                 else:
                     active_buckets.remove(selected_key)

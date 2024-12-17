@@ -53,21 +53,37 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             )
         self.model.to(self.device)
         
-        # Get model dtype
-        self.model_dtype = next(self.model.parameters()).dtype
+        # Initialize VAE
+        self.vae = vae
+        if self.vae is not None:
+            self.vae.to(self.device)
         
-        # Configure memory format
-        configure_model_memory_format(
-            model=self.model,
-            config=self.config
-        )
+        # Initialize training state
+        self.global_step = 0
+        self.current_epoch = 0
+        self.optimizer = None
+        self.lr_scheduler = None
+        self.dataloader = None
         
-        # Setup memory optimizations
+        # Setup optimizer and scheduler
+        self.setup_optimizer()
+        
+        # Configure model format and optimizations
+        self._setup_model_optimizations()
+
+    def _setup_model_optimizations(self):
+        """Setup model memory optimizations."""
         try:
+            # Configure memory format
+            configure_model_memory_format(
+                model=self.model,
+                config=self.config
+            )
+            
+            # Setup memory optimizations
             batch_size = self.config.training.batch_size
             micro_batch_size = batch_size // self.config.training.gradient_accumulation_steps
             
-            # Set up memory optimizations
             memory_setup = setup_memory_optimizations(
                 model=self.model,
                 config=self.config,
@@ -90,36 +106,6 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         except Exception as e:
             logger.error(f"Error setting up memory optimizations: {e}")
             raise
-            
-        # Configure noise scheduler
-        try:
-            scheduler_params = configure_noise_scheduler(self.config, self.device)
-            self.scheduler = scheduler_params['scheduler']
-            self.sigmas = scheduler_params['sigmas']
-            self.alphas = scheduler_params['alphas']
-            self.betas = scheduler_params['betas']
-            self.alphas_cumprod = scheduler_params['alphas_cumprod']
-            self.snr_values = scheduler_params['snr_values']
-            self.snr_weights = scheduler_params['snr_weights']
-            self.c_skip = scheduler_params['c_skip']
-            self.c_out = scheduler_params['c_out']
-            self.c_in = scheduler_params['c_in']
-            self.num_train_timesteps = len(self.sigmas)
-        except Exception as e:
-            logger.error(f"Error configuring scheduler: {e}")
-            raise
-            
-        # Initialize training state
-        self.global_step = 0
-        self.current_epoch = 0
-        
-        # Initialize optimizer and scheduler
-        self.setup_optimizer()
-        
-        logger.info(
-            f"Initialized trainer on {self.device}\n"
-            f"Model dtype: {self.model_dtype}"
-        )
 
     def setup_optimizer(self):
         """Setup optimizer and learning rate scheduler."""
@@ -294,13 +280,16 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             logger.error(f"Error in training step: {e}")
             raise
 
-    def train_epoch(self, dataloader: DataLoader) -> None:
+    def train_epoch(self, epoch: int) -> None:
         """Train for one epoch."""
         self.model.train()
         total_loss = 0
         num_batches = 0
         
-        for batch_idx, batch in enumerate(dataloader):
+        if self.dataloader is None:
+            raise ValueError("Dataloader not set. Call set_dataloader() first.")
+        
+        for batch_idx, batch in enumerate(self.dataloader):
             try:
                 # Zero gradients
                 self.optimizer.zero_grad()
@@ -311,6 +300,12 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                     total_loss += loss.item()
                 
                 # Update weights
+                if self.config.training.max_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), 
+                        self.config.training.max_grad_norm
+                    )
+                
                 self.optimizer.step()
                 if self.lr_scheduler is not None:
                     self.lr_scheduler.step()
@@ -324,35 +319,27 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                     self.log_metrics({
                         'loss': loss.item(),
                         'lr': self.optimizer.param_groups[0]['lr'],
-                        'epoch': self.current_epoch,
+                        'epoch': epoch,
                         'step': self.global_step
                     })
                 
                 # Save checkpoint
                 if self.global_step % self.config.training.save_steps == 0:
-                    self.save_checkpoint()
+                    self.save_checkpoint(self.config.paths.checkpoints_dir, epoch)
                     
             except Exception as e:
                 logger.error(f"Error in batch {batch_idx}: {e}")
                 logger.error(traceback.format_exc())
                 continue
         
-        # Update epoch counter
-        self.current_epoch += 1
-        
         # Log epoch metrics
         self.log_metrics({
-            'epoch': self.current_epoch,
-            'epoch_loss': total_loss / num_batches
+            'epoch': epoch,
+            'epoch_loss': total_loss / num_batches if num_batches > 0 else float('inf')
         }, step_type="epoch")
 
     def save_checkpoint(self, checkpoints_dir: str, epoch: int) -> None:
-        """Save model checkpoint.
-        
-        Args:
-            checkpoints_dir: Directory to save checkpoints
-            epoch: Current epoch number
-        """
+        """Save model checkpoint."""
         try:
             checkpoint_path = os.path.join(
                 checkpoints_dir,
@@ -384,6 +371,10 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             use_wandb=self.config.training.use_wandb,
             step_type=step_type
         )
+
+    def set_dataloader(self, dataloader: DataLoader) -> None:
+        """Set the dataloader."""
+        self.dataloader = dataloader
 
     @staticmethod
     def create_dataloader(
