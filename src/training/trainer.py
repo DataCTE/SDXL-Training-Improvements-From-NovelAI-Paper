@@ -76,10 +76,6 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         if model is None:
             initialize_model_weights(self.model)
         
-        # Set up distributed training
-        if self.config.system.use_fsdp:
-            self._setup_distributed()
-        
         # Configure optimizer with proper parameters
         self._setup_optimizer()
         
