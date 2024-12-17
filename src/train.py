@@ -209,3 +209,20 @@ def main():
         logger.error(f"Fatal error: {str(e)}")
         logger.error(f"Stack trace: {traceback.format_exc()}")
         raise
+
+if __name__ == "__main__":
+    try:
+        # Force flush logging
+        sys.stdout.flush()
+        sys.stderr.flush()
+        logging.getLogger().handlers[0].flush()
+        
+        # Run main with exception handling
+        main()
+    except KeyboardInterrupt:
+        logger.info("Training interrupted by user")
+        sys.exit(0)
+    except Exception as e:
+        logger.critical(f"Critical error occurred: {str(e)}")
+        logger.critical(f"Stack trace: {traceback.format_exc()}")
+        sys.exit(1)
