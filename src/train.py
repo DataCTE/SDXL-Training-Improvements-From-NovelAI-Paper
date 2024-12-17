@@ -113,6 +113,19 @@ def train(config_path: str):
         )
         
         # Create dataset with text embedder and tag weighter
+        dataset_config = NovelAIDatasetConfig(
+            image_size=config.data.image_size,
+            min_size=config.data.min_size,
+            max_dim=config.data.max_dim,
+            bucket_step=config.data.bucket_step,
+            min_bucket_size=config.data.min_bucket_size,
+            bucket_tolerance=config.data.bucket_tolerance,
+            max_aspect_ratio=config.data.max_aspect_ratio,
+            cache_dir=config.data.cache_dir,
+            use_caching=config.data.use_caching,
+            proportion_empty_prompts=config.data.proportion_empty_prompts
+        )
+        
         dataset = NovelAIDataset(
             image_dirs=valid_dirs,
             text_embedder=TextEmbedder(
@@ -124,7 +137,7 @@ def train(config_path: str):
                 config=TagWeightingConfig(**config.tag_weighting.__dict__)
             ),
             vae=vae,
-            config=NovelAIDatasetConfig(**config.data.__dict__),
+            config=dataset_config,
             device=device
         )
         
