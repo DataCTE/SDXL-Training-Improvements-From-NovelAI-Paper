@@ -22,7 +22,6 @@ from .text_embedder import TextEmbedder
 from .image_processor import ImageProcessor, ImageProcessorConfig
 from .cache_manager import CacheManager
 from .batch_processor import BatchProcessor
-from ..dataset import NovelAIDataset, NovelAIDatasetConfig
 from .sampler import AspectBatchSampler
 
 __all__ = [
@@ -44,7 +43,5 @@ __all__ = [
     'ImageProcessorConfig',
     'CacheManager',
     'BatchProcessor',
-    'NovelAIDataset',
-    'NovelAIDatasetConfig',
     'AspectBatchSampler'
 ]

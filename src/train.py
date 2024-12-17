@@ -2,7 +2,7 @@ import os
 import logging
 import torch
 
-from src.data.dataset import NovelAIDataset, NovelAIDatasetConfig
+from src.data import NovelAIDataset, NovelAIDatasetConfig
 from src.training.trainer import NovelAIDiffusionV3Trainer
 from src.utils.model import setup_model
 from src.config.config import Config
