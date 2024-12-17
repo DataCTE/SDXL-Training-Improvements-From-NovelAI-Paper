@@ -121,14 +121,13 @@ class DataConfig:
         # Update max_dim to be the sum of max_image_size dimensions
         self.max_dim = sum(self.max_image_size)
 
-@dataclass
-class TagWeightingConfig:
-    enabled: bool = True
-    min_weight: float = 0.1
-    max_weight: float = 2.0
-    default_weight: float = 1.0
-    update_frequency: int = 1000
-    smoothing_factor: float = 0.1
+class TagWeighterConfig:
+    """Configuration for tag weighting."""
+    min_weight: float = 0.1  # Minimum weight for any tag
+    max_weight: float = 5.0  # Maximum weight for any tag
+    smoothing_factor: float = 0.1  # Smoothing factor for frequency calculations
+    default_weight: float = 1.0  # Default weight when no tags present
+    dtype: torch.dtype = torch.float32
 
 @dataclass
 class ScoringConfig:
@@ -200,7 +199,7 @@ class NovelAIDatasetConfig:
     max_token_length: int = 77  # Default CLIP token length
     
     # Tag weighting settings
-    tag_weighting: TagWeightingConfig = field(default_factory=TagWeightingConfig)
+    tag_weighting: TagWeighterConfig = field(default_factory=TagWeighterConfig)
 
     def __post_init__(self):
         """Convert and validate configuration."""
@@ -233,7 +232,7 @@ class Config:
     model: ModelConfig
     training: TrainingConfig
     data: DataConfig
-    tag_weighting: TagWeightingConfig
+    tag_weighting: TagWeighterConfig
     scoring: ScoringConfig
     system: SystemConfig
     paths: PathsConfig
@@ -261,7 +260,7 @@ class Config:
                 model=ModelConfig(**config_dict['model']),
                 training=TrainingConfig(**config_dict['training']),
                 data=DataConfig(**config_dict['data']),
-                tag_weighting=TagWeightingConfig(**config_dict['tag_weighting']),
+                tag_weighting=TagWeighterConfig(**config_dict['tag_weighting']),
                 scoring=ScoringConfig(**config_dict['scoring']),
                 system=SystemConfig(**config_dict['system']),
                 paths=PathsConfig(**config_dict['paths'])

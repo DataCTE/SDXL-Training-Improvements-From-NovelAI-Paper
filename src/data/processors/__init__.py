@@ -16,7 +16,7 @@ from .sampler import AspectBatchSampler
 # Import utilities
 from .utils.thread_config import get_optimal_cpu_threads, get_optimal_thread_config
 from .utils.caption.text_embedder import TextEmbedder
-from .utils.caption.tag_weighter import TagWeighter, TagWeightingConfig
+from .utils.caption.tag_weighter import TagWeighter, TagWeighterConfig
 from .utils import (
     get_system_resources,
     get_optimal_workers,
@@ -51,7 +51,7 @@ __all__ = [
     # Text processing utilities
     'TextEmbedder',
     'TagWeighter',
-    'TagWeightingConfig',
+    'TagWeighterConfig',
     
     # Thread and system utilities
     'get_optimal_cpu_threads',

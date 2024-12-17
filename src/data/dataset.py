@@ -33,7 +33,7 @@ from .processors.utils import (
 )
 
 # Config import
-from src.config.config import NovelAIDatasetConfig, TagWeightingConfig
+from src.config.config import NovelAIDatasetConfig, TagWeighterConfig
 
 logger = logging.getLogger(__name__)
 
@@ -75,13 +75,13 @@ class NovelAIDataset(Dataset):
 
         # Initialize tag weighter
         self.tag_weighter = TagWeighter(
-            config=TagWeightingConfig(
-                enabled=config.tag_weighting.enabled,
-                min_weight=config.tag_weighting.min_weight,
-                max_weight=config.tag_weighting.max_weight,
-                default_weight=config.tag_weighting.default_weight,
-                update_frequency=config.tag_weighting.update_frequency,
-                smoothing_factor=config.tag_weighting.smoothing_factor
+            config=TagWeighterConfig(
+                min_weight=config.min_weight,
+                max_weight=config.max_weight,
+                smoothing_factor=config.smoothing_factor,
+                default_weight=config.default_weight,
+                dtype=config.dtype
+
             ),
             text_embedder=self.text_embedder
         )
