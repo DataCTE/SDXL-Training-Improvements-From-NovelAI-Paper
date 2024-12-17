@@ -175,6 +175,7 @@ class NovelAIDataset(Dataset):
             def process_chunk(chunk_files: List[str], chunk_id: int) -> Tuple[List[Dict], Dict[str, int]]:
                 chunk_items = []
                 chunk_stats = {'total': 0, 'errors': 0, 'error_types': {}, 'skipped': 0}
+                logger.debug(f"Processing chunk {chunk_id} with {len(chunk_files)} files")
                 
                 for img_path in chunk_files:
                     try:
