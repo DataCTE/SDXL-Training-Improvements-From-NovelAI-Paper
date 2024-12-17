@@ -9,6 +9,8 @@ from src.config.config import Config
 import traceback
 from src.utils.model import configure_model_memory_format, is_xformers_installed
 from diffusers import DDPMScheduler
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 logger = logging.getLogger(__name__)
 
@@ -295,107 +297,38 @@ def setup_memory_optimizations(
             pass
         raise
 
-def setup_accelerator(config: Config) -> Accelerator:
-    """Setup accelerator with proper configuration and error handling."""
-    try:
-        logger.info("Setting up accelerator...")
-        logger.info(f"Mixed precision setting: {config.system.mixed_precision}")
-        logger.info(f"CUDA available: {torch.cuda.is_available()}")
-        if torch.cuda.is_available():
-            logger.info(f"CUDA device count: {torch.cuda.device_count()}")
-            logger.info(f"Current CUDA device: {torch.cuda.current_device()}")
-        
-        # Create FSDP plugin if enabled
-        if config.system.use_fsdp:
-            logger.info("Creating FSDP plugin...")
-            fsdp_plugin = FullyShardedDataParallelPlugin(
-                sharding_strategy="FULL_SHARD" if config.system.full_shard else "SHARD_GRAD_OP",
-                min_num_params=config.system.min_num_params_per_shard,
-                cpu_offload=config.system.cpu_offload,
-                forward_prefetch=config.system.forward_prefetch,
-                backward_prefetch=config.system.backward_prefetch,
-                limit_all_gathers=config.system.limit_all_gathers,
-                state_dict_type="FULL_STATE_DICT",
-                use_orig_params=True,
-                sync_module_states=True,
-            )
-        else:
-            logger.info("FSDP not enabled")
-            fsdp_plugin = None
-
-        logger.info("Creating accelerator...")
-        accelerator = Accelerator(
-            gradient_accumulation_steps=config.training.gradient_accumulation_steps,
-            mixed_precision=config.system.mixed_precision,
-            log_with="wandb",
-            project_dir=config.paths.logs_dir,
-            device_placement=True,
-            fsdp_plugin=fsdp_plugin
-        )
-
-        logger.info(f"Accelerator device: {accelerator.device}")
-        logger.info(f"Accelerator state: distributed={accelerator.distributed_type}, num_processes={accelerator.num_processes}")
-
-        if config.system.use_fsdp and config.system.sync_batch_norm:
-            logger.info("Setting up sync batch norm...")
-            import torch.nn as nn
-            def convert_sync_batchnorm(module):
-                module_output = module
-                if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
-                    module_output = nn.SyncBatchNorm.convert_sync_batchnorm(module)
-                for name, child in module.named_children():
-                    module_output.add_module(name, convert_sync_batchnorm(child))
-                return module_output
-            
-            accelerator.sync_batchnorm = convert_sync_batchnorm
-
-        return accelerator
-
-    except Exception as e:
-        logger.error(f"Failed to setup accelerator: {str(e)}")
-        logger.error(f"Stack trace: {traceback.format_exc()}")
-        raise
-
-def setup_distributed(config: Config) -> Tuple[int, int]:
-    """Initialize distributed training environment with error handling."""
+def setup_distributed():
+    """Setup distributed training with proper error handling."""
     try:
         if not torch.cuda.is_available():
-            logger.warning("CUDA not available, running in CPU mode")
-            return 1, 0
-
-        if torch.distributed.is_initialized():
-            return torch.distributed.get_world_size(), torch.distributed.get_rank()
-
-        world_size = int(os.environ.get("WORLD_SIZE", 1))
-        rank = int(os.environ.get("RANK", 0))
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-
-        if world_size <= 1:
-            logger.info("Running in single process mode")
-            return 1, 0
-
-        torch.distributed.init_process_group(
-            backend=config.system.backend,
-            init_method="env://",
-            world_size=world_size,
-            rank=rank
-        )
-
-        torch.cuda.set_device(local_rank)
-
-        if config.system.cudnn_benchmark:
-            torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-
-        torch.distributed.barrier()
-        logger.info(f"Distributed training initialized: rank {rank}/{world_size}")
-        return world_size, rank
-
+            logger.warning("CUDA not available, distributed training disabled")
+            return False
+            
+        if not dist.is_available():
+            logger.warning("torch.distributed not available, distributed training disabled")
+            return False
+            
+        if not dist.is_initialized():
+            logger.info("Initializing distributed training...")
+            
+            # Initialize process group
+            dist.init_process_group(backend='nccl')
+            
+            # Set device
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            torch.cuda.set_device(local_rank)
+            
+            logger.info(f"Distributed training initialized: rank {dist.get_rank()}/{dist.get_world_size()}")
+            return True
+            
     except Exception as e:
         logger.error(f"Failed to setup distributed training: {str(e)}")
-        logger.error(f"Stack trace: {traceback.format_exc()}")
-        raise 
+        raise
+
+def cleanup_distributed():
+    """Cleanup distributed training resources."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 def verify_memory_optimizations(
     model: torch.nn.Module,

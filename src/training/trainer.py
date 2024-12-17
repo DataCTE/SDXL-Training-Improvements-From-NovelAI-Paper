@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
-from accelerate import Accelerator
 from diffusers import UNet2DConditionModel, AutoencoderKL, DDPMScheduler
 import wandb
 import os
@@ -39,7 +38,7 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         config_path: str,
         model: Optional[UNet2DConditionModel] = None,
         vae: Optional[AutoencoderKL] = None,
-        accelerator: Optional[Accelerator] = None
+        device: Optional[torch.device] = None
     ):
         """Initialize trainer with additional validations and optimizations."""
         super().__init__()
@@ -50,21 +49,8 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         self.config = Config.from_yaml(config_path)
         
         # Set device and precision before scheduler configuration
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._set_precision()
-        
-        # Initialize accelerator with proper configuration
-        self.accelerator = accelerator or Accelerator(
-            mixed_precision=self.config.system.mixed_precision,
-            gradient_accumulation_steps=self.config.training.gradient_accumulation_steps,
-            log_with="wandb",
-            kwargs_handlers=[
-                self._get_accelerator_kwargs()
-            ]
-        )
-        
-        # Update device after accelerator initialization
-        self.device = self.accelerator.device
         
         # Initialize models with proper validation
         self.model = model or create_unet(self.config, self.model_dtype)
@@ -119,7 +105,7 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                 f"gradient_accumulation_steps ({self.config.training.gradient_accumulation_steps})"
             )
             
-        # Set up memory optimizations and get buffers with verification from setup.py
+        # Set up memory optimizations and get buffers with verification
         try:
             initial_memory = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
             
@@ -631,7 +617,7 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                         try:
                             if torch.cuda.is_available():
                                 torch.cuda.reset_peak_memory_stats()
-                            self.accelerator.backward(loss)
+                            loss.backward()
                             if torch.cuda.is_available():
                                 backward_peak = torch.cuda.max_memory_allocated() / 1024**2
                                 if backward_peak > start_mem * 2:  # More than 2x increase
@@ -652,12 +638,11 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                         total_v_pred[start_idx:end_idx] = model_pred.detach()
                         
                         # Log micro-batch metrics
-                        if self.accelerator.is_main_process:
-                            micro_batch_time = time.time() - micro_batch_start
-                            logger.debug(
-                                f"Micro-batch {i+1}/{self.config.training.gradient_accumulation_steps} - "
-                                f"Loss: {loss_value:.4f}, Time: {micro_batch_time:.2f}s"
-                            )
+                        micro_batch_time = time.time() - micro_batch_start
+                        logger.debug(
+                            f"Micro-batch {i+1}/{self.config.training.gradient_accumulation_steps} - "
+                            f"Loss: {loss_value:.4f}, Time: {micro_batch_time:.2f}s"
+                        )
                             
                     except RuntimeError as e:
                         if "out of memory" in str(e):
@@ -669,7 +654,7 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                         raise
                 
                     # Log metrics if main process
-                    if self.accelerator.is_main_process and self.global_step % self.config.training.log_steps == 0:
+                    if self.global_step % self.config.training.log_steps == 0:
                         self._log_training_step(loss_value, running_loss, i, micro_batch['tag_weights'])
                 
                 # Apply gradient clipping
@@ -681,7 +666,7 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                             if param.grad is not None:
                                 grad_norm = max(grad_norm, param.grad.norm().item())
                                 
-                        self.accelerator.clip_grad_norm_(
+                        torch.nn.utils.clip_grad_norm_(
                             self.model.parameters(),
                             self.config.training.max_grad_norm
                         )
@@ -711,28 +696,27 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                 avg_loss = running_loss / self.config.training.gradient_accumulation_steps
                 
                 # Log step completion metrics and check memory using setup.py function
-                if self.accelerator.is_main_process:
-                    step_time = time.time() - step_start
-                    if torch.cuda.is_available():
-                        memory_stats = check_memory_status(
-                            initial_memory=start_mem / 1024,  # Convert MB to GB
-                            device=self.device,
-                            logger=logger
-                        )
-                        
-                        peak_mem = torch.cuda.max_memory_allocated() / 1024**2
-                        mem_diff = peak_mem - start_mem
-                        logger.info(
-                            f"Step completed - "
-                            f"Avg Loss: {avg_loss:.4f}, "
-                            f"Time: {step_time:.2f}s, "
-                            f"Peak Memory: {peak_mem:.0f}MB "
-                            f"(+{mem_diff:.0f}MB)"
-                        )
-                        
-                        # Log any memory leaks detected
-                        if 'leak' in memory_stats:
-                            logger.warning(f"Memory leak detected: {memory_stats['leak']:.2f}GB")
+                step_time = time.time() - step_start
+                if torch.cuda.is_available():
+                    memory_stats = check_memory_status(
+                        initial_memory=start_mem / 1024,  # Convert MB to GB
+                        device=self.device,
+                        logger=logger
+                    )
+                    
+                    peak_mem = torch.cuda.max_memory_allocated() / 1024**2
+                    mem_diff = peak_mem - start_mem
+                    logger.info(
+                        f"Step completed - "
+                        f"Avg Loss: {avg_loss:.4f}, "
+                        f"Time: {step_time:.2f}s, "
+                        f"Peak Memory: {peak_mem:.0f}MB "
+                        f"(+{mem_diff:.0f}MB)"
+                    )
+                    
+                    # Log any memory leaks detected
+                    if 'leak' in memory_stats:
+                        logger.warning(f"Memory leak detected: {memory_stats['leak']:.2f}GB")
                 
                 return total_loss, model_input, total_v_pred, timesteps, avg_loss
             
@@ -747,101 +731,125 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                 pass
             raise
 
-    def train_epoch(
-        self,
-        epoch: int,
-        train_dataloader: torch.utils.data.DataLoader
-    ) -> float:
-        """Train for one epoch with improved error handling and monitoring."""
-        if len(train_dataloader) == 0:
-            raise ValueError("No training data available")
-
-        self.current_epoch = epoch
-        self.model.train()
-        
-        total_loss = 0.0
-        num_batches = len(train_dataloader)
-        last_logging_time = time.time()
-        
-        # Initialize progress bar with more informative metrics
-        progress_bar = tqdm(
-            train_dataloader,
-            desc=f"Epoch {epoch}",
-            disable=not self.accelerator.is_main_process,
-            dynamic_ncols=True  # Adapt to terminal width
-        )
-
+    def train_epoch(self, epoch: int) -> None:
+        """Train for one epoch with improved diagnostics."""
         try:
-            for batch_idx, batch in enumerate(progress_bar):
-                # Add batch processing timing
-                batch_start = time.time()
+            logger.info(f"Starting epoch {epoch}")
+            self.model.train()
+            
+            # Initialize progress bar with more details
+            pbar = tqdm(
+                self.dataloader, 
+                desc=f"Epoch {epoch}",
+                leave=True,
+                dynamic_ncols=True
+            )
+            
+            # Log initial state
+            logger.info("Model device: %s", next(self.model.parameters()).device)
+            logger.info("Starting iteration through %d batches", len(self.dataloader))
+            
+            total_loss = 0.0
+            num_batches = 0
+            
+            for batch_idx, batch in enumerate(pbar):
+                # Log first batch details
+                if batch_idx == 0:
+                    logger.info("Processing first batch:")
+                    logger.info("Batch keys: %s", batch.keys())
+                    for k, v in batch.items():
+                        if isinstance(v, torch.Tensor):
+                            logger.info(f"{k} shape: {v.shape}, device: {v.device}")
                 
-                # Validate batch data
-                if not isinstance(batch, dict) or "model_input" not in batch:
-                    logger.error(f"Invalid batch format at index {batch_idx}")
-                    continue
-                    
                 try:
                     # Process batch with timing
-                    with torch.cuda.amp.autocast(enabled=self.config.system.mixed_precision != "no"):
-                        loss, _, _, _, avg_batch_loss = self.training_step(batch)
+                    start_time = time.time()
                     
-                    total_loss += avg_batch_loss
+                    # Use training_step and properly handle its outputs
+                    batch_loss, model_input, v_pred, timesteps, avg_loss = self.training_step(batch)
                     
-                    # Update progress more frequently
-                    if batch_idx % 10 == 0:  # Update every 10 batches
-                        progress_bar.set_postfix({
-                            'loss': f'{avg_batch_loss:.4f}',
-                            'avg_loss': f'{total_loss/(batch_idx+1):.4f}',
-                            'lr': f'{self.optimizer.param_groups[0]["lr"]:.2e}',
-                            'batch_time': f'{(time.time() - batch_start):.2f}s'
-                        })
-                    
-                    # Periodic logging
-                    current_time = time.time()
-                    if current_time - last_logging_time > self.config.training.log_interval:
-                        if self.accelerator.is_main_process:
-                            # Log detailed metrics
-                            self._log_detailed_metrics(
-                                batch_idx, 
-                                num_batches,
-                                avg_batch_loss, 
-                                total_loss/(batch_idx+1),
-                                current_time - batch_start
-                            )
-                        last_logging_time = current_time
-                    
-                    # Memory management
-                    if batch_idx % 100 == 0:  # Every 100 batches
-                        torch.cuda.empty_cache()
+                    # Log predictions and model input periodically
+                    if batch_idx % self.config.training.log_steps == 0:
+                        # Calculate prediction metrics
+                        pred_mean = v_pred.mean().item()
+                        pred_std = v_pred.std().item()
+                        input_mean = model_input.mean().item()
+                        input_std = model_input.std().item()
                         
-                except RuntimeError as e:
-                    if "out of memory" in str(e):
-                        logger.error(f"OOM error in batch {batch_idx}. Attempting recovery...")
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                        continue
-                    else:
-                        raise e
-                
-                self.global_step += 1
+                        # Log detailed metrics
+                        metrics = {
+                            'train/batch_loss': batch_loss,
+                            'train/avg_loss': avg_loss,
+                            'train/pred_mean': pred_mean,
+                            'train/pred_std': pred_std,
+                            'train/input_mean': input_mean,
+                            'train/input_std': input_std,
+                            'train/timestep_mean': timesteps.float().mean().item(),
+                            'train/learning_rate': self.optimizer.param_groups[0]['lr']
+                        }
+                        self.log_metrics(metrics)
+                    
+                    batch_time = time.time() - start_time
+                    total_loss += avg_loss
+                    num_batches += 1
+                    
+                    # Update progress bar with more informative metrics
+                    pbar.set_postfix({
+                        'batch': batch_idx,
+                        'loss': f"{avg_loss:.4f}",
+                        'avg_loss': f"{total_loss/num_batches:.4f}",
+                        'time/batch': f"{batch_time:.2f}s",
+                        'lr': f"{self.optimizer.param_groups[0]['lr']:.2e}",
+                        'pred_std': f"{pred_std:.2f}" if 'pred_std' in locals() else "N/A"
+                    })
+                    
+                    # Force CUDA sync periodically
+                    if batch_idx % 10 == 0:
+                        torch.cuda.synchronize()
+                    
+                except Exception as e:
+                    logger.error(f"Error in batch {batch_idx}: {str(e)}")
+                    logger.error(traceback.format_exc())
+                    if batch_idx == 0:
+                        # Raise on first batch error
+                        raise
+                    continue
                 
                 # Save checkpoint if needed
                 if self.global_step % self.config.training.save_steps == 0:
-                    self._save_checkpoint(batch_idx, avg_batch_loss)
-                    
-        except Exception as e:
-            logger.error(f"Error during training: {str(e)}")
-            raise e
-        finally:
-            progress_bar.close()
+                    # Include prediction statistics in checkpoint
+                    self._save_checkpoint(
+                        batch_idx,
+                        {
+                            'loss': avg_loss,
+                            'pred_mean': v_pred.mean().item(),
+                            'pred_std': v_pred.std().item()
+                        }
+                    )
+                
+                self.global_step += 1
             
-        return total_loss / num_batches
+            # Log epoch summary
+            epoch_avg_loss = total_loss / num_batches
+            logger.info(f"Epoch {epoch} completed - Average loss: {epoch_avg_loss:.4f}")
+            
+            # Save epoch metrics
+            epoch_metrics = {
+                'epoch': epoch,
+                'epoch_avg_loss': epoch_avg_loss,
+                'total_steps': self.global_step
+            }
+            self.log_metrics(epoch_metrics, step_type="epoch")
+                
+        except Exception as e:
+            logger.error(f"Error in epoch {epoch}: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
 
 
 
     @staticmethod
-    def collate_fn(batch: List[Tuple]) -> Dict[str, Union[torch.Tensor, Dict[str, torch.Tensor], List[Tuple[int, int]]]]:
+    def collate_fn(batch: List[Tuple]) -> Dict[str, Union[torch.Tensor, Dict[str, torch.Tensor], List[Tuple[int, int]]]:
         """Efficiently collate batch data with optimal padding and dimension handling."""
         try:
             # Validate input batch
@@ -1011,7 +1019,7 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         )
 
     
-    def _save_checkpoint(self, batch_idx, loss):
+    def _save_checkpoint(self, batch_idx, metrics):
         """Internal method to save checkpoint during training."""
         try:
             checkpoint_path = os.path.join(
@@ -1025,9 +1033,15 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                 scheduler=self.lr_scheduler,
                 config=self.config,
                 global_step=self.global_step,
-                current_epoch=self.current_epoch
+                current_epoch=self.current_epoch,
+                metrics=metrics  # Save the metrics dictionary
             )
-            logger.info(f"Saved checkpoint at step {self.global_step} (batch {batch_idx}, loss: {loss:.4f})")
+            logger.info(
+                f"Saved checkpoint at step {self.global_step} "
+                f"(batch {batch_idx}, loss: {metrics['loss']:.4f}, "
+                f"pred_mean: {metrics['pred_mean']:.4f}, "
+                f"pred_std: {metrics['pred_std']:.4f})"
+            )
         except Exception as e:
             logger.error(f"Error saving checkpoint: {str(e)}")
 
@@ -1105,10 +1119,13 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         )
 
     def log_metrics(self, metrics: Dict[str, Any], step_type: str = "step"):
-        log_metrics(
-            metrics, self.global_step, self.accelerator.is_main_process,
-            self.config.training.use_wandb, step_type
-        )
+        """Log metrics without accelerator dependency."""
+        if self.config.training.use_wandb:
+            wandb.log(metrics, step=self.global_step)
+        
+        # Log to console
+        metrics_str = ", ".join([f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}" for k, v in metrics.items()])
+        logger.info(f"{step_type.capitalize()} {self.global_step}: {metrics_str}")
 
     def get_karras_scalings(self, timestep_indices: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Get Karras noise schedule scalings for given timesteps."""
