@@ -230,11 +230,9 @@ class TextEmbedder:
         end_idx: int
     ) -> Dict[str, torch.Tensor]:
         """Process a batch of prompts efficiently."""
-        batch_prompts = prompts[start_idx:end_idx]
-        
         # Tokenize with padding
         text_inputs = tokenizer(
-            batch_prompts,
+            prompts,
             padding="max_length",
             max_length=self.max_length,
             truncation=True,
@@ -269,15 +267,7 @@ class TextEmbedder:
         prompt: Union[str, List[str]],
         proportion_empty_prompts: float = 0.0
     ) -> Dict[str, torch.Tensor]:
-        """Generate text embeddings for SDXL with optimized batch processing.
-        
-        Args:
-            prompt: Text prompt or list of prompts
-            proportion_empty_prompts: Proportion of prompts to make empty
-            
-        Returns:
-            Dictionary containing text embeddings and pooled embeddings
-        """
+        """Generate text embeddings for SDXL with optimized batch processing."""
         if isinstance(prompt, str):
             prompt = [prompt]
             
@@ -296,55 +286,73 @@ class TextEmbedder:
         
         # Process in batches
         for i in range(0, total_prompts, self.batch_size):
-            batch_prompts = prompts[i:i + self.batch_size]
+            batch_end = min(i + self.batch_size, total_prompts)
+            batch_prompts = prompts[i:batch_end]
             
-            # Process with both encoders
-            embeds_one = self._process_batch(
-                batch_prompts, 
-                self.tokenizer_one, 
-                self.text_encoder_one, 
-                i, 
-                min(i + self.batch_size, total_prompts)
-            )
-            embeds_two = self._process_batch(
-                batch_prompts,
-                self.tokenizer_two,
-                self.text_encoder_two,
-                i,
-                min(i + self.batch_size, total_prompts)
-            )
-            
-            # Combine embeddings
-            prompt_embeds = torch.cat([
-                embeds_one['prompt_embeds'],
-                embeds_two['prompt_embeds']
-            ], dim=-1)
-            
-            pooled_prompt_embeds = embeds_two['pooled_prompt_embeds']
-            
-            # Collect results
-            all_prompt_embeds.append(prompt_embeds)
-            all_pooled_embeds.append(pooled_prompt_embeds)
-            
-            # Update progress
-            update_progress_stats(stats, len(batch_prompts))
-            if stats.should_log():
-                log_progress(stats, prefix="Text Processing: ")
+            try:
+                # Process with both encoders
+                embeds_one = self._process_batch(
+                    batch_prompts, 
+                    self.tokenizer_one, 
+                    self.text_encoder_one,
+                    i,
+                    batch_end
+                )
+                embeds_two = self._process_batch(
+                    batch_prompts,
+                    self.tokenizer_two,
+                    self.text_encoder_two,
+                    i,
+                    batch_end
+                )
+                
+                # Combine embeddings
+                prompt_embeds = torch.cat([
+                    embeds_one['prompt_embeds'],
+                    embeds_two['prompt_embeds']
+                ], dim=-1)
+                
+                pooled_prompt_embeds = embeds_two['pooled_prompt_embeds']
+                
+                # Collect results
+                all_prompt_embeds.append(prompt_embeds)
+                all_pooled_embeds.append(pooled_prompt_embeds)
+                
+                # Update progress
+                update_progress_stats(stats, len(batch_prompts))
+                if stats.should_log():
+                    log_progress(stats, prefix="Text Processing: ")
+                    
+            except Exception as e:
+                logger.error(f"Error processing batch {i}: {str(e)}")
+                # Return empty tensors for failed batch
+                return {
+                    "prompt_embeds": torch.empty(0, device=self.device),
+                    "pooled_prompt_embeds": torch.empty(0, device=self.device)
+                }
 
-        # Combine all batches
-        prompt_embeds = torch.cat(all_prompt_embeds, dim=0)
-        pooled_prompt_embeds = torch.cat(all_pooled_embeds, dim=0)
-        
-        # Keep on GPU if needed
-        if self.device.type == "cuda":
+        try:
+            # Combine all batches
+            prompt_embeds = torch.cat(all_prompt_embeds, dim=0)
+            pooled_prompt_embeds = torch.cat(all_pooled_embeds, dim=0)
+            
+            # Keep on GPU if needed
+            if self.device.type == "cuda":
+                return {
+                    "prompt_embeds": prompt_embeds,
+                    "pooled_prompt_embeds": pooled_prompt_embeds
+                }
+            else:
+                return {
+                    "prompt_embeds": prompt_embeds.cpu(),
+                    "pooled_prompt_embeds": pooled_prompt_embeds.cpu()
+                }
+                
+        except Exception as e:
+            logger.error(f"Error combining batches: {str(e)}")
             return {
-                "prompt_embeds": prompt_embeds,
-                "pooled_prompt_embeds": pooled_prompt_embeds
-            }
-        else:
-            return {
-                "prompt_embeds": prompt_embeds.cpu(),
-                "pooled_prompt_embeds": pooled_prompt_embeds.cpu()
+                "prompt_embeds": torch.empty(0, device=self.device),
+                "pooled_prompt_embeds": torch.empty(0, device=self.device)
             }
 
     @torch.no_grad()
