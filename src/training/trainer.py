@@ -18,6 +18,7 @@ from src.config.config import Config, VAEModelConfig
 import numpy as np
 import random
 import logging
+import sys
 
 logger = logging.getLogger(__name__)
 
@@ -898,14 +899,6 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         prefetch_factor: int = 2
     ) -> DataLoader:
         """Create optimized dataloader."""
-        # Set multiprocessing start method to 'spawn' for CUDA compatibility
-        if torch.cuda.is_available():
-            try:
-                import multiprocessing as mp
-                mp.set_start_method('spawn', force=True)
-            except RuntimeError:
-                pass  # Method already set
-        
         # Convert ThreadConfig to int if needed
         if hasattr(num_workers, 'num_threads'):
             num_workers = num_workers.num_threads
@@ -917,6 +910,15 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             drop_last=True
         )
 
+        # Use 'fork' on Linux for better compatibility
+        mp_context = None
+        if sys.platform == 'linux':
+            try:
+                import multiprocessing as mp
+                mp_context = mp.get_context('fork')
+            except:
+                pass
+
         return DataLoader(
             dataset,
             batch_sampler=sampler,
@@ -926,7 +928,7 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             prefetch_factor=prefetch_factor if num_workers > 0 else None,
             worker_init_fn=NovelAIDiffusionV3Trainer._worker_init_fn,
             collate_fn=NovelAIDiffusionV3Trainer.collate_fn,
-            multiprocessing_context='spawn' if torch.cuda.is_available() else None
+            multiprocessing_context=mp_context
         )
 
     def save_checkpoint(self, path: str):
