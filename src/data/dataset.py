@@ -46,9 +46,7 @@ class NovelAIDataset(Dataset):
         device: torch.device = torch.device('cuda')
     ):
         """Initialize NovelAI dataset with optimized components."""
-        # Log system info at startup
-        log_system_info("Dataset Initialization - ")
-        
+        super().__init__()
         self.config = config
         self.device = device
         self.vae = vae
@@ -76,14 +74,11 @@ class NovelAIDataset(Dataset):
         # Initialize tag weighter
         self.tag_weighter = TagWeighter(
             config=TagWeighterConfig(
-                min_weight=config.min_weight,
-                max_weight=config.max_weight,
-                smoothing_factor=config.smoothing_factor,
-                default_weight=config.default_weight,
-                dtype=config.dtype
-
-            ),
-            text_embedder=self.text_embedder
+                default_weight=config.tag_weighting.default_weight,
+                min_weight=config.tag_weighting.min_weight,
+                max_weight=config.tag_weighting.max_weight,
+                smoothing_factor=config.tag_weighting.smoothing_factor
+            )
         )
         
         # Initialize text processor
@@ -281,7 +276,8 @@ class NovelAIDataset(Dataset):
                 'latent': latent,
                 'text_embeds': text_data['embeds'],
                 'pooled_embeds': text_data['pooled_embeds'],
-                'tags': text_data['tags']
+                'tags': text_data['tags'],
+                'tag_weights': text_data.get('tag_weights', None)
             }
             
         except Exception as e:

@@ -123,10 +123,10 @@ class DataConfig:
 
 class TagWeighterConfig:
     """Configuration for tag weighting."""
-    min_weight: float = 0.1  # Minimum weight for any tag
-    max_weight: float = 5.0  # Maximum weight for any tag
-    smoothing_factor: float = 0.1  # Smoothing factor for frequency calculations
-    default_weight: float = 1.0  # Default weight when no tags present
+    default_weight: float = 1.0
+    min_weight: float = 0.1
+    max_weight: float = 3.0
+    smoothing_factor: float = 1e-4
     dtype: torch.dtype = torch.float32
 
 @dataclass

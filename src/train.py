@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 def train(config_path: str):
     """Main training function with improved setup and error handling."""
-    is_main_process = True  # Move this to the top of the function
+    is_main_process = True
     
     try:
         # Parse arguments first
@@ -103,7 +103,7 @@ def train(config_path: str):
         logger.info("Setting up models...")
         unet, vae = setup_model(args, device, config)
         
-        # Setup memory optimizations first
+        # Setup memory optimizations
         batch_size = config.training.batch_size
         micro_batch_size = batch_size // config.training.gradient_accumulation_steps
         
@@ -133,10 +133,17 @@ def train(config_path: str):
                     logger.warning(f"- Failed to enable {opt}")
             logger.warning("Training will continue but may be less efficient")
         
-        # Initialize tag weighter with config
-        tag_weighter = TagWeighter(config=config.tag_weighting)
+        # Initialize tag weighter with proper configuration
+        tag_weighter_config = TagWeighterConfig(
+            default_weight=config.tag_weighting.default_weight,
+            min_weight=config.tag_weighting.min_weight,
+            max_weight=config.tag_weighting.max_weight,
+            smoothing_factor=config.tag_weighting.smoothing_factor
+        )
         
-        # Create dataset config with tag weighter
+        tag_weighter = TagWeighter(config=tag_weighter_config)
+        
+        # Create dataset config
         dataset_config = NovelAIDatasetConfig(
             image_size=config.data.image_size,
             max_image_size=config.data.max_image_size,
@@ -153,17 +160,17 @@ def train(config_path: str):
             proportion_empty_prompts=config.data.proportion_empty_prompts,
             max_consecutive_batch_samples=2,
             model_name=config.model.pretrained_model_name,
-            tag_weighting=config.tag_weighting,
+            tag_weighting=tag_weighter_config,  # Pass the proper tag weighter config
             max_token_length=config.data.max_token_length
         )
         
-        # Create dataset using the proper interface
+        # Create dataset
         dataset = NovelAIDataset(
             image_dirs=config.data.image_dirs,
             config=dataset_config,
             vae=vae,
             device=device,
-            tag_weighter=tag_weighter
+            tag_weighter=tag_weighter  # Pass the initialized tag weighter
         )
         
         if len(dataset) == 0:
@@ -171,11 +178,11 @@ def train(config_path: str):
             
         logger.info(f"Dataset initialized with {len(dataset)} samples")
         
-        # Create trainer with dataset
+        # Create trainer
         trainer = NovelAIDiffusionV3Trainer(
             config=config,
             model=unet,
-            dataset=dataset,  # Pass dataset directly
+            dataset=dataset,
             device=device
         )
         
@@ -198,14 +205,13 @@ def train(config_path: str):
         
     except Exception as e:
         logger.error(f"Training failed: {str(e)}")
-        logger.error(f"Stack trace: {traceback.format_exc()}")
+        logger.error(traceback.format_exc())
         raise
     finally:
-        # Use cleanup function
         cleanup_logging(is_main_process)
         gc.collect()
         torch.cuda.empty_cache()
-        
+
 if __name__ == "__main__":
     from src.config.arg_parser import parse_args
     args = parse_args()
