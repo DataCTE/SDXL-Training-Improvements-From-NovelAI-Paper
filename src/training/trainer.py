@@ -866,6 +866,28 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             "crop_top_lefts": crop_top_lefts,
             "target_sizes": target_sizes
         }
+    
+    @staticmethod
+    def _worker_init_fn(worker_id: int) -> None:
+        """Initialize worker with optimized settings."""
+        # Set worker seed for reproducibility
+        worker_seed = torch.initial_seed() % 2**32
+        np.random.seed(worker_seed)
+        random.seed(worker_seed)
+        
+        # Set thread settings for worker
+        torch.set_num_threads(1)
+        
+        if torch.cuda.is_available():
+            # Clear CUDA cache
+            torch.cuda.empty_cache()
+            
+            # Set device to GPU 0
+            try:
+                torch.cuda.set_device(0)  # Always use first GPU
+            except Exception as e:
+                logger.warning(f"Could not set GPU device for worker {worker_id}: {e}")
+                
     @staticmethod
     def create_dataloader(
         dataset: NovelAIDataset,
@@ -894,27 +916,6 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             shuffle=True,
             drop_last=True
         )
-
-        @staticmethod
-        def _worker_init_fn(worker_id: int) -> None:
-            """Initialize worker with optimized settings."""
-            # Set worker seed for reproducibility
-            worker_seed = torch.initial_seed() % 2**32
-            np.random.seed(worker_seed)
-            random.seed(worker_seed)
-            
-            # Set thread settings for worker
-            torch.set_num_threads(1)
-            
-            if torch.cuda.is_available():
-                # Clear CUDA cache
-                torch.cuda.empty_cache()
-                
-                # Set device to GPU 0
-                try:
-                    torch.cuda.set_device(0)  # Always use first GPU
-                except Exception as e:
-                    logger.warning(f"Could not set GPU device for worker {worker_id}: {e}")
 
         return DataLoader(
             dataset,
