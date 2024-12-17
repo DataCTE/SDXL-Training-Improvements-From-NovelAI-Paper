@@ -5,9 +5,9 @@ import numpy as np
 from pathlib import Path
 import json
 import logging
-from src.data.thread_config import get_optimal_cpu_threads
-from src.data.text_embedder import TextEmbedder
-from src.data.utils.system_utils import get_gpu_memory_usage, calculate_optimal_batch_size
+from src.data.processors.thread_config import get_optimal_cpu_threads
+from src.data.processors.text_embedder import TextEmbedder
+from src.data.processors.utils.system_utils import get_gpu_memory_usage, calculate_optimal_batch_size
 
 logger = logging.getLogger(__name__)
 
