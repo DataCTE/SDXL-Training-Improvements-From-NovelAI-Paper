@@ -122,6 +122,7 @@ def train(config_path: str):
             bucket_tolerance=config.data.bucket_tolerance,
             max_aspect_ratio=config.data.max_aspect_ratio,
             cache_dir=config.data.cache_dir,
+            text_cache_dir=config.data.text_cache_dir,
             use_caching=config.data.use_caching,
             proportion_empty_prompts=config.data.proportion_empty_prompts
         )

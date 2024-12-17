@@ -140,6 +140,21 @@ class PathsConfig:
     vae_samples_dir: str = "vae_samples"
 
 @dataclass
+class NovelAIDatasetConfig:
+    """Configuration for NovelAI dataset."""
+    image_size: Tuple[int, int] = (1024, 1024)
+    min_size: int = 256
+    max_dim: int = 8192
+    bucket_step: int = 8
+    min_bucket_size: int = 16
+    bucket_tolerance: float = 0.2
+    max_aspect_ratio: float = 2.0
+    cache_dir: str = "latent_cache"
+    text_cache_dir: str = "text_cache"
+    use_caching: bool = True
+    proportion_empty_prompts: float = 0.0
+
+@dataclass
 class Config:
     data: DataConfig
     model: ModelConfig = field(default_factory=ModelConfig)
