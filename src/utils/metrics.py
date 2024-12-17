@@ -10,12 +10,17 @@ import traceback
 
 logger = logging.getLogger(__name__)
 
-def setup_logging(logs_dir: str, is_main_process: bool = True) -> None:
+def setup_logging(
+    config: Config,
+    logs_dir: str, 
+    is_main_process: bool = True
+) -> None:
     """Setup logging configuration.
     
     Args:
+        config: Training configuration
         logs_dir: Directory to store log files
-        is_main_process: Whether this is the main process in distributed training
+        is_main_process: Whether this is the main process
     """
     try:
         # Create logs directory if it doesn't exist
@@ -43,6 +48,21 @@ def setup_logging(logs_dir: str, is_main_process: bool = True) -> None:
         
         if is_main_process:
             logger.info(f"Logging setup complete. Logs will be saved to: {logs_dir}")
+            
+            # Initialize wandb if enabled
+            if config.training.use_wandb:
+                try:
+                    import wandb
+                    if not wandb.run:
+                        wandb.init(
+                            project=config.training.wandb_project,
+                            name=config.training.wandb_run_name,
+                            tags=config.training.wandb_tags,
+                            config=config
+                        )
+                    logger.info("Wandb initialized successfully")
+                except Exception as e:
+                    logger.error(f"Error initializing wandb: {e}")
             
     except Exception as e:
         print(f"Error setting up logging: {str(e)}", file=sys.stderr)
@@ -137,7 +157,7 @@ def log_metrics(
         metrics: Dictionary of metrics to log
         step: Current training step
         is_main_process: Whether this is the main process
-        use_wandb: Whether to use wandb logging
+        use_wandb: Whether to use wandb
         step_type: Type of step (e.g. "step", "epoch")
     """
     if not is_main_process:
@@ -149,10 +169,24 @@ def log_metrics(
                                for k, v in metrics.items()])
         logger.info(f"{step_type.capitalize()} {step}: {metric_str}")
         
-        # Log to wandb
+        # Log to wandb if enabled (assume already initialized)
         if use_wandb:
             import wandb
             wandb.log(metrics, step=step)
             
     except Exception as e:
-        logger.error(f"Error logging metrics: {str(e)}") 
+        logger.error(f"Error logging metrics: {str(e)}")
+
+def cleanup_logging(is_main_process: bool = True) -> None:
+    """Cleanup logging resources.
+    
+    Args:
+        is_main_process: Whether this is the main process
+    """
+    if is_main_process:
+        try:
+            import wandb
+            if wandb.run:
+                wandb.finish()
+        except Exception as e:
+            logger.error(f"Error cleaning up wandb: {e}")

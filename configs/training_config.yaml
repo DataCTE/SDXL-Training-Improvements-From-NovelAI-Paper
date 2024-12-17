@@ -42,6 +42,11 @@ training:
   early_stopping_patience: 5
   early_stopping_threshold: 0.01
   
+  # Add wandb settings
+  use_wandb: true
+  wandb_project: "sdxl-training"
+  wandb_run_name: null
+  wandb_tags: []
 
 # Data configuration
 data:

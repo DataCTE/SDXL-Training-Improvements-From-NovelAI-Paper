@@ -17,8 +17,6 @@ class VAEModelConfig:
 
 @dataclass
 class ModelConfig:
-    hidden_size: int = 768
-    cross_attention_dim: int = 2048
     sigma_data: float = 1.0
     sigma_min: float = 0.002
     sigma_max: float = 20000.0
@@ -26,13 +24,19 @@ class ModelConfig:
     num_timesteps: int = 1000
     min_snr_gamma: float = 0.1
     pretrained_model_name: str = "stabilityai/stable-diffusion-xl-base-1.0"
-    vae: VAEModelConfig = field(default_factory=VAEModelConfig)
+    hidden_size: int = 768
+    cross_attention_dim: int = 2048
 
 @dataclass
 class TrainingConfig:
     batch_size: int = 32
     gradient_accumulation_steps: int = 4
     learning_rate: float = 4.0e-7
+    vae_learning_rate: float = 4.5e-5
+    vae_warmup_steps: int = 1000
+    vae_min_lr: float = 1e-6
+    use_discriminator: bool = True
+    discriminator_learning_rate: float = 4.5e-5
     num_epochs: int = 10
     save_steps: int = 1000
     log_steps: int = 10
@@ -40,34 +44,24 @@ class TrainingConfig:
     weight_decay: float = 1.0e-2
     optimizer_eps: float = 1.0e-8
     optimizer_betas: Tuple[float, float] = (0.9, 0.999)
-    vae_learning_rate: float = 4.5e-5
-    vae_warmup_steps: int = 1000
-    vae_min_lr: float = 1e-6
-    use_discriminator: bool = True
-    discriminator_learning_rate: float = 4.5e-5
-    prediction_type: str = "v_prediction"  # v_prediction or epsilon
     
     # Learning rate scheduler settings
-    lr_scheduler: Optional[Literal["cosine", "linear", "none"]] = "none"
+    lr_scheduler: Literal["cosine", "linear", "none"] = "none"
     max_train_steps: Optional[int] = None
-    warmup_steps: Optional[int] = 0
+    warmup_steps: int = 0
     
-    # Timestep bias parameters
+    prediction_type: Literal["v_prediction", "epsilon"] = "v_prediction"
     timestep_bias_strategy: Literal["none", "earlier", "later", "range"] = "none"
     timestep_bias_multiplier: float = 1.0
     timestep_bias_begin: int = 0
     timestep_bias_end: int = 1000
     timestep_bias_portion: float = 0.25
-    
-    # SNR parameters
-    snr_gamma: Optional[float] = 5.0
-    max_grad_norm: Optional[float] = 1.0
-    
-    # Early stopping parameters
-    early_stopping_patience: Optional[int] = 5
+    snr_gamma: float = 5.0
+    max_grad_norm: float = 1.0
+    early_stopping_patience: int = 5
     early_stopping_threshold: float = 0.01
     
-    # Add wandb configuration
+    # Add wandb configuration that was missing
     use_wandb: bool = False
     wandb_project: str = "sdxl-training"
     wandb_run_name: Optional[str] = None

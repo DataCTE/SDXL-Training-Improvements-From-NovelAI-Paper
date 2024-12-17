@@ -12,7 +12,7 @@ from src.training.trainer import NovelAIDiffusionV3Trainer
 from src.utils.model import setup_model
 from src.config.config import Config
 from src.utils.setup import setup_distributed, verify_memory_optimizations
-from src.utils.metrics import setup_logging, log_system_info
+from src.utils.metrics import setup_logging, log_system_info, cleanup_logging
 from src.data.text_embedder import TextEmbedder
 from src.data.tag_weighter import TagWeighter, TagWeightingConfig
 from src.data.validation import validate_directories
@@ -97,24 +97,13 @@ def train(config_path: str):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         is_main_process = True  # Always True for single GPU
 
-        # Configure logging
-        setup_logging(config.paths.logs_dir, is_main_process)
-
+        # Configure logging and wandb
+        setup_logging(config, config.paths.logs_dir, is_main_process)
+        
         # Log system information
         if is_main_process:
             log_system_info()
         
-        # Initialize wandb if enabled
-        if hasattr(config.training, 'use_wandb') and config.training.use_wandb and is_main_process:
-            if not hasattr(config.training, 'wandb_project'):
-                logger.warning("Wandb enabled but project name not configured. Disabling wandb.")
-            else:
-                wandb.init(
-                    project=config.training.wandb_project,
-                    name=config.training.wandb_run_name,
-                    config=config.to_dict()
-                )
-
         # Validate directories
         valid_dirs, total_images = validate_directories(config)
         if is_main_process:
@@ -215,16 +204,13 @@ def train(config_path: str):
         
         logger.info("Training complete!")
         
-        # Cleanup
-        if config.training.use_wandb and is_main_process:
-            wandb.finish()
-            
     except Exception as e:
         logger.error(f"Training failed: {str(e)}")
         logger.error(f"Stack trace: {traceback.format_exc()}")
         raise
     finally:
-        # Cleanup
+        # Use cleanup function
+        cleanup_logging(is_main_process)
         gc.collect()
         torch.cuda.empty_cache()
         

@@ -16,6 +16,7 @@ from src.utils.model import configure_model_memory_format
 from src.training.scheduler import configure_noise_scheduler, get_karras_scalings
 from src.utils.noise import generate_noise
 from src.utils.embeddings import get_add_time_ids
+from src.utils.metrics import log_metrics as utils_log_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +135,6 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             
             # Calculate max_train_steps if not set
             if self.config.training.max_train_steps is None:
-                # We'll need to set this when we know the dataset size
                 logger.info("max_train_steps not set, will be calculated when dataloader is provided")
                 self.max_train_steps = None
             else:
@@ -150,14 +150,14 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                 if self.config.training.lr_scheduler == "cosine":
                     self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                         self.optimizer,
-                        T_max=self.max_train_steps,
+                        T_max=self.max_train_steps - self.config.training.warmup_steps
                     )
                 elif self.config.training.lr_scheduler == "linear":
                     self.lr_scheduler = torch.optim.lr_scheduler.LinearLR(
                         self.optimizer,
                         start_factor=1.0,
                         end_factor=0.1,
-                        total_iters=self.max_train_steps
+                        total_iters=self.max_train_steps - self.config.training.warmup_steps
                     )
             else:
                 self.lr_scheduler = None
@@ -370,14 +370,14 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             raise
 
     def log_metrics(self, metrics: Dict[str, Any], step_type: str = "step") -> None:
-        """Log metrics to wandb and console."""
-        if self.config.training.use_wandb:
-            wandb.log(metrics, step=self.global_step)
-        
-        # Log to console
-        metrics_str = ", ".join([f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}" 
-                               for k, v in metrics.items()])
-        logger.info(f"{step_type.capitalize()} {self.global_step}: {metrics_str}")
+        """Log metrics using utility function."""
+        utils_log_metrics(
+            metrics=metrics,
+            step=self.global_step,
+            is_main_process=True,  # TODO: Add distributed training support
+            use_wandb=self.config.training.use_wandb,
+            step_type=step_type
+        )
 
     @staticmethod
     def create_dataloader(
@@ -398,4 +398,8 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             num_workers=0,  # Force single process
             pin_memory=pin_memory
         )
+
+    def __del__(self):
+        """Remove wandb cleanup since it's handled by cleanup_logging"""
+        pass
 
