@@ -1,38 +1,27 @@
+"""NovelAI Diffusion V3 Trainer with optimized memory usage."""
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.distributed as dist
-from diffusers import UNet2DConditionModel, AutoencoderKL, DDPMScheduler
-import wandb
 import os
-from typing import Dict, Tuple, Optional, List, Union, Any
-from torch.utils.data import DataLoader
-from tqdm.auto import tqdm
-import math
-from src.data.dataset import NovelAIDataset
-from src.data.sampler import AspectBatchSampler
-from src.data.thread_config import ThreadConfig
-import yaml
-from src.config.config import Config, VAEModelConfig
-import numpy as np
-import random
 import logging
-import sys
 import time
+import gc
+from typing import Dict, Optional, Union, Tuple, Any
+from diffusers import UNet2DConditionModel, AutoencoderKL
+from torch.utils.data import DataLoader
+import wandb
 import traceback
-from src.utils.model import initialize_model_weights
-from src.utils.setup import setup_memory_optimizations, verify_memory_optimizations, verify_buffer_states, verify_scheduler_parameters, check_memory_status
+from src.config.config import Config
+from src.data.dataset import NovelAIDataset
+from src.utils.setup import setup_memory_optimizations, verify_memory_optimizations
+from src.utils.model import configure_model_memory_format
 from src.training.scheduler import configure_noise_scheduler, get_karras_scalings
-from src.utils.model import create_unet, create_vae, is_xformers_installed
-from src.utils.metrics import compute_grad_norm, log_metrics
 from src.utils.noise import generate_noise
 from src.utils.embeddings import get_add_time_ids
-from src.utils.checkpoints import save_checkpoint
-import gc
 
 logger = logging.getLogger(__name__)
 
 class NovelAIDiffusionV3Trainer(torch.nn.Module):
+    """Trainer for NovelAI Diffusion V3 with optimized memory usage."""
+    
     def __init__(
         self,
         config_path: str,
@@ -40,394 +29,48 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         vae: Optional[AutoencoderKL] = None,
         device: Optional[torch.device] = None
     ):
-        """Initialize trainer with additional validations and optimizations."""
+        """Initialize trainer with optimized memory usage."""
         super().__init__()
         
-        # Load and validate config first
-        if not os.path.exists(config_path):
-            raise FileNotFoundError(f"Config file not found at {config_path}")
-        self.config = Config.from_yaml(config_path)
+        # Load and validate config
+        self.config = Config.load(config_path)
         
-        # Set device and precision before scheduler configuration
+        # Setup device
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self._set_precision()
         
-        # Initialize models with proper validation
-        self.model = model or create_unet(self.config, self.model_dtype)
-        self.vae = vae or create_vae(self.model_dtype)
-        
-        # Validate model architectures
-        self._validate_model_architecture()
-        
-        # Move models to device and set dtype with verification
-        try:
-            initial_memory = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
-            self._setup_models()
-            if torch.cuda.is_available():
-                memory_increase = torch.cuda.memory_allocated() - initial_memory
-                logger.info(f"Model loading increased memory usage by {memory_increase/(1024**3):.2f}GB")
-                
-        except Exception as e:
-            logger.error(f"Error setting up models: {str(e)}")
-            raise
-        
-        # Initialize model weights if needed
-        if model is None:
-            initialize_model_weights(self.model)
-        
-        # Configure optimizer with proper parameters and verification
-        try:
-            self._setup_optimizer()
-            
-            # Verify optimizer state
-            if not hasattr(self.optimizer, 'state'):
-                raise RuntimeError("Optimizer initialization failed")
-            
-            # Verify parameter groups
-            if len(self.optimizer.param_groups) == 0:
-                raise RuntimeError("No parameter groups in optimizer")
-                
-            # Verify learning rate
-            if any(group['lr'] != self.config.training.learning_rate for group in self.optimizer.param_groups):
-                raise RuntimeError("Learning rate mismatch in optimizer")
-                
-        except Exception as e:
-            logger.error(f"Error setting up optimizer: {e}")
-            raise
-        
-        # Calculate and verify micro batch size
-        batch_size = self.config.training.batch_size
-        self.micro_batch_size = batch_size // self.config.training.gradient_accumulation_steps
-        
-        if batch_size % self.config.training.gradient_accumulation_steps != 0:
-            raise ValueError(
-                f"Batch size ({batch_size}) must be divisible by "
-                f"gradient_accumulation_steps ({self.config.training.gradient_accumulation_steps})"
+        # Initialize model and move to device
+        self.model = model
+        if self.model is None:
+            self.model = UNet2DConditionModel.from_pretrained(
+                self.config.model.pretrained_model_name_or_path,
+                subfolder="unet"
             )
-            
-        # Set up memory optimizations and get buffers with verification
+        self.model.to(self.device)
+        
+        # Get model dtype
+        self.model_dtype = next(self.model.parameters()).dtype
+        
+        # Configure memory format
+        configure_model_memory_format(
+            model=self.model,
+            channels_last=self.config.system.channels_last
+        )
+        
+        # Setup memory optimizations
         try:
-            initial_memory = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
+            batch_size = self.config.training.batch_size
+            micro_batch_size = batch_size // self.config.training.gradient_accumulation_steps
             
-            memory_buffers = setup_memory_optimizations(
+            # Set up memory optimizations
+            memory_setup = setup_memory_optimizations(
                 model=self.model,
                 config=self.config,
                 device=self.device,
                 batch_size=batch_size,
-                micro_batch_size=self.micro_batch_size
+                micro_batch_size=micro_batch_size
             )
             
-            if torch.cuda.is_available():
-                memory_increase = torch.cuda.memory_allocated() - initial_memory
-                logger.info(f"Memory optimization setup increased memory by {memory_increase/(1024**3):.2f}GB")
-            
-            # Verify buffer states using setup.py function
-            buffer_states = verify_buffer_states(
-                buffers=memory_buffers,
-                micro_batch_size=self.micro_batch_size,
-                model_dtype=self.model_dtype,
-                device=self.device,
-                logger=logger
-            )
-            
-            if not all(buffer_states.values()):
-                logger.error("Some buffers are invalid")
-                raise RuntimeError("Invalid buffer states")
-            
-            # Unpack memory buffers
-            self.noise_template = memory_buffers['noise_template']
-            self.grad_norm_buffer = memory_buffers['grad_norm_buffer']
-            self.noise_buffer = memory_buffers['noise_buffer']
-            self.latent_buffer = memory_buffers['latent_buffer']
-            self.timestep_buffer = memory_buffers['timestep_buffer']
-            self.snr_weight_buffer = memory_buffers.get('snr_weight_buffer')
-                
-        except Exception as e:
-            logger.error(f"Error setting up memory optimizations: {e}")
-            # Try emergency cleanup
-            try:
-                gc.collect()
-                torch.cuda.empty_cache()
-            except:
-                pass
-            raise
-        
-        # Configure noise scheduler and get parameters with verification
-        try:
-            scheduler_params = configure_noise_scheduler(self.config, self.device)
-            
-            # Verify scheduler parameters using setup.py function
-            param_states = verify_scheduler_parameters(
-                scheduler_params=scheduler_params,
-                device=self.device,
-                logger=logger
-            )
-            
-            if not all(param_states.values()):
-                logger.error("Some scheduler parameters are invalid")
-                raise RuntimeError("Invalid scheduler parameters")
-            
-            # Unpack scheduler parameters
-            self.scheduler = scheduler_params['scheduler']
-            self.alphas = scheduler_params['alphas']
-            self.betas = scheduler_params['betas']
-            self.alphas_cumprod = scheduler_params['alphas_cumprod']
-            self.sigmas = scheduler_params['sigmas']
-            self.snr_values = scheduler_params['snr_values']
-            self.snr_weights = scheduler_params['snr_weights']
-            self.c_skip = scheduler_params['c_skip']
-            self.c_out = scheduler_params['c_out']
-            self.c_in = scheduler_params['c_in']
-                
-        except Exception as e:
-            logger.error(f"Error configuring scheduler: {e}")
-            raise
-        
-        # Initialize training state
-        self._initialize_training_state()
-        
-        # Final memory check using setup.py function
-        if torch.cuda.is_available():
-            memory_stats = check_memory_status(
-                initial_memory=torch.cuda.memory_allocated() / (1024**3),
-                device=self.device,
-                logger=logger
-            )
-            
-            if 'leak' in memory_stats:
-                logger.warning(f"Memory leak detected during initialization: {memory_stats['leak']:.2f}GB")
-            else:
-                logger.info(f"Final GPU memory usage: {memory_stats.get('current', 0):.2f}GB")
-
-    def _get_accelerator_kwargs(self):
-        """Get additional kwargs for accelerator setup."""
-        kwargs = {
-            "even_batches": True,  # Ensure consistent batch sizes
-            "dispatch_batches": None,  # Let accelerator handle batch dispatch
-            "split_batches": False,  # Don't split batches across devices
-            "step_scheduler_with_optimizer": True,  # Sync scheduler with optimizer steps
-        }
-        
-        if self.config.system.dynamo_backend:
-            kwargs["dynamo_backend"] = self.config.system.dynamo_backend
-        
-        return kwargs
-
-    def _set_precision(self):
-        """Configure model precision based on settings."""
-        if self.config.system.mixed_precision == "bf16":
-            self.model_dtype = torch.bfloat16
-            # Enable auto-casting for better performance
-            torch.set_float32_matmul_precision('high')
-        elif self.config.system.mixed_precision == "fp16":
-            self.model_dtype = torch.float16
-        else:
-            self.model_dtype = torch.float32
-
-    def _setup_models(self):
-        """Setup models with proper device and dtype."""
-        try:
-            # Add debug logging
-            logger.info(f"CUDA available: {torch.cuda.is_available()}")
-            if torch.cuda.is_available():
-                logger.info(f"CUDA device count: {torch.cuda.device_count()}")
-                logger.info(f"Current CUDA device: {torch.cuda.current_device()}")
-            
-            logger.info(f"Target device: {self.device}")
-            logger.info(f"Target dtype: {self.model_dtype}")
-            
-            # Check current device state
-            current_model_device = next(self.model.parameters()).device
-            current_vae_device = next(self.vae.parameters()).device
-            
-            logger.info(f"Current model device: {current_model_device}")
-            logger.info(f"Current VAE device: {current_vae_device}")
-            
-            # Only move if needed - use device type comparison
-            if current_model_device.type != self.device.type:
-                logger.info(f"Moving model from {current_model_device} to {self.device}")
-                try:
-                    self.model = self.model.to(device=self.device, dtype=self.model_dtype)
-                    logger.info("Model move completed")
-                except Exception as e:
-                    logger.error(f"Error moving model: {str(e)}")
-                    logger.error(f"Model state dict keys: {self.model.state_dict().keys()}")
-                    raise
-            elif next(self.model.parameters()).dtype != self.model_dtype:
-                logger.info(f"Converting model dtype to {self.model_dtype}")
-                self.model = self.model.to(dtype=self.model_dtype)
-                
-            if current_vae_device.type != self.device.type:
-                logger.info(f"Moving VAE from {current_vae_device} to {self.device}")
-                try:
-                    self.vae = self.vae.to(device=self.device, dtype=self.model_dtype)
-                    logger.info("VAE move completed")
-                except Exception as e:
-                    logger.error(f"Error moving VAE: {str(e)}")
-                    raise
-            elif next(self.vae.parameters()).dtype != self.model_dtype:
-                logger.info(f"Converting VAE dtype to {self.model_dtype}")
-                self.vae = self.vae.to(dtype=self.model_dtype)
-            
-            # Set training/eval modes
-            self.model.train()
-            self.vae.eval()
-            self.vae.requires_grad_(False)
-            
-            # Verify final state
-            final_model_device = next(self.model.parameters()).device
-            final_model_dtype = next(self.model.parameters()).dtype
-            logger.info(f"Final model device: {final_model_device}")
-            logger.info(f"Final model dtype: {final_model_dtype}")
-            
-            # Compare device types and indices
-            if final_model_device.type != self.device.type or (
-                self.device.type == 'cuda' and 
-                final_model_device.index != self.device.index if self.device.index is not None else final_model_device.index != 0
-            ):
-                logger.error(f"Model device mismatch: expected {self.device}, got {final_model_device}")
-                raise RuntimeError(f"Model failed to move to correct device (expected {self.device}, got {final_model_device})")
-            if final_model_dtype != self.model_dtype:
-                logger.error(f"Model dtype mismatch: expected {self.model_dtype}, got {final_model_dtype}")
-                raise RuntimeError("Model failed to convert to correct dtype")
-                
-        except Exception as e:
-            logger.error(f"Error in _setup_models: {str(e)}")
-            logger.error(f"Stack trace: {traceback.format_exc()}")
-            raise
-
-    def _validate_model_architecture(self):
-        """Validate model is a proper SDXL UNet."""
-        # Basic validation that this is an SDXL UNet
-        if not isinstance(self.model, UNet2DConditionModel):
-            raise ValueError("Model must be a UNet2DConditionModel")
-        
-        # Validate VAE
-        if not isinstance(self.vae, AutoencoderKL):
-            raise ValueError("VAE must be an AutoencoderKL")
-        
-        if self.vae.config.latent_channels != 4:
-            raise ValueError("VAE must have 4 latent channels")
-
-    def _setup_optimizer(self):
-        """Configure optimizer with proper parameters."""
-        # Get optimizer parameters from config
-        optimizer_params = {
-            'lr': self.config.training.learning_rate,
-            'betas': self.config.training.optimizer_betas,
-            'eps': self.config.training.optimizer_eps,
-            'weight_decay': self.config.training.weight_decay
-        }
-        from adamw_bf16 import AdamWBF16
-        # Create AdamW optimizer
-        self.optimizer = AdamWBF16(
-            self.model.parameters(),
-            **optimizer_params
-        )
-        
-        # Create learning rate scheduler
-        self.lr_scheduler = None  # Renamed from self.scheduler to self.lr_scheduler
-
-    def _initialize_training_state(self):
-        """Initialize training state variables.
-        
-        Sets up:
-        1. Step counters
-        2. Loss tracking
-        3. Gradient scaler for mixed precision
-        4. Progress tracking
-        """
-        # Initialize step counters
-        self.global_step = 0
-        self.current_epoch = 0
-        
-        # Initialize loss tracking
-        self.running_loss = 0.0
-        self.num_steps = 0
-        self.best_loss = float('inf')
-        
-        # Initialize gradient scaler for mixed precision training
-        if self.config.system.mixed_precision in ["fp16", "bf16"]:
-            self.scaler = torch.amp.GradScaler('cuda')
-        else:
-            self.scaler = None
-        
-        # Initialize progress tracking
-        self.train_time = 0.0
-        self.samples_seen = 0
-        self.steps_since_save = 0
-        
-        # Initialize validation tracking
-        self.best_val_loss = float('inf')
-        self.steps_without_improvement = 0
-        
-        # Initialize early stopping state
-        if hasattr(self.config.training, 'early_stopping_patience'):
-            self.early_stopping_counter = 0
-            self.best_model_step = 0
-        
-        # Initialize gradient accumulation state
-        self.current_accumulation_step = 0
-
-
-    def compute_loss(
-        self,
-        model_pred: torch.Tensor,
-        target: torch.Tensor,
-        timesteps: torch.Tensor,
-        weights: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Compute weighted loss with error handling."""
-        try:
-            # Validate inputs
-            if not isinstance(model_pred, torch.Tensor):
-                raise ValueError("model_pred must be a tensor")
-            if not isinstance(target, torch.Tensor):
-                raise ValueError("target must be a tensor")
-            if model_pred.shape != target.shape:
-                raise ValueError(f"Shape mismatch: model_pred {model_pred.shape} vs target {target.shape}")
-
-            # Basic MSE in float32 for stability
-            loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
-            
-            # Average over non-batch dimensions
-            loss = loss.mean(dim=list(range(1, len(loss.shape))))
-            
-            # Apply SNR weights if enabled
-            if self.config.training.snr_gamma is not None:
-                snr_weights = self.compute_snr_weight(timesteps)
-                if snr_weights is not None:
-                    loss = loss * snr_weights.to(loss.device)
-            
-            # Apply sample weights if provided
-            if weights is not None:
-                if weights.shape != loss.shape:
-                    raise ValueError(f"Weight shape {weights.shape} doesn't match loss shape {loss.shape}")
-                loss = loss * weights
-            
-            return loss.mean()
-
-        except Exception as e:
-            logger.error(f"Error in compute_loss: {str(e)}")
-            logger.error(f"Stack trace: {traceback.format_exc()}")
-            raise
-
-
-
-    def training_step(
-        self,
-        batch: Dict[str, Union[torch.Tensor, Dict[str, torch.Tensor]]],
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
-        """Execute optimized training step with comprehensive error handling."""
-        try:
-            # Track memory usage before step
-            if torch.cuda.is_available():
-                torch.cuda.reset_peak_memory_stats()
-                start_mem = torch.cuda.memory_allocated() / 1024**2
-            
-            step_start = time.time()
-            
-            # Re-verify memory optimizations are still active using setup.py functions
+            # Verify optimizations
             optimization_states = verify_memory_optimizations(
                 model=self.model,
                 config=self.config,
@@ -435,699 +78,294 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                 logger=logger
             )
             
-            # Take action if optimizations were lost
             if not all(optimization_states.values()):
-                logger.warning("Some memory optimizations were lost - attempting to restore")
-                try:
-                    memory_buffers = setup_memory_optimizations(
-                        model=self.model,
-                        config=self.config,
-                        device=self.device,
-                        batch_size=self.config.training.batch_size,
-                        micro_batch_size=self.micro_batch_size
-                    )
-                    # Re-verify after restore attempt
-                    optimization_states = verify_memory_optimizations(
-                        model=self.model,
-                        config=self.config,
-                        device=self.device,
-                        logger=logger
-                    )
-                    if not all(optimization_states.values()):
-                        logger.error("Failed to restore memory optimizations")
-                except Exception as e:
-                    logger.error(f"Error restoring optimizations: {e}")
-            
-            with torch.autocast(device_type='cuda', dtype=self.model_dtype):
-                try:
-                    # Get and validate inputs
-                    model_input = batch["model_input"].to(
-                        device=self.device,
-                        dtype=self.model_dtype,
-                        memory_format=torch.channels_last if self.config.system.channels_last else torch.contiguous_format,
-                        non_blocking=True
-                    )
-                except KeyError as e:
-                    logger.error(f"Missing key in batch: {e}")
-                    raise
-                except RuntimeError as e:
-                    logger.error(f"Error moving model input to device: {e}")
-                    raise
+                logger.warning("Some memory optimizations failed to initialize")
                 
-                try:
-                    # Process inputs efficiently
-                    tag_weights = batch["tag_weights"].to(self.device, non_blocking=True)
-                    text_embeds = batch["text_embeds"]
-                    encoder_hidden_states = text_embeds["text_embeds"].to(self.device, non_blocking=True)
-                    pooled_embeds = text_embeds["pooled_text_embeds"].to(self.device, non_blocking=True)
-                except KeyError as e:
-                    logger.error(f"Missing embedding key in batch: {e}")
-                    raise
-                except RuntimeError as e:
-                    logger.error(f"Error processing embeddings: {e}")
-                    raise
-
-                # Initialize prediction tensor with correct memory format
-                try:
-                    total_v_pred = torch.empty_like(
-                        model_input,
-                        memory_format=torch.channels_last if self.config.system.channels_last else torch.contiguous_format
-                    )
-                except RuntimeError as e:
-                    logger.error(f"Error creating prediction tensor: {e}")
-                    raise
-                
-                # Clear gradients efficiently
-                self.optimizer.zero_grad(set_to_none=True)
-                
-                total_loss = 0.0
-                running_loss = 0.0
-                
-                # Process in micro-batches
-                for i in range(self.config.training.gradient_accumulation_steps):
-                    micro_batch_start = time.time()
-                    start_idx = i * self.micro_batch_size
-                    end_idx = start_idx + self.micro_batch_size
-                    
-                    try:
-                        # Verify buffer states using setup.py function
-                        buffer_states = verify_buffer_states(
-                            buffers={
-                                'noise_buffer': self.noise_buffer,
-                                'latent_buffer': self.latent_buffer,
-                                'timestep_buffer': self.timestep_buffer,
-                                'noise_template': self.noise_template,
-                                'grad_norm_buffer': self.grad_norm_buffer,
-                                **(({'snr_weight_buffer': self.snr_weight_buffer} 
-                                   if self.snr_weight_buffer is not None else {}))
-                            },
-                            micro_batch_size=self.micro_batch_size,
-                            model_dtype=self.model_dtype,
-                            device=self.device,
-                            logger=logger
-                        )
-                        
-                        # Take action if buffers are invalid
-                        if not all(buffer_states.values()):
-                            logger.warning("Some buffers are invalid - attempting to restore")
-                            try:
-                                memory_buffers = setup_memory_optimizations(
-                                    model=self.model,
-                                    config=self.config,
-                                    device=self.device,
-                                    batch_size=self.config.training.batch_size,
-                                    micro_batch_size=self.micro_batch_size
-                                )
-                                # Update buffer references
-                                self.noise_buffer = memory_buffers['noise_buffer']
-                                self.latent_buffer = memory_buffers['latent_buffer']
-                                self.timestep_buffer = memory_buffers['timestep_buffer']
-                                self.noise_template = memory_buffers['noise_template']
-                                self.grad_norm_buffer = memory_buffers['grad_norm_buffer']
-                                if 'snr_weight_buffer' in memory_buffers:
-                                    self.snr_weight_buffer = memory_buffers['snr_weight_buffer']
-                            except Exception as e:
-                                logger.error(f"Error restoring buffers: {e}")
-                                raise
-                            
-                        micro_batch = {
-                            'latents': model_input[start_idx:end_idx],
-                            'encoder_states': encoder_hidden_states[start_idx:end_idx],
-                            'pooled': pooled_embeds[start_idx:end_idx],
-                            'tag_weights': tag_weights[start_idx:end_idx],
-                        }
-                        
-                        # Generate noise efficiently using pre-allocated buffer
-                        self.noise_buffer.normal_()
-                        noise = self.noise_buffer[:micro_batch['latents'].shape[0]]
-                        
-                        # Sample timesteps
-                        timesteps = torch.randint(
-                            0, self.num_timesteps, (self.micro_batch_size,),
-                            device=self.device
-                        )
-                        
-                        # Get sigmas and add noise using pre-allocated buffer
-                        sigmas = self.scheduler.sigmas[timesteps].to(dtype=self.model_dtype)
-                        self.latent_buffer.copy_(micro_batch['latents'])
-                        self.latent_buffer.addcmul_(sigmas[:, None, None, None], noise)
-                        noisy_latents = self.latent_buffer[:micro_batch['latents'].shape[0]]
-                        
-                        # Scale input
-                        if self.config.training.prediction_type == "v_prediction":
-                            scaled_input = self.c_in[timesteps].to(dtype=self.model_dtype)[:, None, None, None] * noisy_latents
-                        else:
-                            scaled_input = noisy_latents
-                            
-                        # Get time embeddings
-                        time_ids = self._get_add_time_ids(
-                            original_sizes=batch["original_sizes"][start_idx:end_idx],
-                            crops_coords_top_lefts=batch["crop_top_lefts"][start_idx:end_idx],
-                            target_sizes=batch["target_sizes"][start_idx:end_idx],
-                            batch_size=self.micro_batch_size
-                        )
-                        
-                        # Run model forward pass
-                        model_pred = self.model(
-                            scaled_input,
-                            timesteps,
-                            encoder_hidden_states=micro_batch['encoder_states'],
-                            added_cond_kwargs={
-                                "text_embeds": micro_batch['pooled'],
-                                "time_ids": time_ids
-                            },
-                            return_dict=False
-                        )[0]
-                        
-                        # Get target
-                        target = noise if self.config.training.prediction_type == "epsilon" else (
-                            self.c_skip[timesteps].to(dtype=self.model_dtype)[:, None, None, None] * micro_batch['latents'] +
-                            self.c_out[timesteps].to(dtype=self.model_dtype)[:, None, None, None] * noise
-                        )
-                        
-                        # Compute loss
-                        loss = self.compute_loss(
-                            model_pred, 
-                            target,
-                            timesteps,
-                            micro_batch['tag_weights']
-                        ) / self.config.training.gradient_accumulation_steps
-                        
-                        # Backward pass with memory tracking
-                        try:
-                            if torch.cuda.is_available():
-                                torch.cuda.reset_peak_memory_stats()
-                            loss.backward()
-                            if torch.cuda.is_available():
-                                backward_peak = torch.cuda.max_memory_allocated() / 1024**2
-                                if backward_peak > start_mem * 2:  # More than 2x increase
-                                    logger.warning(f"High memory usage in backward pass: {backward_peak:.0f}MB")
-                        except RuntimeError as e:
-                            if "out of memory" in str(e):
-                                logger.error(f"OOM in backward pass: {e}")
-                                if torch.cuda.is_available():
-                                    torch.cuda.empty_cache()
-                            raise
-                        
-                        # Update metrics
-                        loss_value = loss.item()
-                        total_loss += loss_value
-                        running_loss += loss_value
-                        
-                        # Store predictions
-                        total_v_pred[start_idx:end_idx] = model_pred.detach()
-                        
-                        # Log micro-batch metrics
-                        micro_batch_time = time.time() - micro_batch_start
-                        logger.debug(
-                            f"Micro-batch {i+1}/{self.config.training.gradient_accumulation_steps} - "
-                            f"Loss: {loss_value:.4f}, Time: {micro_batch_time:.2f}s"
-                        )
-                            
-                    except RuntimeError as e:
-                        if "out of memory" in str(e):
-                            logger.error(f"OOM in micro-batch {i+1}: {e}")
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-                            raise
-                        logger.error(f"Error in micro-batch {i+1}: {e}")
-                        raise
-                
-                    # Log metrics if main process
-                    if self.global_step % self.config.training.log_steps == 0:
-                        self._log_training_step(loss_value, running_loss, i, micro_batch['tag_weights'])
-                
-                # Apply gradient clipping
-                if self.config.training.max_grad_norm is not None:
-                    try:
-                        # Track gradient norms
-                        grad_norm = 0.0
-                        for param in self.model.parameters():
-                            if param.grad is not None:
-                                grad_norm = max(grad_norm, param.grad.norm().item())
-                                
-                        torch.nn.utils.clip_grad_norm_(
-                            self.model.parameters(),
-                            self.config.training.max_grad_norm
-                        )
-                        
-                        # Verify clipping worked
-                        clipped_grad_norm = 0.0
-                        for param in self.model.parameters():
-                            if param.grad is not None:
-                                clipped_grad_norm = max(clipped_grad_norm, param.grad.norm().item())
-                                
-                        if clipped_grad_norm > self.config.training.max_grad_norm * 1.1:  # 10% tolerance
-                            logger.warning(f"Gradient clipping may not be working: {clipped_grad_norm:.2f} > {self.config.training.max_grad_norm}")
-                            
-                    except RuntimeError as e:
-                        logger.error(f"Error during gradient clipping: {e}")
-                        raise
-                
-                # Update params
-                try:
-                    self.optimizer.step()
-                    if self.lr_scheduler is not None:
-                        self.lr_scheduler.step()
-                except RuntimeError as e:
-                    logger.error(f"Error during optimizer step: {e}")
-                    raise
-
-                avg_loss = running_loss / self.config.training.gradient_accumulation_steps
-                
-                # Log step completion metrics and check memory using setup.py function
-                step_time = time.time() - step_start
-                if torch.cuda.is_available():
-                    memory_stats = check_memory_status(
-                        initial_memory=start_mem / 1024,  # Convert MB to GB
-                        device=self.device,
-                        logger=logger
-                    )
-                    
-                    peak_mem = torch.cuda.max_memory_allocated() / 1024**2
-                    mem_diff = peak_mem - start_mem
-                    logger.info(
-                        f"Step completed - "
-                        f"Avg Loss: {avg_loss:.4f}, "
-                        f"Time: {step_time:.2f}s, "
-                        f"Peak Memory: {peak_mem:.0f}MB "
-                        f"(+{mem_diff:.0f}MB)"
-                    )
-                    
-                    # Log any memory leaks detected
-                    if 'leak' in memory_stats:
-                        logger.warning(f"Memory leak detected: {memory_stats['leak']:.2f}GB")
-                
-                return total_loss, model_input, total_v_pred, timesteps, avg_loss
-            
         except Exception as e:
-            logger.error(f"Unexpected error in training step: {str(e)}")
-            logger.error(f"Stack trace: {traceback.format_exc()}")
-            # Emergency cleanup
-            try:
-                gc.collect()
-                torch.cuda.empty_cache()
-            except:
-                pass
+            logger.error(f"Error setting up memory optimizations: {e}")
             raise
-
-    def train_epoch(self, epoch: int) -> None:
-        """Train for one epoch with improved diagnostics."""
-        try:
-            logger.info(f"Starting epoch {epoch}")
-            self.model.train()
             
-            # Initialize progress bar with more details
-            pbar = tqdm(
-                self.dataloader, 
-                desc=f"Epoch {epoch}",
-                leave=True,
-                dynamic_ncols=True
+        # Configure noise scheduler
+        try:
+            scheduler_params = configure_noise_scheduler(self.config, self.device)
+            self.scheduler = scheduler_params['scheduler']
+            self.sigmas = scheduler_params['sigmas']
+            self.alphas = scheduler_params['alphas']
+            self.betas = scheduler_params['betas']
+            self.alphas_cumprod = scheduler_params['alphas_cumprod']
+            self.snr_values = scheduler_params['snr_values']
+            self.snr_weights = scheduler_params['snr_weights']
+            self.c_skip = scheduler_params['c_skip']
+            self.c_out = scheduler_params['c_out']
+            self.c_in = scheduler_params['c_in']
+            self.num_train_timesteps = len(self.sigmas)
+        except Exception as e:
+            logger.error(f"Error configuring scheduler: {e}")
+            raise
+            
+        # Initialize training state
+        self.global_step = 0
+        self.current_epoch = 0
+        
+        # Initialize optimizer and scheduler
+        self.setup_optimizer()
+        
+        logger.info(
+            f"Initialized trainer on {self.device}\n"
+            f"Model dtype: {self.model_dtype}"
+        )
+
+    def setup_optimizer(self):
+        """Setup optimizer and learning rate scheduler."""
+        try:
+            # Create optimizer
+            self.optimizer = torch.optim.AdamW(
+                self.model.parameters(),
+                lr=self.config.training.learning_rate,
+                betas=self.config.training.adam_betas,
+                weight_decay=self.config.training.weight_decay,
+                eps=self.config.training.adam_epsilon
             )
             
-            # Log initial state
-            logger.info("Model device: %s", next(self.model.parameters()).device)
-            logger.info("Starting iteration through %d batches", len(self.dataloader))
-            
-            total_loss = 0.0
-            num_batches = 0
-            
-            for batch_idx, batch in enumerate(pbar):
-                # Log first batch details
-                if batch_idx == 0:
-                    logger.info("Processing first batch:")
-                    logger.info("Batch keys: %s", batch.keys())
-                    for k, v in batch.items():
-                        if isinstance(v, torch.Tensor):
-                            logger.info(f"{k} shape: {v.shape}, device: {v.device}")
-                
-                try:
-                    # Process batch with timing
-                    start_time = time.time()
-                    
-                    # Use training_step and properly handle its outputs
-                    batch_loss, model_input, v_pred, timesteps, avg_loss = self.training_step(batch)
-                    
-                    # Log predictions and model input periodically
-                    if batch_idx % self.config.training.log_steps == 0:
-                        # Calculate prediction metrics
-                        pred_mean = v_pred.mean().item()
-                        pred_std = v_pred.std().item()
-                        input_mean = model_input.mean().item()
-                        input_std = model_input.std().item()
-                        
-                        # Log detailed metrics
-                        metrics = {
-                            'train/batch_loss': batch_loss,
-                            'train/avg_loss': avg_loss,
-                            'train/pred_mean': pred_mean,
-                            'train/pred_std': pred_std,
-                            'train/input_mean': input_mean,
-                            'train/input_std': input_std,
-                            'train/timestep_mean': timesteps.float().mean().item(),
-                            'train/learning_rate': self.optimizer.param_groups[0]['lr']
-                        }
-                        self.log_metrics(metrics)
-                    
-                    batch_time = time.time() - start_time
-                    total_loss += avg_loss
-                    num_batches += 1
-                    
-                    # Update progress bar with more informative metrics
-                    pbar.set_postfix({
-                        'batch': batch_idx,
-                        'loss': f"{avg_loss:.4f}",
-                        'avg_loss': f"{total_loss/num_batches:.4f}",
-                        'time/batch': f"{batch_time:.2f}s",
-                        'lr': f"{self.optimizer.param_groups[0]['lr']:.2e}",
-                        'pred_std': f"{pred_std:.2f}" if 'pred_std' in locals() else "N/A"
-                    })
-                    
-                    # Force CUDA sync periodically
-                    if batch_idx % 10 == 0:
-                        torch.cuda.synchronize()
-                    
-                except Exception as e:
-                    logger.error(f"Error in batch {batch_idx}: {str(e)}")
-                    logger.error(traceback.format_exc())
-                    if batch_idx == 0:
-                        # Raise on first batch error
-                        raise
-                    continue
-                
-                # Save checkpoint if needed
-                if self.global_step % self.config.training.save_steps == 0:
-                    # Include prediction statistics in checkpoint
-                    self._save_checkpoint(
-                        batch_idx,
-                        {
-                            'loss': avg_loss,
-                            'pred_mean': v_pred.mean().item(),
-                            'pred_std': v_pred.std().item()
-                        }
-                    )
-                
-                self.global_step += 1
-            
-            # Log epoch summary
-            epoch_avg_loss = total_loss / num_batches
-            logger.info(f"Epoch {epoch} completed - Average loss: {epoch_avg_loss:.4f}")
-            
-            # Save epoch metrics
-            epoch_metrics = {
-                'epoch': epoch,
-                'epoch_avg_loss': epoch_avg_loss,
-                'total_steps': self.global_step
-            }
-            self.log_metrics(epoch_metrics, step_type="epoch")
+            # Create scheduler if needed
+            if self.config.training.lr_scheduler == "cosine":
+                self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    self.optimizer,
+                    T_max=self.config.training.max_train_steps
+                )
+            elif self.config.training.lr_scheduler == "linear":
+                self.lr_scheduler = torch.optim.lr_scheduler.LinearLR(
+                    self.optimizer,
+                    start_factor=1.0,
+                    end_factor=0.1,
+                    total_iters=self.config.training.max_train_steps
+                )
+            else:
+                self.lr_scheduler = None
                 
         except Exception as e:
-            logger.error(f"Error in epoch {epoch}: {str(e)}")
-            logger.error(traceback.format_exc())
+            logger.error(f"Error setting up optimizer: {e}")
             raise
 
+    def compute_loss(
+        self,
+        model_pred: torch.Tensor,
+        target: torch.Tensor,
+        timesteps: torch.Tensor,
+        weights: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Compute weighted loss with SNR scaling."""
+        # Basic MSE in float32 for stability
+        loss = torch.nn.functional.mse_loss(model_pred.float(), target.float(), reduction="none")
+        
+        # Average over non-batch dimensions
+        loss = loss.mean(dim=list(range(1, len(loss.shape))))
+        
+        # Apply SNR weights if enabled
+        if self.config.training.snr_gamma is not None and self.snr_weights is not None:
+            snr = self.snr_weights[timesteps]
+            loss = loss * snr
+        
+        # Apply sample weights if provided
+        if weights is not None:
+            loss = loss * weights
+            
+        return loss.mean()
 
-
-    @staticmethod
-    def collate_fn(batch: List[Tuple]) -> Dict[str, Union[torch.Tensor, Dict[str, torch.Tensor], List[Tuple[int, int]]]]:
-        """Efficiently collate batch data with optimal padding and dimension handling."""
+    def training_step(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Execute training step with memory optimization."""
         try:
-            # Validate input batch
-            if not batch:
-                raise ValueError("Empty batch received")
-            if not all(len(item) == 3 for item in batch):
-                raise ValueError("Each batch item must contain (image, text_embeds, tag_weight)")
-
-            # Unpack batch efficiently
-            try:
-                images, text_embeds_dicts, tag_weights = [], [], []
-                for i, (img, txt, w) in enumerate(batch):
-                    if not isinstance(img, torch.Tensor):
-                        raise TypeError(f"Image at index {i} is not a tensor")
-                    if not isinstance(txt, dict):
-                        raise TypeError(f"Text embeddings at index {i} is not a dictionary")
-                    if not isinstance(w, torch.Tensor):
-                        raise TypeError(f"Tag weight at index {i} is not a tensor")
-                    
-                    images.append(img)
-                    text_embeds_dicts.append(txt)
-                    tag_weights.append(w)
-            except Exception as e:
-                logger.error(f"Error unpacking batch: {str(e)}")
-                raise
-
-            # Pre-compute dimensions once
-            try:
-                vae_scale_factor = 8
-                max_res = 1024
-                shapes = torch.tensor([[img.shape[1], img.shape[2]] for img in images])
-                max_height, max_width = shapes.max(0)[0].tolist()
-            except Exception as e:
-                logger.error(f"Error computing image dimensions: {str(e)}")
-                raise
-
-            # Prepare storage with pre-allocated lists
-            target_sizes = []
-            padded_images = []
-            original_sizes = []
-            crop_top_lefts = []
-
-            # Process each image efficiently
-            try:
-                for i, (img, (h, w)) in enumerate(zip(images, shapes)):
-                    try:
-                        # Convert to pixel space once
-                        orig_height = h * vae_scale_factor
-                        orig_width = w * vae_scale_factor
-                        original_sizes.append((orig_height, orig_width))
-
-                        # Calculate target size efficiently
-                        aspect_ratio = w / h
-                        if aspect_ratio >= 1:
-                            target_height = min(max_res, orig_height)
-                            target_width = min(max_res, int(target_height * aspect_ratio))
-                        else:
-                            target_width = min(max_res, orig_width)
-                            target_height = min(max_res, int(target_width / aspect_ratio))
-
-                        # Ensure dimensions are multiples of 8 using bit operations
-                        target_height = target_height & ~7
-                        target_width = target_width & ~7
-                        target_sizes.append((target_height, target_width))
-
-                        # Calculate crops efficiently
-                        vae_target_h = target_height // vae_scale_factor
-                        vae_target_w = target_width // vae_scale_factor
-                        crop_top = ((h - vae_target_h) // 2) * vae_scale_factor
-                        crop_left = ((w - vae_target_w) // 2) * vae_scale_factor
-                        crop_top_lefts.append((max(0, crop_top), max(0, crop_left)))
-
-                        # Optimize padding
-                        if h != max_height or w != max_width:
-                            pad_h = max_height - h
-                            pad_w = max_width - w
-                            padding = [0, pad_w, 0, pad_h]  # Left, Right, Top, Bottom
-                            padded = F.pad(img, padding, mode='constant', value=0)
-                            padded_images.append(padded)
-                        else:
-                            padded_images.append(img)
-                    except Exception as e:
-                        logger.error(f"Error processing image {i}: {str(e)}")
-                        raise
-            except Exception as e:
-                logger.error("Error in image processing loop")
-                raise
-
-            # Stack tensors efficiently
-            try:
-                stacked_images = torch.stack(padded_images, dim=0)
-                tag_weights = torch.stack(tag_weights, dim=0)
-            except Exception as e:
-                logger.error(f"Error stacking tensors: {str(e)}")
-                raise
-
+            # Track memory usage
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+                start_mem = torch.cuda.memory_allocated() / 1024**2
+            
+            # Process inputs
+            model_input = batch["model_input"].to(
+                device=self.device,
+                dtype=self.model_dtype,
+                memory_format=torch.channels_last if self.config.system.channels_last else torch.contiguous_format,
+                non_blocking=True
+            )
+            
             # Process embeddings
-            try:
-                def process_embeddings(embeds_list: List[torch.Tensor], name: str) -> torch.Tensor:
-                    try:
-                        stacked = torch.stack(embeds_list, dim=0)
-                        if stacked.dim() == 4:
-                            stacked = stacked.squeeze(1)
-                        elif stacked.dim() == 3 and stacked.size(1) == 1:
-                            stacked = stacked.squeeze(1)
-                        return stacked
-                    except Exception as e:
-                        logger.error(f"Error processing {name} embeddings: {str(e)}")
-                        raise
-
-                # Get embeddings efficiently
-                base_embeds = process_embeddings([d["base_text_embeds"] for d in text_embeds_dicts], "base")
-                large_embeds = process_embeddings([d["large_text_embeds"] for d in text_embeds_dicts], "large")
-                large_pooled = process_embeddings([d["large_pooled_embeds"] for d in text_embeds_dicts], "pooled")
-
-            except KeyError as e:
-                logger.error(f"Missing key in text embeddings dictionary: {str(e)}")
-                raise
-            except Exception as e:
-                logger.error(f"Error processing embeddings: {str(e)}")
-                raise
-
-            # Create embeddings dict without redundant storage
-            text_embeds_dict = {
-                "text_embeds": large_embeds,
-                "pooled_text_embeds": large_pooled,
-                "text_embeds_large": large_embeds,
-                "pooled_text_embeds_large": large_pooled,
-                "text_embeds_small": base_embeds,
-                "pooled_text_embeds_small": None,
-            }
-
-            return {
-                "model_input": stacked_images,
-                "text_embeds": text_embeds_dict,
-                "tag_weights": tag_weights,
-                "original_sizes": original_sizes,
-                "crop_top_lefts": crop_top_lefts,
-                "target_sizes": target_sizes
-            }
-
+            text_embeds = batch["text_embeds"]
+            encoder_hidden_states = text_embeds["text_embeds"].to(self.device, non_blocking=True)
+            pooled_embeds = text_embeds["pooled_text_embeds"].to(self.device, non_blocking=True)
+            tag_weights = batch["tag_weights"].to(self.device, non_blocking=True)
+            
+            # Sample timesteps
+            timesteps = torch.randint(0, self.num_train_timesteps, (model_input.shape[0],), device=self.device)
+            
+            # Generate noise
+            noise = generate_noise(
+                model_input.shape,
+                self.device,
+                self.model_dtype,
+                model_input  # Use model_input as layout template
+            )
+            
+            # Get sigmas and add noise
+            sigmas = self.sigmas[timesteps].to(dtype=self.model_dtype)
+            noisy_latents = model_input + sigmas[:, None, None, None] * noise
+            
+            # Scale input
+            if self.config.training.prediction_type == "v_prediction":
+                scaled_input = self.c_in[timesteps].to(dtype=self.model_dtype)[:, None, None, None] * noisy_latents
+            else:
+                scaled_input = noisy_latents
+                
+            # Get time embeddings
+            time_ids = get_add_time_ids(
+                original_sizes=batch["original_sizes"],
+                crops_coords_top_lefts=batch["crop_top_lefts"],
+                target_sizes=batch["target_sizes"],
+                batch_size=model_input.shape[0],
+                dtype=self.model_dtype,
+                device=self.device
+            )
+            
+            # Forward pass
+            model_pred = self.model(
+                scaled_input,
+                timesteps,
+                encoder_hidden_states=encoder_hidden_states,
+                added_cond_kwargs={
+                    "text_embeds": pooled_embeds,
+                    "time_ids": time_ids
+                },
+                return_dict=False
+            )[0]
+            
+            # Get target
+            if self.config.training.prediction_type == "epsilon":
+                target = noise
+            else:  # v_prediction
+                target = (
+                    self.c_skip[timesteps].to(dtype=self.model_dtype)[:, None, None, None] * model_input +
+                    self.c_out[timesteps].to(dtype=self.model_dtype)[:, None, None, None] * noise
+                )
+            
+            # Compute loss
+            loss = self.compute_loss(model_pred, target, timesteps, tag_weights)
+            
+            # Backward pass
+            loss.backward()
+            
+            # Log memory usage
+            if torch.cuda.is_available():
+                peak_mem = torch.cuda.max_memory_allocated() / 1024**2
+                mem_diff = peak_mem - start_mem
+                logger.debug(f"Memory usage: {peak_mem:.0f}MB (+{mem_diff:.0f}MB)")
+            
+            return loss
+            
         except Exception as e:
-            logger.error(f"Fatal error in collate_fn: {str(e)}")
-            logger.error(f"Stack trace: {traceback.format_exc()}")
+            logger.error(f"Error in training step: {e}")
             raise
-    
-    @staticmethod
-    def create_dataloader(
-        dataset: NovelAIDataset,
-        batch_size: int,
-        pin_memory: bool = True,
-    ) -> DataLoader:
-        """Create optimized dataloader."""
-        # Create sampler for distributed training
-        sampler = dataset.get_sampler(
-            batch_size=batch_size,
-            shuffle=True,
-            drop_last=True
-        )
 
-        return DataLoader(
-            dataset,
-            batch_sampler=sampler,
-            num_workers=0,  # Force single process
-            pin_memory=pin_memory,
-            collate_fn=NovelAIDiffusionV3Trainer.collate_fn
-        )
+    def train_epoch(self, dataloader: DataLoader) -> None:
+        """Train for one epoch."""
+        self.model.train()
+        total_loss = 0
+        num_batches = 0
+        
+        for batch_idx, batch in enumerate(dataloader):
+            try:
+                # Zero gradients
+                self.optimizer.zero_grad()
+                
+                # Accumulate gradients
+                for i in range(self.config.training.gradient_accumulation_steps):
+                    loss = self.training_step(batch)
+                    total_loss += loss.item()
+                
+                # Update weights
+                self.optimizer.step()
+                if self.lr_scheduler is not None:
+                    self.lr_scheduler.step()
+                
+                # Update progress
+                num_batches += 1
+                self.global_step += 1
+                
+                # Log metrics
+                if self.global_step % self.config.training.log_steps == 0:
+                    self.log_metrics({
+                        'loss': loss.item(),
+                        'lr': self.optimizer.param_groups[0]['lr'],
+                        'epoch': self.current_epoch,
+                        'step': self.global_step
+                    })
+                
+                # Save checkpoint
+                if self.global_step % self.config.training.save_steps == 0:
+                    self.save_checkpoint()
+                    
+            except Exception as e:
+                logger.error(f"Error in batch {batch_idx}: {e}")
+                logger.error(traceback.format_exc())
+                continue
+        
+        # Update epoch counter
+        self.current_epoch += 1
+        
+        # Log epoch metrics
+        self.log_metrics({
+            'epoch': self.current_epoch,
+            'epoch_loss': total_loss / num_batches
+        }, step_type="epoch")
 
-    
-    def _save_checkpoint(self, batch_idx, metrics):
-        """Internal method to save checkpoint during training."""
+    def save_checkpoint(self) -> None:
+        """Save model checkpoint."""
         try:
             checkpoint_path = os.path.join(
                 self.config.paths.checkpoints_dir,
                 f"checkpoint_{self.global_step:06d}.pt"
             )
-            save_checkpoint(
-                path=checkpoint_path,
-                model=self.model,
-                optimizer=self.optimizer,
-                scheduler=self.lr_scheduler,
-                config=self.config,
-                global_step=self.global_step,
-                current_epoch=self.current_epoch,
-                metrics=metrics  # Save the metrics dictionary
-            )
-            logger.info(
-                f"Saved checkpoint at step {self.global_step} "
-                f"(batch {batch_idx}, loss: {metrics['loss']:.4f}, "
-                f"pred_mean: {metrics['pred_mean']:.4f}, "
-                f"pred_std: {metrics['pred_std']:.4f})"
-            )
+            
+            # Save checkpoint
+            torch.save({
+                'model_state_dict': self.model.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'scheduler_state_dict': self.lr_scheduler.state_dict() if self.lr_scheduler else None,
+                'global_step': self.global_step,
+                'current_epoch': self.current_epoch
+            }, checkpoint_path)
+            
+            logger.info(f"Saved checkpoint: {checkpoint_path}")
+            
         except Exception as e:
-            logger.error(f"Error saving checkpoint: {str(e)}")
-
-    def save_checkpoint(self, save_dir: str, epoch: int):
-        """Public method to save checkpoint at epoch end."""
-        try:
-            checkpoint_path = os.path.join(
-                save_dir,
-                f"checkpoint_epoch_{epoch:04d}.pt"
-            )
-            save_checkpoint(
-                path=checkpoint_path,
-                model=self.model,
-                optimizer=self.optimizer,
-                scheduler=self.lr_scheduler,
-                config=self.config,
-                global_step=self.global_step,
-                current_epoch=epoch
-            )
-            logger.info(f"Saved checkpoint for epoch {epoch}")
-        except Exception as e:
-            logger.error(f"Error saving checkpoint: {str(e)}")
-            logger.error(traceback.format_exc())
+            logger.error(f"Error saving checkpoint: {e}")
             raise
 
-    def prepare_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Prepare hidden states with error handling."""
-        try:
-            # Validate input dimensions
-            if hidden_states.dim() not in [3, 4]:
-                raise ValueError(f"Expected hidden states to have 3 or 4 dimensions, got {hidden_states.dim()}")
-            
-            # Get shape information
-            if hidden_states.dim() == 4:
-                batch_size, _, seq_len, hidden_size = hidden_states.shape
-                hidden_states = hidden_states.reshape(batch_size, seq_len, hidden_size)
-            else:
-                batch_size, seq_len, hidden_size = hidden_states.shape
-            
-            # Project to cross attention dim if needed
-            if hasattr(self, 'hidden_proj'):
-                # Validate projection matrix shape
-                expected_shape = (self.model.config.cross_attention_dim, hidden_size)
-                actual_shape = self.hidden_proj.weight.shape
-                if actual_shape != expected_shape:
-                    raise ValueError(f"Projection matrix must have shape {expected_shape}, got {actual_shape}")
-                
-                # Project efficiently
-                hidden_states = hidden_states.reshape(-1, hidden_size)  # Flatten
-                hidden_states = self.hidden_proj(hidden_states)  # Project
-                hidden_states = hidden_states.view(batch_size, seq_len, -1)  # Restore
-            else:
-                # Initialize projection layer if needed
-                self._initialize_hidden_proj(hidden_size)
-                hidden_states = self._project_hidden_states(hidden_states, batch_size, seq_len)
-            
-            return hidden_states
-
-        except Exception as e:
-            logger.error(f"Error in prepare_hidden_states: {str(e)}")
-            logger.error(f"Input tensor shape: {hidden_states.shape}")
-            logger.error(f"Stack trace: {traceback.format_exc()}")
-            raise
-    
-    def compute_grad_norm(self) -> float:
-        return compute_grad_norm(self.model, self.grad_norm_buffer)
-
-    def _generate_noise(self, shape: Tuple[int, ...]) -> torch.Tensor:
-        return generate_noise(shape, self.device, self.model_dtype, self.noise_template)
-    
-    def _get_add_time_ids(self, original_sizes, crops_coords_top_lefts, target_sizes, batch_size) -> torch.Tensor:
-        return get_add_time_ids(
-            original_sizes, crops_coords_top_lefts, target_sizes, batch_size,
-            self.model_dtype, self.device
-        )
-
-    def log_metrics(self, metrics: Dict[str, Any], step_type: str = "step"):
-        """Log metrics without accelerator dependency."""
+    def log_metrics(self, metrics: Dict[str, Any], step_type: str = "step") -> None:
+        """Log metrics to wandb and console."""
         if self.config.training.use_wandb:
             wandb.log(metrics, step=self.global_step)
         
         # Log to console
-        metrics_str = ", ".join([f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}" for k, v in metrics.items()])
+        metrics_str = ", ".join([f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}" 
+                               for k, v in metrics.items()])
         logger.info(f"{step_type.capitalize()} {self.global_step}: {metrics_str}")
 
-    def get_karras_scalings(self, timestep_indices: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Get Karras noise schedule scalings for given timesteps."""
-        return get_karras_scalings(self.sigmas, timestep_indices)
+    @staticmethod
+    def create_dataloader(
+        dataset: NovelAIDataset,
+        batch_size: int,
+        pin_memory: bool = True
+    ) -> DataLoader:
+        """Create optimized dataloader."""
+        sampler = dataset.get_sampler(
+            batch_size=batch_size,
+            shuffle=True,
+            drop_last=True
+        )
+        
+        return DataLoader(
+            dataset,
+            batch_sampler=sampler,
+            num_workers=0,  # Force single process
+            pin_memory=pin_memory
+        )
 
