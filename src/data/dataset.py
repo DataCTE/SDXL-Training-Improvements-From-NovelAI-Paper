@@ -19,25 +19,19 @@ from .processors.bucket import BucketManager
 from .processors.sampler import AspectBatchSampler
 from .processors.thread_config import get_optimal_thread_config
 
-# Internal imports from utils
+
 from .processors.utils import (
     find_matching_files,
     ensure_dir,
     get_file_size,
-    validate_image_text_pair,
-    create_thread_pool,
     get_optimal_workers,
     get_system_resources,
     log_system_info,
-    BatchConfig,
-    process_in_chunks,
     calculate_optimal_batch_size,
     create_progress_stats,
     update_progress_stats,
     format_time,
-    log_progress,
-    load_and_validate_image,
-    get_image_stats
+    get_gpu_memory_usage
 )
 
 # Config import
@@ -160,7 +154,12 @@ class NovelAIDataset(Dataset):
         
         # Process data and initialize items
         self.items = []
-        loop.run_until_complete(self._process_data(image_dirs))
+        try:
+            loop.run_until_complete(self._process_data(image_dirs))
+        finally:
+            # Cleanup resources
+            if hasattr(self.batch_processor, 'cleanup'):
+                loop.run_until_complete(self.batch_processor.cleanup())
         
         # Create sampler for efficient batch processing
         self.sampler = AspectBatchSampler(
@@ -222,94 +221,26 @@ class NovelAIDataset(Dataset):
                 f"Total dataset size: {total_size / (1024*1024*1024):.2f}GB"
             )
             
-            # Create batch configuration for processing
-            batch_config = BatchConfig(
-                batch_size=self.batch_processor.batch_size,
-                device=self.device,
-                max_memory_usage=0.9,
-                prefetch_factor=2,
-                log_interval=5.0
-            )
-            
-            # Process files in chunks
-            async def process_chunk(chunk_files: List[str], chunk_id: int) -> Tuple[List[Dict], Dict[str, int]]:
-                chunk_items = []
-                chunk_stats = {'total': 0, 'errors': 0, 'error_types': {}, 'skipped': 0}
-                chunk_progress = create_progress_stats(len(chunk_files))
-                
-                for img_path in chunk_files:
-                    try:
-                        # Validate image-text pair
-                        valid, reason = validate_image_text_pair(img_path)
-                        if not valid:
-                            chunk_stats['error_types'][reason] = chunk_stats['error_types'].get(reason, 0) + 1
-                            chunk_stats['errors'] += 1
-                            continue
-                            
-                        # Get image stats
-                        img = load_and_validate_image(img_path)
-                        if img is None:
-                            chunk_stats['error_types']['invalid_image'] = chunk_stats['error_types'].get('invalid_image', 0) + 1
-                            chunk_stats['errors'] += 1
-                            continue
-                            
-                        img_stats = get_image_stats(img)
-                        
-                        # Find appropriate bucket
-                        bucket = self.bucket_manager.find_bucket(img_stats['width'], img_stats['height'])
-                        if bucket is None:
-                            chunk_stats['error_types']['no_bucket'] = chunk_stats['error_types'].get('no_bucket', 0) + 1
-                            chunk_stats['errors'] += 1
-                            continue
-                            
-                        # Get cache paths
-                        cache_paths = self.cache_manager.get_cache_paths(img_path)
-                        
-                        chunk_items.append({
-                            'image_path': img_path,
-                            'width': img_stats['width'],
-                            'height': img_stats['height'],
-                            'latent_cache': cache_paths['latent'],
-                            'text_cache': cache_paths['text'],
-                            'bucket_key': f"{bucket.width}x{bucket.height}"
-                        })
-                        chunk_stats['total'] += 1
-                        
-                        # Update and log progress
-                        update_progress_stats(chunk_progress, 1)
-                        if chunk_progress.should_log():
-                            log_progress(
-                                chunk_progress,
-                                prefix=f"Chunk {chunk_id} - ",
-                                extra_stats={
-                                    'file_size': f"{get_file_size(img_path) / (1024*1024):.1f}MB",
-                                    'bucket': bucket.width if bucket else "None"
-                                }
-                            )
-                        
-                    except Exception as e:
-                        logger.error(f"Error processing {Path(img_path).name}: {str(e)[:200]}...")
-                        chunk_stats['error_types']['exception'] = chunk_stats['error_types'].get('exception', 0) + 1
-                        chunk_stats['errors'] += 1
-                        continue
-                
-                return chunk_items, chunk_stats
-            
-            # Process chunks in parallel with batch configuration
-            processed_items, final_stats = await process_in_chunks(
+            # Process dataset using batch processor
+            processed_items, final_stats = await self.batch_processor.process_dataset(
                 items=image_files,
-                chunk_size=batch_config.batch_size,
-                process_fn=process_chunk,
-                progress_callback=lambda n, stats: (
+                progress_callback=lambda n, batch_stats: (
                     update_progress_stats(stats, n),
-                    log_progress(stats, prefix="Overall Progress - ")
-                    if stats.should_log(batch_config.log_interval)
-                    else None
+                    log_progress(
+                        stats,
+                        prefix="Processing Dataset - ",
+                        extra_stats={
+                            'batch_size': self.batch_processor.batch_size,
+                            'gpu_memory': f"{get_gpu_memory_usage(self.device):.1%}",
+                            'cache_hits': batch_stats.get('cache_hits', 0),
+                            'cache_misses': batch_stats.get('cache_misses', 0)
+                        }
+                    ) if stats.should_log() else None
                 )
             )
             
-            # Update items list - use processed_items directly
-            self.items = processed_items  # Changed from final_stats['processed_items']
+            # Update items list
+            self.items = processed_items
             
             # Log final statistics
             logger.info(
@@ -317,14 +248,16 @@ class NovelAIDataset(Dataset):
                 f"- Total files: {len(image_files)}\n"
                 f"- Valid items: {len(self.items)}\n"
                 f"- Success rate: {len(self.items)/len(image_files)*100:.1f}%\n"
-                f"- Processing time: {format_time(final_stats['elapsed_seconds'])}\n"
+                f"- Processing time: {format_time(final_stats.get('elapsed_seconds', 0))}\n"
+                f"- Cache hits: {final_stats.get('cache_hits', 0)}\n"
+                f"- Cache misses: {final_stats.get('cache_misses', 0)}\n"
                 f"- Error types:\n" + "\n".join(
-                    f"  - {k}: {v}" for k, v in final_stats['error_types'].items()
+                    f"  - {k}: {v}" for k, v in final_stats.get('error_types', {}).items()
                 )
             )
             
         except Exception as e:
-            logger.error(f"Fatal error in data processing: {e}")
+            logger.error(f"Error in data processing: {e}")
             raise
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:

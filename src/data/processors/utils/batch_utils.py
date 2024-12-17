@@ -220,8 +220,7 @@ async def process_in_chunks(
         'cache_hits': 0,
         'cache_misses': 0,
         'error_types': {},
-        'elapsed_seconds': 0,
-        'processed_items': []
+        'elapsed_seconds': 0
     }
     
     start_time = time.time()
@@ -233,7 +232,6 @@ async def process_in_chunks(
             
             # Store results
             all_results.extend(chunk_results)
-            final_stats['processed_items'].extend(chunk_results)
             
             # Update stats
             for key in ['total', 'errors', 'skipped', 'cache_hits', 'cache_misses']:
@@ -246,7 +244,14 @@ async def process_in_chunks(
             
             # Call progress callback if provided
             if progress_callback:
-                progress_callback(len(chunk), chunk_stats)
+                # Create chunk progress stats
+                chunk_progress_stats = {
+                    **chunk_stats,
+                    'processed_items': chunk_results,
+                    'chunk_id': chunk_id,
+                    'chunk_size': len(chunk)
+                }
+                progress_callback(len(chunk), chunk_progress_stats)
                 
         except Exception as e:
             logger.error(f"Error processing chunk {chunk_id}: {e}")

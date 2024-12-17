@@ -1,10 +1,11 @@
 # src/data/processors/batch_processor.py
 import torch
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Callable
 import logging
 from pathlib import Path
 from PIL import Image
 import asyncio
+import time
 
 # Internal imports from utils
 from src.data.processors.utils.batch_utils import (
@@ -16,7 +17,8 @@ from src.data.processors.utils.batch_utils import (
 from src.data.processors.utils.system_utils import (
     create_thread_pool,
     get_optimal_workers,
-    get_gpu_memory_usage
+    get_gpu_memory_usage,
+    get_memory_usage_gb
 )
 from src.data.processors.utils.progress_utils import (
     create_progress_stats,
@@ -33,7 +35,7 @@ from src.data.processors.tag_weighter import parse_tags
 
 logger = logging.getLogger(__name__)
 
-class BatchProcessor:
+class BatchProcessor(GenericBatchProcessor):
     """Process batches of images and text with GPU optimization."""
     
     def __init__(
@@ -43,145 +45,186 @@ class BatchProcessor:
         text_embedder: TextEmbedder,
         vae,
         device: torch.device,
-        batch_size: int = 32,
+        batch_size: Optional[int] = None,
         prefetch_factor: int = 2,
         max_memory_usage: float = 0.9,
         num_workers: Optional[int] = None
     ):
+        # Calculate optimal batch size and workers if not provided
+        self.batch_size = batch_size or calculate_optimal_batch_size(
+            device=device,
+            min_batch_size=1,
+            max_batch_size=32,
+            target_memory_usage=max_memory_usage
+        )
+        self.num_workers = num_workers or get_optimal_workers()
+        
+        # Create thread pool for async operations
+        self.thread_pool = create_thread_pool(self.num_workers)
+        
+        # Initialize components
         self.image_processor = image_processor
         self.cache_manager = cache_manager
         self.text_embedder = text_embedder
         self.vae = vae
         self.device = device
+        self.prefetch_factor = prefetch_factor
+        self.max_memory_usage = max_memory_usage
         
-        # Calculate optimal batch size based on memory
-        self.batch_size = calculate_optimal_batch_size(
+        # Create batch config
+        self.batch_config = BatchConfig(
+            batch_size=self.batch_size,
             device=device,
-            min_batch_size=1,
-            max_batch_size=batch_size,
-            target_memory_usage=max_memory_usage
+            max_memory_usage=max_memory_usage,
+            prefetch_factor=prefetch_factor
         )
         
-        # Initialize batch processor with optimal configuration
-        self.batch_processor = GenericBatchProcessor(
-            config=BatchConfig(
-                batch_size=self.batch_size,
-                device=device,
-                max_memory_usage=max_memory_usage,
-                prefetch_factor=prefetch_factor
-            ),
-            executor=create_thread_pool(num_workers or get_optimal_workers()),
-            name="BatchProcessor"
-        )
-
-    async def _load_images(self, batch_items: List[Dict], width: int, height: int) -> Tuple[List[Image.Image], List[Dict]]:
-        """Load and validate images asynchronously."""
-        images = []
-        valid_items = []
-        
-        # Create progress stats for image loading
-        stats = create_progress_stats(len(batch_items))
-        
-        for item in batch_items:
-            try:
-                img = load_and_validate_image(
-                    item['path'],
-                    min_size=(width, height),
-                    max_size=(width*2, height*2)  # Allow some flexibility
-                )
-                if img is not None:
-                    images.append(img)
-                    valid_items.append(item)
-                update_progress_stats(stats, 1)
-            except Exception as e:
-                logger.error(f"Error loading image {item['path']}: {e}")
-                stats.failed_items += 1
-                
-            # Log progress periodically
-            if stats.should_log():
-                log_progress(stats, prefix="Loading Images: ")
-                
-        return images, valid_items
-
-    async def process_batch(
-        self,
-        batch_items: List[Dict],
-        width: int,
-        height: int,
-        proportion_empty_prompts: float = 0.0
-    ) -> Tuple[List[Dict], Dict[str, Any]]:
-        """Process a batch of images and return results with stats."""
-        stats = create_progress_stats(len(batch_items))
-        stats.update({
-            'cache_hits': 0,
-            'cache_misses': 0,
-            'error_types': {}
-        })
-        
+    async def _load_and_validate_image(self, image_path: str) -> Optional[Image.Image]:
+        """Load and validate an image file."""
         try:
-            # Load images asynchronously
-            images, valid_items = await self._load_images(batch_items, width, height)
-            if not images:
-                stats.skipped_items = len(batch_items)
-                return [], stats.get_stats()
-
-            # Process images through VAE
-            batch_tensor = self.image_processor.process_batch(images, width, height)
-            with torch.cuda.amp.autocast():
-                latents = self.vae.encode(batch_tensor).latent_dist.sample()
-                latents = latents * self.vae.config.scaling_factor
-
-            # Process text in parallel
-            save_tasks = []
-            text_batch = []
-            text_indices = []
-            
-            for i, item in enumerate(valid_items):
-                if not item['text_cache'].exists():
-                    stats.cache_misses += 1
-                    with open(item['path'].with_suffix('.txt'), 'r', encoding='utf-8') as f:
-                        caption = f.read().strip()
-                    text_batch.append(caption)
-                    text_indices.append(i)
-                else:
-                    stats.cache_hits += 1
-
-            # Process text and save results
-            if text_batch:
-                text_embeds = self.text_embedder.encode_prompt_list(
-                    text_batch,
-                    proportion_empty_prompts=proportion_empty_prompts
-                )
-                tags = [parse_tags(txt) for txt in text_batch]
-
-                for idx, i in enumerate(text_indices):
-                    save_tasks.append(
-                        self.cache_manager.save_text_data_async(
-                            valid_items[i]['text_cache'],
-                            {
-                                'embeds': text_embeds['prompt_embeds'][idx],
-                                'pooled_embeds': text_embeds['pooled_prompt_embeds'][idx],
-                                'tags': tags[idx]
-                            }
-                        )
-                    )
-
-            # Save latents
-            for latent, item in zip(latents, valid_items):
-                save_tasks.append(
-                    self.cache_manager.save_latent_async(item['latent_cache'], latent)
-                )
-
-            # Wait for all save operations
-            if save_tasks:
-                await asyncio.gather(*save_tasks)
-                
-            # Update final stats
-            stats.processed_items = len(valid_items)
-            return valid_items, stats.get_stats()
-
+            img_path = Path(image_path)
+            return await asyncio.to_thread(
+                load_and_validate_image,
+                img_path,
+                min_size=(256, 256),  # Minimum size for processing
+                max_size=(8192, 8192)  # Maximum size supported
+            )
         except Exception as e:
-            logger.error(f"Batch processing error: {e}")
-            stats.failed_items = len(batch_items)
-            stats.error_types['batch_failure'] = stats.error_types.get('batch_failure', 0) + 1
-            return [], stats.get_stats()
+            logger.error(f"Error loading image {image_path}: {str(e)[:200]}...")
+            return None
+            
+    async def process_dataset(
+        self,
+        items: List[str],
+        progress_callback: Optional[Callable[[int, Dict[str, Any]], None]] = None
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """Process entire dataset with chunking and progress tracking."""
+        stats = create_progress_stats(len(items))
+        
+        async def process_chunk(chunk: List[str], chunk_id: int) -> Tuple[List[Dict], Dict[str, Any]]:
+            """Process a single chunk of items."""
+            chunk_items = []
+            chunk_stats = {
+                'total': 0,
+                'errors': 0,
+                'skipped': 0,
+                'cache_hits': 0,
+                'cache_misses': 0,
+                'error_types': {},
+                'processed_items': []
+            }
+            
+            # Process items in parallel using thread pool
+            async def process_item(item_path: str) -> Optional[Dict]:
+                try:
+                    # Check cache first
+                    cache_result = await asyncio.to_thread(
+                        self.cache_manager.get_cached_item,
+                        item_path
+                    )
+                    if cache_result is not None:
+                        chunk_stats['cache_hits'] += 1
+                        return cache_result
+                        
+                    # Load and validate image
+                    img = await self._load_and_validate_image(item_path)
+                    if img is None:
+                        chunk_stats['skipped'] += 1
+                        return None
+                        
+                    # Process image
+                    processed_image = await self.image_processor.process_image(img)
+                    if processed_image is None:
+                        chunk_stats['skipped'] += 1
+                        return None
+                        
+                    # Load and process text
+                    text_path = Path(item_path).with_suffix('.txt')
+                    if not text_path.exists():
+                        chunk_stats['error_types']['missing_text'] = \
+                            chunk_stats['error_types'].get('missing_text', 0) + 1
+                        return None
+                        
+                    text = await asyncio.to_thread(text_path.read_text, encoding='utf-8')
+                    tags = parse_tags(text)
+                    text_data = await self.text_embedder.process_text(text, tags)
+                    
+                    if text_data is None:
+                        chunk_stats['skipped'] += 1
+                        return None
+                        
+                    # Create item
+                    item = {
+                        'image_path': item_path,
+                        'processed_image': processed_image,
+                        'text_data': text_data,
+                        'tags': tags
+                    }
+                    
+                    # Cache item
+                    await asyncio.to_thread(
+                        self.cache_manager.cache_item,
+                        item_path,
+                        item
+                    )
+                    
+                    chunk_stats['total'] += 1
+                    chunk_stats['cache_misses'] += 1
+                    return item
+                    
+                except Exception as e:
+                    logger.error(f"Error processing {item_path}: {str(e)[:200]}...")
+                    chunk_stats['errors'] += 1
+                    chunk_stats['error_types'][type(e).__name__] = \
+                        chunk_stats['error_types'].get(type(e).__name__, 0) + 1
+                    return None
+            
+            # Process chunk items in parallel
+            tasks = [process_item(item_path) for item_path in chunk]
+            results = await asyncio.gather(*tasks)
+            
+            # Filter out None results and extend chunk items
+            chunk_items.extend([r for r in results if r is not None])
+            chunk_stats['processed_items'] = chunk_items
+            
+            return chunk_items, chunk_stats
+        
+        # Process chunks
+        processed_items, final_stats = await process_in_chunks(
+            items=items,
+            chunk_size=self.batch_size,
+            process_fn=process_chunk,
+            progress_callback=lambda n, chunk_stats: self._handle_progress(
+                n, chunk_stats, stats, progress_callback
+            )
+        )
+        
+        return processed_items, final_stats
+        
+    def _handle_progress(
+        self,
+        n: int,
+        chunk_stats: Dict[str, Any],
+        overall_stats: Dict[str, Any],
+        progress_callback: Optional[Callable] = None
+    ) -> None:
+        """Handle progress updates and callbacks."""
+        # Update overall stats
+        update_progress_stats(overall_stats, n)
+        
+        # Add extra monitoring stats
+        extra_stats = {
+            'processed': len(chunk_stats.get('processed_items', [])),
+            'errors': chunk_stats.get('errors', 0),
+            'batch_size': self.batch_size,
+            'memory_gb': get_memory_usage_gb(),
+            'gpu_memory': f"{get_gpu_memory_usage(self.device):.1%}"
+        }
+        
+        # Log progress if needed
+        if overall_stats.get('should_log', lambda: True)():
+            log_progress(overall_stats, prefix="Processing - ", extra_stats=extra_stats)
+            
+        # Call user progress callback if provided
+        if progress_callback:
+            progress_callback(n, {**chunk_stats, **extra_stats})
