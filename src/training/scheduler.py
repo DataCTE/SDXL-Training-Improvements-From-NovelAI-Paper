@@ -140,6 +140,10 @@ def configure_noise_scheduler(config: Config, device: torch.device) -> Dict[str,
         if not isinstance(device, torch.device):
             raise ValueError(f"Expected device to be torch.device, got {type(device)}")
             
+        # Normalize device specification
+        if device.type == 'cuda' and device.index is None:
+            device = torch.device('cuda:0')
+            
         # Initialize scheduler
         try:
             scheduler = DDPMScheduler(
@@ -158,21 +162,21 @@ def configure_noise_scheduler(config: Config, device: torch.device) -> Dict[str,
             sigmas = get_sigmas(config, device)
             params = get_scheduler_parameters(sigmas, config, device)
             
-            # Ensure all parameters are on CPU first before moving to target device
+            # Move parameters to device directly without CPU intermediary
             for key, value in params.items():
                 if isinstance(value, torch.Tensor):
-                    params[key] = value.cpu().to(device=device)
+                    params[key] = value.to(device=device)
                     logger.info(f"Moved scheduler parameter {key} to device {device}")
             
             # Verify all parameters are on correct device
             for key, value in params.items():
                 if isinstance(value, torch.Tensor):
-                    if value.device != device:
+                    if str(value.device) != str(device):  # Compare device strings to handle cuda:0 vs cuda
                         logger.error(f"Parameter {key} is on {value.device} but should be on {device}")
                         raise RuntimeError(f"Failed to move scheduler parameter {key} to device {device}")
                     
         except Exception as e:
-            logger.error("Failed to generate scheduler parameters")
+            logger.error(f"Failed to generate scheduler parameters: {str(e)}")
             raise
         
         # Update scheduler with computed values
