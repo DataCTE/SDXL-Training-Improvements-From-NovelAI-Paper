@@ -170,7 +170,10 @@ class PathsConfig:
 @dataclass
 class NovelAIDatasetConfig:
     """Configuration for NovelAI dataset."""
-    # Image size settings
+    # Required parameter first
+    model_name: str  # Required for text embedder
+    
+    # Optional parameters with defaults after
     image_size: Tuple[int, int] = (1024, 1024)
     max_image_size: Tuple[int, int] = (8192, 8192)
     min_image_size: Union[Tuple[int, int], int] = (256, 256)
@@ -191,9 +194,6 @@ class NovelAIDatasetConfig:
     # Dataset settings
     proportion_empty_prompts: float = 0.0
     max_consecutive_batch_samples: int = 2
-    
-    # Model settings
-    model_name: str  # Required for text embedder
     
     # Tag weighting settings
     tag_weighting: TagWeightingConfig = field(default_factory=TagWeightingConfig)
