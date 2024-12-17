@@ -227,66 +227,51 @@ class NovelAIDataset(Dataset):
             # Update tracker with total files
             tracker = create_progress_tracker(
                 total_items=len(image_files),
-                batch_size=self.batch_processor.batch_size,
+                batch_size=4,  # Use very small batches
                 device=self.device
             )
             
-            # Create a progress counter object
-            class ProgressCounter:
-                def __init__(self):
-                    self.count = 0
-                    
-            progress = ProgressCounter()
-            
-            # Process files in batches
-            current_batch = []
-            current_batch_paths = []
-            
-            for image_path in image_files:
-                try:
-                    # Load image
-                    img = self.image_processor.load_image(image_path)
-                    if img is None:
-                        continue
-                        
-                    current_batch.append(img)
-                    current_batch_paths.append(image_path)
-                    
-                    # Process batch when it reaches the target size
-                    if len(current_batch) >= self.batch_processor.batch_size:
-                        processed_tensors, processed_items = await self.image_processor.process_batch(
-                            current_batch,
-                            self.config.image_size[0],
-                            self.config.image_size[1],
-                            cache_manager=self.cache_manager
-                        )
-                        
-                        # Update progress
-                        update_tracker(tracker, processed=len(current_batch))
-                        
-                        # Clear batch
-                        current_batch = []
-                        current_batch_paths = []
-                        
-                        # Clear CUDA cache periodically
-                        if tracker.processed % 1000 == 0:
-                            torch.cuda.empty_cache()
-                            
-                except Exception as e:
-                    logger.error(f"Error processing {image_path}: {e}")
-                    continue
-                    
-            # Process remaining images in the last batch
-            if current_batch:
-                processed_tensors, processed_items = await self.image_processor.process_batch(
-                    current_batch,
-                    self.config.image_size[0],
-                    self.config.image_size[1],
+            # Process files in small batches
+            processed_items = []
+            for i in range(0, len(image_files), 4):  # Process 4 files at a time
+                batch_files = image_files[i:i + 4]
+                
+                # Create batch items
+                batch_items = [{'image_path': f} for f in batch_files]
+                
+                # Process batch
+                batch_processed, stats = await self.batch_processor.process_batch(
+                    batch_items=batch_items,
+                    width=self.config.image_size[0],
+                    height=self.config.image_size[1],
                     cache_manager=self.cache_manager
                 )
                 
-                update_tracker(tracker, processed=len(current_batch))
+                # Update progress and stats
+                processed_items.extend(batch_processed)
+                update_tracker(tracker, processed=len(batch_processed))
                 
+                if stats.get('errors', 0) > 0:
+                    for error_type, count in stats.get('error_types', {}).items():
+                        update_tracker(tracker, failed=count, error_type=error_type)
+                
+                # Log progress
+                if tracker.should_log():
+                    extra_stats = {
+                        'processed': len(processed_items),
+                        'memory': f"{get_gpu_memory_usage(self.device):.1%}",
+                        'errors': tracker.failed_items
+                    }
+                    log_progress(tracker, prefix="Processing dataset: ", extra_stats=extra_stats)
+                
+                # Clear memory periodically
+                if i % 100 == 0:
+                    torch.cuda.empty_cache()
+                    await asyncio.sleep(0.1)  # Small delay to allow memory to clear
+            
+            # Store processed items
+            self.items = processed_items
+            
             # Final cleanup
             torch.cuda.empty_cache()
             

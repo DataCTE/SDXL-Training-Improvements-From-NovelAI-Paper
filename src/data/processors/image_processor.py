@@ -186,44 +186,60 @@ class ImageProcessor:
             logger.debug(f"Resized tensor buffer to {self.buffer_size}")
 
     @torch.no_grad()
-    def process_batch(self, images: List[Image.Image], width: int, height: int, cache_manager: Optional[CacheManager] = None) -> Tuple[torch.Tensor, List[Dict[str, Any]]]:
+    async def process_batch(
+        self, 
+        images: List[Image.Image], 
+        width: int, 
+        height: int,
+        cache_manager: Optional[CacheManager] = None
+    ) -> List[torch.Tensor]:
         """Process a batch of images with immediate caching."""
         batch_size = len(images)
         if batch_size == 0:
-            return torch.empty(0, dtype=self.config.dtype, device=self.config.device), []
+            return []
         
-        processed_items = []
-        try:
-            # Process images
-            processed = await super().process_batch(images, width, height)
+        processed_tensors = []
+        
+        # Process in smaller sub-batches
+        sub_batch_size = min(4, batch_size)  # Process max 4 images at once
+        
+        for i in range(0, batch_size, sub_batch_size):
+            sub_batch = images[i:i + sub_batch_size]
             
-            # Encode through VAE if available
-            if self.vae_encoder is not None:
-                encoded = await self.vae_encoder.encode_image(processed)
+            try:
+                # Process images
+                sub_processed = []
+                for img in sub_batch:
+                    tensor = await self._process_single_image(img, width, height)
+                    sub_processed.append(tensor)
                 
-                # Prepare items for caching
-                for i, img in enumerate(images):
-                    item = {
-                        'image_path': getattr(img, 'filename', f'image_{i}'),
-                        'processed_image': encoded[i].cpu(),  # Move to CPU immediately
-                        'text_data': {}  # Add any text data if available
-                    }
-                    processed_items.append(item)
-                
-                # Cache items immediately if cache manager is provided
-                if cache_manager is not None:
-                    await cache_manager.cache_batch_items(processed_items)
+                # Stack tensors
+                if sub_processed:
+                    batch_tensor = torch.stack(sub_processed)
                     
-                # Clear processed tensors from GPU
-                processed = processed.cpu()
-                encoded = encoded.cpu()
-                torch.cuda.empty_cache()
+                    # Encode through VAE if available
+                    if self.vae_encoder is not None:
+                        batch_tensor = await self.vae_encoder.encode_image(batch_tensor)
+                    
+                    # Move to CPU immediately and append
+                    for tensor in batch_tensor:
+                        processed_tensors.append(tensor.cpu())
+                        
+                    # Clear GPU memory
+                    del batch_tensor
+                    torch.cuda.empty_cache()
                 
-            return processed, processed_items
-            
-        except Exception as e:
-            logger.error(f"Error processing batch: {e}")
-            return torch.empty(0, dtype=self.config.dtype, device=self.config.device), []
+            except Exception as e:
+                logger.error(f"Error processing sub-batch: {e}")
+                # Add empty tensors for failed items
+                for _ in range(len(sub_batch)):
+                    processed_tensors.append(
+                        torch.zeros((4, height//8, width//8), 
+                        dtype=self.config.dtype, 
+                        device='cpu')
+                    )
+        
+        return processed_tensors
 
     @torch.no_grad()
     def encode_vae(self, vae, pixel_values: torch.Tensor) -> torch.Tensor:

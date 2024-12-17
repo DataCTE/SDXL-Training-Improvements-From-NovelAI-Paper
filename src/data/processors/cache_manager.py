@@ -257,39 +257,49 @@ class CacheManager:
             # Continue processing even if caching fails
 
     async def cache_batch_items(self, items: List[Dict[str, Any]]) -> None:
-        """Cache a batch of items immediately after processing.
-        
-        Args:
-            items: List of dictionaries containing processed data
-        """
+        """Cache a batch of items immediately after processing."""
         if not self.use_caching:
             return
             
         try:
-            # Process each item in the batch concurrently
-            tasks = []
+            # Group items by type to reduce disk I/O
+            latent_tasks = []
+            text_tasks = []
+            
             for item in items:
-                if 'image_path' not in item or 'processed_image' not in item:
+                if 'image_path' not in item:
                     continue
                     
                 # Get cache paths
                 cache_paths = self.get_cache_paths(item['image_path'])
                 
-                # Prepare text data with tag weights if available
-                text_data = item.get('text_data', {})
-                if 'tag_weights' in item:
-                    text_data['tag_weights'] = item['tag_weights']
+                # Queue latent caching if present
+                if 'processed_image' in item:
+                    latent_tasks.append(
+                        self.save_latent_async(
+                            cache_paths['latent'],
+                            item['processed_image']
+                        )
+                    )
                 
-                # Create tasks for both latent and text data
-                tasks.extend([
-                    self.save_latent_async(cache_paths['latent'], item['processed_image']),
-                    self.save_text_data_async(cache_paths['text'], text_data)
-                ])
+                # Queue text caching if present
+                if 'text_data' in item:
+                    text_data = item['text_data']
+                    if 'tag_weights' in item:
+                        text_data['tag_weights'] = item['tag_weights']
+                    text_tasks.append(
+                        self.save_text_data_async(
+                            cache_paths['text'],
+                            text_data
+                        )
+                    )
             
-            # Execute all save operations concurrently
-            if tasks:
-                await asyncio.gather(*tasks)
-                
+            # Execute all save operations in parallel
+            if latent_tasks:
+                await asyncio.gather(*latent_tasks)
+            if text_tasks:
+                await asyncio.gather(*text_tasks)
+            
             # Clear memory cache periodically
             if self.total_saved % 100 == 0:
                 self.memory_cache.clear()

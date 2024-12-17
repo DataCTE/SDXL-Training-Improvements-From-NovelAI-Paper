@@ -133,7 +133,7 @@ class AspectBatchSampler(Sampler[List[int]]):
                     total += math.ceil(len(bucket) / self.batch_size)
         return total
 
-    def __iter__(self) -> Iterator[List[int]]:
+    async def __iter__(self) -> AsyncIterator[List[int]]:
         """Create and yield batches for current epoch efficiently."""
         try:
             epoch_start = time.time()
@@ -205,10 +205,11 @@ class AspectBatchSampler(Sampler[List[int]]):
                     
                     # Process batch using BatchProcessor
                     try:
-                        processed_items, batch_stats = self.batch_processor.process_batch(
+                        processed_items, batch_stats = await self.batch_processor.process_batch(
                             batch_items=batch_items,
                             width=width,
-                            height=height
+                            height=height,
+                            cache_manager=self.dataset.cache_manager
                         )
                         
                         # Update progress tracker
@@ -251,10 +252,11 @@ class AspectBatchSampler(Sampler[List[int]]):
                             for idx in final_batch
                         ]
                         try:
-                            processed_items, batch_stats = self.batch_processor.process_batch(
+                            processed_items, batch_stats = await self.batch_processor.process_batch(
                                 batch_items=batch_items,
                                 width=width,
-                                height=height
+                                height=height,
+                                cache_manager=self.dataset.cache_manager
                             )
                             
                             if processed_items:
