@@ -73,7 +73,7 @@ data:
   use_caching: true
   
   # VAE settings
-  vae_batch_size: 32
+  vae_batch_size: 1
   vae_image_size: [256, 256]
   vae_validation_split: 0.1
   

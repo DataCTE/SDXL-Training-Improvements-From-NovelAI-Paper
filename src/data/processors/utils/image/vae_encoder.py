@@ -16,7 +16,7 @@ class VAEEncoderConfig:
     dtype: torch.dtype = torch.float16
     enable_memory_efficient_attention: bool = True
     enable_vae_slicing: bool = True
-    vae_batch_size: int = 8
+    vae_batch_size: int = 1
     max_memory_usage: float = 0.9
 
 class VAEEncoder:
@@ -77,41 +77,40 @@ class VAEEncoder:
         # Process one image at a time
         for i in range(batch_size):
             try:
-                # Get single image
-                current_image = pixel_values[i:i+1]
+                # Get single image and move to CPU until needed
+                current_image = pixel_values[i:i+1].to(self.config.device)
                 
+                # Encode with automatic mixed precision
                 with torch.cuda.amp.autocast(dtype=self.config.dtype):
                     latents = self.vae.encode(current_image).latent_dist.sample()
                     latents = latents * self.vae.config.scaling_factor
-                    latents_list.append(latents)
                     
-                # Clear cache after each image
+                # Move latents to CPU immediately to free GPU memory
+                latents_list.append(latents.cpu())
+                
+                # Aggressively clear cache
                 torch.cuda.empty_cache()
+                
+                # Move original image back to CPU
+                current_image = current_image.cpu()
                 
             except RuntimeError as e:
                 logger.error(f"Error encoding image {i}: {str(e)[:200]}...")
                 # Return empty tensor of correct shape for failed image
                 latents_list.append(torch.zeros(
-                    (1, 4, current_image.shape[2]//8, current_image.shape[3]//8),
+                    (1, 4, pixel_values.shape[2]//8, pixel_values.shape[3]//8),
                     dtype=self.config.dtype,
-                    device=self.config.device
+                    device='cpu'
                 ))
         
-        # Combine all latents
-        return torch.cat(latents_list, dim=0)
+        # Combine all latents and move final result to GPU
+        return torch.cat(latents_list, dim=0).to(self.config.device)
 
     async def encode_image(self, image_tensor: torch.Tensor) -> Optional[torch.Tensor]:
-        """Encode a single image through VAE asynchronously.
-        
-        Args:
-            image_tensor: Tensor of shape (channels, height, width)
-            
-        Returns:
-            VAE encoded latent or None if encoding fails
-        """
+        """Encode a single image through VAE asynchronously."""
         try:
-            # Add batch dimension
-            image_tensor = image_tensor.unsqueeze(0)
+            # Add batch dimension and ensure on CPU initially
+            image_tensor = image_tensor.unsqueeze(0).cpu()
             
             # Encode through VAE
             latents = await asyncio.to_thread(
