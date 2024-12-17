@@ -44,7 +44,7 @@ def setup_memory_optimizations(
             if hasattr(model, 'conv_in') and hasattr(model.conv_in, 'weight'):
                 for param in model.parameters():
                     if param.dim() == 4:  # Only convert 4D tensors (NCHW format)
-                        param.data = param.data.to(memory_format=torch.channels_last)
+                        param.data = param.data.contiguous(memory_format=torch.channels_last)
                 model = model.to(memory_format=torch.channels_last)
         except Exception as e:
             logger.warning(f"Memory format optimization failed: {e}")
@@ -138,11 +138,18 @@ def setup_memory_optimizations(
                     logger.warning(f"{name} size mismatch: got {tensor.size()}, expected {expected_size}")
                 if tensor.dtype != expected_dtype:
                     logger.warning(f"{name} dtype mismatch: got {tensor.dtype}, expected {expected_dtype}")
+                    # Convert to expected dtype if needed
+                    tensor = tensor.to(dtype=expected_dtype)
                 if tensor.device.type != expected_device.type or (
                     expected_device.type == 'cuda' and 
                     tensor.device.index != (expected_device.index if expected_device.index is not None else 0)
                 ):
                     logger.warning(f"{name} device mismatch: got {tensor.device}, expected {expected_device}")
+                    # Move to correct device if needed
+                    tensor = tensor.to(device=expected_device)
+                # Ensure contiguity
+                if not tensor.is_contiguous():
+                    tensor = tensor.contiguous()
                 return tensor
             
             # Allocate and verify each buffer
@@ -154,7 +161,7 @@ def setup_memory_optimizations(
                         device=device,
                         dtype=torch.bfloat16,
                         memory_format=memory_format
-                    ),
+                    ).contiguous(),
                     (batch_size, 4, 128, 128),
                     torch.bfloat16,
                     device
@@ -167,9 +174,9 @@ def setup_memory_optimizations(
             try:
                 grad_norm_buffer = verify_tensor(
                     "grad_norm_buffer",
-                    torch.zeros(len(list(model.parameters())), device=device),
+                    torch.zeros(len(list(model.parameters())), device=device, dtype=torch.bfloat16),
                     (len(list(model.parameters())),),
-                    torch.float32,
+                    torch.bfloat16,
                     device
                 )
                 buffers['grad_norm_buffer'] = grad_norm_buffer
@@ -191,7 +198,7 @@ def setup_memory_optimizations(
                         device=device,
                         dtype=torch.bfloat16,
                         memory_format=memory_format
-                    ),
+                    ).contiguous(),
                     (micro_batch_size, 4, max_latent_height, max_latent_width),
                     torch.bfloat16,
                     device
@@ -204,7 +211,7 @@ def setup_memory_optimizations(
             try:
                 latent_buffer = verify_tensor(
                     "latent_buffer",
-                    torch.empty_like(noise_buffer, memory_format=memory_format),
+                    torch.empty_like(noise_buffer, memory_format=memory_format).contiguous(),
                     noise_buffer.size(),
                     noise_buffer.dtype,
                     device
@@ -217,7 +224,7 @@ def setup_memory_optimizations(
             try:
                 timestep_buffer = verify_tensor(
                     "timestep_buffer",
-                    torch.empty((micro_batch_size,), device=device, dtype=torch.long),
+                    torch.empty((micro_batch_size,), device=device, dtype=torch.long).contiguous(),
                     (micro_batch_size,),
                     torch.long,
                     device
@@ -231,7 +238,7 @@ def setup_memory_optimizations(
                 try:
                     snr_weight_buffer = verify_tensor(
                         "snr_weight_buffer",
-                        torch.empty((micro_batch_size,), device=device, dtype=torch.bfloat16),
+                        torch.empty((micro_batch_size,), device=device, dtype=torch.bfloat16).contiguous(),
                         (micro_batch_size,),
                         torch.bfloat16,
                         device
@@ -267,8 +274,17 @@ def setup_memory_optimizations(
             
             # Verify model can still do a basic forward pass
             try:
+                # Create dummy inputs for UNet forward pass
                 dummy_input = torch.randn(1, model.config.in_channels, 64, 64, device=device)
-                model(dummy_input)
+                dummy_timestep = torch.tensor([0], device=device)
+                dummy_encoder_hidden_states = torch.randn(1, 77, model.config.cross_attention_dim, device=device)
+                
+                # Perform forward pass with all required arguments
+                model(
+                    dummy_input,
+                    timestep=dummy_timestep,
+                    encoder_hidden_states=dummy_encoder_hidden_states
+                )
             except Exception as e:
                 logger.warning(f"Model forward pass verification failed: {e}")
                 
@@ -340,15 +356,22 @@ def verify_memory_optimizations(
     device: torch.device,
     logger: logging.Logger
 ) -> Dict[str, bool]:
-    """Verify memory optimizations are still active.
-    Returns dict of optimization states that can be checked by trainer.
-    """
+    """Verify memory optimizations are still active."""
     optimization_states = {}
     
     try:
         # Verify memory format
         if config.system.channels_last:
-            format_ok = model.conv_in.weight.data.memory_format == torch.channels_last
+            # Check if any 4D parameter is in channels_last format
+            format_ok = False
+            for param in model.parameters():
+                if param.dim() == 4:
+                    try:
+                        if param.is_contiguous(memory_format=torch.channels_last):
+                            format_ok = True
+                            break
+                    except Exception:
+                        continue
             if not format_ok:
                 logger.warning("channels_last memory format was lost")
             optimization_states['channels_last'] = format_ok
