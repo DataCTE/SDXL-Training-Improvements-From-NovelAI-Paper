@@ -117,6 +117,9 @@ class DataConfig:
         # Set min_bucket_resolution if not specified
         if self.min_bucket_resolution is None:
             self.min_bucket_resolution = min(self.min_image_size)
+            
+        # Update max_dim to be the sum of max_image_size dimensions
+        self.max_dim = sum(self.max_image_size)
 
 @dataclass
 class TagWeightingConfig:

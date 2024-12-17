@@ -149,7 +149,8 @@ def train(config_path: str):
             proportion_empty_prompts=config.data.proportion_empty_prompts,
             max_consecutive_batch_samples=2,  # Fixed value as per dataset implementation
             model_name=config.model.pretrained_model_name,
-            tag_weighting=config.tag_weighting
+            tag_weighting=config.tag_weighting,
+            max_token_length=config.data.max_token_length
         )
         
         # Create dataset using the proper interface
