@@ -93,6 +93,7 @@ system:
   gradient_checkpointing: true  # Essential for SDXL
   mixed_precision: "bf16"  # Essential for training
   gradient_accumulation_steps: 4  # Essential for training
+  channels_last: true  # Memory format optimization
 
 # Paths configuration
 paths:

@@ -113,6 +113,7 @@ class SystemConfig:
     gradient_checkpointing: bool = True  # Essential for SDXL
     mixed_precision: str = "bf16"  # Essential for training
     gradient_accumulation_steps: int = 4  # Essential for training
+    channels_last: bool = True  # Memory format optimization
     
     def __init__(self, **kwargs):
         """Initialize with support for legacy fields."""
@@ -121,7 +122,8 @@ class SystemConfig:
             'enable_xformers',
             'gradient_checkpointing',
             'mixed_precision',
-            'gradient_accumulation_steps'
+            'gradient_accumulation_steps',
+            'channels_last'
         }
         
         # Filter to only keep essential fields
