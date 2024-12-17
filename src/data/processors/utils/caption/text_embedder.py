@@ -44,7 +44,7 @@ def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: st
         else:
             raise ValueError(f"{model_class} is not supported.")
 
-def enable_memory_efficient_attention(model: torch.nn.Module) -> bool:
+def setup_memory_efficient_attention(model: torch.nn.Module) -> bool:
     """Enable memory efficient attention using xformers if available."""
     try:
         import xformers
@@ -129,8 +129,8 @@ class TextEmbedder:
 
             # Enable memory efficient attention if available
             if enable_memory_efficient_attention:
-                enable_memory_efficient_attention(self.text_encoder_one)
-                enable_memory_efficient_attention(self.text_encoder_two)
+                setup_memory_efficient_attention(self.text_encoder_one)
+                setup_memory_efficient_attention(self.text_encoder_two)
 
             # Freeze text encoders and set to eval mode
             self.text_encoder_one.eval()
