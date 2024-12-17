@@ -7,6 +7,7 @@ import multiprocessing
 from typing import Optional, Tuple, List
 from pathlib import Path
 import traceback
+import torch.distributed as dist
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -25,7 +26,6 @@ from src.utils.setup import setup_accelerator, setup_distributed
 from src.utils.model import setup_model
 from src.data.validation import validate_directories
 from src.data import get_optimal_cpu_threads
-from torch.distributed import dist
 
 def main():
     try:
