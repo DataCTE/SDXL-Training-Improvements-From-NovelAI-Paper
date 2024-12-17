@@ -25,6 +25,12 @@ training:
   weight_decay: 1.0e-2
   optimizer_eps: 1.0e-8
   optimizer_betas: [0.9, 0.999]
+  
+  # Learning rate scheduler settings
+  lr_scheduler: "none"  # Options: "cosine", "linear", "none"
+  max_train_steps: null  # Will be calculated from num_epochs if not set
+  warmup_steps: 0
+  
   prediction_type: "v_prediction"
   timestep_bias_strategy: "none"
   timestep_bias_multiplier: 1.0

@@ -47,7 +47,12 @@ class TrainingConfig:
     discriminator_learning_rate: float = 4.5e-5
     prediction_type: str = "v_prediction"  # v_prediction or epsilon
     
-    # New timestep bias parameters
+    # Learning rate scheduler settings
+    lr_scheduler: Optional[Literal["cosine", "linear", "none"]] = "none"
+    max_train_steps: Optional[int] = None
+    warmup_steps: Optional[int] = 0
+    
+    # Timestep bias parameters
     timestep_bias_strategy: Literal["none", "earlier", "later", "range"] = "none"
     timestep_bias_multiplier: float = 1.0
     timestep_bias_begin: int = 0

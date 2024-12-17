@@ -132,26 +132,50 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                 eps=self.config.training.optimizer_eps
             )
             
-            # Create scheduler if needed
-            if hasattr(self.config.training, 'lr_scheduler'):
+            # Calculate max_train_steps if not set
+            if self.config.training.max_train_steps is None:
+                # We'll need to set this when we know the dataset size
+                logger.info("max_train_steps not set, will be calculated when dataloader is provided")
+                self.max_train_steps = None
+            else:
+                self.max_train_steps = self.config.training.max_train_steps
+            
+            # Create scheduler if enabled
+            if self.config.training.lr_scheduler != "none":
+                if self.max_train_steps is None:
+                    logger.warning("Cannot create scheduler yet as max_train_steps is not set")
+                    self.lr_scheduler = None
+                    return
+                
                 if self.config.training.lr_scheduler == "cosine":
                     self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                         self.optimizer,
-                        T_max=self.config.training.max_train_steps
+                        T_max=self.max_train_steps,
                     )
                 elif self.config.training.lr_scheduler == "linear":
                     self.lr_scheduler = torch.optim.lr_scheduler.LinearLR(
                         self.optimizer,
                         start_factor=1.0,
                         end_factor=0.1,
-                        total_iters=self.config.training.max_train_steps
+                        total_iters=self.max_train_steps
                     )
-                else:
-                    self.lr_scheduler = None
+            else:
+                self.lr_scheduler = None
                 
         except Exception as e:
             logger.error(f"Error setting up optimizer: {e}")
             raise
+
+    def set_train_dataset_size(self, dataset_size: int):
+        """Set the dataset size and calculate max_train_steps if needed."""
+        if self.max_train_steps is None:
+            steps_per_epoch = dataset_size // (self.config.training.batch_size * self.config.training.gradient_accumulation_steps)
+            self.max_train_steps = steps_per_epoch * self.config.training.num_epochs
+            logger.info(f"Calculated max_train_steps: {self.max_train_steps}")
+            
+            # Now we can create the scheduler if it was pending
+            if self.config.training.lr_scheduler != "none" and self.lr_scheduler is None:
+                self.setup_optimizer()
 
     def compute_loss(
         self,
