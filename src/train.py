@@ -6,13 +6,16 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 import wandb
 from pathlib import Path
-from src.data.dataset import NovelAIDataset
+from src.data.dataset import NovelAIDataset, NovelAIDatasetConfig
 from src.data.sampler import AspectBatchSampler
 from src.training.trainer import NovelAIDiffusionV3Trainer
 from src.utils.model import setup_model
 from src.config.config import Config
-from src.utils.setup import setup_distributed, setup_memory_optimizations, verify_memory_optimizations
-from src.utils.metrics import log_system_info
+from src.utils.setup import setup_distributed, verify_memory_optimizations
+from src.utils.metrics import setup_logging, log_system_info
+from src.data.text_embedder import TextEmbedder
+from src.data.tag_weighter import TagWeighter, TagWeightingConfig
+from src.data.validation import validate_directories
 import gc
 import traceback
 from src.config.arg_parser import parse_args
@@ -38,6 +41,9 @@ def train(config_path: str):
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             is_main_process = True
 
+        # Configure logging
+        setup_logging(config.paths.logs_dir, is_main_process)
+
         # Log system information
         if is_main_process:
             log_system_info()
@@ -49,6 +55,12 @@ def train(config_path: str):
                 name=config.training.wandb_run_name,
                 config=config.to_dict()
             )
+
+        # Validate directories
+        valid_dirs, total_images = validate_directories(config)
+        if is_main_process:
+            logger.info(f"Found {total_images} valid images across {len(valid_dirs)} directories")
+        config.data.image_dirs = valid_dirs
         
         # Setup models with verification using args
         logger.info("Setting up models...")
@@ -91,11 +103,24 @@ def train(config_path: str):
             device=device
         )
         
-        # Create dataset and dataloader
+        # Create dataset with text embedder and tag weighter
         dataset = NovelAIDataset(
-            config=config,
+            image_dirs=valid_dirs,
+            text_embedder=TextEmbedder(
+                pretrained_model_name_or_path=config.model.pretrained_model_name,
+                device=device,
+                dtype=torch.bfloat16 if config.system.mixed_precision == "bf16" else torch.float32
+            ),
+            tag_weighter=TagWeighter(
+                config=TagWeightingConfig(**config.tag_weighting.__dict__)
+            ),
+            vae=vae,
+            config=NovelAIDatasetConfig(**config.data.__dict__),
             device=device
         )
+        
+        if len(dataset) == 0:
+            raise ValueError("Dataset contains no valid samples after initialization")
         
         # Create sampler
         sampler = AspectBatchSampler(
