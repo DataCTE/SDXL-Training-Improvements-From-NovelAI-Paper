@@ -25,11 +25,15 @@ from .processors.utils import (
     get_system_resources,
     log_system_info,
     calculate_optimal_batch_size,
-    create_progress_stats,
-    update_progress_stats,
     format_time,
     get_gpu_memory_usage,
     log_progress
+)
+from .processors.utils.progress_utils import (
+    create_progress_tracker,
+    update_tracker,
+    log_progress,
+    format_time
 )
 
 # Config import
@@ -51,47 +55,68 @@ class NovelAIDataset(Dataset):
         self.device = device
         self.vae = vae
         
-        # Get optimal configuration
-        thread_config = get_optimal_thread_config()
-        resources = get_system_resources()
-        optimal_batch_size = calculate_optimal_batch_size(
-            device=device,
-            min_batch_size=config.min_bucket_size,
-            max_batch_size=64,
-            target_memory_usage=0.9
-        )
-        num_workers = get_optimal_workers(memory_per_worker_gb=1.0)
-        
-        # Initialize text embedder
-        self.text_embedder = TextEmbedder(
-            pretrained_model_name_or_path=config.model_name,
-            device=device,
-            max_length=config.max_token_length,
-            enable_memory_efficient_attention=True,
-            max_memory_usage=0.9
-        )
-
-        # Initialize tag weighter with config
-        self.tag_weighter = TagWeighter(config=config.tag_weighting)
-        
-        # Initialize text processor
-        self.text_processor = TextProcessor(
-            text_embedder=self.text_embedder,
-            tag_weighter=self.tag_weighter,
-            num_workers=num_workers,
+        # Create progress tracker for initialization
+        tracker = create_progress_tracker(
+            total_items=1,  # For initialization progress
             device=device
         )
         
-        # Initialize bucket manager
-        self.bucket_manager = BucketManager(
-            max_image_size=config.max_image_size,
-            min_image_size=config.min_image_size,
-            bucket_step=config.bucket_step,
-            min_bucket_resolution=config.min_bucket_resolution,
-            max_aspect_ratio=config.max_aspect_ratio,
-            bucket_tolerance=config.bucket_tolerance
-        )
+        try:
+            # Get optimal configuration
+            thread_config = get_optimal_thread_config()
+            resources = get_system_resources()
+            optimal_batch_size = calculate_optimal_batch_size(
+                device=device,
+                min_batch_size=config.min_bucket_size,
+                max_batch_size=64,
+                target_memory_usage=0.9
+            )
+            num_workers = get_optimal_workers(memory_per_worker_gb=1.0)
+            
+            # Initialize components with progress tracking
+            self.text_embedder = TextEmbedder(
+                pretrained_model_name_or_path=config.model_name,
+                device=device,
+                max_length=config.max_token_length,
+                enable_memory_efficient_attention=True,
+                max_memory_usage=0.9
+            )
+            update_tracker(tracker, processed=1)
 
+            # Initialize tag weighter with config
+            self.tag_weighter = TagWeighter(config=config.tag_weighting)
+            
+            # Initialize processors
+            self.text_processor = TextProcessor(
+                text_embedder=self.text_embedder,
+                tag_weighter=self.tag_weighter,
+                num_workers=num_workers,
+                device=device
+            )
+            
+            # Initialize bucket manager
+            self.bucket_manager = BucketManager(
+                max_image_size=config.max_image_size,
+                min_image_size=config.min_image_size,
+                bucket_step=config.bucket_step,
+                min_bucket_resolution=config.min_bucket_resolution,
+                max_aspect_ratio=config.max_aspect_ratio,
+                bucket_tolerance=config.bucket_tolerance
+            )
+            
+            # Log initialization progress
+            if tracker.should_log():
+                extra_stats = {
+                    'batch_size': optimal_batch_size,
+                    'workers': num_workers,
+                    'memory_usage': f"{get_gpu_memory_usage(device):.1%}"
+                }
+                log_progress(tracker, prefix="Dataset initialization: ", extra_stats=extra_stats)
+                
+        except Exception as e:
+            logger.error(f"Error during dataset initialization: {e}")
+            raise
+        
         # Initialize image processor
         self.image_processor = ImageProcessor(
             config=ImageProcessorConfig(

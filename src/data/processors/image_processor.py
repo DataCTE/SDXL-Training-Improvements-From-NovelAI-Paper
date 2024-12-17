@@ -14,6 +14,11 @@ from src.data.processors.utils.system_utils import get_gpu_memory_usage, get_opt
 from src.data.processors.utils.batch_utils import adjust_batch_size
 from src.data.processors.utils.image_utils import load_and_validate_image, resize_image, get_image_stats
 from src.data.processors.utils.image.vae_encoder import VAEEncoder, VAEEncoderConfig
+from src.data.processors.utils.progress_utils import (
+    create_progress_tracker,
+    update_tracker,
+    log_progress
+)
 
 # Internal imports from processors
 from src.data.processors.bucket import BucketManager
@@ -186,6 +191,13 @@ class ImageProcessor:
         if batch_size == 0:
             return torch.empty(0, dtype=self.config.dtype, device=self.config.device)
         
+        # Create progress tracker
+        tracker = create_progress_tracker(
+            total_items=batch_size,
+            batch_size=self.config.vae_batch_size,
+            device=self.config.device
+        )
+        
         # Adjust buffer size if needed
         self._adjust_buffer_size(batch_size, width, height)
         
@@ -203,10 +215,20 @@ class ImageProcessor:
             try:
                 img_tensor = future.result()
                 output[i].copy_(img_tensor, non_blocking=True)
+                update_tracker(tracker, processed=1)
             except Exception as e:
                 logger.error(f"Error processing image {i}: {e}")
-                # Fill with zeros on error
+                update_tracker(tracker, failed=1, error_type=str(type(e).__name__))
                 output[i].zero_()
+            
+            # Log progress
+            if tracker.should_log():
+                extra_stats = {
+                    'width': width,
+                    'height': height,
+                    'memory_usage': f"{get_gpu_memory_usage(self.config.device):.1%}"
+                }
+                log_progress(tracker, prefix="Processing images: ", extra_stats=extra_stats)
         
         return output
 

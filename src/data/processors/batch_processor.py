@@ -21,9 +21,10 @@ from src.data.processors.utils.system_utils import (
     get_memory_usage_gb
 )
 from src.data.processors.utils.progress_utils import (
-    create_progress_stats,
-    update_progress_stats,
-    log_progress
+    log_progress,
+    create_progress_tracker,
+    update_tracker,
+    ProgressStats
 )
 from src.data.processors.utils.image_utils import load_and_validate_image
 
@@ -106,7 +107,12 @@ class BatchProcessor(GenericBatchProcessor):
         progress_callback: Optional[Callable[[int, Dict[str, Any]], None]] = None
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """Process entire dataset with chunking and progress tracking."""
-        stats = create_progress_stats(len(items))
+        # Create progress tracker with batch info
+        tracker = create_progress_tracker(
+            total_items=len(items),
+            batch_size=self.batch_size,
+            device=self.device
+        )
         
         async def process_chunk(chunk: List[str], chunk_id: int) -> Tuple[List[Dict], Dict[str, Any]]:
             """Process a single chunk of items."""
@@ -134,12 +140,14 @@ class BatchProcessor(GenericBatchProcessor):
                     img = await self._load_and_validate_image(item_path)
                     if img is None:
                         chunk_stats['skipped'] += 1
+                        update_tracker(tracker, failed=1, error_type='invalid_image')
                         return None
                         
                     # Process image
                     processed_image = await self.image_processor.process_image(img)
                     if processed_image is None:
                         chunk_stats['skipped'] += 1
+                        update_tracker(tracker, failed=1, error_type='image_processing_failed')
                         return None
                         
                     # Process text
@@ -148,6 +156,7 @@ class BatchProcessor(GenericBatchProcessor):
                     if text_result is None:
                         chunk_stats['error_types']['text_processing_failed'] = \
                             chunk_stats['error_types'].get('text_processing_failed', 0) + 1
+                        update_tracker(tracker, failed=1, error_type='text_processing_failed')
                         return None
                         
                     text_data, tags = text_result
@@ -165,6 +174,7 @@ class BatchProcessor(GenericBatchProcessor):
                     
                     chunk_stats['total'] += 1
                     chunk_stats['cache_misses'] += 1
+                    update_tracker(tracker, processed=1, cache_misses=1)
                     return item
                     
                 except Exception as e:
@@ -172,6 +182,7 @@ class BatchProcessor(GenericBatchProcessor):
                     chunk_stats['errors'] += 1
                     chunk_stats['error_types'][type(e).__name__] = \
                         chunk_stats['error_types'].get(type(e).__name__, 0) + 1
+                    update_tracker(tracker, failed=1, error_type=type(e).__name__)
                     return None
             
             # Process chunk items in parallel
@@ -190,7 +201,7 @@ class BatchProcessor(GenericBatchProcessor):
             chunk_size=self.batch_size,
             process_fn=process_chunk,
             progress_callback=lambda n, chunk_stats: self._handle_progress(
-                n, chunk_stats, stats, progress_callback
+                n, chunk_stats, tracker, progress_callback
             )
         )
         
@@ -200,29 +211,26 @@ class BatchProcessor(GenericBatchProcessor):
         self,
         n: int,
         chunk_stats: Dict[str, Any],
-        overall_stats: Dict[str, Any],
+        tracker: ProgressStats,
         progress_callback: Optional[Callable] = None
     ) -> None:
         """Handle progress updates and callbacks."""
-        # Update overall stats
-        update_progress_stats(overall_stats, n)
-        
         # Add extra monitoring stats
         extra_stats = {
             'processed': len(chunk_stats.get('processed_items', [])),
             'errors': chunk_stats.get('errors', 0),
-            'batch_size': self.batch_size,
-            'memory_gb': get_memory_usage_gb(),
-            'gpu_memory': f"{get_gpu_memory_usage(self.device):.1%}"
+            'skipped': chunk_stats.get('skipped', 0),
+            'error_types': chunk_stats.get('error_types', {})
         }
         
         # Log progress if needed
-        if overall_stats.get('should_log', lambda: True)():
-            log_progress(overall_stats, prefix="Processing - ", extra_stats=extra_stats)
-            
-        # Call user progress callback if provided
-        if progress_callback:
-            progress_callback(n, {**chunk_stats, **extra_stats})
+        if tracker.should_log():
+            log_progress(
+                tracker,
+                prefix="Processing - ",
+                extra_stats=extra_stats,
+                callback=progress_callback
+            )
 
     async def cleanup(self):
         """Clean up resources asynchronously."""
@@ -250,3 +258,70 @@ class BatchProcessor(GenericBatchProcessor):
         except Exception as e:
             logger.error(f"Error during cleanup: {str(e)}")
             # Don't re-raise as this is cleanup code
+
+    async def process_batch(
+        self,
+        batch_items: List[Dict],
+        width: int,
+        height: int
+    ) -> Tuple[List[Dict], Dict[str, Any]]:
+        """Process a batch of items with progress tracking."""
+        try:
+            # Create progress tracker for this batch
+            tracker = create_progress_tracker(
+                total_items=len(batch_items),
+                batch_size=self.batch_size,
+                device=self.device
+            )
+            
+            # Convert images to tensors
+            images = []
+            for item in batch_items:
+                try:
+                    img = await self._load_and_validate_image(item['image_path'])
+                    if img is not None:
+                        images.append(img)
+                        update_tracker(tracker, processed=1)
+                    else:
+                        update_tracker(tracker, failed=1, error_type='invalid_image')
+                except Exception as e:
+                    logger.error(f"Error loading image {item['image_path']}: {e}")
+                    update_tracker(tracker, failed=1, error_type=type(e).__name__)
+
+            if not images:
+                return [], {'processed': 0, 'errors': len(batch_items)}
+
+            # Process images in batch
+            try:
+                processed_images = self.image_processor.process_batch(images, width, height)
+                
+                # Create processed items
+                processed_items = []
+                for i, (item, img_tensor) in enumerate(zip(batch_items, processed_images)):
+                    if torch.any(img_tensor):  # Check if tensor contains any non-zero values
+                        processed_items.append({
+                            **item,
+                            'processed_image': img_tensor
+                        })
+                    else:
+                        update_tracker(tracker, failed=1, error_type='processing_failed')
+
+                # Log final batch stats
+                if tracker.should_log():
+                    extra_stats = {
+                        'width': width,
+                        'height': height,
+                        'success_rate': f"{len(processed_items)/len(batch_items)*100:.1f}%"
+                    }
+                    log_progress(tracker, prefix="Batch: ", extra_stats=extra_stats)
+
+                return processed_items, tracker.get_stats()
+
+            except Exception as e:
+                logger.error(f"Error processing batch: {e}")
+                update_tracker(tracker, failed=len(images), error_type='batch_processing_error')
+                return [], tracker.get_stats()
+
+        except Exception as e:
+            logger.error(f"Batch processing error: {e}")
+            return [], {'processed': 0, 'errors': len(batch_items)}

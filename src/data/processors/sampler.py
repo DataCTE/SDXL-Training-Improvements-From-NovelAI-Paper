@@ -9,10 +9,10 @@ import traceback
 # Internal imports from utils
 
 from src.data.processors.utils.progress_utils import (
-    create_progress_stats,
-    update_progress_stats,
-    format_time,
-    log_progress
+    create_progress_tracker,
+    update_tracker,
+    log_progress,
+    format_time
 )
 
 # Internal imports from processors
@@ -139,8 +139,12 @@ class AspectBatchSampler(Sampler[List[int]]):
             epoch_start = time.time()
             logger.info(f"\nStarting epoch {self.epoch}")
             
-            # Create progress stats for this epoch
-            stats = create_progress_stats(self.total_batches)
+            # Create progress tracker for this epoch
+            tracker = create_progress_tracker(
+                total_items=self.total_batches,
+                batch_size=self.batch_size,
+                device=self.dataset.device
+            )
             
             # Shuffle buckets if needed
             if self.shuffle:
@@ -201,29 +205,44 @@ class AspectBatchSampler(Sampler[List[int]]):
                     
                     # Process batch using BatchProcessor
                     try:
-                        import asyncio
                         processed_items, batch_stats = self.batch_processor.process_batch(
                             batch_items=batch_items,
                             width=width,
                             height=height
                         )
                         
-                        # Update progress stats
-                        update_progress_stats(stats, len(processed_items), batch_stats)
-                        
-                        if len(processed_items) > 0:
+                        # Update progress tracker
+                        if processed_items:
+                            update_tracker(
+                                tracker,
+                                processed=len(processed_items),
+                                cache_hits=batch_stats.get('cache_hits', 0),
+                                cache_misses=batch_stats.get('cache_misses', 0)
+                            )
+                            
+                            if batch_stats.get('errors', 0) > 0:
+                                for error_type, count in batch_stats.get('error_types', {}).items():
+                                    update_tracker(tracker, failed=count, error_type=error_type)
+                            
                             yield batch
                             
                         # Log progress periodically
-                        if stats.should_log():
-                            log_progress(stats, prefix="Batch Processing: ")
+                        if tracker.should_log():
+                            extra_stats = {
+                                'active_buckets': len(active_buckets),
+                                'current_bucket': f"{width}x{height}",
+                                'consecutive_samples': consecutive_samples[selected_key],
+                                'error_types': tracker.error_types
+                            }
+                            log_progress(tracker, prefix="Batch Processing: ", extra_stats=extra_stats)
                         
                     except Exception as e:
                         logger.error(f"Error processing batch: {str(e)}")
                         logger.error(traceback.format_exc())
+                        update_tracker(tracker, failed=len(batch), error_type='batch_processing_error')
                     
                 elif not self.drop_last and bucket.remaining_samples() > 0:
-                    # Handle final partial batch
+                    # Handle final partial batch similarly to regular batch
                     final_batch = bucket.get_next_batch(bucket.remaining_samples())
                     if final_batch:
                         # Process final batch
@@ -238,15 +257,19 @@ class AspectBatchSampler(Sampler[List[int]]):
                                 height=height
                             )
                             
-                            # Update progress stats
-                            update_progress_stats(stats, len(processed_items), batch_stats)
-                            
-                            if len(processed_items) > 0:
+                            if processed_items:
+                                update_tracker(
+                                    tracker,
+                                    processed=len(processed_items),
+                                    cache_hits=batch_stats.get('cache_hits', 0),
+                                    cache_misses=batch_stats.get('cache_misses', 0)
+                                )
                                 yield final_batch
                                 
                         except Exception as e:
                             logger.error(f"Error processing final batch: {str(e)}")
                             logger.error(traceback.format_exc())
+                            update_tracker(tracker, failed=len(final_batch), error_type='final_batch_error')
                             
                     active_buckets.remove(selected_key)
                 else:
@@ -257,9 +280,12 @@ class AspectBatchSampler(Sampler[List[int]]):
             logger.info(
                 f"\nEpoch {self.epoch} completed:"
                 f"\n- Time: {format_time(epoch_time)}"
-                f"\n- Processed: {stats.processed_items}/{stats.total_items}"
-                f"\n- Success rate: {(stats.processed_items/stats.total_items)*100:.1f}%"
-                f"\n- Processing rate: {stats.rate:.1f} items/s"
+                f"\n- Processed: {tracker.processed_items}/{tracker.total_items}"
+                f"\n- Success rate: {(tracker.processed_items/tracker.total_items)*100:.1f}%"
+                f"\n- Processing rate: {tracker.rate:.1f} items/s"
+                f"\n- Cache hits/misses: {tracker.cache_hits}/{tracker.cache_misses}"
+                f"\n- Failed items: {tracker.failed_items}"
+                f"\n- Error types: {tracker.error_types}"
             )
             
             # Increment epoch

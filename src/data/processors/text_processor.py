@@ -8,7 +8,11 @@ from pathlib import Path
 from src.data.processors.utils.caption.text_embedder import TextEmbedder
 from src.data.processors.utils.caption.tag_weighter import parse_tags, TagWeighter
 from src.data.processors.utils.system_utils import get_optimal_workers, create_thread_pool
-from src.data.processors.utils.progress_utils import create_progress_stats, update_progress_stats, log_progress
+from src.data.processors.utils.progress_utils import (
+    create_progress_tracker,
+    update_tracker,
+    log_progress
+)
 
 logger = logging.getLogger(__name__)
 
@@ -22,14 +26,7 @@ class TextProcessor:
         num_workers: Optional[int] = None,
         device: Optional[torch.device] = None
     ):
-        """Initialize text processor.
-        
-        Args:
-            text_embedder: Text embedding model
-            tag_weighter: Optional tag weighting model
-            num_workers: Number of worker threads
-            device: Torch device for processing
-        """
+        """Initialize text processor."""
         self.text_embedder = text_embedder
         self.tag_weighter = tag_weighter
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -46,14 +43,7 @@ class TextProcessor:
         )
 
     async def process_text(self, text: str) -> Tuple[Dict[str, Any], List[str]]:
-        """Process text and extract tags with optional weighting.
-        
-        Args:
-            text: Input text to process
-            
-        Returns:
-            Tuple of (text_data, tags)
-        """
+        """Process text and extract tags with optional weighting."""
         try:
             # Parse tags
             tag_dict = parse_tags(text)
@@ -88,15 +78,50 @@ class TextProcessor:
             logger.error(f"Error processing text: {str(e)[:200]}...")
             return None, []
 
-    async def process_text_file(self, text_path: Path) -> Optional[Tuple[Dict[str, Any], List[str]]]:
-        """Process text from a file.
+    async def process_batch(
+        self,
+        texts: List[str],
+        batch_size: int = 32
+    ) -> List[Tuple[Dict[str, Any], List[str]]]:
+        """Process a batch of texts in parallel."""
+        results = []
         
-        Args:
-            text_path: Path to text file
+        # Create progress tracker
+        tracker = create_progress_tracker(
+            total_items=len(texts),
+            batch_size=batch_size,
+            device=self.device
+        )
+        
+        # Process in batches
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
             
-        Returns:
-            Tuple of (text_data, tags) if successful, None otherwise
-        """
+            # Process batch items in parallel
+            tasks = [self.process_text(text) for text in batch]
+            batch_results = await asyncio.gather(*tasks)
+            
+            # Process results and update tracker
+            for result in batch_results:
+                if result[0] is not None:
+                    results.append(result)
+                    update_tracker(tracker, processed=1)
+                else:
+                    update_tracker(tracker, failed=1, error_type='text_processing_failed')
+            
+            # Log progress
+            if tracker.should_log():
+                extra_stats = {
+                    'successful': len(results),
+                    'failed': tracker.failed_items,
+                    'error_types': tracker.error_types
+                }
+                log_progress(tracker, prefix="Processing texts: ", extra_stats=extra_stats)
+            
+        return results
+
+    async def process_text_file(self, text_path: Path) -> Optional[Tuple[Dict[str, Any], List[str]]]:
+        """Process text from a file."""
         try:
             if not text_path.exists():
                 logger.error(f"Text file not found: {text_path}")
@@ -113,50 +138,6 @@ class TextProcessor:
         except Exception as e:
             logger.error(f"Error processing text file {text_path}: {str(e)[:200]}...")
             return None
-
-    async def process_batch(
-        self,
-        texts: List[str],
-        batch_size: int = 32
-    ) -> List[Tuple[Dict[str, Any], List[str]]]:
-        """Process a batch of texts in parallel.
-        
-        Args:
-            texts: List of texts to process
-            batch_size: Size of processing batches
-            
-        Returns:
-            List of (text_data, tags) tuples
-        """
-        results = []
-        
-        # Create progress stats
-        stats = create_progress_stats(len(texts))
-        
-        # Process in batches
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i:i + batch_size]
-            
-            # Process batch items in parallel
-            tasks = [self.process_text(text) for text in batch]
-            batch_results = await asyncio.gather(*tasks)
-            
-            # Filter out failed results and update stats
-            successful_results = []
-            for result in batch_results:
-                if result[0] is not None:
-                    successful_results.append(result)
-                    update_progress_stats(stats, processed=1)
-                else:
-                    update_progress_stats(stats, failed=1)
-            
-            results.extend(successful_results)
-            
-            # Log progress
-            if stats.should_log():
-                log_progress(stats, prefix="Processing texts: ")
-            
-        return results
 
     async def cleanup(self):
         """Clean up resources."""
