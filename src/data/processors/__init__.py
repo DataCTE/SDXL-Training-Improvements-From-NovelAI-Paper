@@ -21,7 +21,7 @@ from .tag_weighter import TagWeighter, TagWeightingConfig
 from .text_embedder import TextEmbedder
 from .image_processor import ImageProcessor, ImageProcessorConfig
 from .cache_manager import CacheManager
-from .batch_processor import BatchProcessor
+from .text_processor import BatchProcessor
 from .sampler import AspectBatchSampler
 from .thread_config import get_optimal_thread_config
 

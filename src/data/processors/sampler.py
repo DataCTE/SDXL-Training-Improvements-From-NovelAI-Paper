@@ -18,7 +18,7 @@ from src.data.processors.utils.progress_utils import (
 
 # Internal imports from processors
 from src.data.processors.bucket import BucketManager
-from src.data.processors.thread_config import get_optimal_thread_config
+from src.data.processors.utils.thread_config import get_optimal_thread_config
 from src.data.processors.batch_processor import BatchProcessor
 
 logger = logging.getLogger(__name__)

@@ -29,9 +29,8 @@ from src.data.processors.utils.image_utils import load_and_validate_image
 
 # Internal imports from processors
 from src.data.processors.cache_manager import CacheManager
-from src.data.processors.text_embedder import TextEmbedder
+from src.data.processors.text_processor import TextProcessor
 from src.data.processors.image_processor import ImageProcessor
-from src.data.processors.tag_weighter import parse_tags
 
 logger = logging.getLogger(__name__)
 
@@ -41,8 +40,8 @@ class BatchProcessor(GenericBatchProcessor):
     def __init__(
         self,
         image_processor: ImageProcessor,
+        text_processor: TextProcessor,
         cache_manager: CacheManager,
-        text_embedder: TextEmbedder,
         vae,
         device: torch.device,
         batch_size: Optional[int] = None,
@@ -64,8 +63,8 @@ class BatchProcessor(GenericBatchProcessor):
         
         # Initialize components
         self.image_processor = image_processor
+        self.text_processor = text_processor
         self.cache_manager = cache_manager
-        self.text_embedder = text_embedder
         self.vae = vae
         self.device = device
         self.prefetch_factor = prefetch_factor
@@ -77,6 +76,14 @@ class BatchProcessor(GenericBatchProcessor):
             device=device,
             max_memory_usage=max_memory_usage,
             prefetch_factor=prefetch_factor
+        )
+        
+        logger.info(
+            f"Initialized BatchProcessor:\n"
+            f"- Device: {device}\n"
+            f"- Batch size: {self.batch_size}\n"
+            f"- Workers: {self.num_workers}\n"
+            f"- Prefetch factor: {prefetch_factor}"
         )
         
     async def _load_and_validate_image(self, image_path: str) -> Optional[Image.Image]:
@@ -92,7 +99,7 @@ class BatchProcessor(GenericBatchProcessor):
         except Exception as e:
             logger.error(f"Error loading image {image_path}: {str(e)[:200]}...")
             return None
-            
+
     async def process_dataset(
         self,
         items: List[str],
@@ -118,10 +125,7 @@ class BatchProcessor(GenericBatchProcessor):
             async def process_item(item_path: str) -> Optional[Dict]:
                 try:
                     # Check cache first
-                    cache_result = await asyncio.to_thread(
-                        self.cache_manager.get_cached_item,
-                        item_path
-                    )
+                    cache_result = await self.cache_manager.get_cached_item(item_path)
                     if cache_result is not None:
                         chunk_stats['cache_hits'] += 1
                         return cache_result
@@ -138,21 +142,16 @@ class BatchProcessor(GenericBatchProcessor):
                         chunk_stats['skipped'] += 1
                         return None
                         
-                    # Load and process text
+                    # Process text
                     text_path = Path(item_path).with_suffix('.txt')
-                    if not text_path.exists():
-                        chunk_stats['error_types']['missing_text'] = \
-                            chunk_stats['error_types'].get('missing_text', 0) + 1
+                    text_result = await self.text_processor.process_text_file(text_path)
+                    if text_result is None:
+                        chunk_stats['error_types']['text_processing_failed'] = \
+                            chunk_stats['error_types'].get('text_processing_failed', 0) + 1
                         return None
                         
-                    text = await asyncio.to_thread(text_path.read_text, encoding='utf-8')
-                    tags = parse_tags(text)
-                    text_data = await self.text_embedder.process_text(text, tags)
+                    text_data, tags = text_result
                     
-                    if text_data is None:
-                        chunk_stats['skipped'] += 1
-                        return None
-                        
                     # Create item
                     item = {
                         'image_path': item_path,
@@ -162,11 +161,7 @@ class BatchProcessor(GenericBatchProcessor):
                     }
                     
                     # Cache item
-                    await asyncio.to_thread(
-                        self.cache_manager.cache_item,
-                        item_path,
-                        item
-                    )
+                    await self.cache_manager.cache_item(item_path, item)
                     
                     chunk_stats['total'] += 1
                     chunk_stats['cache_misses'] += 1
@@ -228,3 +223,30 @@ class BatchProcessor(GenericBatchProcessor):
         # Call user progress callback if provided
         if progress_callback:
             progress_callback(n, {**chunk_stats, **extra_stats})
+
+    async def cleanup(self):
+        """Clean up resources asynchronously."""
+        try:
+            # Clean up thread pool
+            if hasattr(self, 'thread_pool'):
+                self.thread_pool.shutdown(wait=True)
+            
+            # Clean up processors
+            if hasattr(self.image_processor, 'cleanup'):
+                await self.image_processor.cleanup()
+            if hasattr(self.text_processor, 'cleanup'):
+                await self.text_processor.cleanup()
+            
+            # Clean up cache manager
+            if hasattr(self.cache_manager, 'cleanup'):
+                await self.cache_manager.cleanup()
+            
+            # Clear CUDA cache
+            if self.device.type == 'cuda':
+                torch.cuda.empty_cache()
+                
+            logger.info("Successfully cleaned up batch processor resources")
+            
+        except Exception as e:
+            logger.error(f"Error during cleanup: {str(e)}")
+            # Don't re-raise as this is cleanup code

@@ -10,16 +10,17 @@ import asyncio
 from tqdm import tqdm
 
 # Internal imports from processors
-from .processors.text_embedder import TextEmbedder
-from .processors.tag_weighter import TagWeighter
+from .processors.text_processor import TextProcessor
+from .processors.batch_processor import BatchProcessor
 from .processors.image_processor import ImageProcessor, ImageProcessorConfig
 from .processors.cache_manager import CacheManager
-from .processors.batch_processor import BatchProcessor
 from .processors.bucket import BucketManager
 from .processors.sampler import AspectBatchSampler
-from .processors.thread_config import get_optimal_thread_config
 
-
+# Import utilities
+from .processors.utils.caption.text_embedder import TextEmbedder
+from .processors.utils.caption.tag_weighter import TagWeighter
+from .processors.utils.thread_config import get_optimal_thread_config
 from .processors.utils import (
     find_matching_files,
     ensure_dir,
@@ -31,7 +32,8 @@ from .processors.utils import (
     create_progress_stats,
     update_progress_stats,
     format_time,
-    get_gpu_memory_usage
+    get_gpu_memory_usage,
+    log_progress
 )
 
 # Config import
@@ -55,7 +57,18 @@ class NovelAIDataset(Dataset):
         self.device = device
         self.vae = vae
         
-        # Initialize text embedder internally
+        # Get optimal configuration
+        thread_config = get_optimal_thread_config()
+        resources = get_system_resources()
+        optimal_batch_size = calculate_optimal_batch_size(
+            device=device,
+            min_batch_size=config.min_bucket_size,
+            max_batch_size=64,
+            target_memory_usage=0.9
+        )
+        num_workers = get_optimal_workers(memory_per_worker_gb=1.0)
+        
+        # Initialize text embedder
         self.text_embedder = TextEmbedder(
             pretrained_model_name_or_path=config.model_name,
             device=device,
@@ -64,40 +77,28 @@ class NovelAIDataset(Dataset):
             max_memory_usage=0.9
         )
 
-        # Initialize tag weighter internally
-        tag_weighter_config = TagWeightingConfig(
-            enabled=config.tag_weighting.enabled,
-            min_weight=config.tag_weighting.min_weight,
-            max_weight=config.tag_weighting.max_weight,
-            default_weight=config.tag_weighting.default_weight,
-            update_frequency=config.tag_weighting.update_frequency,
-            smoothing_factor=config.tag_weighting.smoothing_factor
-        )
-        
+        # Initialize tag weighter
         self.tag_weighter = TagWeighter(
-            config=tag_weighter_config,
+            config=TagWeightingConfig(
+                enabled=config.tag_weighting.enabled,
+                min_weight=config.tag_weighting.min_weight,
+                max_weight=config.tag_weighting.max_weight,
+                default_weight=config.tag_weighting.default_weight,
+                update_frequency=config.tag_weighting.update_frequency,
+                smoothing_factor=config.tag_weighting.smoothing_factor
+            ),
             text_embedder=self.text_embedder
         )
         
-        # Get model dtype from VAE
-        self.dtype = next(vae.parameters()).dtype
-        
-        # Get optimal thread configuration and resources
-        thread_config = get_optimal_thread_config()
-        resources = get_system_resources()
-        
-        # Calculate optimal batch size based on GPU memory
-        optimal_batch_size = calculate_optimal_batch_size(
-            device=device,
-            min_batch_size=config.min_bucket_size,
-            max_batch_size=64,  # Adjustable maximum
-            target_memory_usage=0.9
+        # Initialize text processor
+        self.text_processor = TextProcessor(
+            text_embedder=self.text_embedder,
+            tag_weighter=self.tag_weighter,
+            num_workers=num_workers,
+            device=device
         )
         
-        # Get optimal number of workers based on system resources
-        num_workers = get_optimal_workers(memory_per_worker_gb=1.0)  # 1GB per worker
-        
-        # Initialize components with optimized parameters
+        # Initialize bucket manager
         self.bucket_manager = BucketManager(
             max_image_size=config.max_image_size,
             min_image_size=config.min_image_size,
@@ -107,9 +108,10 @@ class NovelAIDataset(Dataset):
             bucket_tolerance=config.bucket_tolerance
         )
 
+        # Initialize image processor
         self.image_processor = ImageProcessor(
-            ImageProcessorConfig(
-                dtype=self.dtype,
+            config=ImageProcessorConfig(
+                dtype=next(vae.parameters()).dtype,
                 device=device,
                 max_image_size=config.max_image_size,
                 min_image_size=config.min_image_size,
@@ -120,20 +122,22 @@ class NovelAIDataset(Dataset):
                 prefetch_factor=thread_config.prefetch_factor,
                 max_memory_usage=0.9
             ),
-            bucket_manager=self.bucket_manager
+            bucket_manager=self.bucket_manager,
+            vae=self.vae
         )
         
+        # Initialize cache manager
         self.cache_manager = CacheManager(
             cache_dir=config.cache_dir,
             max_workers=num_workers,
             use_caching=config.use_caching
         )
         
-        # Initialize batch processor with optimized configuration
+        # Initialize batch processor
         self.batch_processor = BatchProcessor(
             image_processor=self.image_processor,
+            text_processor=self.text_processor,
             cache_manager=self.cache_manager,
-            text_embedder=self.text_embedder,
             vae=self.vae,
             device=device,
             batch_size=optimal_batch_size,
@@ -173,7 +177,7 @@ class NovelAIDataset(Dataset):
             prefetch_factor=thread_config.prefetch_factor
         )
         
-        # Enhanced logging with system resource information
+        # Log initialization info
         logger.info(
             f"Initialized dataset with {len(self)} samples\n"
             f"System Resources:\n"
@@ -182,13 +186,18 @@ class NovelAIDataset(Dataset):
             f"{resources.gpu_memory_used:.1f}GB used\n"
             f"- Workers: {num_workers}\n"
             f"- Optimal Batch Size: {optimal_batch_size}\n"
+            f"\nComponents:\n"
+            f"- Text Processor: Initialized with {self.text_processor.num_workers} workers\n"
+            f"- Image Processor: Using {self.image_processor.num_workers} workers\n"
+            f"- Cache Manager: {'Enabled' if config.use_caching else 'Disabled'}\n"
+            f"- Bucket Manager: {len(self.bucket_manager.buckets)} buckets\n"
             f"\nConfig:\n"
             f"- Max image size: {config.max_image_size}\n"
             f"- Min image size: {config.min_image_size}\n"
             f"- Bucket step: {config.bucket_step}\n"
             f"- Max aspect ratio: {config.max_aspect_ratio}\n"
-            f"- Cache enabled: {config.use_caching}\n"
-            f"Bucket stats: {self.bucket_manager.get_stats()}"
+            f"\nBucket Stats:\n"
+            f"{self.bucket_manager.get_stats()}"
         )
 
     async def _process_data(self, image_dirs: List[str]) -> None:
@@ -239,7 +248,7 @@ class NovelAIDataset(Dataset):
                 )
             )
             
-            # Update items list
+            # Update items list and assign to buckets
             self.items = processed_items
             
             # Log final statistics
@@ -289,3 +298,24 @@ class NovelAIDataset(Dataset):
     def get_sampler(self) -> AspectBatchSampler:
         """Get the aspect ratio-aware batch sampler."""
         return self.sampler
+
+    async def cleanup(self):
+        """Clean up all resources."""
+        try:
+            # Clean up all processors
+            await self.batch_processor.cleanup()
+            await self.text_processor.cleanup()
+            await self.image_processor.cleanup()
+            
+            # Clean up cache manager
+            if hasattr(self.cache_manager, 'cleanup'):
+                await self.cache_manager.cleanup()
+            
+            # Clear CUDA cache
+            if self.device.type == 'cuda':
+                torch.cuda.empty_cache()
+                
+            logger.info("Successfully cleaned up all dataset resources")
+            
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")

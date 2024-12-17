@@ -184,3 +184,74 @@ class CacheManager:
             "hit_rate": self.cache_hits / max(1, self.cache_hits + self.cache_misses),
             "memory_usage_gb": get_memory_usage_gb()
         }
+
+    async def get_cached_item(self, image_path: str) -> Optional[Dict[str, Any]]:
+        """Get cached item data for both latent and text asynchronously.
+        
+        Args:
+            image_path: Path to the image file
+            
+        Returns:
+            Dict containing cached data if both latent and text exist, None otherwise
+        """
+        try:
+            # Get cache paths
+            cache_paths = self.get_cache_paths(image_path)
+            
+            # Check if both cache files exist
+            if not (cache_paths['latent'].exists() and cache_paths['text'].exists()):
+                return None
+                
+            # Load cached data asynchronously
+            latent, text_data = await asyncio.gather(
+                asyncio.to_thread(self.load_latent, cache_paths['latent']),
+                asyncio.to_thread(self.load_text_data, cache_paths['text'])
+            )
+            
+            # Return combined data
+            cached_item = {
+                'image_path': image_path,
+                'latent': latent,
+                'text_data': text_data,
+                'latent_cache': cache_paths['latent'],
+                'text_cache': cache_paths['text']
+            }
+            
+            # Add tag weights if they exist in text data
+            if 'tag_weights' in text_data:
+                cached_item['tag_weights'] = text_data['tag_weights']
+            
+            return cached_item
+            
+        except Exception as e:
+            logger.debug(f"Cache miss for {image_path}: {str(e)}")
+            return None
+
+    async def cache_item(self, image_path: str, item: Dict[str, Any]) -> None:
+        """Cache both latent and text data for an item asynchronously.
+        
+        Args:
+            image_path: Path to the image file
+            item: Dictionary containing processed data
+        """
+        if not self.use_caching:
+            return
+            
+        try:
+            # Get cache paths
+            cache_paths = self.get_cache_paths(image_path)
+            
+            # Prepare text data with tag weights if available
+            text_data = item['text_data']
+            if 'tag_weights' in item:
+                text_data['tag_weights'] = item['tag_weights']
+            
+            # Save latent and text data concurrently
+            await asyncio.gather(
+                self.save_latent_async(cache_paths['latent'], item['processed_image']),
+                self.save_text_data_async(cache_paths['text'], text_data)
+            )
+            
+        except Exception as e:
+            logger.error(f"Error caching item {image_path}: {e}")
+            # Continue processing even if caching fails
