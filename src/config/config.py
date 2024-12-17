@@ -78,7 +78,7 @@ class DataConfig:
     
     # Add missing bucketing and size configuration
     min_size: int = 256  # Minimum image dimension
-    max_dim: int = 2048  # Maximum image dimension
+    max_dim: int = 8192  # Maximum image dimension
     bucket_step: int = 8  # Resolution step size for buckets
     min_bucket_size: int = 16  # Minimum images per bucket
     bucket_tolerance: float = 0.2  # Tolerance for bucket aspect ratios
