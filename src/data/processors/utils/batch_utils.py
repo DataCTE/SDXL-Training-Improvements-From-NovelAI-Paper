@@ -4,7 +4,12 @@ from typing import TypeVar, List, Dict, Any, Optional, Callable, Tuple
 from concurrent.futures import ThreadPoolExecutor
 import time
 from .system_utils import get_gpu_memory_usage, get_memory_usage_gb, adjust_batch_size
-from .progress_utils import ProgressStats, create_progress_stats, update_progress_stats, log_progress
+from .progress_utils import (
+    ProgressStats,
+    create_progress_tracker,
+    update_tracker,
+    log_progress
+)
 from src.config.config import BatchConfig
 
 logger = logging.getLogger(__name__)
@@ -109,7 +114,7 @@ class BatchProcessor:
         backoff_factor: float = 1.5
     ) -> List[Any]:
         """Process items in batches with automatic memory management and retry logic."""
-        self.stats = create_progress_stats(len(items))
+        self.stats = create_progress_tracker(len(items))
         results = []
         
         try:
@@ -130,7 +135,7 @@ class BatchProcessor:
                             results.extend(batch_result)
                             
                             # Update stats
-                            update_progress_stats(
+                            update_tracker(
                                 self.stats,
                                 processed=len(batch_items),
                                 memory_gb=get_memory_usage_gb()
@@ -152,7 +157,7 @@ class BatchProcessor:
                             
                         except Exception as e:
                             logger.error(f"Error processing batch {start_idx}:{end_idx}: {e}")
-                            update_progress_stats(self.stats, failed=len(batch_items))
+                            update_tracker(self.stats, failed=len(batch_items))
                             
                         finally:
                             if cleanup_fn:
