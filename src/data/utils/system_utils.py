@@ -125,20 +125,26 @@ def calculate_optimal_batch_size(
     min_batch_size: int = 1,
     max_batch_size: int = 64,
     target_memory_usage: float = 0.8,
-    growth_factor: float = 0.1
+    growth_factor: float = 0.1,
+    safety_margin: float = 0.1
 ) -> int:
-    """Calculate optimal batch size based on available GPU memory."""
+    """Calculate optimal batch size with additional safety margin."""
     if device.type != "cuda":
         return max_batch_size
         
     current_memory = get_gpu_memory_usage(device)
-    available_memory = 1 - current_memory
+    available_memory = (1 - current_memory) * (1 - safety_margin)
     
-    if available_memory <= 0:
-        return min_batch_size
-        
-    optimal_size = int(max_batch_size * (available_memory / target_memory_usage) * growth_factor)
-    return max(min_batch_size, min(optimal_size, max_batch_size))
+    # Use growth factor to scale the initial batch size
+    optimal_size = min(
+        max_batch_size,
+        max(
+            min_batch_size,
+            int(available_memory / target_memory_usage * max_batch_size * (1 + growth_factor))
+        )
+    )
+    
+    return optimal_size
 
 class MemoryCache:
     """Memory cache with size limit and automatic cleanup."""

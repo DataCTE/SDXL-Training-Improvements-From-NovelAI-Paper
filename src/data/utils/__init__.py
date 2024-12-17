@@ -40,8 +40,29 @@ from .batch_utils import (
     BatchConfig,
     BatchProcessor,
     create_tensor_buffer,
-    process_in_chunks
+    process_in_chunks,
+    process_in_chunks_sync
 )
+
+import asyncio
+from typing import List, Any, Callable, Tuple, Dict
+
+
+async def process_in_chunks_sync(
+    items: List[Any],
+    chunk_size: int,
+    process_fn: Callable,
+    num_workers: int,
+    **kwargs
+) -> Tuple[List[Any], Dict[str, Any]]:
+    """Synchronous wrapper for process_in_chunks."""
+    return await process_in_chunks(
+        items=items,
+        chunk_size=chunk_size,
+        process_fn=process_fn,
+        num_workers=num_workers,
+        **kwargs
+    )
 
 __all__ = [
     # System utilities
@@ -82,5 +103,6 @@ __all__ = [
     'BatchConfig',
     'BatchProcessor',
     'create_tensor_buffer',
-    'process_in_chunks'
+    'process_in_chunks',
+    'process_in_chunks_sync'
 ] 

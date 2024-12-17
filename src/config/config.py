@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Literal, Union
 import yaml
+import torch
 
 
 
@@ -203,6 +204,16 @@ class NovelAIDatasetConfig:
         # Set min_bucket_resolution if not specified
         if self.min_bucket_resolution is None:
             self.min_bucket_resolution = min(self.min_image_size)
+
+@dataclass
+class BatchConfig:
+    """Configuration for batch processing."""
+    batch_size: int
+    device: torch.device
+    dtype: torch.dtype = torch.float16
+    max_memory_usage: float = 0.9
+    prefetch_factor: int = 2
+    log_interval: float = 5.0
 
 @dataclass
 class Config:

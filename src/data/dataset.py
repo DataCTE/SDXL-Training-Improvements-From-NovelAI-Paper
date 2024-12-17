@@ -296,12 +296,11 @@ class NovelAIDataset(Dataset):
                 }, refresh=True)
                 pbar.update(n)
             
-            processed_items, final_stats = await process_in_chunks(
+            processed_items, final_stats = process_in_chunks(
                 items=image_files,
                 chunk_size=chunk_size,
                 process_fn=process_chunk,
-                num_workers=get_optimal_workers(),
-                progress_interval=0.1
+                progress_callback=lambda n, stats: update_progress(n, stats)
             )
             
             # Print chunk completion status
