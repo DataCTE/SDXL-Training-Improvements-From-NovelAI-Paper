@@ -81,9 +81,10 @@ class TextProcessor:
     async def process_batch(
         self,
         texts: List[str],
-        batch_size: int = 32
+        batch_size: int = 32,
+        cache_manager: Optional[CacheManager] = None
     ) -> List[Tuple[Dict[str, Any], List[str]]]:
-        """Process a batch of texts in parallel."""
+        """Process a batch of texts in parallel with immediate caching."""
         results = []
         
         # Create progress tracker
@@ -93,35 +94,64 @@ class TextProcessor:
             device=self.device
         )
         
-        # Process in batches
+        # Process in smaller batches to manage memory
         for i in range(0, len(texts), batch_size):
             batch = texts[i:i + batch_size]
+            batch_results = []
             
             # Process batch items in parallel
             tasks = [self.process_text(text) for text in batch]
-            batch_results = await asyncio.gather(*tasks)
+            text_results = await asyncio.gather(*tasks)
             
-            # Process results and update tracker
-            for result in batch_results:
-                if result[0] is not None:
-                    results.append(result)
+            # Process results and prepare for caching
+            for j, (text_data, tags) in enumerate(text_results):
+                if text_data is not None:
+                    # Move tensors to CPU immediately
+                    if 'embeds' in text_data:
+                        text_data['embeds'] = text_data['embeds'].cpu()
+                    if 'pooled_embeds' in text_data:
+                        text_data['pooled_embeds'] = text_data['pooled_embeds'].cpu()
+                    if 'tag_weights' in text_data:
+                        text_data['tag_weights'] = text_data['tag_weights'].cpu()
+                    
+                    # Create cache item
+                    cache_item = {
+                        'text_path': getattr(batch[j], 'filename', f'text_{i+j}'),
+                        'text_data': text_data,
+                        'tags': tags
+                    }
+                    batch_results.append(cache_item)
+                    results.append((text_data, tags))
                     update_tracker(tracker, processed=1)
                 else:
                     update_tracker(tracker, failed=1, error_type='text_processing_failed')
+            
+            # Cache batch results immediately if cache manager is provided
+            if cache_manager is not None and batch_results:
+                await cache_manager.cache_batch_items(batch_results)
+            
+            # Clear GPU cache periodically
+            if i % (batch_size * 10) == 0:
+                torch.cuda.empty_cache()
             
             # Log progress
             if tracker.should_log():
                 extra_stats = {
                     'successful': len(results),
                     'failed': tracker.failed_items,
-                    'error_types': tracker.error_types
+                    'error_types': tracker.error_types,
+                    'memory_usage': f"{get_gpu_memory_usage(self.device):.1%}"
                 }
                 log_progress(tracker, prefix="Processing texts: ", extra_stats=extra_stats)
-            
+        
         return results
 
-    async def process_text_file(self, text_path: Path) -> Optional[Tuple[Dict[str, Any], List[str]]]:
-        """Process text from a file."""
+    async def process_text_file(
+        self,
+        text_path: Path,
+        cache_manager: Optional[CacheManager] = None
+    ) -> Optional[Tuple[Dict[str, Any], List[str]]]:
+        """Process text from a file with immediate caching."""
         try:
             if not text_path.exists():
                 logger.error(f"Text file not found: {text_path}")
@@ -133,7 +163,31 @@ class TextProcessor:
             )
             
             # Process text and tags
-            return await self.process_text(text)
+            text_data, tags = await self.process_text(text)
+            
+            if text_data is not None and cache_manager is not None:
+                # Move tensors to CPU for caching
+                if 'embeds' in text_data:
+                    text_data['embeds'] = text_data['embeds'].cpu()
+                if 'pooled_embeds' in text_data:
+                    text_data['pooled_embeds'] = text_data['pooled_embeds'].cpu()
+                if 'tag_weights' in text_data:
+                    text_data['tag_weights'] = text_data['tag_weights'].cpu()
+                
+                # Create cache item
+                cache_item = {
+                    'text_path': str(text_path),
+                    'text_data': text_data,
+                    'tags': tags
+                }
+                
+                # Cache immediately
+                await cache_manager.cache_batch_items([cache_item])
+                
+                # Clear GPU cache
+                torch.cuda.empty_cache()
+            
+            return text_data, tags
             
         except Exception as e:
             logger.error(f"Error processing text file {text_path}: {str(e)[:200]}...")

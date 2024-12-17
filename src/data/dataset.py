@@ -210,7 +210,7 @@ class NovelAIDataset(Dataset):
         )
 
     async def _process_data(self, image_dirs: List[str]) -> None:
-        """Process all data files asynchronously with progress tracking."""
+        """Process all data files asynchronously with progress tracking and immediate caching."""
         try:
             # Create initial progress tracker
             tracker = create_progress_tracker(0, device=self.device)
@@ -239,33 +239,56 @@ class NovelAIDataset(Dataset):
             progress = ProgressCounter()
             
             # Process files in batches
-            processed_items, stats = await self.batch_processor.process_dataset(
-                items=image_files,
-                progress_callback=lambda n, chunk_stats: (
-                    setattr(progress, 'count', progress.count + n),
-                    update_tracker(tracker, processed=n),
-                    log_progress(
-                        tracker,
-                        prefix="Dataset Processing: ",
-                        extra_stats={
-                            **chunk_stats,
-                            'total_processed': progress.count
-                        }
-                    ) if tracker.should_log() else None
-                )[2]  # Return the log_progress result
-            )
+            current_batch = []
+            current_batch_paths = []
             
-            # Store processed items
-            self.items = processed_items
-            
-            # Log final stats
-            logger.info(
-                f"\nDataset processing complete:"
-                f"\n- Total items: {len(self.items):,}"
-                f"\n- Processing time: {format_time(stats['elapsed_seconds'])}"
-                f"\n- Success rate: {(len(self.items)/len(image_files))*100:.1f}%"
-                f"\n- Cache hits/misses: {stats.get('cache_hits', 0)}/{stats.get('cache_misses', 0)}"
-            )
+            for image_path in image_files:
+                try:
+                    # Load image
+                    img = self.image_processor.load_image(image_path)
+                    if img is None:
+                        continue
+                        
+                    current_batch.append(img)
+                    current_batch_paths.append(image_path)
+                    
+                    # Process batch when it reaches the target size
+                    if len(current_batch) >= self.batch_processor.batch_size:
+                        processed_tensors, processed_items = await self.image_processor.process_batch(
+                            current_batch,
+                            self.config.image_size[0],
+                            self.config.image_size[1],
+                            cache_manager=self.cache_manager
+                        )
+                        
+                        # Update progress
+                        update_tracker(tracker, processed=len(current_batch))
+                        
+                        # Clear batch
+                        current_batch = []
+                        current_batch_paths = []
+                        
+                        # Clear CUDA cache periodically
+                        if tracker.processed % 1000 == 0:
+                            torch.cuda.empty_cache()
+                            
+                except Exception as e:
+                    logger.error(f"Error processing {image_path}: {e}")
+                    continue
+                    
+            # Process remaining images in the last batch
+            if current_batch:
+                processed_tensors, processed_items = await self.image_processor.process_batch(
+                    current_batch,
+                    self.config.image_size[0],
+                    self.config.image_size[1],
+                    cache_manager=self.cache_manager
+                )
+                
+                update_tracker(tracker, processed=len(current_batch))
+                
+            # Final cleanup
+            torch.cuda.empty_cache()
             
         except Exception as e:
             logger.error(f"Error processing dataset: {e}")

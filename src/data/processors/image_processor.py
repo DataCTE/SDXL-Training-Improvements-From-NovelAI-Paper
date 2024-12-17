@@ -1,7 +1,7 @@
 # src/data/processors/image_processor.py
 import torch
 from PIL import Image
-from typing import Tuple, List, Optional, Dict
+from typing import Tuple, List, Optional, Dict, Any
 from torchvision import transforms
 from dataclasses import dataclass
 import numpy as np
@@ -22,6 +22,7 @@ from src.data.processors.utils.progress_utils import (
 
 # Internal imports from processors
 from src.data.processors.bucket import BucketManager
+from src.data.processors.cache_manager import CacheManager
 
 logger = logging.getLogger(__name__)
 
@@ -185,52 +186,44 @@ class ImageProcessor:
             logger.debug(f"Resized tensor buffer to {self.buffer_size}")
 
     @torch.no_grad()
-    def process_batch(self, images: List[Image.Image], width: int, height: int) -> torch.Tensor:
-        """Process a batch of images with optimized parallel processing and GPU utilization."""
+    def process_batch(self, images: List[Image.Image], width: int, height: int, cache_manager: Optional[CacheManager] = None) -> Tuple[torch.Tensor, List[Dict[str, Any]]]:
+        """Process a batch of images with immediate caching."""
         batch_size = len(images)
         if batch_size == 0:
-            return torch.empty(0, dtype=self.config.dtype, device=self.config.device)
+            return torch.empty(0, dtype=self.config.dtype, device=self.config.device), []
         
-        # Create progress tracker
-        tracker = create_progress_tracker(
-            total_items=batch_size,
-            batch_size=self.config.vae_batch_size,
-            device=self.config.device
-        )
-        
-        # Adjust buffer size if needed
-        self._adjust_buffer_size(batch_size, width, height)
-        
-        # Get output tensor view
-        output = self.tensor_buffer[:batch_size, :, :height, :width]
-        
-        # Process images in parallel with GPU acceleration
-        futures = []
-        for i, img in enumerate(images):
-            future = self.executor.submit(self._process_single_image, img, width, height)
-            futures.append((i, future))
-        
-        # Collect results efficiently
-        for i, future in futures:
-            try:
-                img_tensor = future.result()
-                output[i].copy_(img_tensor, non_blocking=True)
-                update_tracker(tracker, processed=1)
-            except Exception as e:
-                logger.error(f"Error processing image {i}: {e}")
-                update_tracker(tracker, failed=1, error_type=str(type(e).__name__))
-                output[i].zero_()
+        processed_items = []
+        try:
+            # Process images
+            processed = await super().process_batch(images, width, height)
             
-            # Log progress
-            if tracker.should_log():
-                extra_stats = {
-                    'width': width,
-                    'height': height,
-                    'memory_usage': f"{get_gpu_memory_usage(self.config.device):.1%}"
-                }
-                log_progress(tracker, prefix="Processing images: ", extra_stats=extra_stats)
-        
-        return output
+            # Encode through VAE if available
+            if self.vae_encoder is not None:
+                encoded = await self.vae_encoder.encode_image(processed)
+                
+                # Prepare items for caching
+                for i, img in enumerate(images):
+                    item = {
+                        'image_path': getattr(img, 'filename', f'image_{i}'),
+                        'processed_image': encoded[i].cpu(),  # Move to CPU immediately
+                        'text_data': {}  # Add any text data if available
+                    }
+                    processed_items.append(item)
+                
+                # Cache items immediately if cache manager is provided
+                if cache_manager is not None:
+                    await cache_manager.cache_batch_items(processed_items)
+                    
+                # Clear processed tensors from GPU
+                processed = processed.cpu()
+                encoded = encoded.cpu()
+                torch.cuda.empty_cache()
+                
+            return processed, processed_items
+            
+        except Exception as e:
+            logger.error(f"Error processing batch: {e}")
+            return torch.empty(0, dtype=self.config.dtype, device=self.config.device), []
 
     @torch.no_grad()
     def encode_vae(self, vae, pixel_values: torch.Tensor) -> torch.Tensor:
