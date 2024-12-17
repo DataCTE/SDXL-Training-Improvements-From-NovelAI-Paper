@@ -27,6 +27,7 @@ from src.utils.model import setup_model
 from src.data.validation import validate_directories
 from src.data import get_optimal_cpu_threads
 from diffusers import UNet2DConditionModel, AutoencoderKL
+from src.utils.metrics import setup_logging, log_system_info
 
 def main():
     """Main training function."""

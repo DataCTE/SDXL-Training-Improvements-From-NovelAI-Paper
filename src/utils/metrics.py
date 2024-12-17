@@ -1,76 +1,158 @@
 import torch
 import logging
-import wandb
+import os
+import sys
+import platform
+import psutil
+from pathlib import Path
+from typing import Dict, Any, Optional
 import traceback
-from typing import Dict, Any
 
 logger = logging.getLogger(__name__)
 
-def compute_grad_norm(model: torch.nn.Module, grad_norm_buffer: torch.Tensor) -> float:
-    """Compute gradient norm using pre-allocated buffer."""
-    try:
-        if not isinstance(model, torch.nn.Module):
-            raise ValueError(f"Expected model to be torch.nn.Module, got {type(model)}")
-        if not isinstance(grad_norm_buffer, torch.Tensor):
-            raise ValueError(f"Expected grad_norm_buffer to be torch.Tensor, got {type(grad_norm_buffer)}")
-            
-        grad_norm_buffer.zero_()
-        
-        for i, p in enumerate(model.parameters()):
-            if p.grad is not None:
-                try:
-                    grad_norm_buffer[i] = p.grad.data.norm(2).item()
-                except IndexError as e:
-                    logger.error(f"Buffer size mismatch at index {i}")
-                    raise
-                except RuntimeError as e:
-                    logger.error(f"Error computing gradient norm for parameter {i}: {str(e)}")
-                    raise
-        
-        return torch.sqrt(torch.sum(grad_norm_buffer * grad_norm_buffer)).item()
+def setup_logging(logs_dir: str, is_main_process: bool = True) -> None:
+    """Setup logging configuration.
     
+    Args:
+        logs_dir: Directory to store log files
+        is_main_process: Whether this is the main process in distributed training
+    """
+    try:
+        # Create logs directory if it doesn't exist
+        os.makedirs(logs_dir, exist_ok=True)
+        
+        # Setup logging format
+        log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        
+        # Configure root logger
+        logging.basicConfig(
+            level=logging.INFO if is_main_process else logging.WARNING,
+            format=log_format,
+            handlers=[
+                # Console handler
+                logging.StreamHandler(sys.stdout),
+                # File handler
+                logging.FileHandler(os.path.join(logs_dir, 'training.log'))
+            ] if is_main_process else []
+        )
+        
+        # Suppress unnecessary warnings
+        logging.getLogger("torch.distributed.distributed_c10d").setLevel(logging.WARNING)
+        logging.getLogger("transformers").setLevel(logging.WARNING)
+        logging.getLogger("diffusers").setLevel(logging.WARNING)
+        
+        if is_main_process:
+            logger.info(f"Logging setup complete. Logs will be saved to: {logs_dir}")
+            
     except Exception as e:
-        logger.error(f"Error in compute_grad_norm: {str(e)}")
-        logger.error(f"Stack trace: {traceback.format_exc()}")
+        print(f"Error setting up logging: {str(e)}", file=sys.stderr)
         raise
 
-def log_metrics(metrics: Dict[str, Any], global_step: int, is_main_process: bool, 
-                use_wandb: bool, step_type: str = "step"):
-    """Unified logging function for all metrics."""
+def log_system_info() -> None:
+    """Log system information including hardware, OS, and Python/PyTorch versions."""
     try:
-        if not isinstance(metrics, dict):
-            raise ValueError(f"Expected metrics to be dict, got {type(metrics)}")
-        if not isinstance(global_step, int):
-            raise ValueError(f"Expected global_step to be int, got {type(global_step)}")
+        # System info
+        logger.info("System Information:")
+        logger.info(f"OS: {platform.system()} {platform.version()}")
+        logger.info(f"Python version: {sys.version}")
+        logger.info(f"PyTorch version: {torch.__version__}")
         
-        if not is_main_process:
-            return
+        # CPU info
+        cpu_count = psutil.cpu_count(logical=False)
+        cpu_threads = psutil.cpu_count(logical=True)
+        logger.info(f"CPU: {cpu_count} physical cores, {cpu_threads} threads")
         
-        if use_wandb:
-            try:
-                wandb.log(metrics, step=global_step)
-            except Exception as e:
-                logger.error(f"Error logging to wandb: {str(e)}")
-                logger.error(traceback.format_exc())
+        # Memory info
+        memory = psutil.virtual_memory()
+        logger.info(f"System memory: {memory.total / (1024**3):.1f}GB total, {memory.available / (1024**3):.1f}GB available")
         
-        try:
-            if step_type == "step":
-                logger.info(
-                    f"Step {global_step} | "
-                    f"Loss: {metrics.get('train/loss', 0):.4f} | "
-                    f"LR: {metrics.get('train/learning_rate', 0):.2e}"
-                )
-            elif step_type == "epoch":
-                logger.info(
-                    f"Epoch {metrics.get('epoch', 0)} | "
-                    f"Avg Loss: {metrics.get('train/epoch_loss', 0):.4f}"
-                )
-            else:
-                logger.warning(f"Unknown step_type: {step_type}")
-        except Exception as e:
-            logger.error(f"Error formatting log message: {str(e)}")
-            logger.error(traceback.format_exc())
+        # GPU info
+        if torch.cuda.is_available():
+            logger.info("GPU Information:")
+            for i in range(torch.cuda.device_count()):
+                props = torch.cuda.get_device_properties(i)
+                logger.info(f"GPU {i}: {props.name}")
+                logger.info(f"  Memory: {props.total_memory / (1024**3):.1f}GB")
+                logger.info(f"  Compute capability: {props.major}.{props.minor}")
+                logger.info(f"  Multi-processor count: {props.multi_processor_count}")
+                
+                # Current memory usage
+                memory_allocated = torch.cuda.memory_allocated(i) / (1024**3)
+                memory_reserved = torch.cuda.memory_reserved(i) / (1024**3)
+                logger.info(f"  Memory usage: {memory_allocated:.1f}GB allocated, {memory_reserved:.1f}GB reserved")
+        else:
+            logger.warning("No GPU available - running in CPU mode")
+            
+        # CUDA environment
+        if torch.cuda.is_available():
+            logger.info("CUDA Environment:")
+            logger.info(f"CUDA version: {torch.version.cuda}")
+            logger.info(f"cuDNN version: {torch.backends.cudnn.version()}")
+            logger.info(f"cuDNN enabled: {torch.backends.cudnn.enabled}")
+            logger.info(f"cuDNN benchmark: {torch.backends.cudnn.benchmark}")
+            logger.info(f"cuDNN deterministic: {torch.backends.cudnn.deterministic}")
+            logger.info(f"TF32 allowed: {torch.backends.cuda.matmul.allow_tf32}")
+            
+            # Check for tensor cores
+            for i in range(torch.cuda.device_count()):
+                props = torch.cuda.get_device_properties(i)
+                has_tensor_cores = props.major >= 7
+                logger.info(f"GPU {i} tensor cores: {'Available' if has_tensor_cores else 'Not available'}")
+                
+        # Additional PyTorch info
+        logger.info("PyTorch Configuration:")
+        logger.info(f"Number of threads: {torch.get_num_threads()}")
+        logger.info(f"Default dtype: {torch.get_default_dtype()}")
         
     except Exception as e:
-        logger.error(f"Error in log_metrics: {str(e)}")
-        logger.error(f"Stack trace: {traceback.format_exc()}") 
+        logger.error(f"Error logging system information: {str(e)}")
+        logger.error(f"Stack trace: {traceback.format_exc()}")
+        
+def compute_grad_norm(model: torch.nn.Module, grad_norm_buffer: torch.Tensor) -> float:
+    """Compute gradient norm efficiently using pre-allocated buffer."""
+    try:
+        # Get all gradients
+        grads = [p.grad for p in model.parameters() if p.grad is not None]
+        if not grads:
+            return 0.0
+            
+        # Compute norms efficiently
+        grad_norm_buffer[:len(grads)].copy_(torch.tensor([g.norm().item() for g in grads]))
+        return grad_norm_buffer[:len(grads)].norm().item()
+        
+    except Exception as e:
+        logger.error(f"Error computing gradient norm: {str(e)}")
+        return 0.0
+
+def log_metrics(
+    metrics: Dict[str, Any],
+    step: int,
+    is_main_process: bool,
+    use_wandb: bool,
+    step_type: str = "step"
+) -> None:
+    """Log metrics to console and wandb if enabled.
+    
+    Args:
+        metrics: Dictionary of metrics to log
+        step: Current training step
+        is_main_process: Whether this is the main process
+        use_wandb: Whether to use wandb logging
+        step_type: Type of step (e.g. "step", "epoch")
+    """
+    if not is_main_process:
+        return
+        
+    try:
+        # Log to console
+        metric_str = " - ".join([f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}" 
+                               for k, v in metrics.items()])
+        logger.info(f"{step_type.capitalize()} {step}: {metric_str}")
+        
+        # Log to wandb
+        if use_wandb:
+            import wandb
+            wandb.log(metrics, step=step)
+            
+    except Exception as e:
+        logger.error(f"Error logging metrics: {str(e)}") 
