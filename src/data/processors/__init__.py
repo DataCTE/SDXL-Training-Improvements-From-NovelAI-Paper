@@ -4,7 +4,19 @@ import multiprocessing
 import torch
 from typing import Dict
 from dataclasses import dataclass
-from .thread_config import get_optimal_cpu_threads
+
+# Import all processors
+from .text_processor import TextProcessor
+from .batch_processor import BatchProcessor
+from .image_processor import ImageProcessor, ImageProcessorConfig
+from .cache_manager import CacheManager
+from .bucket import BucketManager, ImageBucket
+from .sampler import AspectBatchSampler
+
+# Import utilities
+from .utils.thread_config import get_optimal_cpu_threads, get_optimal_thread_config
+from .utils.caption.text_embedder import TextEmbedder
+from .utils.caption.tag_weighter import TagWeighter, TagWeightingConfig
 from .utils import (
     get_system_resources,
     get_optimal_workers,
@@ -14,36 +26,55 @@ from .utils import (
     get_memory_usage_gb,
     log_system_info,
     calculate_chunk_size,
-    MemoryCache
+    MemoryCache,
+    find_matching_files,
+    ensure_dir,
+    get_file_size,
+    calculate_optimal_batch_size,
+    create_progress_stats,
+    update_progress_stats,
+    format_time,
+    log_progress
 )
-from .bucket import ImageBucket
-from .tag_weighter import TagWeighter, TagWeightingConfig
-from .text_embedder import TextEmbedder
-from .image_processor import ImageProcessor, ImageProcessorConfig
-from .cache_manager import CacheManager
-from .text_processor import BatchProcessor
-from .sampler import AspectBatchSampler
-from .thread_config import get_optimal_thread_config
 
 __all__ = [
+    # Main processors
+    'TextProcessor',
+    'BatchProcessor',
+    'ImageProcessor',
+    'ImageProcessorConfig',
+    'CacheManager',
+    'BucketManager',
+    'ImageBucket',
+    'AspectBatchSampler',
+    
+    # Text processing utilities
+    'TextEmbedder',
+    'TagWeighter',
+    'TagWeightingConfig',
+    
+    # Thread and system utilities
     'get_optimal_cpu_threads',
+    'get_optimal_thread_config',
     'get_system_resources',
     'get_optimal_workers',
     'get_gpu_memory_usage',
     'create_thread_pool',
     'adjust_batch_size',
     'get_memory_usage_gb',
-    'log_system_info',
+    
+    # File and data utilities
+    'find_matching_files',
+    'ensure_dir',
+    'get_file_size',
+    'calculate_optimal_batch_size',
     'calculate_chunk_size',
     'MemoryCache',
-    'ImageBucket',
-    'TagWeighter',
-    'TagWeightingConfig',
-    'TextEmbedder',
-    'ImageProcessor',
-    'ImageProcessorConfig',
-    'CacheManager',
-    'BatchProcessor',
-    'AspectBatchSampler',
-    'get_optimal_thread_config'
+    
+    # Progress and logging utilities
+    'log_system_info',
+    'create_progress_stats',
+    'update_progress_stats',
+    'format_time',
+    'log_progress'
 ]
