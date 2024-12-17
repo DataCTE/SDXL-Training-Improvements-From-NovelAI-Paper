@@ -294,14 +294,25 @@ class TextEmbedder:
         all_prompt_embeds = []
         all_pooled_embeds = []
         
-        # Process in optimized batches using process_in_chunks
-        async def process_chunk(chunk_prompts: List[str], chunk_id: int) -> Dict[str, torch.Tensor]:
-            start_idx = chunk_id * self.batch_size
-            end_idx = min(start_idx + self.batch_size, total_prompts)
+        # Process in batches
+        for i in range(0, total_prompts, self.batch_size):
+            batch_prompts = prompts[i:i + self.batch_size]
             
             # Process with both encoders
-            embeds_one = self._process_batch(chunk_prompts, self.tokenizer_one, self.text_encoder_one, start_idx, end_idx)
-            embeds_two = self._process_batch(chunk_prompts, self.tokenizer_two, self.text_encoder_two, start_idx, end_idx)
+            embeds_one = self._process_batch(
+                batch_prompts, 
+                self.tokenizer_one, 
+                self.text_encoder_one, 
+                i, 
+                min(i + self.batch_size, total_prompts)
+            )
+            embeds_two = self._process_batch(
+                batch_prompts,
+                self.tokenizer_two,
+                self.text_encoder_two,
+                i,
+                min(i + self.batch_size, total_prompts)
+            )
             
             # Combine embeddings
             prompt_embeds = torch.cat([
@@ -311,27 +322,14 @@ class TextEmbedder:
             
             pooled_prompt_embeds = embeds_two['pooled_prompt_embeds']
             
+            # Collect results
+            all_prompt_embeds.append(prompt_embeds)
+            all_pooled_embeds.append(pooled_prompt_embeds)
+            
             # Update progress
-            update_progress_stats(stats, len(chunk_prompts))
+            update_progress_stats(stats, len(batch_prompts))
             if stats.should_log():
                 log_progress(stats, prefix="Text Processing: ")
-            
-            return {
-                'prompt_embeds': prompt_embeds,
-                'pooled_prompt_embeds': pooled_prompt_embeds
-            }
-        
-        # Process all chunks
-        chunk_results =  process_in_chunks(
-            items=prompts,
-            chunk_size=self.batch_size,
-            process_fn=process_chunk
-        )
-        
-        # Combine results
-        for result in chunk_results:
-            all_prompt_embeds.append(result['prompt_embeds'])
-            all_pooled_embeds.append(result['pooled_prompt_embeds'])
 
         # Combine all batches
         prompt_embeds = torch.cat(all_prompt_embeds, dim=0)
