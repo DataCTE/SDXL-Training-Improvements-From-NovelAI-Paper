@@ -15,14 +15,19 @@ from src.utils.setup import setup_distributed, setup_memory_optimizations, verif
 from src.utils.metrics import log_system_info
 import gc
 import traceback
+from src.config.arg_parser import parse_args
 
 logger = logging.getLogger(__name__)
+
 
 def train(config_path: str):
     """Main training function with improved setup and error handling."""
     try:
+        # Parse arguments first
+        args = parse_args()
+        
         # Load config
-        config = Config.from_yaml(config_path)
+        config = Config.from_yaml(args.config)
         
         # Setup distributed training if enabled
         if config.system.distributed:
@@ -45,9 +50,9 @@ def train(config_path: str):
                 config=config.to_dict()
             )
         
-        # Setup models with verification
+        # Setup models with verification using args
         logger.info("Setting up models...")
-        unet, vae = setup_model(None, device, config)
+        unet, vae = setup_model(args, device, config)
         
         # Apply memory optimizations and verify
         optimization_states = verify_memory_optimizations(
@@ -140,10 +145,6 @@ def train(config_path: str):
         torch.cuda.empty_cache()
         
 if __name__ == "__main__":
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='Train SDXL model')
-    parser.add_argument('--config', type=str, required=True, help='Path to config file')
-    
-    args = parser.parse_args()
+    from src.config.arg_parser import parse_args
+    args = parse_args()
     train(args.config)

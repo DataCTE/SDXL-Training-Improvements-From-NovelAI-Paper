@@ -2,6 +2,7 @@ import argparse
 import os
 import logging
 import sys
+import traceback
 
 logger = logging.getLogger(__name__)
 
