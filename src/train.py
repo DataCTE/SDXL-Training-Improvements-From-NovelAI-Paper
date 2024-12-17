@@ -26,117 +26,66 @@ from src.utils.setup import setup_accelerator, setup_distributed
 from src.utils.model import setup_model
 from src.data.validation import validate_directories
 from src.data import get_optimal_cpu_threads
+from diffusers import UNet2DConditionModel, AutoencoderKL
 
 def main():
+    """Main training function."""
     try:
-        # Force initial cleanup
-        import gc
-        gc.collect()
-        torch.cuda.empty_cache()
-        
         args = parse_args()
         
-        # Load config
+        # Load and validate config
         config = Config.from_yaml(args.config)
-        
-        # SDXL-specific: Check available GPU memory
-        if torch.cuda.is_available():
-            gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3  # GB
-            if gpu_memory < 24:  # SDXL needs at least 24GB
-                logger.warning(f"WARNING: Available GPU memory ({gpu_memory:.1f}GB) may be insufficient for SDXL training")
-                logger.warning("Consider reducing batch size or using gradient accumulation")
-        
-        # Create directories from config
-        if dist.is_initialized() and dist.get_rank() == 0:
-            for path in [
-                config.paths.checkpoints_dir,
-                config.paths.logs_dir,
-                config.paths.output_dir,
-                config.data.cache_dir,
-                config.data.text_cache_dir
-            ]:
-                os.makedirs(path, exist_ok=True)
         
         # Setup distributed training
         world_size, rank = setup_distributed(config)
         is_main_process = rank == 0
         
-        # SDXL-specific: Adjust batch size based on available memory
-        if torch.cuda.is_available():
-            try:
-                # Get memory stats
-                gpu_memory = torch.cuda.get_device_properties(0).total_memory
-                reserved_memory = torch.cuda.memory_reserved(0)
-                allocated_memory = torch.cuda.memory_allocated(0)
-                free_memory = gpu_memory - reserved_memory
-                
-                # Log memory stats
-                if is_main_process:
-                    logger.info(f"GPU Memory: Total={gpu_memory/1024**3:.1f}GB, "
-                              f"Reserved={reserved_memory/1024**3:.1f}GB, "
-                              f"Allocated={allocated_memory/1024**3:.1f}GB, "
-                              f"Free={free_memory/1024**3:.1f}GB")
-                
-                # Adjust batch size if needed
-                min_free_memory = 6 * 1024**3  # Need at least 6GB free
-                if free_memory < min_free_memory:
-                    old_batch_size = config.training.batch_size
-                    new_batch_size = max(1, old_batch_size // 2)
-                    config.training.batch_size = new_batch_size
-                    if is_main_process:
-                        logger.warning(f"Reducing batch size from {old_batch_size} to {new_batch_size} due to memory constraints")
-                        
-            except Exception as e:
-                logger.warning(f"Failed to check GPU memory: {e}")
+        # Configure logging
+        setup_logging(config.paths.logs_dir, is_main_process)
+        
+        # Log system info
+        if is_main_process:
+            log_system_info()
         
         # Setup accelerator
         accelerator = setup_accelerator(config)
         device = accelerator.device
-        
-        # Initialize wandb if main process
-        if is_main_process:
-            try:
-                wandb.init(
-                    project="sdxl-finetune",
-                    config={
-                        "batch_size": config.training.batch_size,
-                        "grad_accum_steps": config.training.gradient_accumulation_steps,
-                        "effective_batch": config.training.batch_size * config.training.gradient_accumulation_steps * world_size,
-                        "learning_rate": config.training.learning_rate,
-                        "num_epochs": config.training.num_epochs,
-                        "world_size": world_size,
-                        "rank": rank,
-                        "backend": config.system.backend,
-                        "timestep_bias_strategy": config.training.timestep_bias_strategy,
-                        "snr_gamma": config.training.snr_gamma,
-                        "gpu_memory_gb": torch.cuda.get_device_properties(0).total_memory / 1024**3 if torch.cuda.is_available() else 0
-                    }
-                )
-            except Exception as e:
-                logger.error(f"Failed to initialize wandb: {str(e)}")
-                raise
         
         # Setup models with memory tracking
         try:
             if is_main_process:
                 logger.info("Setting up models...")
                 initial_mem = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
-                
-            unet, vae = setup_model(args, device, config)
+            
+            # Use setup_model from model.py but don't move to device
+            unet, vae = setup_model(args, None, config)  # Pass None as device to prevent device movement
             
             if is_main_process and torch.cuda.is_available():
                 mem_change = torch.cuda.memory_allocated() - initial_mem
                 logger.info(f"Models loaded. Memory usage: {mem_change/1024**3:.1f}GB")
+                
+            # Verify models were created successfully
+            if not isinstance(unet, UNet2DConditionModel):
+                raise RuntimeError("Failed to create UNet model")
+            if not isinstance(vae, AutoencoderKL):
+                raise RuntimeError("Failed to create VAE model")
+                
         except Exception as e:
             logger.error(f"Failed to setup models: {str(e)}")
+            logger.error(f"Stack trace: {traceback.format_exc()}")
             raise
         
+        # Apply sync batch norm if needed
         if config.system.use_fsdp and config.system.sync_batch_norm:
-            unet = accelerator.sync_batchnorm(unet)
-            if args.train_vae:
-                vae = accelerator.sync_batchnorm(vae)
+            try:
+                unet = accelerator.sync_batchnorm(unet)
+                if args.train_vae:
+                    vae = accelerator.sync_batchnorm(vae)
+            except Exception as e:
+                logger.error(f"Failed to apply sync batch norm: {e}")
+                raise
         
-        # Initialize appropriate trainer
+        # Initialize appropriate trainer - let trainer handle device movement
         try:
             if args.train_vae:
                 trainer = VAETrainer(
@@ -147,12 +96,13 @@ def main():
             else:
                 trainer = NovelAIDiffusionV3Trainer(
                     config_path=args.config,
-                    model=unet,
-                    vae=vae,
+                    model=unet,      # Pass model without device movement
+                    vae=vae,         # Pass VAE without device movement
                     accelerator=accelerator
                 )
         except Exception as e:
             logger.error(f"Failed to initialize trainer: {str(e)}")
+            logger.error(f"Stack trace: {traceback.format_exc()}")
             raise
         
         # Validate directories and update config
@@ -173,7 +123,7 @@ def main():
                 text_embedder=TextEmbedder(
                     pretrained_model_name_or_path=config.model.pretrained_model_name,
                     device=device,
-                    dtype=torch.bfloat16
+                    dtype=torch.bfloat16 if config.system.mixed_precision == "bf16" else torch.float32
                 ),
                 tag_weighter=TagWeighter(
                     config=TagWeightingConfig(
@@ -206,7 +156,7 @@ def main():
                 
             if is_main_process and torch.cuda.is_available():
                 mem_change = torch.cuda.memory_allocated() - initial_mem
-                logger.info(f"Dataset loaded. Memory usage: {mem_change/1024**3:.1f}GB")
+                logger.info(f"Dataset initialized. Memory usage: {mem_change/1024**3:.1f}GB")
             
         except Exception as e:
             logger.error(f"Failed to initialize dataset: {str(e)}")
@@ -227,10 +177,7 @@ def main():
             train_dataloader = trainer.create_dataloader(
                 dataset=dataset,
                 batch_size=config.training.batch_size,
-                num_workers=config.data.num_workers,
-                pin_memory=True,
-                persistent_workers=True,
-                prefetch_factor=2
+                pin_memory=True
             )
             
             if is_main_process and torch.cuda.is_available():
@@ -241,87 +188,23 @@ def main():
             logger.error(f"Failed to create dataloader: {str(e)}")
             raise
         
-        # Training loop
-        start_epoch = trainer.current_epoch
-        save_dir = config.paths.checkpoints_dir
-        
+        # Train
         try:
             if is_main_process:
-                logger.info(f"Starting {'VAE' if args.train_vae else 'UNet'} training from epoch {start_epoch + 1}")
-                if torch.cuda.is_available():
-                    logger.info(f"Initial GPU memory: {torch.cuda.memory_allocated()/1024**3:.1f}GB")
+                logger.info("Starting training...")
             
-            for epoch in range(start_epoch, config.training.num_epochs + 1):
-                if is_main_process:
-                    logger.info(f"\nStarting epoch {epoch}")
-                    if torch.cuda.is_available():
-                        logger.info(f"GPU memory before epoch: {torch.cuda.memory_allocated()/1024**3:.1f}GB")
-                
-                if hasattr(train_dataloader.sampler, "set_epoch"):
-                    train_dataloader.sampler.set_epoch(epoch)
-                
-                # Clear memory before training
-                gc.collect()
-                torch.cuda.empty_cache()
-                
-                epoch_loss = trainer.train_epoch(
-                    epoch=epoch,
-                    train_dataloader=train_dataloader
-                )
+            for epoch in range(config.training.num_epochs):
+                avg_loss = trainer.train_epoch(epoch, train_dataloader)
                 
                 if is_main_process:
-                    logger.info(f"Epoch {epoch} completed. Average loss: {epoch_loss:.4f}")
-                    if torch.cuda.is_available():
-                        logger.info(f"GPU memory after epoch: {torch.cuda.memory_allocated()/1024**3:.1f}GB")
+                    logger.info(f"Epoch {epoch} completed with average loss: {avg_loss:.4f}")
+                    trainer.save_checkpoint(config.paths.checkpoints_dir, epoch)
                     
-                    # Save checkpoint
-                    trainer.save_checkpoint(save_dir, epoch)
-                    
-                    # Log metrics
-                    prefix = "vae_" if args.train_vae else "unet_"
-                    wandb.log({
-                        f"{prefix}epoch": epoch,
-                        f"{prefix}loss": epoch_loss,
-                        "gpu_memory_gb": torch.cuda.memory_allocated() / 1024**3 if torch.cuda.is_available() else 0
-                    }, step=trainer.global_step)
-                
-                if world_size > 1:
-                    torch.distributed.barrier()
-                
-                # Clear memory after epoch
-                gc.collect()
-                torch.cuda.empty_cache()
-                
-        except KeyboardInterrupt:
-            if is_main_process:
-                logger.info("\nTraining interrupted. Saving final checkpoint...")
-                trainer.save_checkpoint(save_dir, epoch)
-                
         except Exception as e:
-            logger.error(f"Training failed: {str(e)}")
-            logger.error(traceback.format_exc())
-            raise
+            logger.error(f"Error during training: {str(e)}")
+            raise e
             
-        finally:
-            # Cleanup
-            if is_main_process:
-                wandb.finish()
-            accelerator.end_training()
-            
-            if world_size > 1:
-                torch.distributed.destroy_process_group()
-                
-            # Final memory cleanup
-            gc.collect()
-            torch.cuda.empty_cache()
-                
-            if is_main_process:
-                logger.info("Training completed!")
-
     except Exception as e:
-        logger.error(f"Fatal error in main: {str(e)}")
+        logger.error(f"Fatal error: {str(e)}")
         logger.error(f"Stack trace: {traceback.format_exc()}")
-        sys.exit(1)
-
-if __name__ == "__main__":
-    main()
+        raise

@@ -253,14 +253,43 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
 
     def _setup_models(self):
         """Setup models with proper device and dtype."""
-        # Move models to device
-        self.model = self.model.to(device=self.device, dtype=self.model_dtype)
-        self.vae = self.vae.to(device=self.device, dtype=self.model_dtype)
-        
-        # Set training/eval modes
-        self.model.train()
-        self.vae.eval()
-        self.vae.requires_grad_(False)
+        try:
+            # Check current device state
+            current_model_device = next(self.model.parameters()).device
+            current_vae_device = next(self.vae.parameters()).device
+            
+            # Only move if needed
+            if current_model_device != self.device:
+                logger.info(f"Moving model from {current_model_device} to {self.device}")
+                self.model = self.model.to(device=self.device, dtype=self.model_dtype)
+            elif next(self.model.parameters()).dtype != self.model_dtype:
+                logger.info(f"Converting model dtype to {self.model_dtype}")
+                self.model = self.model.to(dtype=self.model_dtype)
+                
+            if current_vae_device != self.device:
+                logger.info(f"Moving VAE from {current_vae_device} to {self.device}")
+                self.vae = self.vae.to(device=self.device, dtype=self.model_dtype)
+            elif next(self.vae.parameters()).dtype != self.model_dtype:
+                logger.info(f"Converting VAE dtype to {self.model_dtype}")
+                self.vae = self.vae.to(dtype=self.model_dtype)
+            
+            # Set training/eval modes
+            self.model.train()
+            self.vae.eval()
+            self.vae.requires_grad_(False)
+            
+            # Verify final state
+            if next(self.model.parameters()).device != self.device:
+                logger.error(f"Model device mismatch: expected {self.device}, got {next(self.model.parameters()).device}")
+                raise RuntimeError("Model failed to move to correct device")
+            if next(self.model.parameters()).dtype != self.model_dtype:
+                logger.error(f"Model dtype mismatch: expected {self.model_dtype}, got {next(self.model.parameters()).dtype}")
+                raise RuntimeError("Model failed to convert to correct dtype")
+                
+        except Exception as e:
+            logger.error(f"Error in _setup_models: {str(e)}")
+            logger.error(f"Stack trace: {traceback.format_exc()}")
+            raise
 
     def _validate_model_architecture(self):
         """Validate model is a proper SDXL UNet."""

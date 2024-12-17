@@ -39,9 +39,7 @@ def create_unet(config: Config, model_dtype: torch.dtype) -> UNet2DConditionMode
             torch_dtype=model_dtype
         )
         
-        # Apply memory optimizations
-        unet = configure_model_memory_format(unet, config)
-        
+        # Don't apply memory optimizations here - let trainer handle it
         return unet
         
     except Exception as e:
@@ -65,11 +63,9 @@ def create_vae(model_dtype: torch.dtype) -> AutoencoderKL:
             torch_dtype=model_dtype
         )
         
-        # Freeze VAE parameters
-        vae.requires_grad_(False)
-        vae.eval()
-        
+        # Don't set eval/grad state here - let trainer handle it
         return vae
+        
     except Exception as e:
         logger.error(f"Failed to create VAE: {str(e)}")
         logger.error(f"Stack trace: {traceback.format_exc()}")
@@ -77,11 +73,22 @@ def create_vae(model_dtype: torch.dtype) -> AutoencoderKL:
 
 def setup_model(
     args,
-    device: torch.device,
+    device: Optional[torch.device],
     config: Config
 ) -> tuple[UNet2DConditionModel, AutoencoderKL]:
-    """Setup UNet and VAE models with error handling."""
+    """Setup UNet and VAE models with error handling.
+    
+    Args:
+        args: Command line arguments
+        device: Optional device to move models to. If None, models stay on CPU
+        config: Configuration object
+        
+    Returns:
+        tuple[UNet2DConditionModel, AutoencoderKL]: Configured UNet and VAE models
+    """
     try:
+        # Determine model dtype from config
+        model_dtype = torch.bfloat16 if config.system.mixed_precision == "bf16" else torch.float32
         pretrained_model_name = config.model.pretrained_model_name
         
         logger.info("Loading VAE...")
@@ -89,19 +96,17 @@ def setup_model(
             logger.info(f"Loading VAE from: {args.vae_path}")
             vae = AutoencoderKL.from_pretrained(
                 args.vae_path,
-                torch_dtype=torch.bfloat16,
+                torch_dtype=model_dtype,
                 use_safetensors=True
-            ).to(device)
+            )
         else:
             vae = AutoencoderKL.from_pretrained(
                 pretrained_model_name,
                 subfolder="vae",
-                torch_dtype=torch.bfloat16
-            ).to(device)
+                torch_dtype=model_dtype
+            )
             
-        if not args.train_vae:
-            vae.eval()
-            vae.requires_grad_(False)
+        # Don't set eval/grad state here - let trainer handle it
         
         logger.info("Loading UNet...")
         if args.resume_from_checkpoint:
@@ -109,9 +114,9 @@ def setup_model(
             unet = UNet2DConditionModel.from_pretrained(
                 args.resume_from_checkpoint,
                 subfolder="unet",
-                torch_dtype=torch.bfloat16,
+                torch_dtype=model_dtype,
                 use_safetensors=True
-            ).to(device)
+            )
         elif args.unet_path:
             logger.info(f"Loading UNet weights from: {args.unet_path}")
             unet_dir = os.path.dirname(args.unet_path)
@@ -120,15 +125,15 @@ def setup_model(
             if os.path.exists(config_path):
                 unet = UNet2DConditionModel.from_pretrained(
                     unet_dir,
-                    torch_dtype=torch.bfloat16,
+                    torch_dtype=model_dtype,
                     use_safetensors=True
-                ).to(device)
+                )
             else:
                 unet = UNet2DConditionModel.from_pretrained(
                     pretrained_model_name,
                     subfolder="unet",
-                    torch_dtype=torch.bfloat16,
-                ).to(device)
+                    torch_dtype=model_dtype
+                )
                 state_dict = load_file(args.unet_path)
                 unet.load_state_dict(state_dict)
         else:
@@ -136,9 +141,14 @@ def setup_model(
             unet = UNet2DConditionModel.from_pretrained(
                 pretrained_model_name,
                 subfolder="unet",
-                torch_dtype=torch.bfloat16,
+                torch_dtype=model_dtype,
                 use_safetensors=True
-            ).to(device)
+            )
+        
+        # Only move to device if device is specified
+        if device is not None:
+            unet = unet.to(device)
+            vae = vae.to(device)
         
         return unet, vae
 
