@@ -6,17 +6,9 @@ import warnings
 import logging
 import torch.amp
 import asyncio
-
-# Internal imports from utils
-from src.data.processors.utils.system_utils import (
-    get_gpu_memory_usage,
-    get_optimal_workers,
-    create_thread_pool
-)
 from src.data.processors.utils.batch_utils import (
     process_in_chunks,
     calculate_optimal_batch_size,
-    BatchConfig
 )
 from src.data.processors.utils.progress_utils import (
     create_progress_stats,
