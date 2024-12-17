@@ -121,6 +121,7 @@ class DataConfig:
         # Update max_dim to be the sum of max_image_size dimensions
         self.max_dim = sum(self.max_image_size)
 
+@dataclass
 class TagWeighterConfig:
     """Configuration for tag weighting."""
     default_weight: float = 1.0

@@ -71,15 +71,8 @@ class NovelAIDataset(Dataset):
             max_memory_usage=0.9
         )
 
-        # Initialize tag weighter
-        self.tag_weighter = TagWeighter(
-            config=TagWeighterConfig(
-                default_weight=config.tag_weighting.default_weight,
-                min_weight=config.tag_weighting.min_weight,
-                max_weight=config.tag_weighting.max_weight,
-                smoothing_factor=config.tag_weighting.smoothing_factor
-            )
-        )
+        # Initialize tag weighter with config
+        self.tag_weighter = TagWeighter(config=config.tag_weighting)
         
         # Initialize text processor
         self.text_processor = TextProcessor(
