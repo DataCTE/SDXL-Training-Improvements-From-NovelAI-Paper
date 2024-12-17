@@ -1,3 +1,12 @@
+"""Utility functions for data processing."""
+
+from .file_utils import (
+    find_matching_files,
+    ensure_dir,
+    get_file_size,
+    validate_image_text_pair
+)
+
 from .system_utils import (
     SystemResources,
     get_system_resources,
@@ -27,15 +36,6 @@ from .progress_utils import (
     update_progress_stats
 )
 
-from .file_utils import (
-    ensure_dir,
-    get_file_size,
-    find_matching_files,
-    safe_file_write,
-    get_cache_paths,
-    cleanup_temp_files
-)
-
 from .batch_utils import (
     BatchConfig,
     BatchProcessor,
@@ -43,8 +43,13 @@ from .batch_utils import (
     process_in_chunks
 )
 
-
 __all__ = [
+    # File utilities
+    'find_matching_files',
+    'ensure_dir',
+    'get_file_size',
+    'validate_image_text_pair',
+    
     # System utilities
     'SystemResources',
     'get_system_resources',
@@ -62,7 +67,6 @@ __all__ = [
     'load_and_validate_image',
     'resize_image',
     'get_image_stats',
-    'validate_image_text_pair',
     
     # Progress utilities
     'ProgressStats',
@@ -71,17 +75,9 @@ __all__ = [
     'create_progress_stats',
     'update_progress_stats',
     
-    # File utilities
-    'ensure_dir',
-    'get_file_size',
-    'find_matching_files',
-    'safe_file_write',
-    'get_cache_paths',
-    'cleanup_temp_files',
-    
     # Batch utilities
     'BatchConfig',
     'BatchProcessor',
     'create_tensor_buffer',
     'process_in_chunks'
-] 
+]
