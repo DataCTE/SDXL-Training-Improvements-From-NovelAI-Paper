@@ -5,12 +5,42 @@ import logging
 from dataclasses import dataclass
 from collections import defaultdict
 import numpy as np
+import re
 from src.config.config import TagWeighterConfig
 
 logger = logging.getLogger(__name__)
 
-@dataclass
-
+def parse_tags(caption: str) -> Dict[str, List[str]]:
+    """Parse a caption string into categorized tags.
+    
+    Args:
+        caption (str): Input caption string with tags in format: [class::tag1, tag2] [class2::tag3]
+    
+    Returns:
+        Dict[str, List[str]]: Dictionary mapping tag classes to lists of tags
+    """
+    tags: Dict[str, List[str]] = defaultdict(list)
+    
+    # Find all bracketed sections
+    brackets = re.findall(r'\[(.*?)\]', caption)
+    
+    for bracket in brackets:
+        if '::' in bracket:
+            # Handle class-specific tags
+            tag_class, tag_list = bracket.split('::', 1)
+            tag_class = tag_class.strip()
+            for tag in tag_list.split(','):
+                tag = tag.strip()
+                if tag:
+                    tags[tag_class].append(tag)
+        else:
+            # Handle general tags without class
+            for tag in bracket.split(','):
+                tag = tag.strip()
+                if tag:
+                    tags['general'].append(tag)
+    
+    return dict(tags)
     
 class TagWeighter:
     def __init__(self, config: Optional[TagWeighterConfig] = None):
