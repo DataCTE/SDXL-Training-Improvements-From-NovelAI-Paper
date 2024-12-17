@@ -220,17 +220,28 @@ class BatchProcessor(GenericBatchProcessor):
             'processed': len(chunk_stats.get('processed_items', [])),
             'errors': chunk_stats.get('errors', 0),
             'skipped': chunk_stats.get('skipped', 0),
-            'error_types': chunk_stats.get('error_types', {})
+            'error_types': chunk_stats.get('error_types', {}),
+            'gpu_memory': f"{get_gpu_memory_usage(self.device):.1%}",
+            'batch_size': self.batch_size
         }
+        
+        # Update tracker
+        update_tracker(tracker, processed=n)
         
         # Log progress if needed
         if tracker.should_log():
             log_progress(
                 tracker,
                 prefix="Processing - ",
-                extra_stats=extra_stats,
-                callback=progress_callback
+                extra_stats=extra_stats
             )
+        
+        # Call progress callback if provided
+        if progress_callback is not None:
+            try:
+                progress_callback(n, extra_stats)
+            except Exception as e:
+                logger.error(f"Error in progress callback: {e}")
 
     async def cleanup(self):
         """Clean up resources asynchronously."""

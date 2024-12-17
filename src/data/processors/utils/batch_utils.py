@@ -240,11 +240,11 @@ async def process_in_chunks(
                     final_stats['error_types'].get(error_type, 0) + count
             
             # Call progress callback if provided
-            if progress_callback:
-                progress_callback(
-                    len(chunk),  # Number of items processed
-                    chunk_stats  # Stats for this chunk
-                )
+            if progress_callback is not None:
+                try:
+                    progress_callback(len(chunk_results), chunk_stats)
+                except Exception as e:
+                    logger.error(f"Error in progress callback: {e}")
                 
         except Exception as e:
             logger.error(f"Error processing chunk {chunk_id}: {e}")

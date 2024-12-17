@@ -241,7 +241,7 @@ class NovelAIDataset(Dataset):
                         prefix="Dataset Processing: ",
                         extra_stats=chunk_stats
                     ) if tracker.should_log() else None
-                )[1]  # Return the log_progress result
+                )
             )
             
             # Store processed items
