@@ -5,9 +5,10 @@ import logging
 import asyncio
 from pathlib import Path
 
+from src.data.processors.cache_manager import CacheManager
 from src.data.processors.utils.caption.text_embedder import TextEmbedder
 from src.data.processors.utils.caption.tag_weighter import parse_tags, TagWeighter
-from src.data.processors.utils.system_utils import get_optimal_workers, create_thread_pool
+from src.data.processors.utils.system_utils import get_optimal_workers, create_thread_pool, get_gpu_memory_usage
 from src.data.processors.utils.progress_utils import (
     create_progress_tracker,
     update_tracker,
