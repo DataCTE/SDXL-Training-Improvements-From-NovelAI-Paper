@@ -44,74 +44,17 @@ def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: st
         else:
             raise ValueError(f"{model_class} is not supported.")
 
-def enable_clip_memory_efficient_attention(model: torch.nn.Module) -> bool:
-    """Enable memory efficient attention for CLIP models if possible."""
+def enable_memory_efficient_attention(model: torch.nn.Module) -> bool:
+    """Enable memory efficient attention using xformers if available."""
     try:
         import xformers
-        import xformers.ops
-        
-        def forward_memory_efficient(self, x, attention_mask=None):
-            """Memory efficient attention forward pass."""
-            try:
-                h_ = self.heads
-                q = self.to_q(x)
-                k = self.to_k(x)
-                v = self.to_v(x)
-                
-                # Split heads
-                q = q.view(q.shape[0], -1, h_, q.shape[-1] // h_).transpose(1, 2)
-                k = k.view(k.shape[0], -1, h_, k.shape[-1] // h_).transpose(1, 2)
-                v = v.view(v.shape[0], -1, h_, v.shape[-1] // h_).transpose(1, 2)
-                
-                # Create attention mask
-                if attention_mask is not None:
-                    attention_mask = attention_mask.view(attention_mask.shape[0], 1, attention_mask.shape[1], 1)
-                    attention_mask = attention_mask.expand(-1, h_, -1, attention_mask.shape[-1])
-                    attention_mask = (attention_mask < 0.5)
-                
-                # Apply memory efficient attention
-                out = xformers.ops.memory_efficient_attention(
-                    q, k, v,
-                    attn_bias=None,
-                    p=0.0,
-                    scale=self.scale,
-                    mask=attention_mask
-                )
-                
-                # Merge heads
-                out = out.transpose(1, 2).contiguous()
-                out = out.view(out.shape[0], -1, h_ * out.shape[-1])
-                
-                result = self.to_out(out)
-                
-                # Clean up intermediate tensors
-                del q, k, v, out
-                if attention_mask is not None:
-                    del attention_mask
-                torch.cuda.empty_cache()
-                
-                return result
-                
-            except Exception as e:
-                logger.error(f"Error in memory efficient attention: {e}")
-                # Fall back to original implementation
-                return self._original_forward(x, attention_mask)
-        
-        # Store original forward for fallback
-        for name, module in model.named_modules():
-            if "attn" in name.lower() and hasattr(module, "to_q"):
-                if not hasattr(module, '_original_forward'):
-                    module._original_forward = module.forward
-                module.forward = forward_memory_efficient.__get__(module)
-                found = True
-                
-        if found:
-            logger.info("Enabled xformers memory efficient attention for CLIP model")
+        if hasattr(model, "enable_xformers_memory_efficient_attention"):
+            model.enable_xformers_memory_efficient_attention()
+            logger.info("Enabled xformers memory efficient attention")
             return True
         else:
-            logger.warning("Could not find attention layers to optimize")
+            logger.warning("Model does not support xformers attention")
             return False
-            
     except ImportError:
         logger.warning("xformers not available, using standard attention")
         return False
@@ -186,8 +129,8 @@ class TextEmbedder:
 
             # Enable memory efficient attention if available
             if enable_memory_efficient_attention:
-                enable_clip_memory_efficient_attention(self.text_encoder_one)
-                enable_clip_memory_efficient_attention(self.text_encoder_two)
+                enable_memory_efficient_attention(self.text_encoder_one)
+                enable_memory_efficient_attention(self.text_encoder_two)
 
             # Freeze text encoders and set to eval mode
             self.text_encoder_one.eval()
