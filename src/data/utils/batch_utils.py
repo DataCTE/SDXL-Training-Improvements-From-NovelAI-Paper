@@ -140,9 +140,19 @@ def process_in_chunks(
     chunk_size: int,
     process_fn: Callable[[List[T]], Tuple[List[Any], Dict[str, int]]],
     num_workers: int,
-    progress_interval: float = 5.0
+    progress_interval: float = 5.0,
+    progress_callback: Optional[Callable[[int, Dict[str, Any]], None]] = None
 ) -> Tuple[List[Any], Dict[str, Any]]:
-    """Process items in chunks with parallel execution."""
+    """Process items in chunks with progress tracking.
+    
+    Args:
+        items: List of items to process
+        chunk_size: Size of each chunk
+        process_fn: Function to process each chunk
+        num_workers: Number of worker threads
+        progress_interval: Interval for progress updates in seconds
+        progress_callback: Optional callback for progress updates
+    """
     chunks = [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
     stats = create_progress_stats(len(items))
     results = []
@@ -176,6 +186,10 @@ def process_in_chunks(
                         prefix=f"Chunk {chunk_id}/{len(chunks)} - ",
                         extra_stats=chunk_stats
                     )
+                    
+                # Call progress callback if provided
+                if progress_callback:
+                    progress_callback(len(chunk), chunk_stats)
                     
             except Exception as e:
                 logger.error(f"Error processing chunk {chunk_id}: {e}")

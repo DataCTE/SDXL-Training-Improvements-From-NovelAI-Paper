@@ -301,8 +301,7 @@ class NovelAIDataset(Dataset):
                 chunk_size=chunk_size,
                 process_fn=process_chunk,
                 num_workers=get_optimal_workers(),
-                progress_interval=0.1,
-                progress_callback=lambda n, stats: update_progress(n, stats)
+                progress_interval=0.1
             )
             
             # Print chunk completion status
