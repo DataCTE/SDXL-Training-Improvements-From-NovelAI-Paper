@@ -150,40 +150,59 @@ def create_tensor_buffer(
 async def process_in_chunks(
     items: List[T],
     chunk_size: int,
-    process_fn: Callable[[List[T]], Tuple[List[Any], Dict[str, int]]],
+    process_fn: Callable[[List[T], int], Tuple[List[Any], Dict[str, int]]],
     progress_callback: Optional[Callable[[int, Dict[str, Any]], None]] = None
 ) -> Tuple[List[Any], Dict[str, Any]]:
-    """Process items in chunks with progress tracking."""
+    """Process items in chunks with progress tracking and async support.
+    
+    Args:
+        items: List of items to process
+        chunk_size: Size of each chunk
+        process_fn: Async function that processes a chunk and returns (results, stats)
+        progress_callback: Optional callback for progress updates
+    """
     chunks = [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
-    stats = create_progress_stats(len(items))
-    results = []
-
+    all_results = []
+    final_stats = {
+        'total': 0,
+        'errors': 0,
+        'skipped': 0,
+        'cache_hits': 0,
+        'cache_misses': 0,
+        'error_types': {},
+        'elapsed_seconds': 0
+    }
+    
+    start_time = time.time()
+    
     for chunk_id, chunk in enumerate(chunks):
         try:
+            # Process chunk and await result
             chunk_results, chunk_stats = await process_fn(chunk, chunk_id)
-            results.extend(chunk_results)
             
-            # Update stats and progress
+            # Extend results
+            all_results.extend(chunk_results)
+            
+            # Update stats
+            for key in ['total', 'errors', 'skipped', 'cache_hits', 'cache_misses']:
+                final_stats[key] += chunk_stats.get(key, 0)
+                
+            # Merge error types
+            for error_type, count in chunk_stats.get('error_types', {}).items():
+                final_stats['error_types'][error_type] = \
+                    final_stats['error_types'].get(error_type, 0) + count
+            
+            # Call progress callback if provided
             if progress_callback:
                 progress_callback(len(chunk), chunk_stats)
+                
         except Exception as e:
             logger.error(f"Error processing chunk {chunk_id}: {e}")
-            update_progress_stats(stats, failed=len(chunk))
-            
-    return results, stats.get_stats()
-
-async def process_in_chunks_sync(
-    items: List[Any],
-    chunk_size: int,
-    process_fn: Callable,
-    num_workers: int,
-    **kwargs
-) -> Tuple[List[Any], Dict[str, Any]]:
-    """Synchronous wrapper for process_in_chunks."""
-    return await process_in_chunks(
-        items=items,
-        chunk_size=chunk_size,
-        process_fn=process_fn,
-        num_workers=num_workers,
-        **kwargs
-    )
+            final_stats['errors'] += len(chunk)
+            final_stats['error_types']['chunk_failure'] = \
+                final_stats['error_types'].get('chunk_failure', 0) + 1
+    
+    # Calculate elapsed time
+    final_stats['elapsed_seconds'] = time.time() - start_time
+    
+    return all_results, final_stats
