@@ -165,6 +165,13 @@ class NovelAIDataset(Dataset):
             stats.total_items = len(image_files)
             logger.info(f"Found {len(image_files)} potential image-text pairs")
             
+            # Calculate chunk size for parallel processing
+            chunk_size = calculate_chunk_size(
+                total_items=len(image_files),
+                optimal_workers=get_optimal_workers(),
+                min_chunk_size=100
+            )
+            
             def process_chunk(chunk_files: List[str], chunk_id: int) -> Tuple[List[Dict], Dict[str, int]]:
                 chunk_items = []
                 chunk_stats = {'total': 0, 'errors': 0, 'error_types': {}, 'skipped': 0}
