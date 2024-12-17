@@ -231,9 +231,10 @@ class TagWeighter:
         if self.text_embedder is not None:
             # Use text embedder to calculate similarity-based adjustment
             try:
-                embeddings = self.text_embedder.encode_prompt_list(tags)
-                similarity_factor = self._calculate_similarity_factor(embeddings)
-                return base_weight * similarity_factor
+                embeddings = self.text_embedder.encode_prompt_list_sync(tags)
+                if embeddings is not None:
+                    similarity_factor = self._calculate_similarity_factor(embeddings)
+                    return base_weight * similarity_factor
             except Exception as e:
                 logger.warning(f"Error calculating embedding similarity: {e}")
                 
