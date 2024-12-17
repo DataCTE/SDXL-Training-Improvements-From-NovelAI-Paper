@@ -207,14 +207,7 @@ async def process_in_chunks(
     process_fn: Callable[[List[T], int], Tuple[List[Any], Dict[str, int]]],
     progress_callback: Optional[Callable[[int, Dict[str, Any]], None]] = None
 ) -> Tuple[List[Any], Dict[str, Any]]:
-    """Process items in chunks with progress tracking and async support.
-    
-    Args:
-        items: List of items to process
-        chunk_size: Size of each chunk
-        process_fn: Async function that processes a chunk and returns (results, stats)
-        progress_callback: Optional callback for progress updates
-    """
+    """Process items in chunks with progress tracking."""
     chunks = [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
     all_results = []
     final_stats = {
@@ -248,14 +241,10 @@ async def process_in_chunks(
             
             # Call progress callback if provided
             if progress_callback:
-                # Create chunk progress stats
-                chunk_progress_stats = {
-                    **chunk_stats,
-                    'processed_items': chunk_results,
-                    'chunk_id': chunk_id,
-                    'chunk_size': len(chunk)
-                }
-                progress_callback(len(chunk), chunk_progress_stats)
+                progress_callback(
+                    len(chunk),  # Number of items processed
+                    chunk_stats  # Stats for this chunk
+                )
                 
         except Exception as e:
             logger.error(f"Error processing chunk {chunk_id}: {e}")
