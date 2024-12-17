@@ -29,11 +29,10 @@ from .image_utils import (
 )
 
 from .progress_utils import (
-    ProgressStats,
-    format_time,
+    create_progress_tracker,
+    update_tracker,
     log_progress,
-    create_progress_stats,
-    update_progress_stats
+    format_time
 )
 
 from .batch_utils import (
@@ -69,11 +68,10 @@ __all__ = [
     'get_image_stats',
     
     # Progress utilities
-    'ProgressStats',
-    'format_time',
+    'create_progress_tracker',
+    'update_tracker',
     'log_progress',
-    'create_progress_stats',
-    'update_progress_stats',
+    'format_time',
     
     # Batch utilities
     'BatchConfig',
