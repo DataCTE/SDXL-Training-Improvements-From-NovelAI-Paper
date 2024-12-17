@@ -210,72 +210,51 @@ class NovelAIDataset(Dataset):
         )
 
     async def _process_data(self, image_dirs: List[str]) -> None:
-        """Process data and assign to buckets efficiently."""
-        stats = create_progress_stats(0)
-        
+        """Process all data files asynchronously with progress tracking."""
         try:
-            # Find all valid image files and calculate total size
+            # Create initial progress tracker
+            tracker = create_progress_tracker(0, device=self.device)
+            
+            # Find all image files
             image_files = []
-            total_size = 0
             for image_dir in image_dirs:
-                files = find_matching_files(
-                    image_dir,
-                    extensions={'.jpg', '.jpeg', '.png', '.webp'},
-                    recursive=True,
-                    require_text_pair=True
-                )
-                for file in files:
-                    file_size = get_file_size(file)
-                    total_size += file_size
-                image_files.extend(files)
+                found_files = find_matching_files(image_dir, ['.jpg', '.jpeg', '.png'])
+                image_files.extend(found_files)
                 
             if not image_files:
-                raise ValueError("No valid image-text pairs found!")
-            
-            # Update total in progress stats
-            stats.total_items = len(image_files)
-            logger.info(
-                f"Found {len(image_files)} potential image-text pairs\n"
-                f"Total dataset size: {total_size / (1024*1024*1024):.2f}GB"
+                raise ValueError(f"No valid image files found in {image_dirs}")
+                
+            # Update tracker with total files
+            tracker = create_progress_tracker(
+                total_items=len(image_files),
+                batch_size=self.batch_processor.batch_size,
+                device=self.device
             )
             
-            # Process dataset using batch processor
-            processed_items, final_stats = await self.batch_processor.process_dataset(
+            # Process files in batches
+            processed_items, stats = await self.batch_processor.process_dataset(
                 items=image_files,
-                progress_callback=lambda n, batch_stats: (
-                    update_progress_stats(stats, n),
-                    log_progress(
-                        stats,
-                        prefix="Processing Dataset - ",
-                        extra_stats={
-                            'batch_size': self.batch_processor.batch_size,
-                            'gpu_memory': f"{get_gpu_memory_usage(self.device):.1%}",
-                            'cache_hits': batch_stats.get('cache_hits', 0),
-                            'cache_misses': batch_stats.get('cache_misses', 0)
-                        }
-                    ) if stats.should_log() else None
+                progress_callback=lambda n, chunk_stats: log_progress(
+                    tracker,
+                    prefix="Dataset Processing: ",
+                    extra_stats=chunk_stats
                 )
             )
             
-            # Update items list and assign to buckets
+            # Store processed items
             self.items = processed_items
             
-            # Log final statistics
+            # Log final stats
             logger.info(
-                f"\nData processing complete:\n"
-                f"- Total files: {len(image_files)}\n"
-                f"- Valid items: {len(self.items)}\n"
-                f"- Success rate: {len(self.items)/len(image_files)*100:.1f}%\n"
-                f"- Processing time: {format_time(final_stats.get('elapsed_seconds', 0))}\n"
-                f"- Cache hits: {final_stats.get('cache_hits', 0)}\n"
-                f"- Cache misses: {final_stats.get('cache_misses', 0)}\n"
-                f"- Error types:\n" + "\n".join(
-                    f"  - {k}: {v}" for k, v in final_stats.get('error_types', {}).items()
-                )
+                f"\nDataset processing complete:"
+                f"\n- Total items: {len(self.items):,}"
+                f"\n- Processing time: {format_time(stats['elapsed_seconds'])}"
+                f"\n- Success rate: {(len(self.items)/len(image_files))*100:.1f}%"
+                f"\n- Cache hits/misses: {stats.get('cache_hits', 0)}/{stats.get('cache_misses', 0)}"
             )
             
         except Exception as e:
-            logger.error(f"Error in data processing: {e}")
+            logger.error(f"Error processing dataset: {e}")
             raise
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
