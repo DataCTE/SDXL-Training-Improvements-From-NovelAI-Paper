@@ -195,66 +195,115 @@ class ImageProcessor:
         width: int, 
         height: int
     ) -> List[torch.Tensor]:
-        """Process a batch of images without caching."""
+        """Process a batch of images with optimized speed and memory management."""
         batch_size = len(images)
         if batch_size == 0:
             return []
         
         processed_tensors = []
         
-        # Process in smaller sub-batches
-        sub_batch_size = min(4, batch_size)
-        
-        for i in range(0, batch_size, sub_batch_size):
-            sub_batch = images[i:i + sub_batch_size]
+        try:
+            # Larger sub-batches for better throughput, dynamically adjusted based on GPU memory
+            available_memory = torch.cuda.get_device_properties(self.config.device).total_memory
+            memory_per_image = width * height * 4 * 4  # Rough estimate of memory needed per image
+            optimal_batch_size = min(
+                max(4, int(available_memory * 0.3 / memory_per_image)),  # Use 30% of GPU memory
+                16,  # Cap at 16 images
+                batch_size
+            )
             
-            try:
-                # Process images
-                sub_processed = []
-                for img in sub_batch:
-                    # Process single image
-                    tensor = await self.process_image(img)
-                    if tensor is not None:
-                        sub_processed.append(tensor)
-                    # Clear original image reference
-                    del img
+            # Create multiple CUDA streams for overlapped operations
+            compute_stream = torch.cuda.Stream()
+            transfer_stream = torch.cuda.Stream()
+            
+            # Pre-allocate pinned memory for faster transfers
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            
+            for i in range(0, batch_size, optimal_batch_size):
+                sub_batch = images[i:i + optimal_batch_size]
+                
+                # Process images in parallel with thread pool
+                preprocessing_tasks = [
+                    asyncio.to_thread(self.preprocess, img, width, height)
+                    for img in sub_batch
+                ]
+                
+                # Use asyncio.gather for concurrent preprocessing
+                sub_processed = await asyncio.gather(*preprocessing_tasks)
+                sub_processed = [t for t in sub_processed if t is not None]
                 
                 if sub_processed:
-                    # Stack tensors if we have any successful results
-                    batch_tensor = torch.stack(sub_processed)
-                    # Clear individual tensors after stacking
-                    del sub_processed
+                    with torch.cuda.stream(transfer_stream):
+                        # Efficient pinned memory transfer
+                        batch_tensor = torch.stack(sub_processed)
+                        batch_tensor = batch_tensor.pin_memory()
+                        batch_tensor = batch_tensor.to(
+                            self.config.device,
+                            non_blocking=True
+                        )
+                        del sub_processed
                     
-                    # Move to CPU immediately and append
-                    for tensor in batch_tensor:
-                        cpu_tensor = tensor.cpu()
-                        processed_tensors.append(cpu_tensor)
-                        del tensor  # Clear GPU tensor immediately
+                    with torch.cuda.stream(compute_stream):
+                        if self.vae_encoder is not None:
+                            try:
+                                # Process through VAE with automatic mixed precision
+                                with torch.cuda.amp.autocast():
+                                    encoded = await self.vae_encoder.encode_batch(batch_tensor)
+                                    
+                                # Efficient async transfer back to CPU
+                                with torch.cuda.stream(transfer_stream):
+                                    for tensor in encoded:
+                                        processed_tensors.append(
+                                            tensor.cpu(non_blocking=True).pin_memory()
+                                        )
+                                del encoded
+                                
+                            except Exception as e:
+                                logger.error(f"VAE encoding error: {str(e)[:200]}...")
+                                for _ in range(len(batch_tensor)):
+                                    processed_tensors.append(
+                                        torch.zeros((4, height//8, width//8), 
+                                        dtype=self.config.dtype, 
+                                        device='cpu')
+                                    )
+                        else:
+                            # Efficient async transfer for preprocessed tensors
+                            with torch.cuda.stream(transfer_stream):
+                                for tensor in batch_tensor:
+                                    processed_tensors.append(
+                                        tensor.cpu(non_blocking=True).pin_memory()
+                                    )
+                        
+                        # Cleanup batch
+                        del batch_tensor
                     
-                    del batch_tensor
-                    torch.cuda.empty_cache()
-                    gc.collect()
-                    await asyncio.sleep(0.01)  # Give other tasks a chance to run
-                
-            except Exception as e:
-                logger.error(f"Error processing sub-batch: {e}")
-                # Create zero tensors on CPU directly for failed items
-                for _ in range(len(sub_batch)):
-                    processed_tensors.append(
-                        torch.zeros((4, height//8, width//8), 
-                        dtype=self.config.dtype, 
-                        device='cpu')
-                    )
+                    # Synchronize less frequently
+                    if i % (optimal_batch_size * 2) == 0:
+                        # Only synchronize the compute stream
+                        compute_stream.synchronize()
+                        if torch.cuda.memory_allocated() > available_memory * 0.8:
+                            torch.cuda.empty_cache()
+                            await asyncio.sleep(0.0001)  # Minimal sleep
             
-            # Clear memory after each sub-batch
+            # Final synchronization of both streams
+            compute_stream.synchronize()
+            transfer_stream.synchronize()
+            
+            return processed_tensors
+            
+        except Exception as e:
+            logger.error(f"Batch processing error: {str(e)[:200]}...")
+            if 'sub_processed' in locals():
+                del sub_processed
+            if 'batch_tensor' in locals():
+                del batch_tensor
             torch.cuda.empty_cache()
-            gc.collect()
-        
-        return processed_tensors
+            raise
 
     @torch.no_grad()
     def encode_vae(self, vae, pixel_values: torch.Tensor) -> torch.Tensor:
-        """Encode images through VAE one at a time to minimize memory usage."""
+        """Optimized VAE encoding with better memory management."""
         if self.config.enable_memory_efficient_attention:
             vae.enable_xformers_memory_efficient_attention()
         
@@ -262,33 +311,44 @@ class ImageProcessor:
             vae.enable_slicing()
         
         batch_size = pixel_values.shape[0]
-        latents_list = []
         
-        # Process one image at a time
-        for i in range(batch_size):
-            try:
-                # Get single image
-                current_image = pixel_values[i:i+1]
-                
-                with torch.cuda.amp.autocast(dtype=self.config.dtype):
-                    latents = vae.encode(current_image).latent_dist.sample()
-                    latents = latents * vae.config.scaling_factor
-                    latents_list.append(latents)
-                
-                # Clear cache after each image
-                torch.cuda.empty_cache()
-                
-            except RuntimeError as e:
-                logger.error(f"Error encoding image {i}: {str(e)[:200]}...")
-                # Return empty tensor of correct shape for failed image
-                latents_list.append(torch.zeros(
-                    (1, 4, current_image.shape[2]//8, current_image.shape[3]//8),
-                    dtype=self.config.dtype,
-                    device=self.config.device
-                ))
+        # Create CUDA streams for overlapped operations
+        compute_stream = torch.cuda.Stream()
+        transfer_stream = torch.cuda.Stream()
         
-        # Combine all latents
-        return torch.cat(latents_list, dim=0)
+        try:
+            with torch.cuda.stream(compute_stream):
+                # Process in optimal sub-batches
+                sub_batch_size = min(8, batch_size)
+                latents_list = []
+                
+                for i in range(0, batch_size, sub_batch_size):
+                    # Get current sub-batch
+                    sub_batch = pixel_values[i:i+sub_batch_size]
+                    
+                    with torch.cuda.amp.autocast(dtype=self.config.dtype):
+                        latents = vae.encode(sub_batch).latent_dist.sample()
+                        latents = latents * vae.config.scaling_factor
+                        
+                        # Async transfer of results
+                        with torch.cuda.stream(transfer_stream):
+                            latents_list.append(latents)
+                    
+                    # Optional cleanup for very large batches
+                    if i % (sub_batch_size * 4) == 0 and torch.cuda.memory_allocated() > torch.cuda.get_device_properties(self.config.device).total_memory * 0.8:
+                        compute_stream.synchronize()
+                        torch.cuda.empty_cache()
+                
+                # Combine results efficiently
+                result = torch.cat(latents_list, dim=0)
+                del latents_list
+                
+                return result
+                
+        except Exception as e:
+            logger.error(f"VAE encoding error: {str(e)[:200]}...")
+            torch.cuda.empty_cache()
+            raise
 
     def _get_optimal_size(self, width: int, height: int) -> Tuple[int, int]:
         """Get optimal size considering bucket constraints if available."""
