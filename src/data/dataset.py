@@ -1,31 +1,19 @@
 # src/data/dataset.py
-from typing import List, Optional, Tuple, Dict, Union
+from typing import List, Optional, Dict, Any
 import torch
 from torch.utils.data import Dataset
 from pathlib import Path
 import logging
-from dataclasses import dataclass
-import os
 from PIL import Image
-from concurrent.futures import ThreadPoolExecutor
-import psutil
-from collections import defaultdict
-
+import time
 from src.data.text_embedder import TextEmbedder
 from src.data.tag_weighter import TagWeighter
 from src.data.image_processor import ImageProcessor, ImageProcessorConfig
 from src.data.cache_manager import CacheManager
 from src.data.batch_processor import BatchProcessor
-from src.data.sampler import AspectBatchSampler
 from src.data.bucket import BucketManager
-from src.data.utils import (
-    find_matching_files,
-    get_optimal_workers,
-    process_in_chunks,
-    calculate_chunk_size,
-    log_system_info,
-    get_memory_usage_gb
-)
+from src.data.thread_config import get_optimal_thread_config
+from src.data.utils import find_matching_files
 from src.config.config import NovelAIDatasetConfig
 
 logger = logging.getLogger(__name__)
@@ -49,84 +37,62 @@ class NovelAIDataset(Dataset):
         
         # Get model dtype from VAE
         self.dtype = next(vae.parameters()).dtype
-
-        # Validate bucket configuration first
-        self._validate_bucket_config()
         
-        # Initialize bucket manager before other components
+        # Get optimal thread configuration
+        thread_config = get_optimal_thread_config()
+        
+        # Initialize bucket manager first
         self.bucket_manager = BucketManager(
-            max_image_size=config.image_size,
-            min_image_size=config.min_size,
+            max_image_size=config.max_image_size,
+            min_image_size=config.min_image_size,
             bucket_step=config.bucket_step,
-            min_bucket_resolution=config.min_bucket_size or (config.min_size[0] * config.min_size[1]),
+            min_bucket_resolution=config.min_bucket_resolution,
             max_aspect_ratio=config.max_aspect_ratio,
             bucket_tolerance=config.bucket_tolerance
         )
 
-        # Initialize optimized components after bucket_manager
+        # Initialize image processor with bucket manager
         self.image_processor = ImageProcessor(
             ImageProcessorConfig(
                 dtype=self.dtype,
-                device=device
+                device=device,
+                max_image_size=config.max_image_size,
+                min_image_size=config.min_image_size
             ),
             bucket_manager=self.bucket_manager
         )
         
-        # Initialize parallel processing with optimal workers
-        self.num_workers = get_optimal_workers()
-        
         # Initialize cache manager
         self.cache_manager = CacheManager(
             cache_dir=config.cache_dir,
-            max_workers=self.num_workers
+            max_workers=thread_config.num_threads
         )
         
+        # Initialize batch processor
         self.batch_processor = BatchProcessor(
             image_processor=self.image_processor,
             cache_manager=self.cache_manager,
             text_embedder=text_embedder,
             vae=vae,
             device=device,
-            batch_size=config.batch_size
+            batch_size=config.batch_size,
+            prefetch_factor=thread_config.prefetch_factor,
+            num_workers=thread_config.num_threads
         )
 
-        # Process data with parallel execution
+        # Process data and initialize items
         self.items = []
-        self._parallel_process_data(image_dirs)
+        self._process_data(image_dirs)
         
         logger.info(
-            f"Initialized dataset with {len(self)} samples using {self.num_workers} CPU threads\n"
+            f"Initialized dataset with {len(self)} samples\n"
             f"Bucket stats: {self.bucket_manager.get_stats()}"
         )
 
-    def _validate_bucket_config(self) -> None:
-        """Validate bucket configuration parameters."""
-        if self.config.bucket_step <= 0:
-            raise ValueError(f"bucket_step must be positive, got {self.config.bucket_step}")
-        if self.config.max_aspect_ratio <= 1:
-            raise ValueError(f"max_aspect_ratio must be greater than 1, got {self.config.max_aspect_ratio}")
-        if self.config.bucket_tolerance <= 0:
-            raise ValueError(f"bucket_tolerance must be positive, got {self.config.bucket_tolerance}")
-
-    def get_sampler(
-        self, 
-        batch_size: Optional[int] = None, 
-        shuffle: bool = True, 
-        drop_last: bool = False,
-        min_bucket_length: int = 1
-    ) -> AspectBatchSampler:
-        """Create an aspect-aware batch sampler using dataset's bucket manager."""
-        return AspectBatchSampler(
-            dataset=self,
-            batch_size=batch_size or self.config.batch_size,
-            shuffle=shuffle,
-            drop_last=drop_last,
-            max_consecutive_batch_samples=self.config.max_consecutive_batch_samples,
-            min_bucket_length=min_bucket_length
-        )
-
-    def _parallel_process_data(self, image_dirs: List[str]):
-        """Process data using parallel execution."""
+    def _process_data(self, image_dirs: List[str]) -> None:
+        """Process data and assign to buckets efficiently."""
+        start_time = time.time()
+        
         # Find all valid image files
         image_files = []
         for image_dir in image_dirs:
@@ -138,130 +104,70 @@ class NovelAIDataset(Dataset):
             )
             image_files.extend(files)
             
-        total_files = len(image_files)
-        if total_files == 0:
-            logger.warning("No valid image-text pairs found!")
-            return
-
-        # Log system info and calculate optimal chunk size
-        log_system_info()
-        optimal_workers = get_optimal_workers()
-        chunk_size = calculate_chunk_size(total_files, optimal_workers)
-        
-        logger.info(
-            f"Processing configuration:\n"
-            f"- Workers: {optimal_workers}\n"
-            f"- Chunk size: {chunk_size} images\n"
-            f"- Total files: {total_files}"
-        )
-        
-        # Process files in chunks
-        self.items, stats = process_in_chunks(
-            items=image_files,
-            chunk_size=chunk_size,
-            process_fn=self._process_chunk,
-            num_workers=optimal_workers
-        )
-        
-        logger.info(
-            f"Dataset preparation completed:\n"
-            f"- Valid items: {len(self.items)}\n"
-            f"- Total files: {total_files}\n"
-            f"- Success rate: {len(self.items)/total_files*100:.1f}%\n"
-            f"Error types: {stats.get('error_types', {})}"
-        )
-
-    def _process_chunk(self, image_files: List[str], chunk_id: int) -> Tuple[List[Dict], Dict[str, int]]:
-        """Process a chunk of image files."""
-        chunk_items = []
-        stats = defaultdict(int)
-        error_types = defaultdict(int)
-        
-        for img_path in image_files:
-            stats['total'] += 1
+        if not image_files:
+            raise ValueError("No valid image-text pairs found!")
             
+        # Process each image and prepare items
+        for img_path in image_files:
             try:
-                # Validate text file
-                txt_path = Path(img_path).with_suffix('.txt')
-                if not txt_path.exists() or txt_path.stat().st_size == 0:
-                    stats['skipped'] += 1
-                    error_types['missing_or_empty_text'] += 1
-                    continue
-                
-                # Validate and load image
-                try:
-                    with Image.open(img_path) as img:
-                        if img.mode not in ('RGB', 'RGBA'):
-                            img = img.convert('RGB')
-                        width, height = img.size
-                        
-                        # Basic image validation
-                        if width < 32 or height < 32:
-                            stats['skipped'] += 1
-                            error_types['image_too_small'] += 1
-                            continue
-                            
-                        if width > 8192 or height > 8192:
-                            stats['skipped'] += 1
-                            error_types['image_too_large'] += 1
-                            continue
-                            
-                        # Find appropriate bucket
-                        bucket = self.bucket_manager.find_bucket(width, height)
-                        if bucket is None:
-                            stats['skipped'] += 1
-                            error_types['no_suitable_bucket'] += 1
-                            continue
-                            
-                        # Get cache paths
-                        cache_paths = self.cache_manager.get_cache_paths(img_path)
-                        
-                        # Add to valid items
-                        chunk_items.append({
-                            'image_path': img_path,
-                            'bucket': bucket,
-                            'latent_cache': cache_paths['latent'],
-                            'text_cache': cache_paths['text'],
-                            'original_size': (height, width),
-                            'crop_top_left': (0, 0)
-                        })
-                        stats['valid'] += 1
-                        
-                except (IOError, OSError) as e:
-                    stats['errors'] += 1
-                    error_types['image_load_error'] += 1
-                    logger.debug(f"Error loading image {img_path}: {e}")
-                    continue
+                # Load and validate image
+                with Image.open(img_path) as img:
+                    if img.mode not in ('RGB', 'RGBA'):
+                        img = img.convert('RGB')
+                    width, height = img.size
+                    
+                    # Find appropriate bucket
+                    bucket = self.bucket_manager.find_bucket(width, height)
+                    if bucket is None:
+                        continue
+                    
+                    # Get cache paths
+                    cache_paths = self.cache_manager.get_cache_paths(img_path)
+                    
+                    # Add to items
+                    self.items.append({
+                        'image_path': img_path,
+                        'width': width,
+                        'height': height,
+                        'latent_cache': cache_paths['latent'],
+                        'text_cache': cache_paths['text'],
+                        'bucket_key': f"{bucket.width}x{bucket.height}"
+                    })
                     
             except Exception as e:
-                stats['errors'] += 1
-                error_types['other_error'] += 1
-                logger.error(f"Unexpected error processing {img_path}: {e}")
+                logger.error(f"Error processing {img_path}: {e}")
                 continue
         
-        stats['error_types'] = dict(error_types)
-        return chunk_items, stats
+        # Log processing stats
+        elapsed = time.time() - start_time
+        logger.info(
+            f"Processed {len(image_files)} files in {elapsed:.2f}s:\n"
+            f"- Valid items: {len(self.items)}\n"
+            f"- Success rate: {len(self.items)/len(image_files)*100:.1f}%"
+        )
 
-    def __getitem__(self, idx: int) -> Dict:
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
         """Get dataset item with cached data."""
         item = self.items[idx]
         
-        # Load cached data efficiently
-        latent = self.cache_manager.load_latent(item['latent_cache'])
-        if len(latent.shape) == 4:
-            latent = latent.squeeze(0)
-        
-        text_data = self.cache_manager.load_text_data(item['text_cache'])
-        tag_weight = torch.tensor(self.tag_weighter.get_weight(text_data['tags']))
-        
-        return {
-            'model_input': latent,
-            'text_embeds': text_data['embeds'],
-            'tag_weights': tag_weight,
-            'original_sizes': item['original_size'],
-            'crop_top_lefts': item['crop_top_left'],
-            'target_sizes': (item['bucket'].height, item['bucket'].width)
-        }
+        try:
+            # Load cached latent
+            latent = self.cache_manager.load_latent(item['latent_cache'])
+            
+            # Load cached text data
+            text_data = self.cache_manager.load_text_data(item['text_cache'])
+            
+            return {
+                **item,
+                'latent': latent,
+                'text_embeds': text_data['embeds'],
+                'pooled_embeds': text_data['pooled_embeds'],
+                'tags': text_data['tags']
+            }
+            
+        except Exception as e:
+            logger.error(f"Error loading item {idx}: {e}")
+            raise
 
     def __len__(self) -> int:
         return len(self.items)

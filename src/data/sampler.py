@@ -1,48 +1,18 @@
-from typing import List, Optional, Iterator, Dict, DefaultDict, Set, Tuple, Union
+from typing import List, Optional, Iterator, Dict
 import torch
 from torch.utils.data import Sampler
-import random
-import numpy as np
-from collections import defaultdict
 import logging
 import math
-from dataclasses import dataclass, field
-import heapq
-from src.data.utils import get_memory_usage_gb
-from src.data.bucket import BucketManager, ImageBucket
+import time
+import traceback
+from src.data.bucket import BucketManager
+from src.data.thread_config import get_optimal_thread_config
+from src.data.batch_processor import BatchProcessor
 
 logger = logging.getLogger(__name__)
 
-@dataclass
-class BucketInfo:
-    """Information about a bucket and its contents."""
-    indices: List[int] = field(default_factory=list)
-    bucket: Optional[ImageBucket] = None
-    used_samples: int = field(default=0, init=False)
-    
-    def __post_init__(self):
-        """Initialize derived properties."""
-        self.used_samples = 0
-        
-    def __len__(self) -> int:
-        return len(self.indices)
-    
-    def remaining_samples(self) -> int:
-        """Get number of remaining samples."""
-        return len(self.indices) - self.used_samples
-    
-    def get_next_batch(self, batch_size: int) -> List[int]:
-        """Get next batch of indices efficiently."""
-        if self.used_samples >= len(self.indices):
-            return []
-            
-        end_idx = min(self.used_samples + batch_size, len(self.indices))
-        batch = self.indices[self.used_samples:end_idx]
-        self.used_samples = end_idx
-        return batch
-
 class AspectBatchSampler(Sampler[List[int]]):
-    """Batch sampler that groups images with similar aspect ratios."""
+    """Batch sampler that groups images with similar aspect ratios for efficient processing."""
     
     def __init__(
         self,
@@ -51,10 +21,24 @@ class AspectBatchSampler(Sampler[List[int]]):
         shuffle: bool = True,
         drop_last: bool = False,
         max_consecutive_batch_samples: int = 2,
-        min_bucket_length: int = 1
+        min_bucket_length: int = 1,
+        debug_mode: bool = False,
+        prefetch_factor: Optional[int] = None
     ):
-        """Initialize using dataset's bucket information."""
+        """Initialize using dataset's bucket information and optimal thread configuration."""
         super().__init__(dataset)
+        
+        # Get optimal thread configuration
+        thread_config = get_optimal_thread_config()
+        self.prefetch_factor = prefetch_factor or thread_config.prefetch_factor
+        
+        # Validate inputs
+        if batch_size < 1:
+            raise ValueError(f"Batch size must be positive, got {batch_size}")
+        if max_consecutive_batch_samples < 1:
+            raise ValueError(f"Max consecutive samples must be positive, got {max_consecutive_batch_samples}")
+        if min_bucket_length < 1:
+            raise ValueError(f"Min bucket length must be positive, got {min_bucket_length}")
         
         self.dataset = dataset
         self.batch_size = batch_size
@@ -62,208 +46,156 @@ class AspectBatchSampler(Sampler[List[int]]):
         self.drop_last = drop_last
         self.max_consecutive_batch_samples = max_consecutive_batch_samples
         self.min_bucket_length = min_bucket_length
+        self.debug_mode = debug_mode
         
-        # Use dataset's bucket manager
+        # Get bucket manager from dataset
+        if not hasattr(dataset, 'bucket_manager') or not isinstance(dataset.bucket_manager, BucketManager):
+            raise ValueError("Dataset must have a valid BucketManager instance")
         self.bucket_manager = dataset.bucket_manager
         
         # Initialize state
-        self.buckets: Dict[str, BucketInfo] = {}
-        self.total_samples = 0
         self.epoch = 0
-        self.rng = np.random.RandomState()
+        self.total_batches = 0
         
-        # Pre-allocate reusable buffers
-        self.bucket_heap = []
-        self.used_buckets: Set[str] = set()
+        # Performance tracking
+        self.creation_time = time.time()
         
-        # Create initial buckets and assign samples
-        self._create_buckets()
-        self._assign_samples_to_buckets()
-        
-        # Calculate number of batches
-        self.total_batches = self._calculate_total_batches()
-        
-        logger.info(
-            f"Initialized sampler:\n"
-            f"- Buckets: {len(self.buckets)}\n"
-            f"- Total batches: {self.total_batches}\n"
-            f"- Total samples: {self.total_samples}\n"
-            f"- Memory usage: {get_memory_usage_gb():.1f}GB"
-        )
-
-    def _get_bucket_key(self, bucket: ImageBucket) -> str:
-        """Get unique key for bucket based on resolution."""
-        key = f"{bucket.width}x{bucket.height}"
-        if not self.bucket_manager.validate_bucket_key(key):
-            raise ValueError(f"Invalid bucket dimensions: {key}")
-        return key
-
-    def _create_buckets(self) -> None:
-        """Create buckets using dataset's bucket information."""
-        bucket_mapping = self.bucket_manager.get_bucket_info()
-        
-        # Create BucketInfo objects for each unique bucket
-        for item in self.dataset.items:
-            bucket = item.get('bucket')
-            if bucket is not None and isinstance(bucket, ImageBucket):
-                bucket_key = self._get_bucket_key(bucket)
-                if bucket_key not in self.buckets and bucket_key in bucket_mapping:
-                    self.buckets[bucket_key] = BucketInfo(bucket=bucket_mapping[bucket_key])
-        
-        if not self.buckets:
-            raise ValueError("No valid buckets could be created from dataset")
-            
-        logger.info(f"Created {len(self.buckets)} buckets from dataset")
-
-    def _assign_samples_to_buckets(self) -> None:
-        """Assign dataset samples to appropriate buckets using existing bucket information."""
         try:
-            total_assigned = 0
+            # Assign samples to buckets
+            self.bucket_manager.assign_to_buckets(dataset.items, shuffle=shuffle)
             
-            for idx, item in enumerate(self.dataset.items):
-                try:
-                    bucket = item.get('bucket')
-                    if bucket is None or not isinstance(bucket, ImageBucket):
-                        logger.error(f"Invalid bucket information for sample {idx}")
-                        continue
-                        
-                    bucket_key = self._get_bucket_key(bucket)
-                    if bucket_key in self.buckets:
-                        self.buckets[bucket_key].indices.append(idx)
-                        total_assigned += 1
-                    else:
-                        logger.debug(f"No matching bucket for sample {idx} (resolution {bucket.width}x{bucket.height})")
-                        
-                except Exception as e:
-                    logger.error(f"Error assigning sample {idx}: {str(e)}")
-                    continue
-                    
-            # Remove empty buckets
-            self.buckets = {
-                key: info for key, info in self.buckets.items()
-                if len(info.indices) >= self.min_bucket_length
-            }
+            # Calculate number of batches
+            self.total_batches = self._calculate_total_batches()
             
-            if total_assigned == 0:
-                raise ValueError("No samples were assigned to any buckets")
-                
-            self.total_samples = sum(len(bucket.indices) for bucket in self.buckets.values())
-            logger.info(f"Assigned {self.total_samples} samples to {len(self.buckets)} buckets")
+            # Log initialization stats
+            self._log_initialization_stats()
             
         except Exception as e:
-            logger.error(f"Failed to assign samples to buckets: {str(e)}")
+            logger.error(f"Failed to initialize sampler: {str(e)}")
+            logger.error(traceback.format_exc())
             raise
+        
+        self.creation_time = time.time() - self.creation_time
+
+    def _log_initialization_stats(self):
+        """Log detailed initialization statistics."""
+        stats = self.bucket_manager.get_stats()
+        logger.info(
+            f"\nSampler Initialization Complete:"
+            f"\n- Buckets: {stats['total_buckets']:,}"
+            f"\n- Total samples: {stats['total_samples']:,}"
+            f"\n- Total batches: {self.total_batches:,}"
+            f"\n- Batch size: {self.batch_size}"
+            f"\n- Prefetch factor: {self.prefetch_factor}"
+            f"\n- Initialization time: {self.creation_time:.2f}s"
+            f"\n\nBucket Statistics:"
+            f"\n- Max bucket size: {stats['max_bucket_size']:,}"
+            f"\n- Min bucket size: {stats['min_bucket_size']:,}"
+            f"\n- Avg bucket size: {stats['avg_bucket_size']:.1f}"
+        )
+        
+        if self.debug_mode:
+            # Log detailed bucket distribution
+            logger.debug("\nBucket Distribution:")
+            for key, count in sorted(stats['samples_per_bucket'].items()):
+                logger.debug(f"- {key}: {count:,} samples")
 
     def _calculate_total_batches(self) -> int:
         """Calculate total number of batches efficiently."""
-        if self.drop_last:
-            return sum(len(bucket) // self.batch_size for bucket in self.buckets.values())
-        else:
-            return sum(math.ceil(len(bucket) / self.batch_size) for bucket in self.buckets.values())
-
-    def _shuffle_buckets(self, epoch: int) -> None:
-        """Shuffle bucket contents with optimized memory usage."""
-        if not self.shuffle:
-            return
-            
-        # Set seed for reproducibility
-        self.rng.seed(epoch)
-        
-        # Shuffle within each bucket using numpy for efficiency
-        for bucket in self.buckets.values():
-            # Convert to numpy array for faster shuffling
-            indices = np.array(bucket.indices, dtype=np.int32)
-            self.rng.shuffle(indices)
-            bucket.indices = indices.tolist()
-            bucket.used_samples = 0
-
-    def _create_batches(self) -> List[List[int]]:
-        """Create batches with optimized scheduling."""
-        all_batches = []
-        
-        # Initialize priority queue with bucket priorities
-        self.bucket_heap = [
-            (-len(bucket), key)  # Negative length for max-heap
-            for key, bucket in self.buckets.items()
-        ]
-        heapq.heapify(self.bucket_heap)
-        
-        self.used_buckets.clear()
-        consecutive_samples = defaultdict(int)
-        
-        while self.bucket_heap:
-            # Get bucket with most remaining samples
-            _, bucket_key = heapq.heappop(self.bucket_heap)
-            bucket = self.buckets[bucket_key]
-            
-            # Skip if bucket is depleted
-            if bucket.remaining_samples() == 0:
-                continue
-                
-            # Check consecutive sample limit
-            if consecutive_samples[bucket_key] >= self.max_consecutive_batch_samples:
-                # Put back in heap with adjusted priority
-                heapq.heappush(self.bucket_heap, (-bucket.remaining_samples(), bucket_key))
-                continue
-            
-            # Get next batch
-            batch = bucket.get_next_batch(self.batch_size)
-            if batch:
-                all_batches.append(batch)
-                consecutive_samples[bucket_key] += 1
-                
-                # Reset other buckets' consecutive counts
-                for other_key in consecutive_samples:
-                    if other_key != bucket_key:
-                        consecutive_samples[other_key] = 0
-                
-                # Put back in heap if not depleted
-                if bucket.remaining_samples() > 0:
-                    heapq.heappush(self.bucket_heap, (-bucket.remaining_samples(), bucket_key))
-            
-            # Handle final partial batch
-            elif not self.drop_last and bucket.remaining_samples() > 0:
-                final_batch = bucket.get_next_batch(bucket.remaining_samples())
-                if final_batch:
-                    all_batches.append(final_batch)
-        
-        return all_batches
+        total = 0
+        for bucket in self.bucket_manager.buckets.values():
+            if len(bucket) >= self.min_bucket_length:
+                if self.drop_last:
+                    total += len(bucket) // self.batch_size
+                else:
+                    total += math.ceil(len(bucket) / self.batch_size)
+        return total
 
     def __iter__(self) -> Iterator[List[int]]:
         """Create and yield batches for current epoch efficiently."""
-        # Shuffle buckets if needed
-        self._shuffle_buckets(self.epoch)
-        
-        # Create all batches
-        all_batches = self._create_batches()
-        
-        # Shuffle batch order if needed
-        if self.shuffle:
-            self.rng.shuffle(all_batches)
-        
-        # Increment epoch
-        self.epoch += 1
-        
-        # Yield batches
-        yield from all_batches
+        try:
+            epoch_start = time.time()
+            logger.info(f"\nStarting epoch {self.epoch}")
+            
+            # Shuffle buckets if needed
+            if self.shuffle:
+                self.bucket_manager.shuffle_buckets(self.epoch)
+            
+            # Track consecutive samples from each bucket
+            consecutive_samples = {key: 0 for key in self.bucket_manager.buckets}
+            active_buckets = set(key for key, bucket in self.bucket_manager.buckets.items() 
+                               if len(bucket) >= self.min_bucket_length)
+            
+            # Process buckets in order of remaining samples
+            while active_buckets:
+                # Find bucket with most remaining samples
+                max_remaining = -1
+                selected_key = None
+                
+                for key in active_buckets:
+                    bucket = self.bucket_manager.buckets[key]
+                    remaining = bucket.remaining_samples()
+                    
+                    if remaining == 0:
+                        active_buckets.remove(key)
+                        continue
+                        
+                    if consecutive_samples[key] >= self.max_consecutive_batch_samples:
+                        continue
+                        
+                    if remaining > max_remaining:
+                        max_remaining = remaining
+                        selected_key = key
+                
+                if selected_key is None:
+                    # Reset consecutive counts if all buckets hit limit
+                    if any(bucket.remaining_samples() > 0 
+                          for bucket in self.bucket_manager.buckets.values()):
+                        consecutive_samples = {key: 0 for key in self.bucket_manager.buckets}
+                        continue
+                    break
+                
+                # Get batch from selected bucket
+                bucket = self.bucket_manager.buckets[selected_key]
+                batch = bucket.get_next_batch(self.batch_size)
+                
+                if batch:
+                    consecutive_samples[selected_key] += 1
+                    for other_key in consecutive_samples:
+                        if other_key != selected_key:
+                            consecutive_samples[other_key] = 0
+                            
+                    # Get bucket dimensions for batch processing
+                    width, height = bucket.width, bucket.height
+                    
+                    # Create batch items with dimensions
+                    batch_items = [
+                        {**self.dataset.items[idx], 'width': width, 'height': height}
+                        for idx in batch
+                    ]
+                    
+                    yield batch
+                    
+                elif not self.drop_last and bucket.remaining_samples() > 0:
+                    # Handle final partial batch
+                    final_batch = bucket.get_next_batch(bucket.remaining_samples())
+                    if final_batch:
+                        yield final_batch
+                    active_buckets.remove(selected_key)
+                else:
+                    active_buckets.remove(selected_key)
+            
+            # Log epoch stats
+            epoch_time = time.time() - epoch_start
+            logger.info(f"Epoch {self.epoch} completed in {epoch_time:.2f}s")
+            
+            # Increment epoch
+            self.epoch += 1
+            
+        except Exception as e:
+            logger.error(f"Error in epoch iteration: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
 
     def __len__(self) -> int:
         return self.total_batches
-    
-    def get_stats(self) -> Dict:
-        """Get detailed statistics about current bucketing."""
-        stats = {
-            "total_buckets": len(self.buckets),
-            "total_samples": self.total_samples,
-            "total_batches": self.total_batches,
-            "aspect_ratios": sorted(self.buckets.keys()),
-            "samples_per_bucket": {
-                aspect: len(bucket) for aspect, bucket in self.buckets.items()
-            },
-            "avg_batch_size": self.total_samples / self.total_batches,
-            "memory_usage_gb": get_memory_usage_gb(),
-            "max_bucket_size": max(len(b) for b in self.buckets.values()),
-            "min_bucket_size": min(len(b) for b in self.buckets.values()),
-            "avg_bucket_size": self.total_samples / len(self.buckets) if self.buckets else 0
-        }
-        return stats

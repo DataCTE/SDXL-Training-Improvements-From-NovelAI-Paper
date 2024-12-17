@@ -1,7 +1,9 @@
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Any, Set, Tuple
+from typing import List, Dict, Optional, Any, Set, Tuple, Iterator
 import logging
 import numpy as np
+import heapq
+from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
@@ -10,7 +12,8 @@ class ImageBucket:
     """Bucket for images of similar aspect ratios."""
     width: int
     height: int
-    items: List[Any] = field(default_factory=list)
+    indices: List[int] = field(default_factory=list)
+    used_samples: int = field(default=0, init=False)
     
     def __post_init__(self):
         """Initialize derived properties."""
@@ -21,35 +24,35 @@ class ImageBucket:
             
         self.aspect_ratio = self.width / self.height
         self.resolution = self.width * self.height
-        self.used_items = 0
+        self.used_samples = 0
         
-    def add_item(self, item: Any) -> None:
-        """Add item to bucket."""
-        self.items.append(item)
+    def add_index(self, idx: int) -> None:
+        """Add sample index to bucket."""
+        self.indices.append(idx)
         
     def clear(self) -> None:
-        """Clear all items from bucket."""
-        self.items.clear()
-        self.used_items = 0
+        """Clear all indices from bucket."""
+        self.indices.clear()
+        self.used_samples = 0
         
-    def get_next_batch(self, batch_size: int) -> List[Any]:
-        """Get next batch of items up to batch_size."""
-        if self.used_items >= len(self.items):
+    def get_next_batch(self, batch_size: int) -> List[int]:
+        """Get next batch of indices up to batch_size."""
+        if self.used_samples >= len(self.indices):
             return []
-        end_idx = min(self.used_items + batch_size, len(self.items))
-        batch = self.items[self.used_items:end_idx]
-        self.used_items = end_idx
+        end_idx = min(self.used_samples + batch_size, len(self.indices))
+        batch = self.indices[self.used_samples:end_idx]
+        self.used_samples = end_idx
         return batch
         
-    def remaining_items(self) -> int:
-        """Get number of remaining items."""
-        return len(self.items) - self.used_items
+    def remaining_samples(self) -> int:
+        """Get number of remaining samples."""
+        return len(self.indices) - self.used_samples
         
     def __len__(self) -> int:
-        return len(self.items)
+        return len(self.indices)
     
     def __repr__(self) -> str:
-        return f"ImageBucket({self.width}x{self.height}, {len(self)} items, ratio={self.aspect_ratio:.3f})"
+        return f"ImageBucket({self.width}x{self.height}, {len(self)} samples, ratio={self.aspect_ratio:.3f})"
 
 class BucketManager:
     """Manager for creating and assigning image buckets."""
@@ -71,8 +74,13 @@ class BucketManager:
         self.bucket_tolerance = bucket_tolerance
         
         # Initialize buckets
-        self.buckets: Dict[float, ImageBucket] = {}
+        self.buckets: Dict[str, ImageBucket] = {}
         self._create_buckets()
+        
+        # State tracking
+        self.total_samples = 0
+        self.epoch = 0
+        self.rng = np.random.RandomState()
         
         logger.info(
             f"Initialized BucketManager:\n"
@@ -105,9 +113,10 @@ class BucketManager:
             """Helper to add bucket if valid."""
             width, height = self._validate_dimensions(width, height)
             resolution = width * height
+            bucket_key = f"{width}x{height}"
             
             # Skip if we've seen this resolution or it's below minimum
-            if (width, height) in seen_resolutions:
+            if bucket_key in seen_resolutions:
                 return
             if resolution < self.min_bucket_resolution:
                 return
@@ -116,8 +125,8 @@ class BucketManager:
             if aspect > self.max_aspect_ratio or aspect < (1/self.max_aspect_ratio):
                 return
                 
-            self.buckets[aspect] = ImageBucket(width=width, height=height)
-            seen_resolutions.add((width, height))
+            self.buckets[bucket_key] = ImageBucket(width=width, height=height)
+            seen_resolutions.add(bucket_key)
             logger.debug(f"Added bucket: {width}x{height} (ratio: {aspect:.2f})")
         
         # Generate buckets more efficiently for large ranges
@@ -155,50 +164,102 @@ class BucketManager:
             
         # Validate and adjust dimensions
         width, height = self._validate_dimensions(width, height)
+        bucket_key = f"{width}x{height}"
+            
+        # Return exact match if exists
+        if bucket_key in self.buckets:
+            return self.buckets[bucket_key]
             
         # Calculate aspect ratio
         aspect = width / height
         if aspect > self.max_aspect_ratio or aspect < (1/self.max_aspect_ratio):
             return None
             
-        # Find closest bucket in log space
-        log_aspect = np.log(aspect)
-        bucket_aspects = np.array(list(self.buckets.keys()))
-        log_bucket_aspects = np.log(bucket_aspects)
+        # Find closest bucket by resolution and aspect ratio
+        min_diff = float('inf')
+        best_bucket = None
+        target_res = width * height
         
-        # Find closest bucket within tolerance
-        diffs = np.abs(log_bucket_aspects - log_aspect)
-        min_idx = np.argmin(diffs)
-        if diffs[min_idx] <= self.bucket_tolerance:
-            return self.buckets[bucket_aspects[min_idx]]
-            
-        return None
+        for key, bucket in self.buckets.items():
+            # Check aspect ratio first
+            ratio_diff = abs(np.log(aspect) - np.log(bucket.aspect_ratio))
+            if ratio_diff > self.bucket_tolerance:
+                continue
+                
+            # Then check resolution
+            res_diff = abs(target_res - bucket.resolution)
+            if res_diff < min_diff:
+                min_diff = res_diff
+                best_bucket = bucket
+                
+        return best_bucket
     
-    def get_stats(self) -> Dict:
-        """Get bucket statistics."""
-        return {
-            "total_buckets": len(self.buckets),
-            "aspect_ratios": sorted(self.buckets.keys()),
-            "items_per_bucket": {
-                aspect: len(bucket) for aspect, bucket in self.buckets.items()
-            },
-            "total_items": sum(len(b) for b in self.buckets.values()),
-            "max_bucket_size": max((len(b) for b in self.buckets.values()), default=0),
-            "min_bucket_size": min((len(b) for b in self.buckets.values()), default=0)
-        }
+    def assign_to_buckets(self, items: List[Dict], shuffle: bool = True) -> None:
+        """Assign items to buckets and optionally shuffle."""
+        # Reset state
+        self.total_samples = 0
+        for bucket in self.buckets.values():
+            bucket.clear()
+        
+        # Assign items to buckets
+        for idx, item in enumerate(items):
+            width = item.get('width')
+            height = item.get('height')
+            if not width or not height:
+                continue
+                
+            bucket = self.find_bucket(width, height)
+            if bucket is not None:
+                bucket.add_index(idx)
+                self.total_samples += 1
+        
+        # Shuffle if requested
+        if shuffle:
+            self.shuffle_buckets()
+    
+    def shuffle_buckets(self, epoch: Optional[int] = None) -> None:
+        """Shuffle indices within each bucket."""
+        if epoch is not None:
+            self.rng.seed(epoch)
+            
+        for bucket in self.buckets.values():
+            if len(bucket.indices) > 0:
+                indices = np.array(bucket.indices)
+                self.rng.shuffle(indices)
+                bucket.indices = indices.tolist()
+                bucket.used_samples = 0
     
     def get_bucket_by_key(self, key: str) -> Optional[ImageBucket]:
         """Get bucket by resolution key (e.g. '512x512')."""
-        width, height = map(int, key.split('x'))
-        aspect = width / height
-        return self.buckets.get(aspect)
+        return self.buckets.get(key)
     
     def get_bucket_info(self) -> Dict[str, ImageBucket]:
         """Get mapping of resolution keys to buckets."""
-        return {
-            f"{bucket.width}x{bucket.height}": bucket 
-            for bucket in self.buckets.values()
+        return self.buckets.copy()
+    
+    def get_stats(self) -> Dict:
+        """Get comprehensive bucket statistics."""
+        stats = {
+            "total_buckets": len(self.buckets),
+            "total_samples": self.total_samples,
+            "samples_per_bucket": {
+                key: len(bucket) for key, bucket in self.buckets.items()
+            },
+            "max_bucket_size": max((len(b) for b in self.buckets.values()), default=0),
+            "min_bucket_size": min((len(b) for b in self.buckets.values()), default=0),
+            "avg_bucket_size": self.total_samples / len(self.buckets) if self.buckets else 0
         }
+        
+        # Add aspect ratio stats
+        if self.buckets:
+            ratios = [b.aspect_ratio for b in self.buckets.values()]
+            stats["aspect_ratios"] = {
+                "min": min(ratios),
+                "max": max(ratios),
+                "mean": sum(ratios) / len(ratios)
+            }
+            
+        return stats
     
     def validate_bucket_key(self, key: str) -> bool:
         """Validate if a bucket key matches expected format and constraints."""
