@@ -1,21 +1,13 @@
 import os
 import logging
 import torch
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader
-import wandb
-from pathlib import Path
+
 from src.data.dataset import NovelAIDataset, NovelAIDatasetConfig
-from src.data.sampler import AspectBatchSampler
 from src.training.trainer import NovelAIDiffusionV3Trainer
 from src.utils.model import setup_model
 from src.config.config import Config
-from src.utils.setup import setup_distributed, verify_memory_optimizations
+from src.utils.setup import verify_memory_optimizations, setup_memory_optimizations
 from src.utils.metrics import setup_logging, log_system_info, cleanup_logging
-from src.data.text_embedder import TextEmbedder
-from src.data.tag_weighter import TagWeighter, TagWeightingConfig
-from src.data.validation import validate_directories
 import gc
 import traceback
 from src.config.arg_parser import parse_args
@@ -55,11 +47,14 @@ def train(config_path: str):
         logger.info(f"- Learning rate: {config.training.learning_rate}")
         logger.info(f"- Num epochs: {config.training.num_epochs}")
         logger.info(f"- Mixed precision: {config.training.mixed_precision}")
+        logger.info(f"- Prediction type: {config.training.prediction_type}")
+        logger.info(f"- SNR gamma: {config.training.snr_gamma}")
         
         logger.info(f"\nSystem config:")
         logger.info(f"- Enable xformers: {config.system.enable_xformers}")
         logger.info(f"- Gradient checkpointing: {config.system.gradient_checkpointing}")
         logger.info(f"- Mixed precision: {config.system.mixed_precision}")
+        logger.info(f"- Channels last: {config.system.channels_last}")
         
         # Validate required directories exist
         for dir_path in [
@@ -73,41 +68,25 @@ def train(config_path: str):
                 logger.info(f"Creating directory: {dir_path}")
                 os.makedirs(dir_path, exist_ok=True)
         
-        # Validate image directories
+        # Basic validation of image directories
+        valid_image_dirs = []
+        total_dirs = len(config.data.image_dirs)
         for img_dir in config.data.image_dirs:
             if not os.path.exists(img_dir):
-                raise ValueError(f"Image directory not found: {img_dir}")
-            logger.info(f"Found image directory: {img_dir}")
-        
-        # Validate model paths
-        def is_valid_model_name(name: str) -> bool:
-            """Validate model name or path."""
-            if os.path.exists(name):
-                return True
-            valid_prefixes = (
-                "stabilityai/",
-                "runwayml/",
-                "CompVis/",
-                "madebyollin/",
-                "openai/",
-                "facebook/"
-            )
-            return any(name.startswith(prefix) for prefix in valid_prefixes)
+                logger.warning(f"Image directory not found: {img_dir}")
+                continue
+            if not os.path.isdir(img_dir):
+                logger.warning(f"Path is not a directory: {img_dir}")
+                continue
+            valid_image_dirs.append(img_dir)
+            logger.info(f"Found valid image directory: {img_dir}")
+            
+        if not valid_image_dirs:
+            raise ValueError("No valid image directories found")
+            
+        logger.info(f"Found {len(valid_image_dirs)} valid directories out of {total_dirs}")
+        config.data.image_dirs = valid_image_dirs
 
-        if not is_valid_model_name(config.model.pretrained_model_name):
-            logger.warning(f"Model path may not be valid: {config.model.pretrained_model_name}")
-        
-        # Validate numeric parameters
-        if config.training.batch_size < 1:
-            raise ValueError(f"Invalid batch size: {config.training.batch_size}")
-        if config.training.learning_rate <= 0:
-            raise ValueError(f"Invalid learning rate: {config.training.learning_rate}")
-        if config.training.num_epochs < 1:
-            raise ValueError(f"Invalid number of epochs: {config.training.num_epochs}")
-        if config.data.num_workers < 0:
-            raise ValueError(f"Invalid number of workers: {config.data.num_workers}")
-        
-        logger.info("Configuration validation complete!")
         
         # Set device
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -119,17 +98,26 @@ def train(config_path: str):
         if is_main_process:
             log_system_info()
         
-        # Validate directories
-        valid_dirs, total_images = validate_directories(config)
-        if is_main_process:
-            logger.info(f"Found {total_images} valid images across {len(valid_dirs)} directories")
-        config.data.image_dirs = valid_dirs
-        
         # Setup models
         logger.info("Setting up models...")
         unet, vae = setup_model(args, device, config)
         
-        # Apply memory optimizations and verify
+        # Setup memory optimizations first
+        batch_size = config.training.batch_size
+        micro_batch_size = batch_size // config.training.gradient_accumulation_steps
+        
+        memory_setup = setup_memory_optimizations(
+            model=unet,
+            config=config,
+            device=device,
+            batch_size=batch_size,
+            micro_batch_size=micro_batch_size
+        )
+        
+        if not memory_setup:
+            logger.warning("Memory optimizations setup failed")
+        
+        # Verify memory optimizations
         optimization_states = verify_memory_optimizations(
             model=unet,
             config=config,
@@ -144,15 +132,7 @@ def train(config_path: str):
                     logger.warning(f"- Failed to enable {opt}")
             logger.warning("Training will continue but may be less efficient")
         
-        # Create trainer
-        trainer = NovelAIDiffusionV3Trainer(
-            config_path=config_path,
-            model=unet,
-            vae=vae,
-            device=device
-        )
-        
-        # Create dataset with text embedder and tag weighter
+        # Create dataset config
         dataset_config = NovelAIDatasetConfig(
             image_size=config.data.image_size,
             max_image_size=config.data.max_image_size,
@@ -167,56 +147,46 @@ def train(config_path: str):
             text_cache_dir=config.data.text_cache_dir,
             use_caching=config.data.use_caching,
             proportion_empty_prompts=config.data.proportion_empty_prompts,
-            max_consecutive_batch_samples=2
+            max_consecutive_batch_samples=2,  # Fixed value as per dataset implementation
+            model_name=config.model.pretrained_model_name,
+            tag_weighting=config.tag_weighting
         )
         
+        # Create dataset using the proper interface
         dataset = NovelAIDataset(
             image_dirs=config.data.image_dirs,
-            text_embedder=TextEmbedder(
-                pretrained_model_name_or_path=config.model.pretrained_model_name,
-                device=device,
-                dtype=torch.bfloat16 if config.system.mixed_precision == "bf16" else torch.float32
-            ),
-            tag_weighter=TagWeighter(
-                config=TagWeightingConfig(**config.tag_weighting.__dict__)
-            ),
-            vae=vae,
             config=dataset_config,
+            vae=vae,
             device=device
         )
         
         if len(dataset) == 0:
             raise ValueError("Dataset contains no valid samples after initialization")
+            
+        logger.info(f"Dataset initialized with {len(dataset)} samples")
         
-        # Create sampler with batch size from training config
-        sampler = AspectBatchSampler(
-            dataset=dataset,
-            batch_size=config.training.batch_size,
-            drop_last=True,
-            shuffle=True
+        # Create trainer with dataset
+        trainer = NovelAIDiffusionV3Trainer(
+            config=config,
+            model=unet,
+            dataset=dataset,  # Pass dataset directly
+            device=device
         )
-        
-        # Create dataloader with data config settings
-        dataloader = DataLoader(
-            dataset,
-            batch_sampler=sampler,
-            num_workers=config.data.num_workers,
-            pin_memory=config.data.pin_memory,
-            persistent_workers=config.data.persistent_workers,
-            collate_fn=trainer.collate_fn
-        )
-        
-        # Assign dataloader to trainer
-        trainer.dataloader = dataloader
         
         # Train
         logger.info("Starting training...")
         for epoch in range(config.training.num_epochs):
-            trainer.train_epoch(epoch)
-            
-            # Save checkpoint
-            if is_main_process:
-                trainer.save_checkpoint(config.paths.checkpoints_dir, epoch)
+            try:
+                trainer.train_epoch(epoch)
+                
+                # Save checkpoint
+                if is_main_process:
+                    trainer.save_checkpoint(config.paths.checkpoints_dir, epoch)
+                    
+            except Exception as e:
+                logger.error(f"Error during epoch {epoch}: {str(e)}")
+                logger.error(traceback.format_exc())
+                raise
         
         logger.info("Training complete!")
         

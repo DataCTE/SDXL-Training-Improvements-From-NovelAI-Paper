@@ -25,21 +25,16 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
     
     def __init__(
         self,
-        config_path: str,
+        config: Config,
         model: Optional[UNet2DConditionModel] = None,
-        vae: Optional[AutoencoderKL] = None,
+        dataset: Optional[NovelAIDataset] = None,
         device: Optional[torch.device] = None
     ):
         """Initialize trainer with optimized memory usage."""
         super().__init__()
         
-        # Load and validate config
-        try:
-            self.config = Config.from_yaml(config_path)
-            logger.info(f"Successfully loaded config from {config_path}")
-        except Exception as e:
-            logger.error(f"Failed to load config from {config_path}: {str(e)}")
-            raise
+        # Store config
+        self.config = config
         
         # Setup device
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -53,23 +48,57 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             )
         self.model.to(self.device)
         
-        # Initialize VAE
-        self.vae = vae
-        if self.vae is not None:
-            self.vae.to(self.device)
+        # Configure noise scheduler and get parameters
+        try:
+            scheduler_params = configure_noise_scheduler(self.config, self.device)
+            self.scheduler = scheduler_params['scheduler']
+            self.sigmas = scheduler_params['sigmas']
+            self.snr_weights = scheduler_params['snr_weights']
+            self.c_skip = scheduler_params['c_skip']
+            self.c_out = scheduler_params['c_out']
+            self.c_in = scheduler_params['c_in']
+            self.num_train_timesteps = self.config.model.num_timesteps
+            logger.info("Successfully configured noise scheduler")
+        except Exception as e:
+            logger.error(f"Failed to configure noise scheduler: {str(e)}")
+            raise
         
         # Initialize training state
         self.global_step = 0
         self.current_epoch = 0
         self.optimizer = None
         self.lr_scheduler = None
-        self.dataloader = None
+        
+        # Get model dtype for consistent tensor operations
+        self.model_dtype = next(self.model.parameters()).dtype
         
         # Setup optimizer and scheduler
         self.setup_optimizer()
         
         # Configure model format and optimizations
-        self._setup_model_optimizations()
+        if not self._setup_model_optimizations():
+            logger.warning("Training will proceed without memory optimizations")
+            
+        # Setup dataset and dataloader
+        self.dataset = dataset
+        if self.dataset is not None:
+            # Use dataset's built-in sampler and dataloader creation
+            self.dataloader = DataLoader(
+                self.dataset,
+                batch_sampler=self.dataset.get_sampler(),
+                num_workers=config.data.num_workers,
+                pin_memory=config.data.pin_memory,
+                persistent_workers=config.data.persistent_workers
+            )
+            
+            # Calculate max_train_steps based on dataset size
+            steps_per_epoch = len(self.dataset) // self.config.training.batch_size
+            self.max_train_steps = steps_per_epoch * self.config.training.num_epochs
+            logger.info(f"Training will run for {self.max_train_steps} steps")
+        else:
+            self.dataloader = None
+            self.max_train_steps = None
+            logger.warning("No dataset provided, trainer initialized without data")
 
     def _setup_model_optimizations(self):
         """Setup model memory optimizations."""
@@ -92,6 +121,11 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                 micro_batch_size=micro_batch_size
             )
             
+            # Verify memory setup was successful
+            if not memory_setup:
+                logger.warning("Memory optimizations setup failed")
+                return False
+            
             # Verify optimizations
             optimization_states = verify_memory_optimizations(
                 model=self.model,
@@ -102,6 +136,10 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             
             if not all(optimization_states.values()):
                 logger.warning("Some memory optimizations failed to initialize")
+                return False
+                
+            logger.info("Memory optimizations setup completed successfully")
+            return True
                 
         except Exception as e:
             logger.error(f"Error setting up memory optimizations: {e}")
@@ -152,17 +190,6 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             logger.error(f"Error setting up optimizer: {e}")
             raise
 
-    def set_train_dataset_size(self, dataset_size: int):
-        """Set the dataset size and calculate max_train_steps if needed."""
-        if self.max_train_steps is None:
-            steps_per_epoch = dataset_size // (self.config.training.batch_size * self.config.training.gradient_accumulation_steps)
-            self.max_train_steps = steps_per_epoch * self.config.training.num_epochs
-            logger.info(f"Calculated max_train_steps: {self.max_train_steps}")
-            
-            # Now we can create the scheduler if it was pending
-            if self.config.training.lr_scheduler != "none" and self.lr_scheduler is None:
-                self.setup_optimizer()
-
     def compute_loss(
         self,
         model_pred: torch.Tensor,
@@ -196,7 +223,7 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                 torch.cuda.reset_peak_memory_stats()
                 start_mem = torch.cuda.memory_allocated() / 1024**2
             
-            # Process inputs
+            # Process inputs - now using dataset's processed data directly
             model_input = batch["model_input"].to(
                 device=self.device,
                 dtype=self.model_dtype,
@@ -204,11 +231,9 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                 non_blocking=True
             )
             
-            # Process embeddings
-            text_embeds = batch["text_embeds"]
-            encoder_hidden_states = text_embeds["text_embeds"].to(self.device, non_blocking=True)
-            pooled_embeds = text_embeds["pooled_text_embeds"].to(self.device, non_blocking=True)
-            tag_weights = batch["tag_weights"].to(self.device, non_blocking=True)
+            # Process embeddings - using dataset's processed embeddings
+            encoder_hidden_states = batch["text_embeds"].to(self.device, non_blocking=True)
+            pooled_embeds = batch["pooled_embeds"].to(self.device, non_blocking=True)
             
             # Sample timesteps
             timesteps = torch.randint(0, self.num_train_timesteps, (model_input.shape[0],), device=self.device)
@@ -221,13 +246,19 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                 model_input  # Use model_input as layout template
             )
             
+            # Get Karras noise schedule scalings
+            c_skip, c_out, c_in = get_karras_scalings(self.sigmas, timesteps)
+            c_skip = c_skip.to(dtype=self.model_dtype)
+            c_out = c_out.to(dtype=self.model_dtype)
+            c_in = c_in.to(dtype=self.model_dtype)
+            
             # Get sigmas and add noise
             sigmas = self.sigmas[timesteps].to(dtype=self.model_dtype)
             noisy_latents = model_input + sigmas[:, None, None, None] * noise
             
-            # Scale input
+            # Scale input based on prediction type
             if self.config.training.prediction_type == "v_prediction":
-                scaled_input = self.c_in[timesteps].to(dtype=self.model_dtype)[:, None, None, None] * noisy_latents
+                scaled_input = c_in[:, None, None, None] * noisy_latents
             else:
                 scaled_input = noisy_latents
                 
@@ -253,17 +284,17 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                 return_dict=False
             )[0]
             
-            # Get target
+            # Get target based on prediction type
             if self.config.training.prediction_type == "epsilon":
                 target = noise
             else:  # v_prediction
                 target = (
-                    self.c_skip[timesteps].to(dtype=self.model_dtype)[:, None, None, None] * model_input +
-                    self.c_out[timesteps].to(dtype=self.model_dtype)[:, None, None, None] * noise
+                    c_skip[:, None, None, None] * model_input +
+                    c_out[:, None, None, None] * noise
                 )
             
             # Compute loss
-            loss = self.compute_loss(model_pred, target, timesteps, tag_weights)
+            loss = self.compute_loss(model_pred, target, timesteps, batch["tag_weights"])
             
             # Backward pass
             loss.backward()
@@ -375,26 +406,6 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
     def set_dataloader(self, dataloader: DataLoader) -> None:
         """Set the dataloader."""
         self.dataloader = dataloader
-
-    @staticmethod
-    def create_dataloader(
-        dataset: NovelAIDataset,
-        batch_size: int,
-        pin_memory: bool = True
-    ) -> DataLoader:
-        """Create optimized dataloader."""
-        sampler = dataset.get_sampler(
-            batch_size=batch_size,
-            shuffle=True,
-            drop_last=True
-        )
-        
-        return DataLoader(
-            dataset,
-            batch_sampler=sampler,
-            num_workers=0,  # Force single process
-            pin_memory=pin_memory
-        )
 
     def __del__(self):
         """Remove wandb cleanup since it's handled by cleanup_logging"""

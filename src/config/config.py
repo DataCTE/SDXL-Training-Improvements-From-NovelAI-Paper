@@ -87,6 +87,9 @@ class DataConfig:
     text_cache_dir: str = "text_cache"
     use_caching: bool = True
     
+    # Text settings
+    max_token_length: int = 77  # Default CLIP token length
+    
     # VAE settings
     vae_batch_size: int = 32
     vae_image_size: Tuple[int, int] = (256, 256)
@@ -188,6 +191,12 @@ class NovelAIDatasetConfig:
     # Dataset settings
     proportion_empty_prompts: float = 0.0
     max_consecutive_batch_samples: int = 2
+    
+    # Model settings
+    model_name: str  # Required for text embedder
+    
+    # Tag weighting settings
+    tag_weighting: TagWeightingConfig = field(default_factory=TagWeightingConfig)
 
     def __post_init__(self):
         """Convert and validate configuration."""
