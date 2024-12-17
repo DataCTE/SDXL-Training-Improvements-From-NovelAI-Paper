@@ -254,21 +254,44 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
     def _setup_models(self):
         """Setup models with proper device and dtype."""
         try:
+            # Add debug logging
+            logger.info(f"CUDA available: {torch.cuda.is_available()}")
+            if torch.cuda.is_available():
+                logger.info(f"CUDA device count: {torch.cuda.device_count()}")
+                logger.info(f"Current CUDA device: {torch.cuda.current_device()}")
+            
+            logger.info(f"Target device: {self.device}")
+            logger.info(f"Target dtype: {self.model_dtype}")
+            
             # Check current device state
             current_model_device = next(self.model.parameters()).device
             current_vae_device = next(self.vae.parameters()).device
             
+            logger.info(f"Current model device: {current_model_device}")
+            logger.info(f"Current VAE device: {current_vae_device}")
+            
             # Only move if needed
             if current_model_device != self.device:
                 logger.info(f"Moving model from {current_model_device} to {self.device}")
-                self.model = self.model.to(device=self.device, dtype=self.model_dtype)
+                try:
+                    self.model = self.model.to(device=self.device, dtype=self.model_dtype)
+                    logger.info("Model move completed")
+                except Exception as e:
+                    logger.error(f"Error moving model: {str(e)}")
+                    logger.error(f"Model state dict keys: {self.model.state_dict().keys()}")
+                    raise
             elif next(self.model.parameters()).dtype != self.model_dtype:
                 logger.info(f"Converting model dtype to {self.model_dtype}")
                 self.model = self.model.to(dtype=self.model_dtype)
                 
             if current_vae_device != self.device:
                 logger.info(f"Moving VAE from {current_vae_device} to {self.device}")
-                self.vae = self.vae.to(device=self.device, dtype=self.model_dtype)
+                try:
+                    self.vae = self.vae.to(device=self.device, dtype=self.model_dtype)
+                    logger.info("VAE move completed")
+                except Exception as e:
+                    logger.error(f"Error moving VAE: {str(e)}")
+                    raise
             elif next(self.vae.parameters()).dtype != self.model_dtype:
                 logger.info(f"Converting VAE dtype to {self.model_dtype}")
                 self.vae = self.vae.to(dtype=self.model_dtype)
@@ -279,11 +302,16 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             self.vae.requires_grad_(False)
             
             # Verify final state
-            if next(self.model.parameters()).device != self.device:
-                logger.error(f"Model device mismatch: expected {self.device}, got {next(self.model.parameters()).device}")
+            final_model_device = next(self.model.parameters()).device
+            final_model_dtype = next(self.model.parameters()).dtype
+            logger.info(f"Final model device: {final_model_device}")
+            logger.info(f"Final model dtype: {final_model_dtype}")
+            
+            if final_model_device != self.device:
+                logger.error(f"Model device mismatch: expected {self.device}, got {final_model_device}")
                 raise RuntimeError("Model failed to move to correct device")
-            if next(self.model.parameters()).dtype != self.model_dtype:
-                logger.error(f"Model dtype mismatch: expected {self.model_dtype}, got {next(self.model.parameters()).dtype}")
+            if final_model_dtype != self.model_dtype:
+                logger.error(f"Model dtype mismatch: expected {self.model_dtype}, got {final_model_dtype}")
                 raise RuntimeError("Model failed to convert to correct dtype")
                 
         except Exception as e:

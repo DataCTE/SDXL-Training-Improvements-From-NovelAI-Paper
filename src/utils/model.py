@@ -76,19 +76,18 @@ def setup_model(
     device: Optional[torch.device],
     config: Config
 ) -> tuple[UNet2DConditionModel, AutoencoderKL]:
-    """Setup UNet and VAE models with error handling.
-    
-    Args:
-        args: Command line arguments
-        device: Optional device to move models to. If None, models stay on CPU
-        config: Configuration object
-        
-    Returns:
-        tuple[UNet2DConditionModel, AutoencoderKL]: Configured UNet and VAE models
-    """
+    """Setup UNet and VAE models with error handling."""
     try:
+        logger.info("Starting model setup...")
+        logger.info(f"Target device: {device}")
+        logger.info(f"CUDA available: {torch.cuda.is_available()}")
+        if torch.cuda.is_available():
+            logger.info(f"CUDA device count: {torch.cuda.device_count()}")
+            logger.info(f"Current CUDA device: {torch.cuda.current_device()}")
+        
         # Determine model dtype from config
         model_dtype = torch.bfloat16 if config.system.mixed_precision == "bf16" else torch.float32
+        logger.info(f"Using model dtype: {model_dtype}")
         pretrained_model_name = config.model.pretrained_model_name
         
         logger.info("Loading VAE...")
@@ -105,6 +104,7 @@ def setup_model(
                 subfolder="vae",
                 torch_dtype=model_dtype
             )
+        logger.info(f"VAE loaded, device: {next(vae.parameters()).device}")
             
         # Don't set eval/grad state here - let trainer handle it
         
@@ -144,11 +144,19 @@ def setup_model(
                 torch_dtype=model_dtype,
                 use_safetensors=True
             )
+        logger.info(f"UNet loaded, device: {next(unet.parameters()).device}")
         
         # Only move to device if device is specified
         if device is not None:
-            unet = unet.to(device)
-            vae = vae.to(device)
+            logger.info(f"Moving models to device: {device}")
+            try:
+                unet = unet.to(device)
+                logger.info(f"UNet moved to device: {next(unet.parameters()).device}")
+                vae = vae.to(device)
+                logger.info(f"VAE moved to device: {next(vae.parameters()).device}")
+            except Exception as e:
+                logger.error(f"Error moving models to device: {str(e)}")
+                raise
         
         return unet, vae
 

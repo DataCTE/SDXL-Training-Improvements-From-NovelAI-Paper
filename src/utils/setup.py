@@ -1,12 +1,14 @@
 import torch
 import os
 import logging
+import gc
 from accelerate import Accelerator
 from accelerate.utils.dataclasses import FullyShardedDataParallelPlugin
 from typing import Tuple, Dict, Any
 from src.config.config import Config
 import traceback
 from src.utils.model import configure_model_memory_format, is_xformers_installed
+from diffusers import DDPMScheduler
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +24,6 @@ def setup_memory_optimizations(
     """
     try:
         # Force garbage collection before setup
-        import gc
         try:
             gc.collect()
             torch.cuda.empty_cache()
@@ -293,8 +294,16 @@ def setup_memory_optimizations(
 def setup_accelerator(config: Config) -> Accelerator:
     """Setup accelerator with proper configuration and error handling."""
     try:
+        logger.info("Setting up accelerator...")
+        logger.info(f"Mixed precision setting: {config.system.mixed_precision}")
+        logger.info(f"CUDA available: {torch.cuda.is_available()}")
+        if torch.cuda.is_available():
+            logger.info(f"CUDA device count: {torch.cuda.device_count()}")
+            logger.info(f"Current CUDA device: {torch.cuda.current_device()}")
+        
         # Create FSDP plugin if enabled
         if config.system.use_fsdp:
+            logger.info("Creating FSDP plugin...")
             fsdp_plugin = FullyShardedDataParallelPlugin(
                 sharding_strategy="FULL_SHARD" if config.system.full_shard else "SHARD_GRAD_OP",
                 min_num_params=config.system.min_num_params_per_shard,
@@ -307,8 +316,10 @@ def setup_accelerator(config: Config) -> Accelerator:
                 sync_module_states=True,
             )
         else:
+            logger.info("FSDP not enabled")
             fsdp_plugin = None
 
+        logger.info("Creating accelerator...")
         accelerator = Accelerator(
             gradient_accumulation_steps=config.training.gradient_accumulation_steps,
             mixed_precision=config.system.mixed_precision,
@@ -318,7 +329,11 @@ def setup_accelerator(config: Config) -> Accelerator:
             fsdp_plugin=fsdp_plugin
         )
 
+        logger.info(f"Accelerator device: {accelerator.device}")
+        logger.info(f"Accelerator state: distributed={accelerator.distributed_type}, num_processes={accelerator.num_processes}")
+
         if config.system.use_fsdp and config.system.sync_batch_norm:
+            logger.info("Setting up sync batch norm...")
             import torch.nn as nn
             def convert_sync_batchnorm(module):
                 module_output = module
