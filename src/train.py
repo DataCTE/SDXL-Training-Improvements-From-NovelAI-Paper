@@ -33,7 +33,7 @@ def train(config_path: str):
         config = Config.from_yaml(args.config)
         
         # Setup distributed training if enabled
-        if config.system.distributed:
+        if config.system.distributed_training:
             setup_distributed()
             device = torch.device(f"cuda:{dist.get_rank()}")
             is_main_process = dist.get_rank() == 0
@@ -78,7 +78,7 @@ def train(config_path: str):
             logger.warning("Some memory optimizations failed to apply")
         
         # Convert models to DDP if using distributed training
-        if config.system.distributed:
+        if config.system.distributed_training:
             unet = torch.nn.SyncBatchNorm.convert_sync_batchnorm(unet)
             vae = torch.nn.SyncBatchNorm.convert_sync_batchnorm(vae)
             
@@ -145,7 +145,7 @@ def train(config_path: str):
         # Train
         logger.info("Starting training...")
         for epoch in range(config.training.num_epochs):
-            if config.system.distributed:
+            if config.system.distributed_training:
                 sampler.set_epoch(epoch)
             
             trainer.train_epoch(epoch)
