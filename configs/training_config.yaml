@@ -58,9 +58,9 @@ data:
     "/workspace/photo-concept-bucket/train"
   ]
   image_size: [1024, 1024]
-  max_image_size: [8192, 8192]
+  max_image_size: [2048, 2048]
   min_image_size: [256, 256]
-  max_dim: 8192
+  max_dim: 2048
   bucket_step: 8
   min_bucket_size: 16
   min_bucket_resolution: null
