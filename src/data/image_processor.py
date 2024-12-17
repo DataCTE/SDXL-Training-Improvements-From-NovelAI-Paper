@@ -29,6 +29,8 @@ class ImageProcessorConfig:
     num_workers: int = 4
     prefetch_factor: int = 2
     max_memory_usage: float = 0.9
+    max_image_size: Tuple[int, int] = (8192, 8192)
+    min_image_size: Tuple[int, int] = (256, 256)
 
 class ImageProcessor:
     def __init__(self, config: ImageProcessorConfig, bucket_manager: Optional[BucketManager] = None):

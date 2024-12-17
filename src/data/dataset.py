@@ -1,11 +1,13 @@
 # src/data/dataset.py
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 import torch
 from torch.utils.data import Dataset
 from pathlib import Path
 import logging
 from PIL import Image
 import time
+
+# Internal imports from data package
 from src.data.text_embedder import TextEmbedder
 from src.data.tag_weighter import TagWeighter
 from src.data.image_processor import ImageProcessor, ImageProcessorConfig
@@ -13,7 +15,23 @@ from src.data.cache_manager import CacheManager
 from src.data.batch_processor import BatchProcessor
 from src.data.bucket import BucketManager
 from src.data.thread_config import get_optimal_thread_config
-from src.data.utils import find_matching_files
+from src.data.utils import (
+    find_matching_files,
+    create_thread_pool,
+    get_optimal_workers,
+    calculate_optimal_batch_size,
+    get_system_resources,
+    log_system_info,
+    create_progress_stats,
+    process_in_chunks,
+    format_time,
+    load_and_validate_image,
+    get_image_stats,
+    validate_image_text_pair,
+    BatchConfig,
+    BatchProcessor
+)
+from src.data.utils.system_utils import calculate_chunk_size
 from src.config.config import NovelAIDatasetConfig
 
 logger = logging.getLogger(__name__)
@@ -29,6 +47,9 @@ class NovelAIDataset(Dataset):
         device: torch.device = torch.device('cuda')
     ):
         """Initialize NovelAI dataset with optimized components."""
+        # Log system info at startup
+        log_system_info("Dataset Initialization - ")
+        
         self.config = config
         self.device = device
         self.text_embedder = text_embedder
@@ -38,10 +59,22 @@ class NovelAIDataset(Dataset):
         # Get model dtype from VAE
         self.dtype = next(vae.parameters()).dtype
         
-        # Get optimal thread configuration
+        # Get optimal thread configuration and resources
         thread_config = get_optimal_thread_config()
+        resources = get_system_resources()
         
-        # Initialize bucket manager first
+        # Calculate optimal batch size based on GPU memory
+        optimal_batch_size = calculate_optimal_batch_size(
+            device=device,
+            min_batch_size=config.min_bucket_size,
+            max_batch_size=64,  # Adjustable maximum
+            target_memory_usage=0.9
+        )
+        
+        # Get optimal number of workers based on system resources
+        num_workers = get_optimal_workers(memory_per_worker_gb=1.0)  # 1GB per worker
+        
+        # Initialize components with optimized parameters
         self.bucket_manager = BucketManager(
             max_image_size=config.max_image_size,
             min_image_size=config.min_image_size,
@@ -51,99 +84,206 @@ class NovelAIDataset(Dataset):
             bucket_tolerance=config.bucket_tolerance
         )
 
-        # Initialize image processor with bucket manager
         self.image_processor = ImageProcessor(
             ImageProcessorConfig(
                 dtype=self.dtype,
                 device=device,
                 max_image_size=config.max_image_size,
-                min_image_size=config.min_image_size
+                min_image_size=config.min_image_size,
+                enable_memory_efficient_attention=True,
+                enable_vae_slicing=True,
+                vae_batch_size=optimal_batch_size,
+                num_workers=num_workers,
+                prefetch_factor=thread_config.prefetch_factor,
+                max_memory_usage=0.9
             ),
             bucket_manager=self.bucket_manager
         )
         
-        # Initialize cache manager
         self.cache_manager = CacheManager(
             cache_dir=config.cache_dir,
-            max_workers=thread_config.num_threads
+            max_workers=num_workers,
+            use_caching=config.use_caching
         )
         
-        # Initialize batch processor
+        # Initialize batch processor with optimized configuration
         self.batch_processor = BatchProcessor(
-            image_processor=self.image_processor,
-            cache_manager=self.cache_manager,
-            text_embedder=text_embedder,
-            vae=vae,
-            device=device,
-            max_consecutive_batch_samples=config.max_consecutive_batch_samples,
-            num_workers=thread_config.num_threads
+            config=BatchConfig(
+                batch_size=optimal_batch_size,
+                device=device,
+                dtype=self.dtype,
+                max_memory_usage=0.9,
+                prefetch_factor=thread_config.prefetch_factor,
+                log_interval=5.0
+            ),
+            executor=create_thread_pool(num_workers),
+            name="DatasetBatchProcessor"
         )
 
         # Process data and initialize items
         self.items = []
         self._process_data(image_dirs)
         
+        # Enhanced logging with system resource information
         logger.info(
             f"Initialized dataset with {len(self)} samples\n"
+            f"System Resources:\n"
+            f"- Available Memory: {resources.available_memory_gb:.1f}GB\n"
+            f"- GPU Memory: {resources.gpu_memory_total:.1f}GB total, "
+            f"{resources.gpu_memory_used:.1f}GB used\n"
+            f"- Workers: {num_workers}\n"
+            f"- Optimal Batch Size: {optimal_batch_size}\n"
+            f"\nConfig:\n"
+            f"- Max image size: {config.max_image_size}\n"
+            f"- Min image size: {config.min_image_size}\n"
+            f"- Bucket step: {config.bucket_step}\n"
+            f"- Max aspect ratio: {config.max_aspect_ratio}\n"
+            f"- Cache enabled: {config.use_caching}\n"
             f"Bucket stats: {self.bucket_manager.get_stats()}"
         )
 
     def _process_data(self, image_dirs: List[str]) -> None:
         """Process data and assign to buckets efficiently."""
-        start_time = time.time()
+        stats = create_progress_stats(0)
         
-        # Find all valid image files
-        image_files = []
-        for image_dir in image_dirs:
-            files = find_matching_files(
-                image_dir,
-                extensions={'.jpg', '.jpeg', '.png', '.webp'},
-                recursive=True,
-                require_text_pair=True
-            )
-            image_files.extend(files)
+        try:
+            # Find all valid image files
+            image_files = []
+            for image_dir in image_dirs:
+                files = find_matching_files(
+                    image_dir,
+                    extensions={'.jpg', '.jpeg', '.png', '.webp'},
+                    recursive=True,
+                    require_text_pair=True
+                )
+                image_files.extend(files)
+                
+            if not image_files:
+                raise ValueError("No valid image-text pairs found!")
             
-        if not image_files:
-            raise ValueError("No valid image-text pairs found!")
+            # Update total in progress stats
+            stats.total_items = len(image_files)
+            logger.info(f"Found {len(image_files)} potential image-text pairs")
             
-        # Process each image and prepare items
-        for img_path in image_files:
-            try:
-                # Load and validate image
-                with Image.open(img_path) as img:
-                    if img.mode not in ('RGB', 'RGBA'):
-                        img = img.convert('RGB')
-                    width, height = img.size
-                    
-                    # Find appropriate bucket
-                    bucket = self.bucket_manager.find_bucket(width, height)
-                    if bucket is None:
+            def process_chunk(chunk_files: List[str], chunk_id: int) -> Tuple[List[Dict], Dict[str, int]]:
+                chunk_items = []
+                chunk_stats = {'total': 0, 'errors': 0, 'error_types': {}, 'skipped': 0}
+                
+                for img_path in chunk_files:
+                    try:
+                        # Check if cache exists
+                        cache_paths = self.cache_manager.get_cache_paths(img_path)
+                        if all(path.exists() for path in cache_paths.values()):
+                            # Add to items without processing
+                            img = Image.open(img_path)
+                            width, height = img.size
+                            img.close()
+                            
+                            bucket = self.bucket_manager.find_bucket(width, height)
+                            if bucket is None:
+                                chunk_stats['error_types']['no_bucket'] = \
+                                    chunk_stats['error_types'].get('no_bucket', 0) + 1
+                                chunk_stats['errors'] += 1
+                                continue
+                                
+                            chunk_items.append({
+                                'image_path': img_path,
+                                'width': width,
+                                'height': height,
+                                'latent_cache': cache_paths['latent'],
+                                'text_cache': cache_paths['text'],
+                                'bucket_key': f"{bucket.width}x{bucket.height}"
+                            })
+                            chunk_stats['skipped'] += 1
+                            chunk_stats['total'] += 1
+                            continue
+                            
+                        # Process uncached images as before...
+                        # Load and validate image
+                        img = load_and_validate_image(
+                            img_path,
+                            min_size=self.config.min_image_size,
+                            max_size=self.config.max_image_size
+                        )
+                        
+                        if img is None:
+                            chunk_stats['error_types']['invalid_image'] = \
+                                chunk_stats['error_types'].get('invalid_image', 0) + 1
+                            chunk_stats['errors'] += 1
+                            continue
+                        
+                        # Validate text pair
+                        valid, reason = validate_image_text_pair(img_path)
+                        if not valid:
+                            chunk_stats['error_types'][reason] = \
+                                chunk_stats['error_types'].get(reason, 0) + 1
+                            chunk_stats['errors'] += 1
+                            continue
+                        
+                        # Get image stats
+                        img_stats = get_image_stats(img)
+                        
+                        # Find appropriate bucket
+                        bucket = self.bucket_manager.find_bucket(
+                            img_stats['width'], 
+                            img_stats['height']
+                        )
+                        if bucket is None:
+                            chunk_stats['error_types']['no_bucket'] = \
+                                chunk_stats['error_types'].get('no_bucket', 0) + 1
+                            chunk_stats['errors'] += 1
+                            continue
+                        
+                        # Get cache paths
+                        cache_paths = self.cache_manager.get_cache_paths(img_path)
+                        
+                        # Add to items
+                        chunk_items.append({
+                            'image_path': img_path,
+                            'width': img_stats['width'],
+                            'height': img_stats['height'],
+                            'latent_cache': cache_paths['latent'],
+                            'text_cache': cache_paths['text'],
+                            'bucket_key': f"{bucket.width}x{bucket.height}"
+                        })
+                        chunk_stats['total'] += 1
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing {img_path}: {e}")
+                        chunk_stats['error_types']['exception'] = \
+                            chunk_stats['error_types'].get('exception', 0) + 1
+                        chunk_stats['errors'] += 1
                         continue
-                    
-                    # Get cache paths
-                    cache_paths = self.cache_manager.get_cache_paths(img_path)
-                    
-                    # Add to items
-                    self.items.append({
-                        'image_path': img_path,
-                        'width': width,
-                        'height': height,
-                        'latent_cache': cache_paths['latent'],
-                        'text_cache': cache_paths['text'],
-                        'bucket_key': f"{bucket.width}x{bucket.height}"
-                    })
-                    
-            except Exception as e:
-                logger.error(f"Error processing {img_path}: {e}")
-                continue
-        
-        # Log processing stats
-        elapsed = time.time() - start_time
-        logger.info(
-            f"Processed {len(image_files)} files in {elapsed:.2f}s:\n"
-            f"- Valid items: {len(self.items)}\n"
-            f"- Success rate: {len(self.items)/len(image_files)*100:.1f}%"
-        )
+                
+                return chunk_items, chunk_stats
+            
+            # Process chunks in parallel
+            processed_items, final_stats = process_in_chunks(
+                items=image_files,
+                chunk_size=chunk_size,
+                process_fn=process_chunk,
+                num_workers=get_optimal_workers(),
+                progress_interval=5.0
+            )
+            
+            # Update items list
+            self.items = processed_items
+            
+            # Log final statistics
+            logger.info(
+                f"Data processing complete:\n"
+                f"- Total files: {len(image_files)}\n"
+                f"- Valid items: {len(self.items)}\n"
+                f"- Success rate: {len(self.items)/len(image_files)*100:.1f}%\n"
+                f"- Processing time: {format_time(final_stats['elapsed_seconds'])}\n"
+                f"- Error types:\n" + "\n".join(
+                    f"  - {k}: {v}" for k, v in final_stats['error_types'].items()
+                )
+            )
+            
+        except Exception as e:
+            logger.error(f"Fatal error in data processing: {e}")
+            raise
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """Get dataset item with cached data."""
