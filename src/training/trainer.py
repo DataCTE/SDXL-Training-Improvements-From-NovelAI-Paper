@@ -849,7 +849,7 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
 
 
     @staticmethod
-    def collate_fn(batch: List[Tuple]) -> Dict[str, Union[torch.Tensor, Dict[str, torch.Tensor], List[Tuple[int, int]]]:
+    def collate_fn(batch: List[Tuple]) -> Dict[str, Union[torch.Tensor, Dict[str, torch.Tensor], List[Tuple[int, int]]]]:
         """Efficiently collate batch data with optimal padding and dimension handling."""
         try:
             # Validate input batch
