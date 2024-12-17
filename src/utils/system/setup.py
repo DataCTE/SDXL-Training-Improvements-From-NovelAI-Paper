@@ -2,15 +2,11 @@ import torch
 import os
 import logging
 import gc
-from accelerate import Accelerator
-from accelerate.utils.dataclasses import FullyShardedDataParallelPlugin
 from typing import Tuple, Dict, Any
 from src.config.config import Config
 import traceback
-from src.utils.model import configure_model_memory_format, is_xformers_installed
-from diffusers import DDPMScheduler
+from src.utils.model.model import configure_model_memory_format, is_xformers_installed
 import torch.distributed as dist
-import torch.multiprocessing as mp
 
 logger = logging.getLogger(__name__)
 

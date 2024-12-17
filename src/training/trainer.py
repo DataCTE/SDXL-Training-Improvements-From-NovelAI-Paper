@@ -11,12 +11,12 @@ import wandb
 import traceback
 from src.config.config import Config
 from src.data.dataset import NovelAIDataset
-from src.utils.setup import setup_memory_optimizations, verify_memory_optimizations
-from src.utils.model import configure_model_memory_format
+from src.utils.system.setup import setup_memory_optimizations, verify_memory_optimizations
+from src.utils.model.model import configure_model_memory_format
 from src.training.scheduler import configure_noise_scheduler, get_karras_scalings
-from src.utils.noise import generate_noise
-from src.utils.embeddings import get_add_time_ids
-from src.utils.metrics import log_metrics as utils_log_metrics
+from src.utils.model.noise import generate_noise
+from src.utils.model.embeddings import get_add_time_ids
+from src.utils.logging.metrics import log_metrics as utils_log_metrics
 
 logger = logging.getLogger(__name__)
 

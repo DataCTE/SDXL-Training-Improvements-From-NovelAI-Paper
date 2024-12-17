@@ -4,10 +4,10 @@ import torch
 
 from src.data import NovelAIDataset, NovelAIDatasetConfig
 from src.training.trainer import NovelAIDiffusionV3Trainer
-from src.utils.model import setup_model
+from src.utils.model.model import setup_model
 from src.config.config import Config
-from src.utils.setup import verify_memory_optimizations, setup_memory_optimizations
-from src.utils.metrics import setup_logging, log_system_info, cleanup_logging
+from src.utils.system.setup import verify_memory_optimizations, setup_memory_optimizations
+from src.utils.logging.metrics import setup_logging, log_system_info, cleanup_logging
 import gc
 import traceback
 from src.config.arg_parser import parse_args
