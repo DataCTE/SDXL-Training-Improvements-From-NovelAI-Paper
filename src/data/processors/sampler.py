@@ -1,4 +1,4 @@
-from typing import List, Optional, Iterator, Dict
+from typing import List, Optional, Iterator, Dict, AsyncIterator
 import torch
 from torch.utils.data import Sampler
 import logging
