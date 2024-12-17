@@ -46,13 +46,18 @@ def get_sigmas(config: Config, device: torch.device) -> torch.Tensor:
         if sigma_max <= sigma_min:
             raise ValueError(f"sigma_max must be greater than sigma_min, got {sigma_max} <= {sigma_min}")
         
-        ramp = torch.linspace(0, 1, num_timesteps, device=device)
+        # Create tensor on CPU first
+        ramp = torch.linspace(0, 1, num_timesteps)
         min_inv_rho = sigma_min ** (1/rho)
         max_inv_rho = sigma_max ** (1/rho)
         
         sigmas = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** rho
         sigmas[0] = sigma_min  # First step
         sigmas[-1] = sigma_max  # ZTSNR step
+        
+        # Move to device at the end
+        sigmas = sigmas.to(device=device)
+        logger.info(f"Generated sigmas on device: {sigmas.device}")
         
         return sigmas
         
@@ -71,36 +76,39 @@ def get_scheduler_parameters(sigmas: torch.Tensor, config: Config, device: torch
         if not isinstance(device, torch.device):
             raise ValueError(f"Expected device to be torch.device, got {type(device)}")
             
-        alphas = 1 / (sigmas**2 + 1)
-        betas = 1 - alphas
-        alphas_cumprod = torch.cumprod(alphas, dim=0)
-        snr_values = 1 / (sigmas ** 2)
+        # Move sigmas to device if needed
+        sigmas = sigmas.to(device=device)
+        
+        # Compute parameters on device
+        alphas = (1 / (sigmas**2 + 1)).to(device=device)
+        betas = (1 - alphas).to(device=device)
+        alphas_cumprod = torch.cumprod(alphas, dim=0).to(device=device)
+        snr_values = (1 / (sigmas ** 2)).to(device=device)
         
         # Compute SNR weights if needed
         snr_weights = None
         if config.training.snr_gamma is not None:
             try:
-                snr_weights = torch.minimum(
-                    snr_values,
-                    torch.tensor(config.training.snr_gamma, device=device)
-                ).float()
+                gamma_tensor = torch.tensor(config.training.snr_gamma, device=device)
+                snr_weights = torch.minimum(snr_values, gamma_tensor).float()
             except RuntimeError as e:
                 logger.error(f"Error computing SNR weights: {str(e)}")
                 raise
         
         # Compute scaling factors based on prediction type
         if config.training.prediction_type == "v_prediction":
-            c_skip = 1 / (sigmas**2 + 1).sqrt()
-            c_out = -sigmas / (sigmas**2 + 1).sqrt()
-            c_in = 1 / (sigmas**2 + 1).sqrt()
+            c_skip = (1 / (sigmas**2 + 1).sqrt()).to(device=device)
+            c_out = (-sigmas / (sigmas**2 + 1).sqrt()).to(device=device)
+            c_in = (1 / (sigmas**2 + 1).sqrt()).to(device=device)
         elif config.training.prediction_type == "epsilon":
             c_skip = alphas_cumprod.sqrt()
             c_out = (1 - alphas_cumprod).sqrt()
-            c_in = torch.ones_like(sigmas)
+            c_in = torch.ones_like(sigmas, device=device)
         else:
             raise ValueError(f"Unknown prediction type: {config.training.prediction_type}")
             
-        return {
+        # Verify all tensors are on the correct device
+        params = {
             'alphas': alphas,
             'betas': betas,
             'alphas_cumprod': alphas_cumprod,
@@ -111,6 +119,13 @@ def get_scheduler_parameters(sigmas: torch.Tensor, config: Config, device: torch
             'c_out': c_out,
             'c_in': c_in
         }
+        
+        # Log device information for debugging
+        for name, param in params.items():
+            if isinstance(param, torch.Tensor):
+                logger.info(f"Parameter {name} on device: {param.device}")
+        
+        return params
         
     except Exception as e:
         logger.error(f"Error in get_scheduler_parameters: {str(e)}")
