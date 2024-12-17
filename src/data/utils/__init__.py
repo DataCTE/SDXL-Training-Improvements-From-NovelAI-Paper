@@ -40,8 +40,7 @@ from .batch_utils import (
     BatchConfig,
     BatchProcessor,
     create_tensor_buffer,
-    process_in_chunks,
-    process_in_chunks_sync
+    process_in_chunks
 )
 
 
@@ -84,6 +83,5 @@ __all__ = [
     'BatchConfig',
     'BatchProcessor',
     'create_tensor_buffer',
-    'process_in_chunks',
-    'process_in_chunks_sync'
+    'process_in_chunks'
 ] 
