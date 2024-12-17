@@ -39,12 +39,13 @@ def setup_memory_optimizations(
         
         # Configure model memory format with verification
         try:
-            original_format = model.conv_in.weight.data.memory_format
-            model = configure_model_memory_format(model, config)
-            # Verify memory format changed if it should have
-            if config.system.channels_last:
-                if model.conv_in.weight.data.memory_format == original_format:
-                    logger.warning("channels_last memory format may not have been applied")
+            if hasattr(model, 'conv_in') and hasattr(model.conv_in, 'weight'):
+                original_format = model.conv_in.weight.data.memory_format
+                model = configure_model_memory_format(model, config)
+                # Verify memory format changed if it should have
+                if config.system.channels_last:
+                    if model.conv_in.weight.data.memory_format == original_format:
+                        logger.warning("channels_last memory format may not have been applied")
         except Exception as e:
             logger.warning(f"Memory format optimization failed: {e}")
         
@@ -141,7 +142,10 @@ def setup_memory_optimizations(
                     logger.warning(f"{name} size mismatch: got {tensor.size()}, expected {expected_size}")
                 if tensor.dtype != expected_dtype:
                     logger.warning(f"{name} dtype mismatch: got {tensor.dtype}, expected {expected_dtype}")
-                if tensor.device != expected_device:
+                if tensor.device.type != expected_device.type or (
+                    expected_device.type == 'cuda' and 
+                    tensor.device.index != (expected_device.index if expected_device.index is not None else 0)
+                ):
                     logger.warning(f"{name} device mismatch: got {tensor.device}, expected {expected_device}")
                 return tensor
             
@@ -481,21 +485,32 @@ def verify_buffer_states(
             
         # Verify buffer properties
         for name, buffer in buffers.items():
+            if name == 'model':  # Skip the model key
+                continue
+                
             # Type check
             if not isinstance(buffer, torch.Tensor):
                 logger.warning(f"Buffer {name} is not a tensor")
                 buffer_states[f'{name}_type'] = False
                 continue
                 
-            # Device check    
-            if buffer.device != device:
-                logger.warning(f"Buffer {name} is on wrong device")
+            # Device type check (cuda vs cpu)
+            if buffer.device.type != device.type:
+                logger.warning(f"Buffer {name} device type mismatch: expected {device.type}, got {buffer.device.type}")
                 buffer_states[f'{name}_device'] = False
                 continue
                 
+            # For CUDA devices, verify index if specified
+            if device.type == 'cuda':
+                expected_index = device.index if device.index is not None else 0
+                if buffer.device.index != expected_index:
+                    logger.warning(f"Buffer {name} CUDA device index mismatch: expected {expected_index}, got {buffer.device.index}")
+                    buffer_states[f'{name}_device'] = False
+                    continue
+                
             # Dtype check
             if name != 'timestep_buffer' and buffer.dtype != model_dtype:
-                logger.warning(f"Buffer {name} has wrong dtype")
+                logger.warning(f"Buffer {name} has wrong dtype: expected {model_dtype}, got {buffer.dtype}")
                 buffer_states[f'{name}_dtype'] = False
                 continue
                 
@@ -508,7 +523,7 @@ def verify_buffer_states(
             # Shape check for batch dimension
             if name in ['noise_buffer', 'latent_buffer', 'timestep_buffer']:
                 if buffer.shape[0] != micro_batch_size:
-                    logger.warning(f"Buffer {name} has wrong batch dimension")
+                    logger.warning(f"Buffer {name} has wrong batch dimension: expected {micro_batch_size}, got {buffer.shape[0]}")
                     buffer_states[f'{name}_shape'] = False
                     continue
                     
