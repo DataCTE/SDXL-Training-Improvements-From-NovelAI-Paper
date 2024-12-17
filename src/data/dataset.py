@@ -17,9 +17,10 @@ from .processors.cache_manager import CacheManager
 from .processors.batch_processor import BatchProcessor
 from .processors.bucket import BucketManager
 from .processors.sampler import AspectBatchSampler
+from .processors.thread_config import get_optimal_thread_config
 
 # Internal imports from utils
-from .utils import (
+from .processors.utils import (
     find_matching_files,
     ensure_dir,
     get_file_size,
