@@ -32,6 +32,69 @@ def train(config_path: str):
         # Load config
         config = Config.from_yaml(args.config)
         
+        # Debug: Validate config before proceeding
+        logger.info("Validating configuration...")
+        logger.info(f"Data config:")
+        logger.info(f"- Image size: {config.data.image_size}")
+        logger.info(f"- Min size: {config.data.min_size}")
+        logger.info(f"- Max dim: {config.data.max_dim}")
+        logger.info(f"- Bucket step: {config.data.bucket_step}")
+        logger.info(f"- Min bucket size: {config.data.min_bucket_size}")
+        logger.info(f"- Bucket tolerance: {config.data.bucket_tolerance}")
+        logger.info(f"- Max aspect ratio: {config.data.max_aspect_ratio}")
+        logger.info(f"- Cache dir: {config.data.cache_dir}")
+        logger.info(f"- Text cache dir: {config.data.text_cache_dir}")
+        logger.info(f"- Num workers: {config.data.num_workers}")
+        logger.info(f"- Pin memory: {config.data.pin_memory}")
+        logger.info(f"- Persistent workers: {config.data.persistent_workers}")
+        
+        logger.info(f"\nTraining config:")
+        logger.info(f"- Batch size: {config.training.batch_size}")
+        logger.info(f"- Learning rate: {config.training.learning_rate}")
+        logger.info(f"- Num epochs: {config.training.num_epochs}")
+        logger.info(f"- Mixed precision: {config.training.mixed_precision}")
+        
+        logger.info(f"\nSystem config:")
+        logger.info(f"- Enable xformers: {config.system.enable_xformers}")
+        logger.info(f"- Channels last: {config.system.channels_last}")
+        logger.info(f"- Gradient checkpointing: {config.system.gradient_checkpointing}")
+        logger.info(f"- Memory efficient attention: {config.system.memory_efficient_attention}")
+        logger.info(f"- Mixed precision: {config.system.mixed_precision}")
+        
+        # Validate required directories exist
+        for dir_path in [
+            config.paths.checkpoints_dir,
+            config.paths.logs_dir,
+            config.paths.output_dir,
+            config.data.cache_dir,
+            config.data.text_cache_dir
+        ]:
+            if not os.path.exists(dir_path):
+                logger.info(f"Creating directory: {dir_path}")
+                os.makedirs(dir_path, exist_ok=True)
+        
+        # Validate image directories
+        for img_dir in config.data.image_dirs:
+            if not os.path.exists(img_dir):
+                raise ValueError(f"Image directory not found: {img_dir}")
+            logger.info(f"Found image directory: {img_dir}")
+        
+        # Validate model paths
+        if not os.path.exists(config.model.pretrained_model_name) and not config.model.pretrained_model_name.startswith(("stabilityai/", "runwayml/", "CompVis/")):
+            logger.warning(f"Model path may not be valid: {config.model.pretrained_model_name}")
+        
+        # Validate numeric parameters
+        if config.training.batch_size < 1:
+            raise ValueError(f"Invalid batch size: {config.training.batch_size}")
+        if config.training.learning_rate <= 0:
+            raise ValueError(f"Invalid learning rate: {config.training.learning_rate}")
+        if config.training.num_epochs < 1:
+            raise ValueError(f"Invalid number of epochs: {config.training.num_epochs}")
+        if config.data.num_workers < 0:
+            raise ValueError(f"Invalid number of workers: {config.data.num_workers}")
+        
+        logger.info("Configuration validation complete!")
+        
         # Set device
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         is_main_process = True  # Always True for single GPU
