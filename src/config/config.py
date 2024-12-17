@@ -154,6 +154,10 @@ class NovelAIDatasetConfig:
     use_caching: bool = True
     proportion_empty_prompts: float = 0.0
     
+    # Add batch-related fields
+    batch_size: int = 32
+    max_consecutive_batch_samples: int = 2
+    
     def __post_init__(self):
         """Convert single integers to tuples for sizes and validate."""
         if isinstance(self.image_size, int):
