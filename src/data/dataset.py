@@ -4,6 +4,7 @@ import torch
 from torch.utils.data import Dataset
 import logging
 import asyncio
+import gc
 
 # Internal imports from processors
 from .processors.text_processor import TextProcessor
@@ -53,7 +54,7 @@ class NovelAIDataset(Dataset):
         super().__init__()
         self.config = config
         self.device = device
-        self.vae = vae
+        self.vae = vae.eval()  # Ensure VAE is in eval mode
         
         # Create progress tracker for initialization
         tracker = create_progress_tracker(
@@ -68,8 +69,8 @@ class NovelAIDataset(Dataset):
             optimal_batch_size = calculate_optimal_batch_size(
                 device=device,
                 min_batch_size=config.min_bucket_size,
-                max_batch_size=64,
-                target_memory_usage=0.9
+                max_batch_size=32,  # Reduced from 64 to prevent memory issues
+                target_memory_usage=0.8  # Reduced from 0.9
             )
             num_workers = get_optimal_workers(memory_per_worker_gb=1.0)
             
@@ -79,7 +80,7 @@ class NovelAIDataset(Dataset):
                 device=device,
                 max_length=config.max_token_length,
                 enable_memory_efficient_attention=True,
-                max_memory_usage=0.9
+                max_memory_usage=0.8
             )
             update_tracker(tracker, processed=1)
 
@@ -129,13 +130,13 @@ class NovelAIDataset(Dataset):
                 vae_batch_size=optimal_batch_size,
                 num_workers=num_workers,
                 prefetch_factor=thread_config.prefetch_factor,
-                max_memory_usage=0.9
+                max_memory_usage=0.8
             ),
             bucket_manager=self.bucket_manager,
             vae=self.vae
         )
         
-        # Initialize cache manager
+        # Initialize cache manager with smaller memory cache
         self.cache_manager = CacheManager(
             cache_dir=config.cache_dir,
             max_workers=num_workers,
@@ -151,7 +152,7 @@ class NovelAIDataset(Dataset):
             device=device,
             batch_size=optimal_batch_size,
             prefetch_factor=thread_config.prefetch_factor,
-            max_memory_usage=0.9,
+            max_memory_usage=0.8,
             num_workers=num_workers
         )
 
@@ -165,7 +166,7 @@ class NovelAIDataset(Dataset):
         # Create cache directory
         ensure_dir(config.cache_dir)
         
-        # Process data and initialize items
+        # Process data and initialize items (store only paths and metadata, not tensors)
         self.items = []
         try:
             loop.run_until_complete(self._process_data(image_dirs))
@@ -173,6 +174,10 @@ class NovelAIDataset(Dataset):
             # Cleanup resources
             if hasattr(self.batch_processor, 'cleanup'):
                 loop.run_until_complete(self.batch_processor.cleanup())
+            
+            # Clear memory
+            torch.cuda.empty_cache()
+            gc.collect()
         
         # Create sampler for efficient batch processing
         self.sampler = AspectBatchSampler(
@@ -208,6 +213,44 @@ class NovelAIDataset(Dataset):
             f"\nBucket Stats:\n"
             f"{self.bucket_manager.get_stats()}"
         )
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        """Get dataset item with cached data."""
+        item = self.items[idx]
+        
+        try:
+            # Load cached latent and ensure it's on CPU
+            latent = self.cache_manager.load_latent(item['latent_cache'])
+            if latent.device.type != 'cpu':
+                latent = latent.cpu()
+            
+            # Load cached text data and ensure tensors are on CPU
+            text_data = self.cache_manager.load_text_data(item['text_cache'])
+            text_data = self.cache_manager._ensure_cpu_tensors(text_data)
+            
+            result = {
+                **item,
+                'latent': latent,
+                'text_embeds': text_data['embeds'],
+                'pooled_embeds': text_data['pooled_embeds'],
+                'tags': text_data['tags'],
+                'tag_weights': text_data.get('tag_weights', None)
+            }
+            
+            # Clear references to original data
+            del latent
+            del text_data
+            
+            # Clear cache periodically
+            if idx % 100 == 0:
+                self.cache_manager.clear_memory_cache()
+                torch.cuda.empty_cache()
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error loading item {idx}: {e}")
+            raise
 
     async def _process_data(self, image_dirs: List[str]) -> None:
         """Process all data files asynchronously with progress tracking."""
@@ -247,8 +290,15 @@ class NovelAIDataset(Dataset):
                     cache_manager=self.cache_manager
                 )
                 
+                # Store only paths and metadata, not tensors
+                for item in batch_processed:
+                    processed_items.append({
+                        'image_path': item['image_path'],
+                        'latent_cache': item['latent_cache'],
+                        'text_cache': item['text_cache']
+                    })
+                
                 # Update progress and stats
-                processed_items.extend(batch_processed)
                 update_tracker(tracker, processed=len(batch_processed))
                 
                 if stats.get('errors', 0) > 0:
@@ -265,50 +315,26 @@ class NovelAIDataset(Dataset):
                     log_progress(tracker, prefix="Processing dataset: ", extra_stats=extra_stats)
                 
                 # Clear memory periodically
-                if i % 100 == 0:
+                if i % 50 == 0:  # More frequent cleanup
+                    self.cache_manager.clear_memory_cache()
                     torch.cuda.empty_cache()
+                    gc.collect()
                     await asyncio.sleep(0.1)  # Small delay to allow memory to clear
+                
+                # Clear batch references
+                del batch_processed
             
-            # Store processed items
+            # Store only paths and metadata
             self.items = processed_items
             
             # Final cleanup
+            self.cache_manager.clear_memory_cache()
             torch.cuda.empty_cache()
+            gc.collect()
             
         except Exception as e:
             logger.error(f"Error processing dataset: {e}")
             raise
-
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        """Get dataset item with cached data."""
-        item = self.items[idx]
-        
-        try:
-            # Load cached latent
-            latent = self.cache_manager.load_latent(item['latent_cache'])
-            
-            # Load cached text data
-            text_data = self.cache_manager.load_text_data(item['text_cache'])
-            
-            return {
-                **item,
-                'latent': latent,
-                'text_embeds': text_data['embeds'],
-                'pooled_embeds': text_data['pooled_embeds'],
-                'tags': text_data['tags'],
-                'tag_weights': text_data.get('tag_weights', None)
-            }
-            
-        except Exception as e:
-            logger.error(f"Error loading item {idx}: {e}")
-            raise
-
-    def __len__(self) -> int:
-        return len(self.items)
-
-    def get_sampler(self) -> AspectBatchSampler:
-        """Get the aspect ratio-aware batch sampler."""
-        return self.sampler
 
     async def cleanup(self):
         """Clean up all resources."""
@@ -322,11 +348,31 @@ class NovelAIDataset(Dataset):
             if hasattr(self.cache_manager, 'cleanup'):
                 await self.cache_manager.cleanup()
             
-            # Clear CUDA cache
+            # Clear references to items
+            if hasattr(self, 'items'):
+                self.items.clear()
+            
+            # Clear sampler
+            if hasattr(self, 'sampler'):
+                del self.sampler
+            
+            # Clear CUDA cache and force garbage collection
             if self.device.type == 'cuda':
                 torch.cuda.empty_cache()
+            gc.collect()
                 
             logger.info("Successfully cleaned up all dataset resources")
             
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
+
+    def __del__(self):
+        """Ensure cleanup when object is deleted."""
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(self.cleanup())
+            else:
+                loop.run_until_complete(self.cleanup())
+        except Exception as e:
+            logger.error(f"Error during dataset deletion: {e}")

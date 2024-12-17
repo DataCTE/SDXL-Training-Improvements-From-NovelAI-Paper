@@ -6,6 +6,7 @@ from pathlib import Path
 from PIL import Image
 import asyncio
 import time
+import gc
 
 # Internal imports from utils
 from src.data.processors.utils.batch_utils import (
@@ -291,10 +292,12 @@ class BatchProcessor(GenericBatchProcessor):
                     for item in sub_batch:
                         cached = await cache_manager.get_cached_item(item['image_path'])
                         if cached:
-                            # Ensure cached tensors are moved to CPU
-                            if 'processed_image' in cached and cached['processed_image'].device.type != 'cpu':
-                                cached['processed_image'] = cached['processed_image'].cpu()
-                            cached_items.append({**item, **cached})
+                            # Store only paths and metadata
+                            cached_items.append({
+                                'image_path': cached['image_path'],
+                                'latent_cache': cached['latent_cache'],
+                                'text_cache': cached['text_cache']
+                            })
                             update_tracker(tracker, processed=1, cache_hits=1)
                         else:
                             uncached_items.append(item)
@@ -306,7 +309,7 @@ class BatchProcessor(GenericBatchProcessor):
                 if not sub_batch:
                     continue
 
-                # Process uncached items
+                # Process uncached items one at a time to minimize memory usage
                 for item in sub_batch:
                     try:
                         # Load and validate image
@@ -326,6 +329,7 @@ class BatchProcessor(GenericBatchProcessor):
                             if isinstance(img_tensor[0], torch.Tensor):
                                 img_tensor[0] = img_tensor[0].cpu()
                             
+                            # Create processed item with all data
                             processed_item = {
                                 **item,
                                 'processed_image': img_tensor[0],
@@ -333,22 +337,34 @@ class BatchProcessor(GenericBatchProcessor):
                                 'tags': text_result[1]
                             }
                             
-                            # Single point of caching
+                            # Cache immediately if enabled
                             if cache_manager is not None:
                                 await cache_manager.cache_item(item['image_path'], processed_item)
                             
-                            processed_items.append(processed_item)
+                            # Store only paths and metadata
+                            processed_items.append({
+                                'image_path': item['image_path'],
+                                'latent_cache': cache_manager.get_cache_paths(item['image_path'])['latent'],
+                                'text_cache': cache_manager.get_cache_paths(item['image_path'])['text']
+                            })
+                            
                             update_tracker(tracker, processed=1)
                             
-                            # Explicitly clear references and CUDA cache
+                            # Explicitly clear references
                             del img
                             del img_tensor
+                            del processed_item
+                            gc.collect()
                             torch.cuda.empty_cache()
                             await asyncio.sleep(0.01)
                             
                     except Exception as e:
                         logger.error(f"Error processing item {item['image_path']}: {e}")
                         update_tracker(tracker, failed=1, error_type=type(e).__name__)
+                    
+                    # Clear memory after each item
+                    gc.collect()
+                    torch.cuda.empty_cache()
                 
                 # Clear CUDA cache after each sub-batch
                 torch.cuda.empty_cache()

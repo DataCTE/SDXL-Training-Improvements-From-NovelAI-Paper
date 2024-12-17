@@ -1,8 +1,9 @@
 from PIL import Image
 import torch
+import logging
 from typing import Tuple, Optional, Dict
 from pathlib import Path
-import logging
+import gc
 
 logger = logging.getLogger(__name__)
 
@@ -13,14 +14,15 @@ def load_and_validate_image(
     required_modes: Tuple[str, ...] = ('RGB', 'RGBA')
 ) -> Optional[Image.Image]:
     """Load and validate an image file."""
+    img = None
     try:
-        with Image.open(path) as img:
+        with Image.open(path) as temp_img:
             # Validate mode
-            if img.mode not in required_modes:
-                img = img.convert('RGB')
+            if temp_img.mode not in required_modes:
+                temp_img = temp_img.convert('RGB')
                 
             # Validate dimensions
-            width, height = img.size
+            width, height = temp_img.size
             if width < min_size[0] or height < min_size[1]:
                 logger.debug(f"Image too small: {width}x{height} < {min_size}")
                 return None
@@ -29,11 +31,19 @@ def load_and_validate_image(
                 logger.debug(f"Image too large: {width}x{height} > {max_size}")
                 return None
                 
-            return img.copy()
+            # Make a copy to ensure file is closed
+            img = temp_img.copy()
             
     except Exception as e:
         logger.debug(f"Error loading image {path}: {e}")
         return None
+        
+    finally:
+        # Force garbage collection if we had any failed operations
+        if img is None:
+            gc.collect()
+            
+    return img
 
 def resize_image(
     img: Image.Image,
@@ -42,7 +52,15 @@ def resize_image(
 ) -> Image.Image:
     """Resize image if needed."""
     if img.size != target_size:
-        return img.resize(target_size, resampling)
+        try:
+            resized = img.resize(target_size, resampling)
+            # Close original if we created a new image
+            if resized is not img:
+                img.close()
+            return resized
+        except Exception as e:
+            logger.error(f"Error resizing image: {e}")
+            return img
     return img
 
 def get_image_stats(img: Image.Image) -> Dict:
@@ -52,7 +70,8 @@ def get_image_stats(img: Image.Image) -> Dict:
         'height': img.height,
         'mode': img.mode,
         'aspect_ratio': img.width / img.height,
-        'resolution': img.width * img.height
+        'resolution': img.width * img.height,
+        'memory_size': img.width * img.height * len(img.getbands())  # Approximate memory size in bytes
     }
 
 def validate_image_text_pair(
@@ -74,4 +93,14 @@ def validate_image_text_pair(
     if txt_path.stat().st_size < min_text_size:
         return False, "Text file empty"
         
-    return True, "Valid pair" 
+    return True, "Valid pair"
+
+def cleanup_image_resources(img: Optional[Image.Image] = None) -> None:
+    """Clean up image resources and force garbage collection."""
+    try:
+        if img is not None:
+            img.close()
+    except Exception as e:
+        logger.debug(f"Error closing image: {e}")
+    finally:
+        gc.collect()

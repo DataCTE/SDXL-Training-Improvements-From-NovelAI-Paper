@@ -11,6 +11,8 @@ from .progress_utils import (
     log_progress
 )
 from src.config.config import BatchConfig
+import gc
+from collections import WeakValueDictionary
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +83,37 @@ class BatchProcessor:
         self.name = name
         self.stats = ProgressStats(total_items=0)
         self.last_memory_check = time.time()
+        self._tensor_cache = WeakValueDictionary()
+        
+    def __del__(self):
+        """Cleanup when processor is deleted."""
+        self.cleanup()
+        
+    def cleanup(self):
+        """Clean up resources."""
+        try:
+            # Clear tensor cache
+            if hasattr(self, '_tensor_cache'):
+                self._tensor_cache.clear()
+            
+            # Clear CUDA cache if using GPU
+            if hasattr(self, 'config') and hasattr(self.config, 'device'):
+                if self.config.device.type == 'cuda':
+                    torch.cuda.empty_cache()
+                    
+            # Force garbage collection
+            gc.collect()
+            
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
+            
+    def _get_cached_tensor(self, key: str, shape: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+        """Get or create tensor from cache."""
+        tensor = self._tensor_cache.get(key)
+        if tensor is None or tensor.shape != shape or tensor.dtype != dtype:
+            tensor = torch.empty(shape, dtype=dtype, device=self.config.device)
+            self._tensor_cache[key] = tensor
+        return tensor
         
     def _should_adjust_batch_size(self) -> bool:
         """Check if it's time to adjust batch size."""
@@ -96,6 +129,13 @@ class BatchProcessor:
             return
             
         current_memory = get_gpu_memory_usage(self.config.device)
+        
+        # Force cleanup if memory usage is too high
+        if current_memory > 0.95:  # 95% memory usage
+            logger.warning("High memory usage detected, forcing cleanup")
+            self.cleanup()
+            current_memory = get_gpu_memory_usage(self.config.device)
+            
         self.config.batch_size = adjust_batch_size(
             current_batch_size=self.config.batch_size,
             max_batch_size=64,
@@ -152,12 +192,19 @@ class BatchProcessor:
                                     }
                                 )
                                 
-                            # Adjust batch size
+                            # Adjust batch size and cleanup if needed
                             self._adjust_batch_size()
+                            
+                            # Periodic cleanup
+                            if self.stats.processed_items % 1000 == 0:
+                                self.cleanup()
                             
                         except Exception as e:
                             logger.error(f"Error processing batch {start_idx}:{end_idx}: {e}")
                             update_tracker(self.stats, failed=len(batch_items))
+                            
+                            # Cleanup on error
+                            self.cleanup()
                             
                         finally:
                             if cleanup_fn:
@@ -176,13 +223,17 @@ class BatchProcessor:
                             f"OOM error, reducing batch size to {self.config.batch_size} "
                             f"(attempt {attempt + 1}/{retry_count})"
                         )
-                        torch.cuda.empty_cache()
+                        self.cleanup()  # Force cleanup on OOM
                         continue
                     raise
                     
         except Exception as e:
             logger.error(f"Error in batch processing: {e}")
             raise
+            
+        finally:
+            # Final cleanup
+            self.cleanup()
             
         return results
 

@@ -4,6 +4,7 @@ from typing import List, Dict, Any, Optional, Tuple
 import logging
 import asyncio
 from pathlib import Path
+import gc
 
 from src.data.processors.cache_manager import CacheManager
 from src.data.processors.utils.caption.text_embedder import TextEmbedder
@@ -67,11 +68,23 @@ class TextProcessor:
                         weights.append(weight)
                 
                 if weights:
-                    text_data['tag_weights'] = torch.tensor(
+                    weight_tensor = torch.tensor(
                         weights, 
                         device=self.device, 
                         dtype=torch.float32
                     )
+                    text_data['tag_weights'] = weight_tensor.cpu()
+                    del weight_tensor
+            
+            # Move all tensors to CPU immediately
+            for key, value in text_data.items():
+                if isinstance(value, torch.Tensor):
+                    text_data[key] = value.cpu()
+                    del value
+            
+            # Clear memory
+            gc.collect()
+            torch.cuda.empty_cache()
             
             return text_data, list(tag_dict.values())
             
@@ -108,12 +121,10 @@ class TextProcessor:
             for j, (text_data, tags) in enumerate(text_results):
                 if text_data is not None:
                     # Move tensors to CPU immediately
-                    if 'embeds' in text_data:
-                        text_data['embeds'] = text_data['embeds'].cpu()
-                    if 'pooled_embeds' in text_data:
-                        text_data['pooled_embeds'] = text_data['pooled_embeds'].cpu()
-                    if 'tag_weights' in text_data:
-                        text_data['tag_weights'] = text_data['tag_weights'].cpu()
+                    for key, value in text_data.items():
+                        if isinstance(value, torch.Tensor):
+                            text_data[key] = value.cpu()
+                            del value
                     
                     # Create cache item
                     cache_item = {
@@ -130,10 +141,13 @@ class TextProcessor:
             # Cache batch results immediately if cache manager is provided
             if cache_manager is not None and batch_results:
                 await cache_manager.cache_batch_items(batch_results)
+                # Clear batch results after caching
+                del batch_results[:]
             
-            # Clear GPU cache periodically
-            if i % (batch_size * 10) == 0:
-                torch.cuda.empty_cache()
+            # Clear memory after each batch
+            gc.collect()
+            torch.cuda.empty_cache()
+            await asyncio.sleep(0.01)
             
             # Log progress
             if tracker.should_log():
@@ -166,13 +180,16 @@ class TextProcessor:
             text_data, tags = await self.process_text(text)
             
             if text_data is not None:
-                # Move tensors to CPU
-                if 'embeds' in text_data:
-                    text_data['embeds'] = text_data['embeds'].cpu()
-                if 'pooled_embeds' in text_data:
-                    text_data['pooled_embeds'] = text_data['pooled_embeds'].cpu()
-                if 'tag_weights' in text_data:
-                    text_data['tag_weights'] = text_data['tag_weights'].cpu()
+                # Move tensors to CPU and clear GPU memory
+                for key, value in text_data.items():
+                    if isinstance(value, torch.Tensor):
+                        text_data[key] = value.cpu()
+                        del value
+                
+                # Clear text data after processing
+                del text
+                gc.collect()
+                torch.cuda.empty_cache()
             
             return text_data, tags
             
@@ -195,7 +212,28 @@ class TextProcessor:
             if self.tag_weighter and hasattr(self.tag_weighter, 'cleanup'):
                 await self.tag_weighter.cleanup()
             
+            # Clear any remaining tensors
+            for attr_name in dir(self):
+                attr = getattr(self, attr_name)
+                if isinstance(attr, torch.Tensor):
+                    delattr(self, attr_name)
+            
+            # Clear CUDA cache and force garbage collection
+            torch.cuda.empty_cache()
+            gc.collect()
+            
             logger.info("Successfully cleaned up text processor resources")
             
         except Exception as e:
             logger.error(f"Error during cleanup: {str(e)}")
+
+    def __del__(self):
+        """Ensure cleanup when object is deleted."""
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(self.cleanup())
+            else:
+                loop.run_until_complete(self.cleanup())
+        except Exception as e:
+            logger.error(f"Error during text processor deletion: {e}")

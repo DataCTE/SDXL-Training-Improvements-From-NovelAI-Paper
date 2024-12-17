@@ -5,9 +5,10 @@ import logging
 import math
 import time
 import traceback
+import gc
+import asyncio
 
 # Internal imports from utils
-
 from src.data.processors.utils.progress_utils import (
     create_progress_tracker,
     update_tracker,
@@ -62,7 +63,9 @@ class AspectBatchSampler(Sampler[List[int]]):
         if min_bucket_length < 1:
             raise ValueError(f"Min bucket length must be positive, got {min_bucket_length}")
         
-        self.dataset = dataset
+        # Store weak references to avoid memory leaks
+        from weakref import proxy
+        self.dataset = proxy(dataset)
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.drop_last = drop_last
@@ -133,7 +136,7 @@ class AspectBatchSampler(Sampler[List[int]]):
                     total += math.ceil(len(bucket) / self.batch_size)
         return total
 
-    async def __iter__(self) -> AsyncIterator[List[int]]:
+    async def __aiter__(self) -> AsyncIterator[List[int]]:
         """Create and yield batches for current epoch efficiently."""
         try:
             epoch_start = time.time()
@@ -227,6 +230,12 @@ class AspectBatchSampler(Sampler[List[int]]):
                             
                             yield batch
                             
+                            # Clear processed items and batch references
+                            del processed_items
+                            del batch_items
+                            gc.collect()
+                            torch.cuda.empty_cache()
+                            
                         # Log progress periodically
                         if tracker.should_log():
                             extra_stats = {
@@ -241,6 +250,11 @@ class AspectBatchSampler(Sampler[List[int]]):
                         logger.error(f"Error processing batch: {str(e)}")
                         logger.error(traceback.format_exc())
                         update_tracker(tracker, failed=len(batch), error_type='batch_processing_error')
+                        
+                        # Clear any failed batch data
+                        del batch_items
+                        gc.collect()
+                        torch.cuda.empty_cache()
                     
                 elif not self.drop_last and bucket.remaining_samples() > 0:
                     # Handle final partial batch similarly to regular batch
@@ -268,14 +282,30 @@ class AspectBatchSampler(Sampler[List[int]]):
                                 )
                                 yield final_batch
                                 
+                                # Clear final batch data
+                                del processed_items
+                                del batch_items
+                                gc.collect()
+                                torch.cuda.empty_cache()
+                                
                         except Exception as e:
                             logger.error(f"Error processing final batch: {str(e)}")
                             logger.error(traceback.format_exc())
                             update_tracker(tracker, failed=len(final_batch), error_type='final_batch_error')
                             
+                            # Clear any failed batch data
+                            del batch_items
+                            gc.collect()
+                            torch.cuda.empty_cache()
+                            
                     active_buckets.remove(selected_key)
                 else:
                     active_buckets.remove(selected_key)
+                
+                # Clear memory after each batch
+                gc.collect()
+                torch.cuda.empty_cache()
+                await asyncio.sleep(0.01)
             
             # Log final epoch stats
             epoch_time = time.time() - epoch_start
@@ -293,10 +323,51 @@ class AspectBatchSampler(Sampler[List[int]]):
             # Increment epoch
             self.epoch += 1
             
+            # Clear epoch data
+            del tracker
+            gc.collect()
+            torch.cuda.empty_cache()
+            
         except Exception as e:
             logger.error(f"Error in epoch iteration: {str(e)}")
             logger.error(traceback.format_exc())
             raise
+
+    async def cleanup(self):
+        """Clean up sampler resources."""
+        try:
+            # Clean up batch processor
+            if hasattr(self, 'batch_processor'):
+                await self.batch_processor.cleanup()
+                del self.batch_processor
+            
+            # Clear bucket references
+            if hasattr(self, 'bucket_manager'):
+                del self.bucket_manager
+            
+            # Clear dataset reference
+            if hasattr(self, 'dataset'):
+                del self.dataset
+            
+            # Clear any remaining data
+            gc.collect()
+            torch.cuda.empty_cache()
+            
+            logger.info("Successfully cleaned up sampler resources")
+            
+        except Exception as e:
+            logger.error(f"Error during sampler cleanup: {e}")
+
+    def __del__(self):
+        """Ensure cleanup when sampler is deleted."""
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(self.cleanup())
+            else:
+                loop.run_until_complete(self.cleanup())
+        except Exception as e:
+            logger.error(f"Error during sampler deletion: {e}")
 
     def __len__(self) -> int:
         return self.total_batches

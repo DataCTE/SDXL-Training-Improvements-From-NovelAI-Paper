@@ -1,10 +1,29 @@
 from pathlib import Path
 import os
 import shutil
-from typing import List, Set, Dict, Optional, Tuple
+from typing import List, Set, Dict, Optional, Tuple, Generator
 import logging
+import gc
+from contextlib import contextmanager
+import tempfile
+import time
 
 logger = logging.getLogger(__name__)
+
+@contextmanager
+def temp_file_handler(suffix: str = '.tmp') -> Generator[Path, None, None]:
+    """Context manager for handling temporary files with automatic cleanup."""
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            temp_path = Path(tmp.name)
+            yield temp_path
+    finally:
+        if temp_path and temp_path.exists():
+            try:
+                temp_path.unlink()
+            except Exception as e:
+                logger.error(f"Error cleaning up temp file {temp_path}: {e}")
 
 def ensure_dir(path: str) -> Path:
     """Ensure directory exists and return Path object."""
@@ -23,53 +42,74 @@ def find_matching_files(
     directory: str,
     extensions: Set[str],
     recursive: bool = True,
-    require_text_pair: bool = False
-) -> List[str]:
-    """Find files with given extensions, optionally requiring text pairs."""
+    require_text_pair: bool = False,
+    batch_size: int = 1000
+) -> Generator[str, None, None]:
+    """Find files with given extensions, optionally requiring text pairs.
+    Returns a generator to avoid loading all paths into memory at once."""
     directory = Path(directory)
     if not directory.exists():
         logger.warning(f"Directory not found: {directory}")
-        return []
+        return
         
     # Get all text files first if needed
     text_files = set()
     if require_text_pair:
-        text_files = {
-            os.path.splitext(f)[0]
-            for f in os.listdir(directory)
-            if f.endswith('.txt')
-        }
+        try:
+            text_files = {
+                os.path.splitext(f)[0]
+                for f in os.listdir(directory)
+                if f.endswith('.txt')
+            }
+        except Exception as e:
+            logger.error(f"Error reading text files: {e}")
+            return
     
-    # Find matching files
-    matched_files = []
+    # Find matching files in batches
     pattern = "**/*" if recursive else "*"
+    batch = []
     
     for ext in extensions:
-        for file_path in directory.glob(f"{pattern}{ext}"):
-            if not require_text_pair or os.path.splitext(file_path.name)[0] in text_files:
-                matched_files.append(str(file_path))
+        try:
+            for file_path in directory.glob(f"{pattern}{ext}"):
+                if not require_text_pair or os.path.splitext(file_path.name)[0] in text_files:
+                    batch.append(str(file_path))
+                    if len(batch) >= batch_size:
+                        yield from batch
+                        batch.clear()
+                        gc.collect()  # Help clean up path strings
+                        
+            # Yield remaining files
+            if batch:
+                yield from batch
+                batch.clear()
                 
-    return matched_files
+        except Exception as e:
+            logger.error(f"Error processing extension {ext}: {e}")
+            
+    # Clear text files set
+    text_files.clear()
+    gc.collect()
 
 def safe_file_write(path: str, data: bytes) -> bool:
-    """Write file atomically using temporary file."""
+    """Write file atomically using temporary file with proper cleanup."""
     path = Path(path)
-    tmp_path = path.with_suffix(path.suffix + '.tmp')
     
-    try:
-        # Write to temporary file
-        with open(tmp_path, 'wb') as f:
-            f.write(data)
+    with temp_file_handler(suffix='.tmp') as tmp_path:
+        try:
+            # Write to temporary file
+            with open(tmp_path, 'wb') as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())  # Ensure data is written to disk
+                
+            # Atomic rename
+            os.replace(tmp_path, path)
+            return True
             
-        # Atomic rename
-        os.replace(tmp_path, path)
-        return True
-        
-    except Exception as e:
-        logger.error(f"Error writing file {path}: {e}")
-        if tmp_path.exists():
-            tmp_path.unlink()
-        return False
+        except Exception as e:
+            logger.error(f"Error writing file {path}: {e}")
+            return False
 
 def get_cache_paths(
     base_path: str,
@@ -91,17 +131,37 @@ def get_cache_paths(
         for name, suffix in suffixes.items()
     }
 
-def cleanup_temp_files(directory: str, pattern: str = "*.tmp") -> int:
-    """Clean up temporary files in directory."""
+def cleanup_temp_files(
+    directory: str,
+    pattern: str = "*.tmp",
+    min_age_seconds: int = 3600  # 1 hour
+) -> int:
+    """Clean up temporary files in directory that are older than min_age_seconds."""
     directory = Path(directory)
     count = 0
+    current_time = time.time()
     
-    for tmp_file in directory.glob(pattern):
-        try:
-            tmp_file.unlink()
-            count += 1
-        except Exception as e:
-            logger.error(f"Error deleting {tmp_file}: {e}")
+    try:
+        for tmp_file in directory.glob(pattern):
+            try:
+                # Check file age
+                if current_time - tmp_file.stat().st_mtime > min_age_seconds:
+                    tmp_file.unlink()
+                    count += 1
+                    
+                    # Periodic GC to prevent memory buildup during large cleanups
+                    if count % 1000 == 0:
+                        gc.collect()
+                        
+            except Exception as e:
+                logger.error(f"Error deleting {tmp_file}: {e}")
+                
+    except Exception as e:
+        logger.error(f"Error during temp file cleanup: {e}")
+        
+    finally:
+        # Final cleanup
+        gc.collect()
             
     return count
 
@@ -110,7 +170,8 @@ def validate_image_text_pair(
     txt_path: Optional[str] = None,
     min_text_size: int = 1,
     max_text_size: int = 100000,  # 100KB max text size
-    required_text_encoding: str = 'utf-8'
+    required_text_encoding: str = 'utf-8',
+    chunk_size: int = 8192  # Read text in chunks
 ) -> Tuple[bool, str]:
     """Validate that an image-text pair exists and is valid.
     
@@ -120,6 +181,7 @@ def validate_image_text_pair(
         min_text_size: Minimum text file size in bytes
         max_text_size: Maximum text file size in bytes
         required_text_encoding: Required text file encoding
+        chunk_size: Size of chunks to read text file in
         
     Returns:
         Tuple of (is_valid, reason)
@@ -143,18 +205,28 @@ def validate_image_text_pair(
         return False, "Text file not found"
         
     # Check text file size
-    text_size = txt_path.stat().st_size
-    if text_size < min_text_size:
-        return False, "Text file empty"
-    if text_size > max_text_size:
-        return False, "Text file too large"
+    try:
+        text_size = txt_path.stat().st_size
+        if text_size < min_text_size:
+            return False, "Text file empty"
+        if text_size > max_text_size:
+            return False, "Text file too large"
+    except Exception as e:
+        return False, f"Error checking text file size: {str(e)}"
         
     # Check text file can be read with correct encoding
     try:
+        has_content = False
         with open(txt_path, 'r', encoding=required_text_encoding) as f:
-            text = f.read().strip()
-            if not text:
-                return False, "Text file contains only whitespace"
+            # Read in chunks to avoid loading entire file
+            while chunk := f.read(chunk_size):
+                if chunk.strip():
+                    has_content = True
+                    break
+                    
+        if not has_content:
+            return False, "Text file contains only whitespace"
+            
     except UnicodeDecodeError:
         return False, f"Text file not in {required_text_encoding} encoding"
     except Exception as e:

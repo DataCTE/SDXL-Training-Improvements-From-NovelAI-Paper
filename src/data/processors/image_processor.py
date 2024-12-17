@@ -8,6 +8,7 @@ import numpy as np
 import logging
 import torch.nn.functional as F
 import asyncio
+import gc
 
 # Internal imports from utils
 from src.data.processors.utils.system_utils import get_gpu_memory_usage, get_optimal_workers, create_thread_pool
@@ -211,9 +212,13 @@ class ImageProcessor:
                 for img in sub_batch:
                     tensor = self._process_single_image(img, width, height)
                     sub_processed.append(tensor)
+                    # Clear original image reference
+                    del img
                 
                 if sub_processed:
                     batch_tensor = torch.stack(sub_processed)
+                    # Clear individual tensors after stacking
+                    del sub_processed
                     
                     if self.vae_encoder is not None:
                         with torch.cuda.amp.autocast(dtype=self.config.dtype):
@@ -221,20 +226,28 @@ class ImageProcessor:
                     
                     # Move to CPU immediately and append
                     for tensor in batch_tensor:
-                        processed_tensors.append(tensor.cpu())
+                        cpu_tensor = tensor.cpu()
+                        processed_tensors.append(cpu_tensor)
+                        del tensor  # Clear GPU tensor immediately
                     
                     del batch_tensor
                     torch.cuda.empty_cache()
+                    gc.collect()
                     await asyncio.sleep(0.01)
                 
             except Exception as e:
                 logger.error(f"Error processing sub-batch: {e}")
+                # Create zero tensors on CPU directly
                 for _ in range(len(sub_batch)):
                     processed_tensors.append(
                         torch.zeros((4, height//8, width//8), 
                         dtype=self.config.dtype, 
                         device='cpu')
                     )
+            
+            # Clear memory after each sub-batch
+            torch.cuda.empty_cache()
+            gc.collect()
         
         return processed_tensors
 
@@ -387,22 +400,40 @@ class ImageProcessor:
         return width, height
 
     async def cleanup(self):
-        """Clean up resources asynchronously."""
+        """Clean up resources."""
         try:
             # Clean up thread pool
             if hasattr(self, 'executor'):
                 self.executor.shutdown(wait=True)
             
             # Clean up VAE encoder
-            if self.vae_encoder is not None:
+            if self.vae_encoder and hasattr(self.vae_encoder, 'cleanup'):
                 await self.vae_encoder.cleanup()
             
-            # Clear CUDA cache
-            if self.config.device.type == 'cuda':
-                torch.cuda.empty_cache()
-                
+            # Clear tensor buffer
+            if hasattr(self, 'tensor_buffer'):
+                del self.tensor_buffer
+            
+            # Clear transform pipeline
+            if hasattr(self, 'transform'):
+                del self.transform
+            
+            # Clear CUDA cache and force garbage collection
+            torch.cuda.empty_cache()
+            gc.collect()
+            
             logger.info("Successfully cleaned up image processor resources")
             
         except Exception as e:
             logger.error(f"Error during cleanup: {str(e)}")
-            # Don't re-raise as this is cleanup code
+
+    def __del__(self):
+        """Ensure cleanup when object is deleted."""
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(self.cleanup())
+            else:
+                loop.run_until_complete(self.cleanup())
+        except Exception as e:
+            logger.error(f"Error during image processor deletion: {e}")

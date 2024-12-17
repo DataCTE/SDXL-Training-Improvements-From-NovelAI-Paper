@@ -4,6 +4,8 @@ import logging
 import numpy as np
 import heapq
 from collections import defaultdict
+import gc
+from weakref import WeakValueDictionary
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +36,7 @@ class ImageBucket:
         """Clear all indices from bucket."""
         self.indices.clear()
         self.used_samples = 0
+        gc.collect()  # Help clean up any references
         
     def get_next_batch(self, batch_size: int) -> List[int]:
         """Get next batch of indices up to batch_size."""
@@ -62,7 +65,7 @@ class BucketManager:
         max_image_size: Tuple[int, int] = (2048, 2048),
         min_image_size: Tuple[int, int] = (256, 256),
         bucket_step: int = 64,
-        min_bucket_resolution: int = 65536,  # 256x256
+        min_bucket_resolution: int = 2048 * 2048,  # 2048x2048=
         max_aspect_ratio: float = 4.0,
         bucket_tolerance: float = 0.2
     ):
@@ -73,8 +76,8 @@ class BucketManager:
         self.max_aspect_ratio = max_aspect_ratio
         self.bucket_tolerance = bucket_tolerance
         
-        # Initialize buckets
-        self.buckets: Dict[str, ImageBucket] = {}
+        # Initialize buckets with WeakValueDictionary to help prevent memory leaks
+        self.buckets: Dict[str, ImageBucket] = WeakValueDictionary()
         self._create_buckets()
         
         # State tracking
@@ -154,6 +157,10 @@ class BucketManager:
                 current_width += self.bucket_step * 2
             else:
                 current_width += self.bucket_step
+        
+        # Clear temporary set
+        seen_resolutions.clear()
+        gc.collect()
             
         logger.info(f"Created {len(self.buckets)} buckets")
     
@@ -216,6 +223,9 @@ class BucketManager:
         # Shuffle if requested
         if shuffle:
             self.shuffle_buckets()
+        
+        # Clear memory after assignment
+        gc.collect()
     
     def shuffle_buckets(self, epoch: Optional[int] = None) -> None:
         """Shuffle indices within each bucket."""
@@ -228,6 +238,12 @@ class BucketManager:
                 self.rng.shuffle(indices)
                 bucket.indices = indices.tolist()
                 bucket.used_samples = 0
+                
+                # Clear numpy array
+                del indices
+        
+        # Clear memory after shuffling
+        gc.collect()
     
     def get_bucket_by_key(self, key: str) -> Optional[ImageBucket]:
         """Get bucket by resolution key (e.g. '512x512')."""
@@ -235,7 +251,7 @@ class BucketManager:
     
     def get_bucket_info(self) -> Dict[str, ImageBucket]:
         """Get mapping of resolution keys to buckets."""
-        return self.buckets.copy()
+        return dict(self.buckets)  # Create new dict to avoid WeakValueDictionary issues
     
     def get_stats(self) -> Dict:
         """Get comprehensive bucket statistics."""
@@ -273,3 +289,28 @@ class BucketManager:
                     width * height >= self.min_bucket_resolution)
         except (ValueError, TypeError):
             return False
+
+    def cleanup(self):
+        """Clean up bucket manager resources."""
+        try:
+            # Clear all buckets
+            for bucket in self.buckets.values():
+                bucket.clear()
+            
+            # Clear bucket dictionary
+            self.buckets.clear()
+            
+            # Clear random number generator
+            del self.rng
+            
+            # Force garbage collection
+            gc.collect()
+            
+            logger.info("Successfully cleaned up bucket manager resources")
+            
+        except Exception as e:
+            logger.error(f"Error during bucket manager cleanup: {e}")
+
+    def __del__(self):
+        """Ensure cleanup when bucket manager is deleted."""
+        self.cleanup()

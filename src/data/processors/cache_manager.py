@@ -76,7 +76,11 @@ class CacheManager:
                 tensor = tensor.detach().cpu()
             
             # Save tensor directly without buffering
-            torch.save(tensor, path, pickle_protocol=4)
+            torch.save(tensor, str(path), pickle_protocol=4)
+            
+            # Ensure file is written to disk
+            with open(path, 'rb') as f:
+                f.read(1)  # Force disk write
             
             # Clear reference and force garbage collection
             del tensor
@@ -98,10 +102,15 @@ class CacheManager:
                     cpu_data[key] = value
             
             # Save data directly without buffering
-            torch.save(cpu_data, path, pickle_protocol=4)
+            torch.save(cpu_data, str(path), pickle_protocol=4)
+            
+            # Ensure file is written to disk
+            with open(path, 'rb') as f:
+                f.read(1)  # Force disk write
             
             # Clear references
             del cpu_data
+            del data  # Also clear original data
             gc.collect()
             
         except Exception as e:
@@ -248,29 +257,37 @@ class CacheManager:
             # Get cache paths
             cache_paths = self.get_cache_paths(image_path)
             
-            # Save latent immediately
+            # Save latent immediately if present
             if 'processed_image' in item:
                 await self.save_latent_async(
                     cache_paths['latent'],
                     item['processed_image']
                 )
+                # Clear the tensor from the item dict after saving
+                del item['processed_image']
             
-            # Save text data immediately
+            # Save text data immediately if present
             if 'text_data' in item:
-                text_data = item['text_data']
+                text_data = item['text_data'].copy()  # Make a copy to avoid modifying original
                 if 'tag_weights' in item:
                     text_data['tag_weights'] = item['tag_weights']
                 await self.save_text_data_async(
                     cache_paths['text'],
                     text_data
                 )
+                # Clear the data from the item dict after saving
+                del item['text_data']
+                if 'tag_weights' in item:
+                    del item['tag_weights']
             
             # Update cache stats
             self.total_saved += 1
             
             # Clear memory cache periodically
-            if self.total_saved % 100 == 0:
+            if self.total_saved % 50 == 0:  # More frequent cleanup
                 self.memory_cache.clear()
+                gc.collect()
+                torch.cuda.empty_cache()
                 
         except Exception as e:
             logger.error(f"Error caching item {image_path}: {e}")
@@ -281,10 +298,7 @@ class CacheManager:
             return
             
         try:
-            # Group items by type to reduce disk I/O
-            latent_tasks = []
-            text_tasks = []
-            
+            # Process each item sequentially to avoid memory buildup
             for item in items:
                 if 'image_path' not in item:
                     continue
@@ -292,36 +306,35 @@ class CacheManager:
                 # Get cache paths
                 cache_paths = self.get_cache_paths(item['image_path'])
                 
-                # Queue latent caching if present
+                # Save latent immediately if present
                 if 'processed_image' in item:
-                    latent_tasks.append(
-                        self.save_latent_async(
-                            cache_paths['latent'],
-                            item['processed_image']
-                        )
+                    await self.save_latent_async(
+                        cache_paths['latent'],
+                        item['processed_image']
                     )
+                    del item['processed_image']  # Clear after saving
                 
-                # Queue text caching if present
+                # Save text data immediately if present
                 if 'text_data' in item:
-                    text_data = item['text_data']
+                    text_data = item['text_data'].copy()
                     if 'tag_weights' in item:
                         text_data['tag_weights'] = item['tag_weights']
-                    text_tasks.append(
-                        self.save_text_data_async(
-                            cache_paths['text'],
-                            text_data
-                        )
+                    await self.save_text_data_async(
+                        cache_paths['text'],
+                        text_data
                     )
+                    del item['text_data']  # Clear after saving
+                    if 'tag_weights' in item:
+                        del item['tag_weights']
+                
+                # Clear memory after each item
+                gc.collect()
+                torch.cuda.empty_cache()
             
-            # Execute all save operations in parallel
-            if latent_tasks:
-                await asyncio.gather(*latent_tasks)
-            if text_tasks:
-                await asyncio.gather(*text_tasks)
-            
-            # Clear memory cache periodically
-            if self.total_saved % 100 == 0:
-                self.memory_cache.clear()
+            # Final cleanup
+            self.memory_cache.clear()
+            gc.collect()
+            torch.cuda.empty_cache()
                 
         except Exception as e:
             logger.error(f"Error caching batch items: {e}")

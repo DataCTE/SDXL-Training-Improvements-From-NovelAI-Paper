@@ -141,7 +141,7 @@ def train(config_path: str):
             smoothing_factor=config.tag_weighting.smoothing_factor
         )
         
-        tag_weighter = TagWeighter(config=tag_weighter_config)
+        TagWeighter(config=tag_weighter_config)
         
         # Create dataset config
         dataset_config = NovelAIDatasetConfig(

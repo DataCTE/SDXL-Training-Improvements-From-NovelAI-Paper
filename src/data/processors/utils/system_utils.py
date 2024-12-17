@@ -6,6 +6,9 @@ from concurrent.futures import ThreadPoolExecutor
 from src.data.processors.utils.thread_config import get_optimal_cpu_threads
 from dataclasses import dataclass
 from pathlib import Path
+from weakref import WeakValueDictionary
+import gc
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -147,49 +150,73 @@ def calculate_optimal_batch_size(
     return optimal_size
 
 class MemoryCache:
-    """Memory cache with size limit and automatic cleanup."""
+    """Memory cache with size limit, automatic cleanup, and weak references."""
     
     def __init__(self, max_items: int = 1000):
         self.max_items = max_items
-        self.cache: Dict[str, Any] = {}
+        self.cache: WeakValueDictionary = WeakValueDictionary()
         self.hits = 0
         self.misses = 0
+        self._last_cleanup = time.time()
     
     def get(self, key: str) -> Optional[Any]:
         """Get item from cache."""
-        if key in self.cache:
-            self.hits += 1
-            return self.cache[key]
+        self._auto_cleanup()
+        try:
+            value = self.cache.get(key)
+            if value is not None:
+                self.hits += 1
+                return value
+        except KeyError:
+            pass
         self.misses += 1
         return None
     
     def set(self, key: str, value: Any) -> None:
         """Set item in cache with automatic cleanup."""
-        self.cache[key] = value
-        self._cleanup()
+        self._auto_cleanup()
+        try:
+            self.cache[key] = value
+            self._cleanup_if_needed()
+        except Exception as e:
+            logger.warning(f"Failed to cache item: {e}")
     
-    def _cleanup(self) -> None:
+    def _auto_cleanup(self) -> None:
+        """Periodically force garbage collection."""
+        current_time = time.time()
+        if current_time - self._last_cleanup > 300:  # Every 5 minutes
+            self.clear(force_gc=True)
+            self._last_cleanup = current_time
+    
+    def _cleanup_if_needed(self) -> None:
         """Clean up cache if it exceeds size limit."""
         if len(self.cache) > self.max_items:
             # Remove oldest items
             remove_keys = list(self.cache.keys())[:-self.max_items]
             for key in remove_keys:
-                del self.cache[key]
+                try:
+                    del self.cache[key]
+                except KeyError:
+                    pass
             logger.debug(
                 f"Cache cleanup: removed {len(remove_keys)} items, "
                 f"{len(self.cache)} remaining"
             )
     
-    def clear(self) -> None:
-        """Clear the cache."""
+    def clear(self, force_gc: bool = False) -> None:
+        """Clear the cache and optionally force garbage collection."""
         self.cache.clear()
+        if force_gc:
+            gc.collect()
     
     def get_stats(self) -> Dict[str, Any]:
         """Get cache statistics."""
+        total = self.hits + self.misses
         return {
             "size": len(self.cache),
             "max_size": self.max_items,
             "hits": self.hits,
             "misses": self.misses,
-            "hit_rate": self.hits / (self.hits + self.misses) if (self.hits + self.misses) > 0 else 0
+            "hit_rate": self.hits / total if total > 0 else 0,
+            "memory_usage_mb": get_memory_usage_gb() * 1024
         } 
