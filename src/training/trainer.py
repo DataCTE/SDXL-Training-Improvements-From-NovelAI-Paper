@@ -302,19 +302,6 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         # Initialize gradient accumulation state
         self.current_accumulation_step = 0
 
-    def compute_snr_weight(self, timesteps: torch.Tensor) -> torch.Tensor:
-        """Compute SNR weights efficiently.
-        
-        Args:
-            timesteps: Timestep indices
-            
-        Returns:
-            SNR weights tensor
-        """
-        if not hasattr(self, 'snr_weights') or self.snr_weights is None:
-            return None
-        
-        return self.snr_weights[timesteps]
 
     def compute_loss(
         self,
