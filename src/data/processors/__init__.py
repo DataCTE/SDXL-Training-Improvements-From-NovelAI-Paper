@@ -23,6 +23,7 @@ from .image_processor import ImageProcessor, ImageProcessorConfig
 from .cache_manager import CacheManager
 from .batch_processor import BatchProcessor
 from .sampler import AspectBatchSampler
+from .thread_config import get_optimal_thread_config
 
 __all__ = [
     'get_optimal_cpu_threads',
@@ -43,5 +44,6 @@ __all__ = [
     'ImageProcessorConfig',
     'CacheManager',
     'BatchProcessor',
-    'AspectBatchSampler'
+    'AspectBatchSampler',
+    'get_optimal_thread_config'
 ]
