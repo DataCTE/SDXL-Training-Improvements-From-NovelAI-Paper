@@ -876,6 +876,14 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
         prefetch_factor: int = 2
     ) -> DataLoader:
         """Create optimized dataloader."""
+        # Set multiprocessing start method to 'spawn' for CUDA compatibility
+        if torch.cuda.is_available():
+            try:
+                import multiprocessing as mp
+                mp.set_start_method('spawn', force=True)
+            except RuntimeError:
+                pass  # Method already set
+        
         # Convert ThreadConfig to int if needed
         if hasattr(num_workers, 'num_threads'):
             num_workers = num_workers.num_threads
@@ -887,6 +895,27 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             drop_last=True
         )
 
+        @staticmethod
+        def _worker_init_fn(worker_id: int) -> None:
+            """Initialize worker with optimized settings."""
+            # Set worker seed for reproducibility
+            worker_seed = torch.initial_seed() % 2**32
+            np.random.seed(worker_seed)
+            random.seed(worker_seed)
+            
+            # Set thread settings for worker
+            torch.set_num_threads(1)
+            
+            if torch.cuda.is_available():
+                # Clear CUDA cache
+                torch.cuda.empty_cache()
+                
+                # Set device to GPU 0
+                try:
+                    torch.cuda.set_device(0)  # Always use first GPU
+                except Exception as e:
+                    logger.warning(f"Could not set GPU device for worker {worker_id}: {e}")
+
         return DataLoader(
             dataset,
             batch_sampler=sampler,
@@ -894,40 +923,10 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             pin_memory=pin_memory,
             persistent_workers=persistent_workers and num_workers > 0,
             prefetch_factor=prefetch_factor if num_workers > 0 else None,
-            worker_init_fn=NovelAIDiffusionV3Trainer._worker_init_fn,  # Reference the static method through the class
-            collate_fn=NovelAIDiffusionV3Trainer.collate_fn  # Add the collate_fn
+            worker_init_fn=NovelAIDiffusionV3Trainer._worker_init_fn,
+            collate_fn=NovelAIDiffusionV3Trainer.collate_fn,
+            multiprocessing_context='spawn' if torch.cuda.is_available() else None
         )
-
-    @staticmethod
-    def _worker_init_fn(worker_id: int) -> None:
-        """Initialize worker with optimized settings.
-        
-        Args:
-            worker_id: ID of the worker process
-        """
-        # Set worker seed for reproducibility
-        worker_seed = torch.initial_seed() % 2**32
-        np.random.seed(worker_seed)
-        random.seed(worker_seed)
-        
-        # Set thread settings for worker
-        torch.set_num_threads(1)  # Limit threads per worker
-        
-        if torch.cuda.is_available():
-            # Pin memory for faster data transfer
-            torch.cuda.empty_cache()
-            
-            # Set device affinity if possible
-            try:
-                # Get number of GPUs
-                num_gpus = torch.cuda.device_count()
-                if num_gpus > 0:
-                    # Assign worker to GPU round-robin
-                    gpu_id = worker_id % num_gpus
-                    torch.cuda.set_device(gpu_id)
-            except Exception as e:
-                logger.warning(f"Could not set GPU affinity for worker {worker_id}: {e}")
-    
 
     def save_checkpoint(self, path: str):
         """Save checkpoint efficiently.
