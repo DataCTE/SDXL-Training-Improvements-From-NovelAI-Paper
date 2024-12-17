@@ -194,6 +194,7 @@ class NovelAIDatasetConfig:
     # Dataset settings
     proportion_empty_prompts: float = 0.0
     max_consecutive_batch_samples: int = 2
+    max_token_length: int = 77  # Default CLIP token length
     
     # Tag weighting settings
     tag_weighting: TagWeightingConfig = field(default_factory=TagWeightingConfig)

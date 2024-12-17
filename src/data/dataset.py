@@ -17,7 +17,6 @@ from .processors.cache_manager import CacheManager
 from .processors.batch_processor import BatchProcessor
 from .processors.bucket import BucketManager
 from .processors.sampler import AspectBatchSampler
-from .processors.thread_config import get_optimal_thread_config
 
 # Internal imports from utils
 from .processors.utils import (
@@ -37,7 +36,8 @@ from .processors.utils import (
     format_time,
     log_progress,
     load_and_validate_image,
-    get_image_stats
+    get_image_stats,
+    get_optimal_thread_config
 )
 
 # Config import
