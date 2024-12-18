@@ -50,22 +50,12 @@ class CacheManager:
         )
 
     def get_cache_paths(self, image_path: str) -> Dict[str, Path]:
-        """Get cache paths and validate they exist."""
+        """Get cache file paths and check existence."""
         stem = Path(image_path).stem
         paths = {
             'latent': self.latent_cache / f"{stem}.pt",
             'text': self.text_cache / f"{stem}.pt"
         }
-        
-        # Log cache status
-        for name, path in paths.items():
-            if path.exists():
-                logger.debug(f"Cache hit for {name}: {path}")
-                self.cache_hits += 1
-            else:
-                logger.debug(f"Cache miss for {name}: {path}")
-                self.cache_misses += 1
-                
         return paths
 
     async def save_latent_async(self, path: Path, tensor: torch.Tensor) -> None:
@@ -249,7 +239,7 @@ class CacheManager:
             return None
 
     async def cache_item(self, image_path: str, item: Dict[str, Any]) -> None:
-        """Cache both latent and text data for an item asynchronously."""
+        """Write latents/text to files as needed."""
         if not self.use_caching:
             return
             

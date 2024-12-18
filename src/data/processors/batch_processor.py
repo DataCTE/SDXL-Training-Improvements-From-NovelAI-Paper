@@ -246,24 +246,24 @@ class BatchProcessor(GenericBatchProcessor):
             )
             
             processed_items = []
-            
-            # Process in somewhat larger sub-batches
             sub_batch_size = min(8, self.config.batch_size)
+
             for i in range(0, len(batch_items), sub_batch_size):
                 sub_batch = batch_items[i:i + sub_batch_size]
-                
-                # Check cache first if enabled
+
+                # Efficiently check if latents are already cached
+                # so we can skip loading and processing images
                 if cache_manager is not None:
                     cached_items = []
                     uncached_items = []
+                    
                     for item in sub_batch:
-                        cached = await cache_manager.get_cached_item(item['image_path'])
-                        if cached:
-                            # Store only paths and metadata
+                        cache_paths = cache_manager.get_cache_paths(item['image_path'])
+                        if cache_paths['latent'].exists():
                             cached_items.append({
-                                'image_path': cached['image_path'],
-                                'latent_cache': cached['latent_cache'],
-                                'text_cache': cached['text_cache']
+                                'image_path': item['image_path'],
+                                'latent_cache': cache_paths['latent'],
+                                'text_cache': cache_paths['text']
                             })
                             update_tracker(tracker, processed=1, cache_hits=1)
                         else:
@@ -276,7 +276,6 @@ class BatchProcessor(GenericBatchProcessor):
                 if not sub_batch:
                     continue
 
-                # Process uncached items one at a time to minimize memory usage
                 for item in sub_batch:
                     try:
                         # Load and validate image
@@ -290,47 +289,38 @@ class BatchProcessor(GenericBatchProcessor):
                         text_result = await self.text_processor.process_text_file(
                             Path(item['image_path']).with_suffix('.txt')
                         )
-                        
+
                         if img_tensor and text_result:
-                            # Move tensors to CPU before caching
                             if isinstance(img_tensor[0], torch.Tensor):
                                 img_tensor[0] = img_tensor[0].cpu()
-                            
-                            # Create processed item with all data
+
                             processed_item = {
                                 **item,
                                 'processed_image': img_tensor[0],
                                 'text_data': text_result[0],
                                 'tags': text_result[1]
                             }
-                            
-                            # Cache immediately if enabled
+
+                            # Cache latents if enabled
                             if cache_manager is not None:
                                 await cache_manager.cache_item(item['image_path'], processed_item)
-                            
-                            # Store only paths and metadata
+
+                            # Track results
                             processed_items.append({
                                 'image_path': item['image_path'],
                                 'latent_cache': cache_manager.get_cache_paths(item['image_path'])['latent'],
                                 'text_cache': cache_manager.get_cache_paths(item['image_path'])['text']
                             })
-                            
                             update_tracker(tracker, processed=1)
-                            
-                            # Explicitly clear references
-                            del img
-                            del img_tensor
-                            del processed_item
+
+                            del img, img_tensor, processed_item
                             await asyncio.sleep(0.01)
-                            
+
                     except Exception as e:
                         logger.error(f"Error processing item {item['image_path']}: {e}")
                         update_tracker(tracker, failed=1, error_type=type(e).__name__)
-                    
-                    # Clear memory after each item
-                    await asyncio.sleep(0.01)
-                
-                # Clear CUDA cache after each sub-batch
+
+                # Clear cache after each sub-batch
                 torch.cuda.empty_cache()
                 await asyncio.sleep(0.01)
 
