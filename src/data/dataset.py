@@ -131,8 +131,13 @@ class NovelAIDataset(Dataset):
             self.sampler = AspectBatchSampler(
                 dataset=self,
                 batch_size=self.config.batch_size,
-                bucket_manager=self.bucket_manager,
-                batch_processor=self.batch_processor
+                shuffle=self.config.shuffle,
+                drop_last=self.config.drop_last,
+                max_consecutive_batch_samples=self.config.max_consecutive_batch_samples,
+                min_bucket_length=self.config.min_bucket_length,
+                debug_mode=self.config.debug_mode,
+                prefetch_factor=self.config.prefetch_factor,
+                bucket_manager=self.bucket_manager
             )
             
         except Exception as e:

@@ -342,6 +342,13 @@ class NovelAIDatasetConfig:
     text_processor_config: Dict[str, Any] = field(default_factory=dict)
     text_embedder_config: 'TextEmbedderConfig' = field(default_factory=lambda: TextEmbedderConfig())
     batch_size: int = DEFAULT_BATCH_SIZE
+    
+    # Add the missing parameters
+    shuffle: bool = True  # Default value
+    drop_last: bool = False  # Default value
+    max_consecutive_batch_samples: int = 2  # Default value
+    min_bucket_length: int = 1  # Default value
+    debug_mode: bool = False  # Default value
 
     def __post_init__(self):
         # Convert image sizes to tuples if needed
