@@ -431,6 +431,6 @@ class ImageProcessorConfig(DeviceConfig):
     vae_batch_size: int = DEFAULT_BATCH_SIZE
     num_workers: int = DEFAULT_NUM_WORKERS
     prefetch_factor: int = DEFAULT_PREFETCH_FACTOR
-    # We can let the parent DeviceConfig handle max_memory_usage, etc.,
-    # but you can add them here if you prefer to override default values.
+    normalize_mean: Tuple[float, ...] = (0.5, 0.5, 0.5)
+    normalize_std: Tuple[float, ...] = (0.5, 0.5, 0.5)
     
