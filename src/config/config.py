@@ -22,6 +22,15 @@ DEFAULT_LR = 4.0e-7
 DEFAULT_VAE_LR = 4.5e-5
 DEFAULT_DISC_LR = 4.5e-5
 
+
+@dataclass
+class DeviceConfig:
+    device: torch.device = torch.device('cuda')
+    dtype: torch.dtype = torch.float16
+    max_memory_usage: float = 0.9
+    enable_memory_efficient_attention: bool = True
+
+
 @dataclass
 class VAEModelConfig:
     latent_channels: int = 3
@@ -200,93 +209,6 @@ class PathsConfig:
     tag_weights_path: Optional[str] = "tag_weights.json"
 
 @dataclass
-class TextEmbedderConfig(DeviceConfig):
-    max_length: int = DEFAULT_MAX_TOKEN_LENGTH
-    batch_size: int = DEFAULT_BATCH_SIZE
-    model_name: str = DEFAULT_MODEL_NAME
-    
-    # Model settings
-    use_fast_tokenizer: bool = True
-    low_cpu_mem_usage: bool = True
-    
-    # Performance settings
-    growth_factor: float = 0.3
-    proportion_empty_prompts: float = 0.0
-    
-    # Subfolder settings
-    tokenizer_subfolder: str = "tokenizer"
-    tokenizer_2_subfolder: str = "tokenizer_2"
-    text_encoder_subfolder: str = "text_encoder"
-    text_encoder_2_subfolder: str = "text_encoder_2"
-
-@dataclass
-class NovelAIDatasetConfig:
-    model_name: str = DEFAULT_MODEL_NAME
-    image_size: Tuple[int, int] = DEFAULT_IMAGE_SIZE
-    max_image_size: Tuple[int, int] = DEFAULT_MAX_IMAGE_SIZE
-    min_image_size: Union[Tuple[int, int], int] = DEFAULT_MIN_IMAGE_SIZE
-    max_dim: int = 2048
-    
-    # Bucket settings
-    bucket_step: int = 8
-    min_bucket_size: int = 16
-    min_bucket_resolution: Optional[int] = None
-    bucket_tolerance: float = 0.2
-    max_aspect_ratio: float = 2.0
-    
-    # Cache settings
-    cache_dir: str = DEFAULT_CACHE_DIR
-    text_cache_dir: str = "text_cache"
-    use_caching: bool = True
-    skip_cached_latents: bool = True
-    
-    # Dataset settings
-    proportion_empty_prompts: float = 0.0
-    max_consecutive_batch_samples: int = 2
-    max_token_length: int = DEFAULT_MAX_TOKEN_LENGTH
-    image_dirs: List[str] = field(default_factory=list)
-    
-    # Tag weighting settings
-    tag_weighting: TagWeighterConfig = field(default_factory=TagWeighterConfig)
-    use_tag_weighting: bool = True
-    tag_weight_ranges: Dict[str, Tuple[float, float]] = field(default_factory=lambda: {
-        'character': (0.8, 1.2),
-        'style': (0.7, 1.3),
-        'quality': (0.6, 1.4),
-        'artist': (0.5, 1.5)
-    })
-    tag_weights_path: Optional[str] = "./latents/latent_weights.json"
-    text_embedder_config: TextEmbedderConfig = field(default_factory=lambda: TextEmbedderConfig(
-        model_name="stabilityai/stable-diffusion-xl-base-1.0",
-        # Add other parameters as needed
-    ))
-
-    def __post_init__(self):
-        """Convert and validate configuration."""
-        # Convert image sizes to tuples if needed
-        if isinstance(self.image_size, (list, tuple)):
-            self.image_size = tuple(self.image_size)
-        if isinstance(self.max_image_size, (list, tuple)):
-            self.max_image_size = tuple(self.max_image_size)
-        if isinstance(self.min_image_size, (list, tuple)):
-            self.min_image_size = tuple(self.min_image_size)
-        elif isinstance(self.min_image_size, int):
-            self.min_image_size = (self.min_image_size, self.min_image_size)
-            
-        # Set min_bucket_resolution if not specified
-        if self.min_bucket_resolution is None:
-            self.min_bucket_resolution = min(self.min_image_size)
-
-        # Validate tag weighting settings
-        if self.use_tag_weighting and not self.tag_weight_ranges:
-            logger.warning("Tag weighting enabled but no ranges specified, using defaults")
-            
-        # Ensure tag weights path exists if specified
-        if self.tag_weights_path:
-            self.tag_weights_path = Path(self.tag_weights_path)
-            self.tag_weights_path.parent.mkdir(parents=True, exist_ok=True)
-
-@dataclass
 class DeviceConfig:
     device: torch.device = torch.device('cuda')
     dtype: torch.dtype = torch.float16
@@ -380,6 +302,76 @@ class TextEmbedderConfig(DeviceConfig):
     tokenizer_2_subfolder: str = "tokenizer_2"
     text_encoder_subfolder: str = "text_encoder"
     text_encoder_2_subfolder: str = "text_encoder_2"
+
+
+@dataclass
+class NovelAIDatasetConfig:
+    model_name: str = DEFAULT_MODEL_NAME
+    image_size: Tuple[int, int] = DEFAULT_IMAGE_SIZE
+    max_image_size: Tuple[int, int] = DEFAULT_MAX_IMAGE_SIZE
+    min_image_size: Union[Tuple[int, int], int] = DEFAULT_MIN_IMAGE_SIZE
+    max_dim: int = 2048
+    
+    # Bucket settings
+    bucket_step: int = 8
+    min_bucket_size: int = 16
+    min_bucket_resolution: Optional[int] = None
+    bucket_tolerance: float = 0.2
+    max_aspect_ratio: float = 2.0
+    
+    # Cache settings
+    cache_dir: str = DEFAULT_CACHE_DIR
+    text_cache_dir: str = "text_cache"
+    use_caching: bool = True
+    skip_cached_latents: bool = True
+    
+    # Dataset settings
+    proportion_empty_prompts: float = 0.0
+    max_consecutive_batch_samples: int = 2
+    max_token_length: int = DEFAULT_MAX_TOKEN_LENGTH
+    image_dirs: List[str] = field(default_factory=list)
+    
+    # Tag weighting settings
+    tag_weighting: TagWeighterConfig = field(default_factory=TagWeighterConfig)
+    use_tag_weighting: bool = True
+    tag_weight_ranges: Dict[str, Tuple[float, float]] = field(default_factory=lambda: {
+        'character': (0.8, 1.2),
+        'style': (0.7, 1.3),
+        'quality': (0.6, 1.4),
+        'artist': (0.5, 1.5)
+    })
+    tag_weights_path: Optional[str] = "./latents/latent_weights.json"
+    text_embedder_config: TextEmbedderConfig = field(default_factory=lambda: TextEmbedderConfig(
+        model_name="stabilityai/stable-diffusion-xl-base-1.0",
+        # Add other parameters as needed
+    ))
+
+    def __post_init__(self):
+        """Convert and validate configuration."""
+        # Convert image sizes to tuples if needed
+        if isinstance(self.image_size, (list, tuple)):
+            self.image_size = tuple(self.image_size)
+        if isinstance(self.max_image_size, (list, tuple)):
+            self.max_image_size = tuple(self.max_image_size)
+        if isinstance(self.min_image_size, (list, tuple)):
+            self.min_image_size = tuple(self.min_image_size)
+        elif isinstance(self.min_image_size, int):
+            self.min_image_size = (self.min_image_size, self.min_image_size)
+            
+        # Set min_bucket_resolution if not specified
+        if self.min_bucket_resolution is None:
+            self.min_bucket_resolution = min(self.min_image_size)
+
+        # Validate tag weighting settings
+        if self.use_tag_weighting and not self.tag_weight_ranges:
+            logger.warning("Tag weighting enabled but no ranges specified, using defaults")
+            
+        # Ensure tag weights path exists if specified
+        if self.tag_weights_path:
+            self.tag_weights_path = Path(self.tag_weights_path)
+            self.tag_weights_path.parent.mkdir(parents=True, exist_ok=True)
+
+
 
 @dataclass
 class GlobalConfig:
