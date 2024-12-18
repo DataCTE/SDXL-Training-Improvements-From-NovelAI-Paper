@@ -124,7 +124,6 @@ class NovelAIDataset(Dataset):
 
             # CacheManager
             self.cache_manager = CacheManager(
-                use_memory_cache=self.config.cache_config.use_memory_cache,
                 use_caching=self.config.cache_config.use_caching,
                 cache_dir=self.config.cache_config.cache_dir,
                 cache_format=self.config.cache_config.cache_format
