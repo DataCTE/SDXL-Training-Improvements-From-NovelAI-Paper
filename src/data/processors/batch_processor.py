@@ -262,13 +262,19 @@ class BatchProcessor(GenericBatchProcessor):
 
             async def process_item(item):
                 try:
-                    # text_result returns a tuple, e.g., (prompt_embeds, pooled_prompt_embeds, tag_weights)
                     text_result = await self.text_processor.process_text(item['text'])
                     if text_result is None:
                         return None
 
-                    # Instead of text_result['prompt_embeds'], properly unpack the tuple, e.g.:
-                    prompt_embeds, pooled_prompt_embeds, tag_weights = text_result
+                    # Adjust to handle either two or three returned values safely
+                    if len(text_result) == 3:
+                        prompt_embeds, pooled_prompt_embeds, tag_weights = text_result
+                    elif len(text_result) == 2:
+                        prompt_embeds, pooled_prompt_embeds = text_result
+                        tag_weights = None
+                    else:
+                        logger.error("Unexpected number of items in text_result.")
+                        return None
 
                     # Process image
                     img_result = await self.image_processor.process_image(
@@ -287,7 +293,7 @@ class BatchProcessor(GenericBatchProcessor):
                         'crop_top_left': img_result['crop_top_left']
                     }
 
-                    # Optionally include tag_weights
+                    # Optionally set tag_weights if present
                     if tag_weights is not None:
                         processed_item['tag_weights'] = tag_weights
 
