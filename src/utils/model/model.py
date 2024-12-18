@@ -248,3 +248,7 @@ def setup_text_encoders(model_name: str, device: torch.device, subfolder: str = 
     )
     
     return (text_encoder_1, text_encoder_2), (tokenizer_1, tokenizer_2)
+
+def get_model_device(model: torch.nn.Module) -> torch.device:
+    """Get the device where the model is located."""
+    return next(model.parameters()).device

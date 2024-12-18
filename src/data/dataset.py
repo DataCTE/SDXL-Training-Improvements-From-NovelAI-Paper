@@ -44,7 +44,7 @@ class NovelAIDataset(Dataset):
     ):
         """Initialize dataset - use create() for async initialization."""
         self.config = config
-        self.device = torch.device(config.device)
+        self.device = next(vae.parameters()).device  # Get device from VAE model
         self.vae = vae
         self.text_encoders = text_encoders
         self.tokenizers = tokenizers
