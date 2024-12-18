@@ -13,6 +13,124 @@ logger = logging.getLogger(__name__)
 T = TypeVar('T')  # Generic type for batch items
 R = TypeVar('R')  # Generic type for processed results
 
+class BatchProcessor:
+    """Generic batch processor with GPU optimization and progress tracking."""
+    
+    def __init__(
+        self,
+        config: Any,
+        executor: ThreadPoolExecutor,
+        name: str = "BatchProcessor"
+    ):
+        """Initialize batch processor with configuration."""
+        try:
+            self.config = config
+            self.executor = executor
+            self.name = name
+            self._tensor_cache = WeakValueDictionary()
+            
+            # Log initialization
+            logger.info(
+                f"Initialized {name}:\n"
+                f"- Device: {config.device}\n"
+                f"- Batch size: {config.batch_size}\n"
+                f"- Cache enabled: {getattr(config, 'use_cache', False)}"
+            )
+            log_system_metrics(prefix=f"{name} initialization: ")
+            
+        except Exception as e:
+            log_error_with_context(e, f"Error initializing {name}")
+            raise
+
+    def __del__(self):
+        """Cleanup when processor is deleted."""
+        self.cleanup()
+
+    async def process_batch(
+        self,
+        batch_items: List[T],
+        stats: Dict[str, Any]
+    ) -> Tuple[List[R], Dict[str, Any]]:
+        """Process a batch of items with resource tracking."""
+        try:
+            batch_stats = {
+                'start_time': time.time(),
+                'start_memory': get_gpu_memory_usage(self.config.device),
+                'batch_size': len(batch_items),
+                'processed': 0,
+                'errors': 0,
+                'cache_hits': 0,
+                'cache_misses': 0
+            }
+
+            # Process items
+            results = []
+            for item in batch_items:
+                try:
+                    result = await self._process_item(item)
+                    if result is not None:
+                        results.append(result)
+                        batch_stats['processed'] += 1
+                except Exception as e:
+                    batch_stats['errors'] += 1
+                    logger.error(f"Error processing item: {str(e)[:200]}...")
+
+            # Update final stats
+            batch_stats.update({
+                'end_memory': get_gpu_memory_usage(self.config.device),
+                'duration': time.time() - batch_stats['start_time'],
+                'memory_change': (
+                    get_gpu_memory_usage(self.config.device) - 
+                    batch_stats['start_memory']
+                )
+            })
+
+            # Log batch metrics
+            log_metrics({
+                'batch_size': batch_stats['batch_size'],
+                'processed': batch_stats['processed'],
+                'errors': batch_stats['errors'],
+                'duration': f"{batch_stats['duration']:.2f}s",
+                'items_per_second': f"{batch_stats['processed']/batch_stats['duration']:.1f}",
+                'memory_usage': f"{batch_stats['end_memory']:.1%}",
+                'memory_change': f"{batch_stats['memory_change']:.1%}"
+            }, step=stats.total_items, step_type="batch")
+
+            return results, batch_stats
+
+        except Exception as e:
+            log_error_with_context(e, "Error in batch processing")
+            return [], {'errors': len(batch_items)}
+
+    async def cleanup(self):
+        """Clean up resources."""
+        try:
+            # Clear tensor cache
+            if hasattr(self, '_tensor_cache'):
+                self._tensor_cache.clear()
+            
+            # Clear CUDA cache if using GPU
+            if hasattr(self, 'config') and hasattr(self.config, 'device'):
+                if self.config.device.type == 'cuda':
+                    torch.cuda.empty_cache()
+            
+            # Force garbage collection
+            gc.collect()
+            
+            logger.info(f"Successfully cleaned up {self.name} resources")
+            
+        except Exception as e:
+            logger.error(f"Error during {self.name} cleanup: {str(e)}")
+            try:
+                torch.cuda.empty_cache()
+                gc.collect()
+            except:
+                pass
+
+    async def _process_item(self, item: T) -> Optional[R]:
+        """Process a single item. Override in subclasses."""
+        raise NotImplementedError("Subclasses must implement _process_item")
+
 def calculate_optimal_batch_size(
     device: torch.device,
     min_batch_size: int = 1,
