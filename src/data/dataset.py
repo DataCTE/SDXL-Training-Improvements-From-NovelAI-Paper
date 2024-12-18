@@ -256,7 +256,14 @@ class NovelAIDataset(Dataset):
                             processed_count += 1
                     
                     # Update tracker
-                    update_tracker(tracker, **batch_stats)
+                    update_tracker(
+                        tracker,
+                        processed=len(processed_items),
+                        failed=batch_stats.get('errors', 0),
+                        cache_hits=batch_stats.get('cache_hits', 0),
+                        cache_misses=batch_stats.get('cache_misses', 0),
+                        error_types=batch_stats.get('error_types', None)
+                    )
                     
                 except Exception as e:
                     logger.error(f"Batch processing failed: {e}")
