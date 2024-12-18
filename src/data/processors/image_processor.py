@@ -76,7 +76,7 @@ class ImageProcessor:
             )
             
         # Fallback to default size if no buckets available
-        logger.warning("No buckets available, using default buffer size")
+        logger.debug("No buckets available yet; using default buffer size until buckets are created")
         return (
             32,  # Initial batch size
             3,   # RGB channels
