@@ -391,6 +391,29 @@ class Config:
     text_processor: 'TextProcessorConfig'
     text_embedder: 'TextEmbedderConfig'
 
+    @classmethod
+    def from_yaml(cls, path: str) -> 'Config':
+        """Load configuration from a YAML file."""
+        with open(path, 'r') as f:
+            config_dict = yaml.safe_load(f)
+
+        # Create an instance of Config using the loaded dictionary
+        return cls(
+            model=ModelConfig(**config_dict['model']),
+            training=TrainingConfig(**config_dict['training']),
+            data=DataConfig(**config_dict['data']),
+            tag_weighting=TagWeighterConfig(**config_dict['tag_weighting']),
+            scoring=ScoringConfig(**config_dict['scoring']),
+            system=SystemConfig(**config_dict['system']),
+            paths=PathsConfig(**config_dict['paths']),
+            global_config=GlobalConfig(**config_dict['global_config']),
+            vae_encoder=VAEEncoderConfig(**config_dict['vae_encoder']),
+            batch_processor=BatchProcessorConfig(**config_dict['batch_processor']),
+            bucket=BucketConfig(**config_dict['bucket']),
+            text_processor=TextProcessorConfig(**config_dict['text_processor']),
+            text_embedder=TextEmbedderConfig(**config_dict['text_embedder'])
+        )
+
     def __post_init__(self):
         # Apply global settings to components
         for component in [self.vae_encoder, self.batch_processor, 
