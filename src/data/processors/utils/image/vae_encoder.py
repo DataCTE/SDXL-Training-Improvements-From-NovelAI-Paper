@@ -78,58 +78,52 @@ class VAEEncoder:
         latents_list = []
         
         try:
-            # Increased sub-batch size but still memory efficient
-            sub_batch_size = min(8, batch_size)  # Increased from 4 to 8
+            # Optimal sub-batch size
+            sub_batch_size = min(8, batch_size)
             
-            # Pre-allocate CUDA stream for better GPU utilization
+            # Use stream for better GPU utilization
             stream = torch.cuda.Stream()
             with torch.cuda.stream(stream):
                 for i in range(0, batch_size, sub_batch_size):
                     sub_batch = pixel_values[i:i+sub_batch_size]
                     
                     try:
-                        # Overlap CPU->GPU transfer with computation
-                        sub_batch = sub_batch.to(
-                            self.config.device, 
-                            non_blocking=True
-                        )
+                        # Ensure sub_batch is on GPU
+                        if not sub_batch.is_cuda:
+                            sub_batch = sub_batch.to(
+                                self.config.device,
+                                non_blocking=True
+                            )
                         
-                        # Encode with automatic mixed precision
+                        # VAE encoding
                         with torch.cuda.amp.autocast(dtype=self.config.dtype):
                             latents = self.vae.encode(sub_batch).latent_dist.sample()
                             latents = latents * self.vae.config.scaling_factor
-                            
-                        # Asynchronous CPU transfer
-                        latents_list.append(latents.cpu(non_blocking=True))
                         
-                        # Cleanup without blocking
-                        del latents
+                        # Store result (keeping on GPU)
+                        latents_list.append(latents)
+                        
                         del sub_batch
                         
                     except RuntimeError as e:
                         logger.error(f"Error encoding sub-batch {i}: {str(e)[:200]}...")
-                        for _ in range(len(sub_batch)):
-                            latents_list.append(torch.zeros(
-                                (1, 4, pixel_values.shape[2]//8, pixel_values.shape[3]//8),
-                                dtype=self.config.dtype,
-                                device='cpu'
-                            ))
+                        # Create zero tensor on correct device
+                        latents_list.append(torch.zeros(
+                            (len(sub_batch), 4, pixel_values.shape[2]//8, pixel_values.shape[3]//8),
+                            dtype=self.config.dtype,
+                            device=self.config.device
+                        ))
                     
-                    # Less frequent but more thorough cleanup
+                    # Periodic cleanup
                     if i % (sub_batch_size * 4) == 0:
-                        torch.cuda.synchronize()
                         torch.cuda.empty_cache()
-            
-            # Wait for all operations to complete
-            torch.cuda.synchronize()
-            
-            # Combine results efficiently
-            result = torch.cat(latents_list, dim=0)
-            del latents_list
-            
-            # Final result to GPU
-            return result.to(self.config.device, non_blocking=True)
-            
+                
+                # Combine results (all on GPU)
+                result = torch.cat(latents_list, dim=0)
+                del latents_list
+                
+                return result
+                
         except Exception as e:
             logger.error(f"Error in batch encoding: {str(e)[:200]}...")
             if 'latents_list' in locals():

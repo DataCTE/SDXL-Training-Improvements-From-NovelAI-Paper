@@ -203,42 +203,37 @@ class ImageProcessor:
         processed_tensors = []
         
         try:
-            # Larger sub-batches for better throughput, dynamically adjusted based on GPU memory
+            # Calculate optimal batch size based on GPU memory
             available_memory = torch.cuda.get_device_properties(self.config.device).total_memory
-            memory_per_image = width * height * 4 * 4  # Rough estimate of memory needed per image
+            memory_per_image = width * height * 4 * 4  # Rough estimate
             optimal_batch_size = min(
-                max(4, int(available_memory * 0.3 / memory_per_image)),  # Use 30% of GPU memory
-                16,  # Cap at 16 images
+                max(4, int(available_memory * 0.3 / memory_per_image)),
+                16,
                 batch_size
             )
             
-            # Create multiple CUDA streams for overlapped operations
+            # Create CUDA streams
             compute_stream = torch.cuda.Stream()
             transfer_stream = torch.cuda.Stream()
-            
-            # Pre-allocate pinned memory for faster transfers
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
             
             for i in range(0, batch_size, optimal_batch_size):
                 sub_batch = images[i:i + optimal_batch_size]
                 
-                # Process images in parallel with thread pool
+                # Parallel preprocessing
                 preprocessing_tasks = [
                     asyncio.to_thread(self.preprocess, img, width, height)
                     for img in sub_batch
                 ]
                 
-                # Use asyncio.gather for concurrent preprocessing
+                # Gather preprocessed tensors
                 sub_processed = await asyncio.gather(*preprocessing_tasks)
                 sub_processed = [t for t in sub_processed if t is not None]
                 
                 if sub_processed:
                     with torch.cuda.stream(transfer_stream):
-                        # Efficient pinned memory transfer
-                        batch_tensor = torch.stack(sub_processed)
-                        batch_tensor = batch_tensor.pin_memory()
-                        batch_tensor = batch_tensor.to(
+                        # Stack tensors while they're on CPU and pin memory
+                        batch_tensor = torch.stack([t.cpu() for t in sub_processed])
+                        batch_tensor = batch_tensor.pin_memory().to(
                             self.config.device,
                             non_blocking=True
                         )
@@ -247,16 +242,15 @@ class ImageProcessor:
                     with torch.cuda.stream(compute_stream):
                         if self.vae_encoder is not None:
                             try:
-                                # Process through VAE with automatic mixed precision
+                                # VAE encoding with mixed precision
                                 with torch.cuda.amp.autocast():
                                     encoded = await self.vae_encoder.encode_batch(batch_tensor)
-                                    
-                                # Efficient async transfer back to CPU
-                                with torch.cuda.stream(transfer_stream):
-                                    for tensor in encoded:
-                                        processed_tensors.append(
-                                            tensor.cpu(non_blocking=True).pin_memory()
-                                        )
+                                
+                                # Transfer results back to CPU
+                                for tensor in encoded:
+                                    # Move to CPU first, then pin
+                                    cpu_tensor = tensor.cpu()
+                                    processed_tensors.append(cpu_tensor.pin_memory())
                                 del encoded
                                 
                             except Exception as e:
@@ -268,25 +262,20 @@ class ImageProcessor:
                                         device='cpu')
                                     )
                         else:
-                            # Efficient async transfer for preprocessed tensors
-                            with torch.cuda.stream(transfer_stream):
-                                for tensor in batch_tensor:
-                                    processed_tensors.append(
-                                        tensor.cpu(non_blocking=True).pin_memory()
-                                    )
+                            # Handle non-VAE case
+                            for tensor in batch_tensor:
+                                cpu_tensor = tensor.cpu()
+                                processed_tensors.append(cpu_tensor.pin_memory())
                         
-                        # Cleanup batch
                         del batch_tensor
                     
-                    # Synchronize less frequently
+                    # Periodic cleanup
                     if i % (optimal_batch_size * 2) == 0:
-                        # Only synchronize the compute stream
                         compute_stream.synchronize()
                         if torch.cuda.memory_allocated() > available_memory * 0.8:
                             torch.cuda.empty_cache()
-                            await asyncio.sleep(0.0001)  # Minimal sleep
             
-            # Final synchronization of both streams
+            # Final synchronization
             compute_stream.synchronize()
             transfer_stream.synchronize()
             
