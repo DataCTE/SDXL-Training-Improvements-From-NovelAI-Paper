@@ -89,10 +89,34 @@ class ImageProcessor:
         if torch.cuda.is_available():
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.benchmark = True
+            
+            # Enable memory pinning for faster transfers
+            if self.use_pinned_memory:
+                torch.cuda.empty_cache()
         
-        # Pre-compile transforms for faster processing
-        self.transform = torch.jit.script(self.transform)
-        self.resize = torch.jit.script(self.resize)
+        # Instead of trying to JIT script the transforms, optimize individual operations
+        if isinstance(self.resize, transforms.Resize):
+            self.resize = torch.compile(self.resize) if hasattr(torch, 'compile') else self.resize
+        
+        # Create a fast transform pipeline
+        self._setup_fast_transforms()
+
+    def _setup_fast_transforms(self):
+        """Setup optimized transform pipeline."""
+        def fast_transform(img):
+            # Convert to tensor efficiently
+            if not isinstance(img, torch.Tensor):
+                img = transforms.functional.to_tensor(img)
+            
+            # Apply normalization using tensor operations
+            if hasattr(self.config, 'normalize_mean') and hasattr(self.config, 'normalize_std'):
+                mean = torch.tensor(self.config.normalize_mean, device=img.device)[None, :, None, None]
+                std = torch.tensor(self.config.normalize_std, device=img.device)[None, :, None, None]
+                img = (img - mean) / std
+            
+            return img
+        
+        self.fast_transform = fast_transform
 
     async def load_image(self, path_or_str) -> "Image.Image":
         """
@@ -109,12 +133,9 @@ class ImageProcessor:
         keep_on_gpu: bool = False,
         **kwargs
     ) -> Dict[str, Any]:
-        """
-        Process a single image with optional cropping, flipping, normalization, and VAE encoding.
-        """
+        """Process a single image with optimized transform pipeline."""
         try:
             if isinstance(image, (str, Path)):
-                # Fix: await the load_image directly instead of using asyncio.to_thread
                 image = await self.load_image(image)
                 if image is None:
                     raise ValueError("Failed to load image")
@@ -128,23 +149,31 @@ class ImageProcessor:
             else:
                 target_size = target_size or self.config.resolution
 
-            # Crop mode
-            if self.config.crop_mode == "center":
-                image = self.center_crop(image)
-            elif self.config.crop_mode == "random":
-                y1, x1, h, w = self.random_crop.get_params(image, (self.config.resolution[0], self.config.resolution[1]))
-                image = transforms.functional.crop(image, y1, x1, h, w)
-            # if "none", skip cropping
+            # Apply transforms efficiently
+            with torch.cuda.amp.autocast(enabled=True):
+                # Apply crop if needed
+                if self.config.crop_mode == "center":
+                    image = self.center_crop(image)
+                elif self.config.crop_mode == "random":
+                    y1, x1, h, w = self.random_crop.get_params(
+                        image, 
+                        (self.config.resolution[0], self.config.resolution[1])
+                    )
+                    image = transforms.functional.crop(image, y1, x1, h, w)
 
-            # Random flip
-            if self.config.random_flip and random.random() < 0.5:
-                image = transforms.functional.hflip(image)
+                # Random flip
+                if self.config.random_flip and random.random() < 0.5:
+                    image = transforms.functional.hflip(image)
 
-            # Convert to tensor and normalize
-            image_tensor = self.transform(image).to(self.config.device, non_blocking=True)
+                # Convert to tensor and normalize using optimized pipeline
+                image_tensor = self.fast_transform(image)
+                
+                # Move to appropriate device
+                device = self.config.device if keep_on_gpu else "cpu"
+                image_tensor = image_tensor.to(device, non_blocking=True)
 
             result = {
-                "pixel_values": image_tensor.cpu(),  # or keep on GPU if you wish
+                "pixel_values": image_tensor,
                 "original_size": original_size or (image.height, image.width),
                 "target_size": target_size,
             }
@@ -155,9 +184,8 @@ class ImageProcessor:
                     image_tensor,
                     keep_on_gpu=(keep_on_gpu or self.always_on_gpu)
                 )
-                if latents is not None and not (keep_on_gpu or self.always_on_gpu):
-                    latents = latents.to("cpu", non_blocking=True)
-                result["latents"] = latents
+                if latents is not None:
+                    result["latents"] = latents
 
             return result
 
