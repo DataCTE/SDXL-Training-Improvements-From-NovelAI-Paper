@@ -64,13 +64,15 @@ class VAEEncoder:
         batch_size = pixel_values.shape[0]
         latents_list = []
         
+        sub_batch_size = min(128, batch_size)
+        
+        compute_stream = torch.cuda.Stream()
+       
+        
         try:
-            sub_batch_size = min(64, batch_size)
-            
-            # Define synchronous encoding function
-            def _encode_sub_batch(sub_batch):
+            def _encode_sub_batch(sub_batch: torch.Tensor) -> torch.Tensor:
                 if not sub_batch.is_cuda:
-                    sub_batch = sub_batch.to(self.config.device, non_blocking=True)
+                    sub_batch = sub_batch.pin_memory().to(self.config.device, non_blocking=True)
                 
                 with torch.cuda.amp.autocast(dtype=self.config.dtype):
                     latents = self.vae.encode(sub_batch).latent_dist.sample()
@@ -79,17 +81,18 @@ class VAEEncoder:
             for i in range(0, batch_size, sub_batch_size):
                 sub_batch = pixel_values[i:i+sub_batch_size]
                 
-                try:
-                    latents = await asyncio.to_thread(_encode_sub_batch, sub_batch)
-                    latents_list.append(latents)
-                    del sub_batch
-                except RuntimeError as e:
-                    logger.error(f"Error encoding sub-batch {i}: {str(e)[:200]}...")
-                    latents_list.append(torch.zeros(
-                        (len(sub_batch), 4, pixel_values.shape[2]//8, pixel_values.shape[3]//8),
-                        dtype=self.config.dtype,
-                        device=self.config.device
-                    ))
+                with torch.cuda.stream(compute_stream):
+                    try:
+                        latents = await asyncio.to_thread(_encode_sub_batch, sub_batch)
+                        latents_list.append(latents)
+                        del sub_batch
+                    except RuntimeError as e:
+                        logger.error(f"Error encoding sub-batch {i}: {str(e)[:200]}...")
+                        latents_list.append(torch.zeros(
+                            (len(sub_batch), 4, pixel_values.shape[2]//8, pixel_values.shape[3]//8),
+                            dtype=self.config.dtype,
+                            device=self.config.device
+                        ))
                 
             result = torch.cat(latents_list, dim=0)
             del latents_list
