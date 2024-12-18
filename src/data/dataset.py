@@ -22,7 +22,7 @@ from .processors.utils.progress_utils import create_progress_tracker, update_tra
 
 
 # Config import
-from src.config.config import NovelAIDatasetConfig, BucketConfig, TextProcessorConfig, ImageProcessorConfig, BatchProcessorConfig
+from src.config.config import NovelAIDatasetConfig, BucketConfig, TextProcessorConfig, ImageProcessorConfig, BatchProcessorConfig, DEFAULT_BATCH_SIZE, DEFAULT_NUM_WORKERS
 
 logger = logging.getLogger(__name__)
 
@@ -106,27 +106,49 @@ class NovelAIDataset(Dataset):
                 if self.config.tag_weights_path and Path(self.config.tag_weights_path).exists():
                     tag_weighter_loaded = TagWeighter.load(self.config.tag_weights_path)
 
-            # BucketManager
+            # BucketManager - unpack the configuration
             self.bucket_manager = BucketManager(
-                max_image_size=self.config.bucket_config.max_image_size,
-                min_image_size=self.config.bucket_config.min_image_size,
-                bucket_step=self.config.bucket_config.bucket_step,
-                min_bucket_resolution=self.config.bucket_config.min_bucket_resolution,
-                max_aspect_ratio=self.config.bucket_config.max_aspect_ratio,
-                bucket_tolerance=self.config.bucket_config.bucket_tolerance,
-                target_resolutions=self.config.bucket_config.target_resolutions,
-                max_ar_error=self.config.bucket_config.max_ar_error
+                max_image_size=self.config.max_image_size,
+                min_image_size=self.config.min_image_size,
+                bucket_step=self.config.bucket_step,
+                min_bucket_resolution=self.config.min_bucket_resolution,
+                max_aspect_ratio=self.config.max_aspect_ratio,
+                bucket_tolerance=self.config.bucket_tolerance,
+                target_resolutions=self.config.target_resolutions,
+                max_ar_error=self.config.max_ar_error
             )
 
             # CacheManager
-            self.cache_manager = CacheManager(self.config.cache_config)
+            self.cache_manager = CacheManager(
+                use_memory_cache=self.config.cache_config.use_memory_cache,
+                use_caching=self.config.cache_config.use_caching,
+                cache_dir=self.config.cache_config.cache_dir,
+                cache_format=self.config.cache_config.cache_format
+            )
 
             # TextProcessor
-            self.text_processor = TextProcessor(TextProcessorConfig())
+            self.text_processor = TextProcessor(
+                num_workers=self.config.text_processor_config.get('num_workers', DEFAULT_NUM_WORKERS),
+                batch_size=self.config.text_processor_config.get('batch_size', DEFAULT_BATCH_SIZE),
+                max_token_length=self.config.max_token_length,
+                enable_tag_weighting=self.config.use_tag_weighting,
+                tag_frequency_threshold=self.config.text_processor_config.get('tag_frequency_threshold', 5),
+                tag_weight_smoothing=self.config.text_processor_config.get('tag_weight_smoothing', 0.1),
+                prefetch_factor=self.config.prefetch_factor,
+                proportion_empty_prompts=self.config.proportion_empty_prompts
+            )
 
             # ImageProcessor
             self.image_processor = ImageProcessor(
-                config=ImageProcessorConfig(device=str(self.device)),
+                config=ImageProcessorConfig(
+                    device=str(self.device),
+                    max_image_size=self.config.max_image_size,
+                    min_image_size=self.config.min_image_size,
+                    enable_vae_slicing=self.config.image_processor_config.get('enable_vae_slicing', True),
+                    vae_batch_size=self.config.batch_size,
+                    num_workers=self.config.image_processor_config.get('num_workers', DEFAULT_NUM_WORKERS),
+                    prefetch_factor=self.config.prefetch_factor
+                ),
                 bucket_manager=self.bucket_manager,
                 vae=self.vae
             )
@@ -136,7 +158,17 @@ class NovelAIDataset(Dataset):
                 config=BatchProcessorConfig(
                     device=str(self.device),
                     batch_size=self.config.batch_size,
-                    max_memory_usage=self.config.batch_processor_mem_fraction
+                    prefetch_factor=self.config.prefetch_factor,
+                    num_workers=self.config.batch_processor_config.num_workers,
+                    max_memory_usage=self.config.batch_processor_config.max_memory_usage,
+                    memory_check_interval=self.config.batch_processor_config.memory_check_interval,
+                    memory_growth_factor=self.config.batch_processor_config.memory_growth_factor,
+                    high_memory_threshold=self.config.batch_processor_config.high_memory_threshold,
+                    cleanup_interval=self.config.batch_processor_config.cleanup_interval,
+                    retry_count=self.config.batch_processor_config.retry_count,
+                    backoff_factor=self.config.batch_processor_config.backoff_factor,
+                    min_batch_size=self.config.batch_processor_config.min_batch_size,
+                    max_batch_size=self.config.batch_processor_config.max_batch_size
                 ),
                 image_processor=self.image_processor,
                 text_processor=self.text_processor,
@@ -236,11 +268,11 @@ class NovelAIDataset(Dataset):
             self.sampler = AspectBatchSampler(
                 dataset=self,
                 batch_size=self.config.batch_size,
-                shuffle=self.config.shuffle_batches,
+                shuffle=self.config.shuffle,
                 drop_last=self.config.drop_last,
-                max_consecutive_batch_samples=2,
-                min_bucket_length=1,
-                debug_mode=False,
+                max_consecutive_batch_samples=self.config.max_consecutive_batch_samples,
+                min_bucket_length=self.config.min_bucket_length,
+                debug_mode=self.config.debug_mode,
                 prefetch_factor=self.config.prefetch_factor,
                 bucket_manager=self.bucket_manager,
                 config=self.config
