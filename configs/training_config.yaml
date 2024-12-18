@@ -139,9 +139,9 @@ batch_processor:
 
 # Image bucketing
 bucket:
-  min_image_size: [256, 256]
-  max_image_size: [2048, 2048]
-  bucket_tolerance: 0.2
+  min_size: [256, 256]
+  max_size: [2048, 2048]
+  tolerance: 0.2
 
 # ===== Data Configuration =====
 data:
