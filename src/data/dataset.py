@@ -96,11 +96,10 @@ class NovelAIDataset(Dataset):
                 config=self.config.text_embedder_config
             )
             
-            # Ensure text_processor_config is converted to TextProcessorConfig
+            # Initialize text processor
             text_processor_config = TextProcessorConfig(**self.config.text_processor_config)  # Convert to dataclass
-            
             self.text_processor = TextProcessor(
-                config=text_processor_config,  # Pass the dataclass instance
+                config=text_processor_config,
                 text_embedder=self.text_embedder,
                 tag_weighter=tag_weighter
             )

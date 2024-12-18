@@ -23,13 +23,13 @@ DEFAULT_VAE_LR = 4.5e-5
 DEFAULT_DISC_LR = 4.5e-5
 
 
+
 @dataclass
 class DeviceConfig:
     device: torch.device = torch.device('cuda')
     dtype: torch.dtype = torch.float16
     max_memory_usage: float = 0.9
     enable_memory_efficient_attention: bool = True
-
 
 @dataclass
 class VAEModelConfig:
@@ -52,7 +52,7 @@ class ModelConfig:
     pretrained_model_name: str = DEFAULT_MODEL_NAME
     hidden_size: int = 768
     cross_attention_dim: int = 2048
-
+    
 @dataclass
 class TrainingConfig:
     batch_size: int = DEFAULT_BATCH_SIZE
@@ -121,30 +121,20 @@ class DataConfig:
     min_bucket_resolution: Optional[int] = None
     bucket_tolerance: float = 0.2
     max_aspect_ratio: float = 2.0
-    
-    # Cache settings
     cache_dir: str = DEFAULT_CACHE_DIR
     text_cache_dir: str = "text_cache"
     use_caching: bool = True
-    
-    # Text settings
     max_token_length: int = DEFAULT_MAX_TOKEN_LENGTH
-    
-    # VAE settings
     vae_batch_size: int = DEFAULT_BATCH_SIZE
     vae_image_size: Tuple[int, int] = (256, 256)
     vae_validation_split: float = 0.1
-    
-    # DataLoader settings
     num_workers: int = DEFAULT_NUM_WORKERS
     pin_memory: bool = True
     persistent_workers: bool = True
     shuffle: bool = True
     proportion_empty_prompts: float = 0.0
-    
-    # Tag weighting settings
     use_tag_weighting: bool = True
-    tag_weighting: TagWeighterConfig = field(default_factory=TagWeighterConfig)
+    tag_weighting: 'TagWeighterConfig' = field(default_factory=lambda: TagWeighterConfig())
     tag_weight_ranges: Dict[str, Tuple[float, float]] = field(default_factory=lambda: {
         'character': (0.8, 1.2),
         'style': (0.7, 1.3),
@@ -208,13 +198,19 @@ class PathsConfig:
     vae_samples_dir: str = "vae_samples"
     tag_weights_path: Optional[str] = "tag_weights.json"
 
-@dataclass
-class DeviceConfig:
-    device: torch.device = torch.device('cuda')
-    dtype: torch.dtype = torch.float16
-    max_memory_usage: float = 0.9
-    enable_memory_efficient_attention: bool = True
 
+@dataclass
+class ImageProcessorConfig(DeviceConfig):
+    """Configuration for image processor."""
+    max_image_size: Tuple[int, int] = DEFAULT_MAX_IMAGE_SIZE
+    min_image_size: Tuple[int, int] = DEFAULT_MIN_IMAGE_SIZE
+    enable_vae_slicing: bool = True
+    vae_batch_size: int = DEFAULT_BATCH_SIZE
+    num_workers: int = DEFAULT_NUM_WORKERS
+    prefetch_factor: int = DEFAULT_PREFETCH_FACTOR
+    normalize_mean: Tuple[float, ...] = (0.5, 0.5, 0.5)
+    normalize_std: Tuple[float, ...] = (0.5, 0.5, 0.5)
+    
 @dataclass
 class CacheConfig:
     use_caching: bool = True
@@ -311,28 +307,20 @@ class NovelAIDatasetConfig:
     max_image_size: Tuple[int, int] = DEFAULT_MAX_IMAGE_SIZE
     min_image_size: Union[Tuple[int, int], int] = DEFAULT_MIN_IMAGE_SIZE
     max_dim: int = 2048
-    
-    # Bucket settings
     bucket_step: int = 8
     min_bucket_size: int = 16
     min_bucket_resolution: Optional[int] = None
     bucket_tolerance: float = 0.2
     max_aspect_ratio: float = 2.0
-    
-    # Cache settings
     cache_dir: str = DEFAULT_CACHE_DIR
     text_cache_dir: str = "text_cache"
     use_caching: bool = True
     skip_cached_latents: bool = True
-    
-    # Dataset settings
     proportion_empty_prompts: float = 0.0
     max_consecutive_batch_samples: int = 2
     max_token_length: int = DEFAULT_MAX_TOKEN_LENGTH
     image_dirs: List[str] = field(default_factory=list)
-    
-    # Tag weighting settings
-    tag_weighting: TagWeighterConfig = field(default_factory=TagWeighterConfig)
+    tag_weighting: 'TagWeighterConfig' = field(default_factory=lambda: TagWeighterConfig())
     use_tag_weighting: bool = True
     tag_weight_ranges: Dict[str, Tuple[float, float]] = field(default_factory=lambda: {
         'character': (0.8, 1.2),
@@ -341,21 +329,11 @@ class NovelAIDatasetConfig:
         'artist': (0.5, 1.5)
     })
     tag_weights_path: Optional[str] = "./latents/latent_weights.json"
-    
-    # Add this line to include image processor configuration
     image_processor_config: Dict[str, Any] = field(default_factory=dict)
-    
-    # Add text processor configuration
     text_processor_config: Dict[str, Any] = field(default_factory=dict)
-    
-    # Add text embedder configuration
-    text_embedder_config: TextEmbedderConfig = field(default_factory=lambda: TextEmbedderConfig(
-        model_name="stabilityai/stable-diffusion-xl-base-1.0",
-        # Add other parameters as needed
-    ))
+    text_embedder_config: 'TextEmbedderConfig' = field(default_factory=lambda: TextEmbedderConfig())
 
     def __post_init__(self):
-        """Convert and validate configuration."""
         # Convert image sizes to tuples if needed
         if isinstance(self.image_size, (list, tuple)):
             self.image_size = tuple(self.image_size)
@@ -365,7 +343,7 @@ class NovelAIDatasetConfig:
             self.min_image_size = tuple(self.min_image_size)
         elif isinstance(self.min_image_size, int):
             self.min_image_size = (self.min_image_size, self.min_image_size)
-            
+
         # Set min_bucket_resolution if not specified
         if self.min_bucket_resolution is None:
             self.min_bucket_resolution = min(self.min_image_size)
@@ -373,11 +351,12 @@ class NovelAIDatasetConfig:
         # Validate tag weighting settings
         if self.use_tag_weighting and not self.tag_weight_ranges:
             logger.warning("Tag weighting enabled but no ranges specified, using defaults")
-            
+
         # Ensure tag weights path exists if specified
         if self.tag_weights_path:
             self.tag_weights_path = Path(self.tag_weights_path)
             self.tag_weights_path.parent.mkdir(parents=True, exist_ok=True)
+
 
 
 
@@ -399,24 +378,23 @@ class GlobalConfig:
 @dataclass
 class Config:
     model: ModelConfig
-    training: TrainingConfig
+    training: 'TrainingConfig'
     data: DataConfig
-    tag_weighting: TagWeighterConfig
-    scoring: ScoringConfig
-    system: SystemConfig
-    paths: PathsConfig
-    global_config: GlobalConfig
-    vae_encoder: VAEEncoderConfig
-    batch_processor: BatchProcessorConfig
-    bucket: BucketConfig
-    text_processor: TextProcessorConfig
-    text_embedder: TextEmbedderConfig
+    tag_weighting: 'TagWeighterConfig'
+    scoring: 'ScoringConfig'
+    system: 'SystemConfig'
+    paths: 'PathsConfig'
+    global_config: 'GlobalConfig'
+    vae_encoder: 'VAEEncoderConfig'
+    batch_processor: 'BatchProcessorConfig'
+    bucket: 'BucketConfig'
+    text_processor: 'TextProcessorConfig'
+    text_embedder: 'TextEmbedderConfig'
 
     def __post_init__(self):
-        """Apply global settings to components."""
-        # Apply device settings
+        # Apply global settings to components
         for component in [self.vae_encoder, self.batch_processor, 
-                         self.text_processor, self.text_embedder]:
+                          self.text_processor, self.text_embedder]:
             component.device = self.global_config.device.device
             component.dtype = self.global_config.device.dtype
             component.max_memory_usage = self.global_config.device.max_memory_usage
@@ -445,53 +423,4 @@ class Config:
 
         # Apply bucket settings
         self.bucket.bucket_tolerance = self.global_config.image.bucket_tolerance
-
-    @classmethod
-    def from_yaml(cls, path: str) -> 'Config':
-        """Load configuration from YAML file with improved error handling."""
-        try:
-            with open(path, 'r') as f:
-                config_dict = yaml.safe_load(f)
-            
-            # Set device from global config
-            device = torch.device(config_dict['global_config']['device']['device'])
-            
-            # Update batch processor config with device
-            if 'batch_processor' in config_dict:
-                config_dict['batch_processor']['device'] = device
-            
-            # Create config instance with proper type conversion
-            return cls(
-                model=ModelConfig(**config_dict['model']),
-                training=TrainingConfig(**config_dict['training']),
-                data=DataConfig(**config_dict['data']),
-                tag_weighting=TagWeighterConfig(**config_dict['tag_weighting']),
-                scoring=ScoringConfig(**config_dict['scoring']),
-                system=SystemConfig(**config_dict['system']),
-                paths=PathsConfig(**config_dict['paths']),
-                global_config=GlobalConfig(**config_dict['global_config']),
-                vae_encoder=VAEEncoderConfig(**config_dict['vae_encoder']),
-                batch_processor=BatchProcessorConfig(**config_dict['batch_processor']),
-                bucket=BucketConfig(**config_dict['bucket']),
-                text_processor=TextProcessorConfig(**config_dict['text_processor']),
-                text_embedder=TextEmbedderConfig(**config_dict['text_embedder'])
-            )
-        except Exception as e:
-            raise ValueError(f"Error loading config from {path}: {str(e)}") from e
-
-    def get_vae_config(self) -> VAEModelConfig:
-        """Helper method to easily access VAE config"""
-        return self.model.vae
-    
-@dataclass
-class ImageProcessorConfig(DeviceConfig):
-    """Configuration for image processor."""
-    max_image_size: Tuple[int, int] = DEFAULT_MAX_IMAGE_SIZE
-    min_image_size: Tuple[int, int] = DEFAULT_MIN_IMAGE_SIZE
-    enable_vae_slicing: bool = True
-    vae_batch_size: int = DEFAULT_BATCH_SIZE
-    num_workers: int = DEFAULT_NUM_WORKERS
-    prefetch_factor: int = DEFAULT_PREFETCH_FACTOR
-    normalize_mean: Tuple[float, ...] = (0.5, 0.5, 0.5)
-    normalize_std: Tuple[float, ...] = (0.5, 0.5, 0.5)
     
