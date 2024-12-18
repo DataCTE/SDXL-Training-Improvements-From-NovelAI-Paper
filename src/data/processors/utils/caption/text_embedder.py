@@ -275,3 +275,74 @@ class TextEmbedder:
         except Exception as e:
             logger.error(f"Error processing text: {str(e)[:200]}...")
             return None
+
+    def _load_text_encoder(self, encoder_type: str):
+        """Load text encoder with proper error handling."""
+        try:
+            # Determine model path and config
+            if encoder_type == "one":
+                subfolder = self.config.text_encoder_subfolder
+            elif encoder_type == "two":
+                subfolder = self.config.text_encoder_2_subfolder
+            else:
+                raise ValueError(f"Invalid encoder type: {encoder_type}")
+            
+            # Import correct model class
+            model_class = import_model_class_from_model_name_or_path(
+                self.config.model_name,
+                subfolder=subfolder
+            )
+            
+            # Load model with optimizations
+            model = model_class.from_pretrained(
+                self.config.model_name,
+                subfolder=subfolder,
+                torch_dtype=self.config.dtype,
+                low_cpu_mem_usage=self.config.low_cpu_mem_usage,
+                device_map=None  # We'll move to device manually
+            )
+            
+            # Move to device and optimize
+            model = model.to(self.config.device)
+            model.eval()
+            
+            if self.config.enable_memory_efficient_attention:
+                setup_memory_efficient_attention(model)
+            
+            logger.info(f"Successfully loaded text encoder {encoder_type}")
+            return model
+            
+        except Exception as e:
+            log_error_with_context(
+                e, 
+                f"Error loading text encoder {encoder_type}"
+            )
+            raise
+
+    def _load_tokenizer(self, tokenizer_type: str):
+        """Load tokenizer with proper error handling."""
+        try:
+            # Determine tokenizer path
+            if tokenizer_type == "one":
+                subfolder = self.config.tokenizer_subfolder
+            elif tokenizer_type == "two":
+                subfolder = self.config.tokenizer_2_subfolder
+            else:
+                raise ValueError(f"Invalid tokenizer type: {tokenizer_type}")
+            
+            # Load tokenizer
+            tokenizer = AutoTokenizer.from_pretrained(
+                self.config.model_name,
+                subfolder=subfolder,
+                use_fast=self.config.use_fast_tokenizer
+            )
+            
+            logger.info(f"Successfully loaded tokenizer {tokenizer_type}")
+            return tokenizer
+            
+        except Exception as e:
+            log_error_with_context(
+                e,
+                f"Error loading tokenizer {tokenizer_type}"
+            )
+            raise
