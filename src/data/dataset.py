@@ -108,12 +108,13 @@ class NovelAIDataset(Dataset):
 
             # BucketManager - unpack the configuration
             self.bucket_manager = BucketManager(
-                max_image_size=self.config.max_image_size,
-                min_image_size=self.config.min_image_size,
-                bucket_step=self.config.bucket_step,
-                min_bucket_resolution=self.config.min_bucket_resolution,
-                max_aspect_ratio=self.config.max_aspect_ratio,
-                bucket_tolerance=self.config.bucket_tolerance,
+                image_size=self.config.image_size,
+                min_size=self.config.min_image_size,
+                max_size=self.config.max_image_size,
+                step=self.config.bucket_step,
+                min_resolution=self.config.min_bucket_resolution,
+                max_ar=self.config.max_aspect_ratio,
+                tolerance=self.config.bucket_tolerance,
                 target_resolutions=self.config.target_resolutions,
                 max_ar_error=self.config.max_ar_error
             )
