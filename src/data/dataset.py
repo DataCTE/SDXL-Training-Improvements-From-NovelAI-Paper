@@ -154,7 +154,10 @@ class NovelAIDataset(Dataset):
                     device=self.device,
                     batch_size=optimal_batch_size,
                     prefetch_factor=thread_config.prefetch_factor,
-                    num_workers=num_workers
+                    num_workers=num_workers,
+                    max_memory_usage=0.8,
+                    min_batch_size=1,
+                    max_batch_size=optimal_batch_size
                 ),
                 image_processor=self.image_processor,
                 text_processor=self.text_processor,

@@ -7,6 +7,7 @@ from .system_utils import get_gpu_memory_usage, get_memory_usage_gb, adjust_batc
 from src.utils.logging.metrics import log_error_with_context, log_metrics, log_system_metrics
 import gc
 from weakref import WeakValueDictionary
+from src.config.config import BatchProcessorConfig
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +19,7 @@ class BatchProcessor:
     
     def __init__(
         self,
-        config: Any,
+        config: BatchProcessorConfig,
         executor: ThreadPoolExecutor,
         name: str = "BatchProcessor"
     ):
@@ -34,7 +35,8 @@ class BatchProcessor:
                 f"Initialized {name}:\n"
                 f"- Device: {config.device}\n"
                 f"- Batch size: {config.batch_size}\n"
-                f"- Cache enabled: {getattr(config, 'use_cache', False)}"
+                f"- Max memory usage: {config.max_memory_usage:.1%}\n"
+                f"- Workers: {config.num_workers}"
             )
             log_system_metrics(prefix=f"{name} initialization: ")
             
