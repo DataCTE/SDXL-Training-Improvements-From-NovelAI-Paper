@@ -1,7 +1,8 @@
 # src/data/processors/image_processor.py
 import torch
 from PIL import Image
-from typing import Tuple, List, Optional, Dict, Any, Union, Path
+from typing import Tuple, List, Optional, Dict, Any, Union
+from pathlib import Path
 from torchvision import transforms
 import numpy as np
 import logging
