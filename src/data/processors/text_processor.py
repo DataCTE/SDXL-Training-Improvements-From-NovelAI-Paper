@@ -49,23 +49,15 @@ class TextProcessor:
             f"- Max token length: {config.max_token_length}"
         )
 
-    async def process_text(self, text: str) -> Tuple[Dict[str, Any], List[str]]:
-        """Process text and extract tags with optional weighting."""
+    async def process_text(self, text: str) -> Dict[str, Any]:
+        """Process text and extract embeddings."""
         try:
-            # Parse tags
-            tag_dict = parse_tags(text)
+            # Get embeddings
+            embeddings = self.text_embedder([text], self.config.proportion_empty_prompts)
             
-            # Update tag frequencies if weighter is available
+            # Parse tags if tag weighting is enabled
             if self.tag_weighter is not None:
-                for tag_class, tags in tag_dict.items():
-                    for tag in tags:
-                        self.tag_weighter.update_frequencies(tag_class, tag)
-            
-            # Process text embeddings
-            text_data = await self.text_embedder.process_text(text, list(tag_dict.values()))
-            
-            # Add tag weights if available
-            if self.tag_weighter is not None:
+                tag_dict = parse_tags(text)
                 weights = []
                 for tag_class, tags in tag_dict.items():
                     for tag in tags:
@@ -73,25 +65,14 @@ class TextProcessor:
                         weights.append(weight)
                 
                 if weights:
-                    weight_tensor = torch.tensor(
-                        weights, 
-                        device=self.config.device, 
-                        dtype=torch.float32
-                    )
-                    text_data['tag_weights'] = weight_tensor.cpu()
-                    del weight_tensor
+                    weight_tensor = torch.tensor(weights, device=self.config.device, dtype=torch.float32)
+                    embeddings['tag_weights'] = weight_tensor.cpu()
             
-            # Move all tensors to CPU immediately
-            for key, value in text_data.items():
-                if isinstance(value, torch.Tensor):
-                    text_data[key] = value.cpu()
-                    del value
-            
-            return text_data, list(tag_dict.values())
+            return embeddings
             
         except Exception as e:
             logger.error(f"Error processing text: {str(e)[:200]}...")
-            return None, []
+            return None
 
     async def process_batch(
         self,

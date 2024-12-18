@@ -66,336 +66,126 @@ def setup_memory_efficient_attention(model: torch.nn.Module) -> bool:
         return False
 
 class TextEmbedder:
-    def __init__(
-        self,
-        config: TextEmbedderConfig
-    ):
-        """Initialize SDXL text embedder with consolidated config."""
-        try:
-            self.config = config
-            
-            # Log initialization start
-            logger.info("Initializing text embedder...")
-            
-            # Initialize models with progress logging
-            logger.info("Loading text encoder one...")
-            self.text_encoder_one = self._load_text_encoder("one")
-            
-            logger.info("Loading text encoder two...")
-            self.text_encoder_two = self._load_text_encoder("two")
-            
-            logger.info("Loading tokenizers...")
-            self.tokenizer_one = self._load_tokenizer("one")
-            self.tokenizer_two = self._load_tokenizer("two")
-            
-            # Initialize tensor cache
-            self._tensor_cache = WeakValueDictionary()
-            
-            # Enable optimizations
-            if self.config.enable_memory_efficient_attention:
-                setup_memory_efficient_attention(self.text_encoder_one)
-                setup_memory_efficient_attention(self.text_encoder_two)
-            
-            # Log final configuration
-            logger.info(
-                f"Text embedder initialized:\n"
-                f"- Device: {config.device}\n"
-                f"- Dtype: {config.dtype}\n"
-                f"- Batch size: {config.batch_size}\n"
-                f"- Max length: {config.max_length}\n"
-                f"- Memory efficient attention: {config.enable_memory_efficient_attention}"
-            )
-            log_system_metrics(prefix="Text embedder initialization: ")
-            
-        except Exception as e:
-            log_error_with_context(e, "Error initializing text embedder")
-            raise
-
-    def __del__(self):
-        """Cleanup when embedder is deleted."""
-        self.cleanup()
-
-    def _get_cached_tensor(self, key: str, shape: tuple, dtype: torch.dtype) -> torch.Tensor:
-        """Get or create tensor from cache."""
-        tensor = self._tensor_cache.get(key)
-        if tensor is None or tensor.shape != shape or tensor.dtype != dtype:
-            tensor = torch.empty(shape, dtype=dtype, device=self.config.device)
-            self._tensor_cache[key] = tensor
-        return tensor
+    def __init__(self, config: TextEmbedderConfig):
+        """Initialize text embedder with both encoders."""
+        self.config = config
+        
+        # Load tokenizers
+        self.tokenizer_one = AutoTokenizer.from_pretrained(
+            config.model_name,
+            subfolder="tokenizer",
+            use_fast=config.use_fast_tokenizer
+        )
+        self.tokenizer_two = AutoTokenizer.from_pretrained(
+            config.model_name,
+            subfolder="tokenizer_2",
+            use_fast=config.use_fast_tokenizer
+        )
+        
+        # Load text encoders
+        text_encoder_cls_one = self._import_model_class_from_model_name(config.model_name, "text_encoder")
+        text_encoder_cls_two = self._import_model_class_from_model_name(config.model_name, "text_encoder_2")
+        
+        self.text_encoder_one = text_encoder_cls_one.from_pretrained(
+            config.model_name,
+            subfolder="text_encoder",
+            torch_dtype=config.dtype
+        )
+        self.text_encoder_two = text_encoder_cls_two.from_pretrained(
+            config.model_name,
+            subfolder="text_encoder_2",
+            torch_dtype=config.dtype
+        )
+        
+        # Move to device and eval mode
+        self.text_encoder_one.to(config.device).eval()
+        self.text_encoder_two.to(config.device).eval()
+        
+        logger.info(
+            f"Initialized TextEmbedder:\n"
+            f"- Model: {config.model_name}\n"
+            f"- Device: {config.device}\n"
+            f"- Dtype: {config.dtype}\n"
+            f"- Max length: {config.max_length}"
+        )
 
     @torch.no_grad()
-    def _process_batch(
-        self,
-        prompts: List[str],
-        tokenizer,
-        text_encoder,
-        start_idx: int,
-        end_idx: int
-    ) -> Dict[str, torch.Tensor]:
-        """Process a batch of prompts efficiently."""
+    def __call__(self, prompts: List[str], proportion_empty_prompts: float = 0.0) -> Dict[str, torch.Tensor]:
+        """Process text with both encoders."""
         try:
-            # Tokenize with padding
-            text_inputs = tokenizer(
-                prompts,
+            # Handle empty prompt replacement
+            captions = []
+            for prompt in prompts:
+                if random.random() < proportion_empty_prompts:
+                    captions.append("")
+                else:
+                    captions.append(prompt)
+
+            # Process with first encoder
+            text_inputs_one = self.tokenizer_one(
+                captions,
                 padding="max_length",
-                max_length=self.config.max_length,
+                max_length=self.tokenizer_one.model_max_length,
                 truncation=True,
-                return_tensors="pt",
+                return_tensors="pt"
+            )
+            text_input_ids_one = text_inputs_one.input_ids.to(self.config.device)
+            
+            prompt_embeds_one = self.text_encoder_one(
+                text_input_ids_one,
+                output_hidden_states=True,
+                return_dict=False
             )
             
-            # Move to device efficiently
-            text_input_ids = text_inputs.input_ids.to(self.config.device, non_blocking=True)
-            attention_mask = text_inputs.attention_mask.to(self.config.device, non_blocking=True)
+            # Process with second encoder
+            text_inputs_two = self.tokenizer_two(
+                captions,
+                padding="max_length",
+                max_length=self.tokenizer_two.model_max_length,
+                truncation=True,
+                return_tensors="pt"
+            )
+            text_input_ids_two = text_inputs_two.input_ids.to(self.config.device)
             
-            # Use new autocast syntax
-            with torch.cuda.amp.autocast(dtype=self.config.dtype):
-                prompt_embeds = text_encoder(
-                    text_input_ids,
-                    attention_mask=attention_mask,
-                    output_hidden_states=True,
-                    return_dict=False
-                )
+            prompt_embeds_two = self.text_encoder_two(
+                text_input_ids_two,
+                output_hidden_states=True,
+                return_dict=False
+            )
             
-            # Extract and reshape embeddings
-            pooled_prompt_embeds = prompt_embeds[0]
-            prompt_embeds = prompt_embeds[-1][-2]
+            # Get pooled and prompt embeddings
+            pooled_prompt_embeds_one = prompt_embeds_one[0]
+            prompt_embeds_one = prompt_embeds_one[-1][-2]
             
-            # Clean up intermediate tensors
-            del text_inputs
-            del text_input_ids
-            del attention_mask
-            torch.cuda.empty_cache()
+            pooled_prompt_embeds_two = prompt_embeds_two[0]
+            prompt_embeds_two = prompt_embeds_two[-1][-2]
+            
+            # Combine embeddings
+            prompt_embeds = torch.cat([prompt_embeds_one, prompt_embeds_two], dim=-1)
+            pooled_prompt_embeds = torch.cat([pooled_prompt_embeds_one, pooled_prompt_embeds_two], dim=-1)
             
             return {
-                'prompt_embeds': prompt_embeds,
-                'pooled_prompt_embeds': pooled_prompt_embeds
+                "prompt_embeds": prompt_embeds.cpu(),
+                "pooled_prompt_embeds": pooled_prompt_embeds.cpu()
             }
             
-        except Exception as e:
-            logger.error(f"Error processing batch {start_idx}:{end_idx}: {e}")
-            # Clean up on error
-            if 'text_inputs' in locals():
-                del text_inputs
-            if 'text_input_ids' in locals():
-                del text_input_ids
-            if 'attention_mask' in locals():
-                del attention_mask
-            if 'prompt_embeds' in locals():
-                del prompt_embeds
-            torch.cuda.empty_cache()
-            raise
-
-    @torch.no_grad()
-    def __call__(
-        self,
-        prompts: List[str],
-        proportion_empty_prompts: float = 0.0
-    ) -> Dict[str, torch.Tensor]:
-        """Process text with detailed metrics tracking."""
-        try:
-            batch_stats = {
-                'batch_size': len(prompts),
-                'start_memory': get_gpu_memory_usage(self.config.device),
-                'start_time': time.time()
-            }
-            
-            # Process text through both encoders
-            with torch.cuda.amp.autocast(dtype=self.config.dtype):
-                # Process with first encoder
-                text_embeddings_1 = self._process_batch(
-                    prompts,
-                    self.tokenizer_one,
-                    self.text_encoder_one,
-                    0,
-                    len(prompts)
-                )
-                
-                # Process with second encoder
-                text_embeddings_2 = self._process_batch(
-                    prompts,
-                    self.tokenizer_two,
-                    self.text_encoder_two,
-                    0,
-                    len(prompts)
-                )
-                
-                # Get prompt embeddings
-                prompt_embeds_1 = text_embeddings_1['prompt_embeds']
-                prompt_embeds_2 = text_embeddings_2['prompt_embeds']
-                
-                # Get pooled embeddings
-                pooled_1 = text_embeddings_1['pooled_prompt_embeds']
-                pooled_2 = text_embeddings_2['pooled_prompt_embeds']
-                
-                # Ensure all tensors have correct batch dimension
-                if prompt_embeds_1.dim() == 2:
-                    prompt_embeds_1 = prompt_embeds_1.unsqueeze(0)
-                if prompt_embeds_2.dim() == 2:
-                    prompt_embeds_2 = prompt_embeds_2.unsqueeze(0)
-                if pooled_1.dim() == 1:
-                    pooled_1 = pooled_1.unsqueeze(0)
-                if pooled_2.dim() == 1:
-                    pooled_2 = pooled_2.unsqueeze(0)
-                
-                # Ensure pooled embeddings have matching dimensions
-                if pooled_1.size(1) != pooled_2.size(1):
-                    # Resize smaller tensor to match larger one
-                    target_size = max(pooled_1.size(1), pooled_2.size(1))
-                    if pooled_1.size(1) < target_size:
-                        pooled_1 = pooled_1.expand(-1, target_size, -1)
-                    if pooled_2.size(1) < target_size:
-                        pooled_2 = pooled_2.expand(-1, target_size, -1)
-                
-                # Combine embeddings along last dimension
-                text_embeddings = torch.cat([prompt_embeds_1, prompt_embeds_2], dim=-1)
-                pooled_embeddings = torch.cat([pooled_1, pooled_2], dim=-1)
-                
-                # Update stats
-                batch_stats.update({
-                    'end_memory': get_gpu_memory_usage(self.config.device),
-                    'duration': time.time() - batch_stats['start_time']
-                })
-                
-                return {
-                    "prompt_embeds": text_embeddings,
-                    "pooled_prompt_embeds": pooled_embeddings
-                }
-                
         except Exception as e:
             log_error_with_context(e, "Error in text embedding")
-            # Return empty tensors on error
             return {
                 "prompt_embeds": torch.empty(0, device=self.config.device),
                 "pooled_prompt_embeds": torch.empty(0, device=self.config.device)
             }
 
-    async def cleanup(self):
-        """Clean up resources."""
-        try:
-            # Clear tensor cache
-            if hasattr(self, '_tensor_cache'):
-                self._tensor_cache.clear()
-            
-            # Clear CUDA cache if using GPU
-            if self.config.device.type == 'cuda':
-                torch.cuda.empty_cache()
-            
-            # Clear model references
-            if hasattr(self, 'text_encoder_one'):
-                del self.text_encoder_one
-            if hasattr(self, 'text_encoder_two'):
-                del self.text_encoder_two
-            if hasattr(self, 'tokenizer_one'):
-                del self.tokenizer_one
-            if hasattr(self, 'tokenizer_two'):
-                del self.tokenizer_two
-            
-            # Force garbage collection
-            gc.collect()
-            
-            logger.info("Successfully cleaned up text embedder resources")
-            
-        except Exception as e:
-            logger.error(f"Error during cleanup: {e}")
-            # Try one last time to clear memory
-            try:
-                torch.cuda.empty_cache()
-                gc.collect()
-            except:
-                pass
+    def _import_model_class_from_model_name(self, pretrained_model_name: str, subfolder: str = "text_encoder"):
+        """Import the correct text encoder class."""
+        config = PretrainedConfig.from_pretrained(pretrained_model_name, subfolder=subfolder)
+        model_class = config.architectures[0]
 
-    async def process_text(
-        self, 
-        text: str, 
-        tags: List[str]
-    ) -> Optional[Dict[str, Any]]:
-        """Process text and tags asynchronously."""
-        try:
-            # Generate embeddings for the text
-            embeddings = self.__call__([text], proportion_empty_prompts=0.0)
-            
-            if not isinstance(embeddings, dict) or 'prompt_embeds' not in embeddings:
-                logger.error("Failed to generate embeddings")
-                return None
-                
-            # Return combined data
-            return {
-                'embeds': embeddings['prompt_embeds'][0],
-                'pooled_embeds': embeddings['pooled_prompt_embeds'][0],
-                'tags': tags
-            }
-            
-        except Exception as e:
-            logger.error(f"Error processing text: {str(e)[:200]}...")
-            return None
-
-    def _load_text_encoder(self, encoder_type: str):
-        """Load text encoder with proper error handling."""
-        try:
-            # Determine model path and config
-            if encoder_type == "one":
-                subfolder = self.config.text_encoder_subfolder
-            elif encoder_type == "two":
-                subfolder = self.config.text_encoder_2_subfolder
-            else:
-                raise ValueError(f"Invalid encoder type: {encoder_type}")
-            
-            # Import correct model class
-            model_class = import_model_class_from_model_name_or_path(
-                self.config.model_name,
-                subfolder=subfolder
-            )
-            
-            # Load model with optimizations
-            model = model_class.from_pretrained(
-                self.config.model_name,
-                subfolder=subfolder,
-                torch_dtype=self.config.dtype,
-                low_cpu_mem_usage=self.config.low_cpu_mem_usage,
-                device_map=None  # We'll move to device manually
-            )
-            
-            # Move to device and optimize
-            model = model.to(self.config.device)
-            model.eval()
-            
-            if self.config.enable_memory_efficient_attention:
-                setup_memory_efficient_attention(model)
-            
-            logger.info(f"Successfully loaded text encoder {encoder_type}")
-            return model
-            
-        except Exception as e:
-            log_error_with_context(
-                e, 
-                f"Error loading text encoder {encoder_type}"
-            )
-            raise
-
-    def _load_tokenizer(self, tokenizer_type: str):
-        """Load tokenizer with proper error handling."""
-        try:
-            # Determine tokenizer path
-            if tokenizer_type == "one":
-                subfolder = self.config.tokenizer_subfolder
-            elif tokenizer_type == "two":
-                subfolder = self.config.tokenizer_2_subfolder
-            else:
-                raise ValueError(f"Invalid tokenizer type: {tokenizer_type}")
-            
-            # Load tokenizer
-            tokenizer = AutoTokenizer.from_pretrained(
-                self.config.model_name,
-                subfolder=subfolder,
-                use_fast=self.config.use_fast_tokenizer
-            )
-            
-            logger.info(f"Successfully loaded tokenizer {tokenizer_type}")
-            return tokenizer
-            
-        except Exception as e:
-            log_error_with_context(
-                e,
-                f"Error loading tokenizer {tokenizer_type}"
-            )
-            raise
+        if model_class == "CLIPTextModel":
+            from transformers import CLIPTextModel
+            return CLIPTextModel
+        elif model_class == "CLIPTextModelWithProjection":
+            from transformers import CLIPTextModelWithProjection
+            return CLIPTextModelWithProjection
+        else:
+            raise ValueError(f"{model_class} is not supported.")

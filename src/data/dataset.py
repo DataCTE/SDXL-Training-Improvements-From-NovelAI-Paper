@@ -8,6 +8,7 @@ import gc
 from PIL import Image
 from tqdm import tqdm
 import time
+from pathlib import Path
 
 # Internal imports from processors
 from .processors.text_processor import TextProcessor
@@ -228,166 +229,43 @@ class NovelAIDataset(Dataset):
             logger.error(f"Error loading item {idx}: {e}")
             raise
 
-    async def _process_data(self, image_dirs: List[str]) -> None:
-        """Process all data files asynchronously with progress tracking."""
+    async def _process_data(self, image_dirs: List[str]):
+        """Process all data with improved embedding handling."""
         try:
-            # Log system info at start
-            log_system_info()
-            logger.info("Starting dataset processing...")
+            # Find all image files
+            image_files = await find_matching_files(image_dirs)
             
-            # Calculate optimal batch size with logging
-            optimal_batch_size = calculate_optimal_batch_size(
-                device=self.device,
-                min_batch_size=self.config.min_bucket_size,
-                max_batch_size=32,
-                target_memory_usage=0.8
-            )
-            logger.info(f"Calculated optimal batch size: {optimal_batch_size}")
-
-            # Find all image files asynchronously with detailed progress
-            logger.info("Scanning directories for image files...")
-            image_files = []
-            scan_stats = {
-                'total_files': 0,
-                'valid_files': 0,
-                'skipped_files': 0,
-                'error_files': 0
-            }
-            
-            for image_dir in image_dirs:
-                logger.info(f"Scanning directory: {image_dir}")
-                dir_stats = {'files': 0, 'errors': 0}
+            # Process images and text in batches
+            for batch in chunks(image_files, self.config.batch_size):
+                # Get text embeddings
+                text_files = [Path(f).with_suffix('.txt') for f in batch]
+                texts = [await asyncio.to_thread(f.read_text) for f in text_files if f.exists()]
                 
-                async for found_file in find_matching_files(
-                    image_dir, 
-                    ['.jpg', '.jpeg', '.png'],
-                    batch_size=optimal_batch_size
-                ):
-                    try:
-                        # Validate file
-                        is_valid, reason = validate_image_text_pair(found_file)
-                        if is_valid:
-                            image_files.append(found_file)
-                            scan_stats['valid_files'] += 1
-                        else:
-                            scan_stats['skipped_files'] += 1
-                            logger.debug(f"Skipped {found_file}: {reason}")
-                            
-                        dir_stats['files'] += 1
-                        scan_stats['total_files'] += 1
-                        
-                        # Log progress periodically
-                        if dir_stats['files'] % 1000 == 0:
-                            logger.info(
-                                f"Processed {dir_stats['files']} files in {image_dir}\n"
-                                f"- Valid: {scan_stats['valid_files']}\n"
-                                f"- Skipped: {scan_stats['skipped_files']}\n"
-                                f"- Errors: {scan_stats['error_files']}"
-                            )
-                            
-                    except Exception as e:
-                        dir_stats['errors'] += 1
-                        scan_stats['error_files'] += 1
-                        log_error_with_context(e, f"Error processing file {found_file}")
+                if texts:
+                    # Get embeddings for batch
+                    embeddings = await self.text_processor.process_batch(texts)
                     
-                    # Yield control periodically
-                    if len(image_files) % (optimal_batch_size * 2) == 0:
-                        await asyncio.sleep(0)
-                
-                logger.info(
-                    f"Completed scanning {image_dir}:\n"
-                    f"- Total files: {dir_stats['files']}\n"
-                    f"- Errors: {dir_stats['errors']}"
-                )
-                
-            if not image_files:
-                raise ValueError(f"No valid image files found in {image_dirs}")
-            
-            # Log final scan results
-            logger.info(
-                f"\nDirectory scan completed:\n"
-                f"- Total files found: {scan_stats['total_files']}\n"
-                f"- Valid files: {scan_stats['valid_files']}\n"
-                f"- Skipped files: {scan_stats['skipped_files']}\n"
-                f"- Error files: {scan_stats['error_files']}"
-            )
-                
-            # Create tracker with total files
-            tracker = create_progress_tracker(
-                total_items=len(image_files),
-                batch_size=optimal_batch_size,
-                device=self.device
-            )
-
-            # Process files in batches with detailed metrics
-            processed_items = []
-            total_batches = (len(image_files) + optimal_batch_size - 1) // optimal_batch_size
-            
-            logger.info(
-                f"\nStarting batch processing:\n"
-                f"- Total files: {len(image_files)}\n"
-                f"- Batch size: {optimal_batch_size}\n"
-                f"- Total batches: {total_batches}"
-            )
-            
-            for batch_num, i in enumerate(range(0, len(image_files), optimal_batch_size)):
-                batch_files = image_files[i:i + optimal_batch_size]
-                batch_items = [{'image_path': f} for f in batch_files]
-                
-                try:
-                    # Process batch with metrics
-                    batch_start = time.time()
-                    batch_processed, stats = await self.batch_processor.process_batch(
-                        batch_items=batch_items,
-                        width=self.config.image_size[0],
-                        height=self.config.image_size[1],
-                        cache_manager=self.cache_manager
-                    )
-                    batch_time = time.time() - batch_start
+                    # Process images
+                    image_results = await self.image_processor.process_batch(batch)
                     
-                    processed_items.extend(batch_processed)
-                    
-                    # Log detailed batch metrics
-                    metrics = {
-                        'batch': f"{batch_num + 1}/{total_batches}",
-                        'processed': len(batch_processed),
-                        'failed': len(batch_files) - len(batch_processed),
-                        'batch_time': f"{batch_time:.2f}s",
-                        'items_per_second': f"{len(batch_processed)/batch_time:.1f}",
-                        'memory': f"{get_gpu_memory_usage(self.device):.1%}",
-                        'cache_hits': stats.get('cache_hits', 0),
-                        'cache_misses': stats.get('cache_misses', 0)
-                    }
-                    
-                    log_metrics(
-                        metrics=metrics,
-                        step=batch_num,
-                        is_main_process=True,
-                        use_wandb=self.config.use_wandb,
-                        step_type="batch"
-                    )
-
-                except Exception as e:
-                    log_error_with_context(
-                        error=e,
-                        context=f"Error processing batch {batch_num + 1}/{total_batches}"
-                    )
-                    continue
-
-                # Allow other tasks to run
-                await asyncio.sleep(0)
+                    # Combine results
+                    for img_result, embedding in zip(image_results, embeddings):
+                        if img_result is not None and embedding is not None:
+                            self.items.append({
+                                'image_path': img_result['image_path'],
+                                'latents': img_result['latents'],
+                                'prompt_embeds': embedding['prompt_embeds'],
+                                'pooled_prompt_embeds': embedding['pooled_prompt_embeds'],
+                                'tag_weights': embedding.get('tag_weights')
+                            })
                 
-            logger.info(
-                f"\nDataset processing completed:\n"
-                f"- Total files processed: {len(processed_items)}/{len(image_files)}\n"
-                f"- Success rate: {(len(processed_items)/len(image_files))*100:.1f}%\n"
-                f"- Total time: {format_time(tracker.elapsed)}"
-            )
-            
-            self.items = processed_items
-
+                # Clear memory periodically
+                if len(self.items) % 1000 == 0:
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                
         except Exception as e:
-            log_error_with_context(e, "Error in dataset processing")
+            logger.error(f"Error processing data: {e}")
             raise
 
     async def cleanup(self):
