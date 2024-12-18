@@ -260,3 +260,21 @@ class BucketManager:
     def __del__(self):
         """Ensure cleanup when bucket manager is deleted."""
         self.cleanup()
+
+    def get_target_size(self, original_size: Tuple[int, int]) -> Tuple[int, int]:
+        """
+        Determine the best target size for the given original size
+        based on the existing buckets. If no matching bucket is found,
+        fall back to validated dimensions.
+        """
+        width, height = original_size
+        # First clamp and step-round the dimensions
+        valid_w, valid_h = self._validate_dimensions(width, height)
+        
+        # Attempt to find a matched bucket
+        bucket = self.find_bucket(valid_w, valid_h)
+        if bucket is not None:
+            return (bucket.width, bucket.height)
+
+        # Fallback to validated dimensions if no bucket is returned
+        return (valid_w, valid_h)
