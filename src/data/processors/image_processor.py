@@ -14,7 +14,7 @@ import random
 from src.data.processors.utils.system_utils import get_gpu_memory_usage, get_optimal_workers, create_thread_pool, cleanup_processor
 from src.data.processors.utils.image_utils import load_and_validate_image, resize_image, get_image_stats
 from src.data.processors.utils.image.vae_encoder import VAEEncoder
-from src.config.config import VAEEncoderConfig  # Import the consolidated config
+from src.config.config import ImageProcessorConfig  # Import the consolidated config
 
 # Internal imports from processors
 from src.data.processors.bucket import BucketManager
@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 class ImageProcessor:
     def __init__(
         self,
-        config: VAEEncoderConfig,
+        config: ImageProcessorConfig,
         bucket_manager: Optional[BucketManager] = None,
         vae = None
     ):
@@ -52,7 +52,7 @@ class ImageProcessor:
             interpolation=transforms.InterpolationMode.BILINEAR,
             antialias=True
         )
-        self.center_crop = transforms.CenterCrop(config.resolution)
+        self.center_crop = transforms.CenterCrop(config.center_crop)
         self.random_crop = transforms.RandomCrop(config.resolution)
         
         logger.info(
