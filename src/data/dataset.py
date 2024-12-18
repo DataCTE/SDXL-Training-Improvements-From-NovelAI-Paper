@@ -89,7 +89,6 @@ class NovelAIDataset(Dataset):
             self.text_processor = TextProcessor(
                 text_embedder=self.text_embedder,
                 tag_weighter=self.tag_weighter,
-                num_workers=num_workers,
                 device=device
             )
             
