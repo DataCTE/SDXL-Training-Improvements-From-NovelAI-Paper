@@ -8,6 +8,28 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+def parse_tags(text: str) -> Dict[str, List[str]]:
+    """Parse text into tag dictionary by category."""
+    tag_dict = {
+        'character': [],
+        'style': [],
+        'quality': [],
+        'artist': []
+    }
+    
+    # Simple parsing - can be enhanced later
+    lines = text.strip().split('\n')
+    for line in lines:
+        if ':' in line:
+            category, tags = line.split(':', 1)
+            category = category.strip().lower()
+            if category in tag_dict:
+                tag_dict[category].extend(
+                    [t.strip() for t in tags.split(',') if t.strip()]
+                )
+    
+    return tag_dict
+
 class TagWeighter:
     """Handles tag weighting and frequency tracking for captions."""
     
