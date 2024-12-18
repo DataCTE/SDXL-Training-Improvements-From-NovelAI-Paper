@@ -349,6 +349,7 @@ class NovelAIDatasetConfig:
     max_consecutive_batch_samples: int = 2  # Default value
     min_bucket_length: int = 1  # Default value
     debug_mode: bool = False  # Default value
+    prefetch_factor: Optional[int] = DEFAULT_PREFETCH_FACTOR
 
     def __post_init__(self):
         # Convert image sizes to tuples if needed

@@ -38,7 +38,8 @@ class AspectBatchSampler(Sampler[List[int]]):
         max_consecutive_batch_samples: int = 2,
         min_bucket_length: int = 1,
         debug_mode: bool = False,
-        prefetch_factor: Optional[int] = None
+        prefetch_factor: Optional[int] = None,
+        bucket_manager: Optional[BucketManager] = None
     ):
         """Initialize using dataset's bucket information and optimal thread configuration."""
         super().__init__(dataset)
@@ -79,7 +80,7 @@ class AspectBatchSampler(Sampler[List[int]]):
         # Get bucket manager from dataset
         if not hasattr(dataset, 'bucket_manager') or not isinstance(dataset.bucket_manager, BucketManager):
             raise ValueError("Dataset must have a valid BucketManager instance")
-        self.bucket_manager = dataset.bucket_manager
+        self.bucket_manager = bucket_manager or dataset.bucket_manager
         
         # Initialize state
         self.epoch = 0
