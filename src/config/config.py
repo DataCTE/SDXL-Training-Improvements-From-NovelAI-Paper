@@ -303,10 +303,12 @@ class VAEEncoderConfig(DeviceConfig):
 class BucketConfig:
     """Configuration for image bucketing."""
     target_size: Tuple[int, int] = DEFAULT_IMAGE_SIZE
-    max_size: Tuple[int, int] = DEFAULT_MAX_IMAGE_SIZE  
     min_size: Tuple[int, int] = DEFAULT_MIN_IMAGE_SIZE
+    max_size: Tuple[int, int] = DEFAULT_MAX_IMAGE_SIZE  
     step: int = 8
     min_resolution: Optional[int] = None
+    min_bucket_resolution: Optional[int] = None
+    min_bucket_size: int = 16
     max_ar: float = 2.0
     tolerance: float = 0.2
     target_resolutions: List[Tuple[int, int]] = field(
