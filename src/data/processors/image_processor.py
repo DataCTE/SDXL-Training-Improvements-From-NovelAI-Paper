@@ -193,15 +193,28 @@ class ImageProcessor:
         """
         Dedicated GPU-based resizing using PyTorch F.interpolate.
         Resizes to self.config.resolution.
+        If x is [C, H, W], we add a batch dimension (N=1) before interpolation 
+        and then remove it afterwards, so that F.interpolate can operate on 4D input.
         """
-        # If x is in shape [C,H,W], add a fake batch dim -> [1,C,H,W]
-        # but in many workflows x might be [B,C,H,W], so be sure your pipeline is consistent.
-        return F.interpolate(
+        # If x is 3D: (C, H, W), add an extra batch dimension -> (1, C, H, W)
+        added_batch_dim = False
+        if x.dim() == 3:
+            x = x.unsqueeze(0)
+            added_batch_dim = True
+
+        # Interpolate now that x is guaranteed to be [N, C, H, W].
+        x = F.interpolate(
             x,
             size=(self.config.resolution[0], self.config.resolution[1]),
             mode='bilinear',
             align_corners=False
         )
+        
+        # If we added a batch dimension, remove it again.
+        if added_batch_dim:
+            x = x.squeeze(0)
+
+        return x
 
     async def load_image(self, path_or_str) -> "Image.Image":
         """
