@@ -8,6 +8,7 @@ from src.utils.logging.metrics import log_error_with_context, log_metrics, log_s
 import gc
 from weakref import WeakValueDictionary
 from src.config.config import BatchProcessorConfig
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -220,3 +221,39 @@ async def process_in_chunks(
     final_stats['elapsed_seconds'] = time.time() - start_time
     
     return all_results, final_stats
+
+async def find_matching_files(
+    directories: List[str],
+    extensions: List[str],
+    recursive: bool = True
+) -> List[str]:
+    """Find files with matching extensions in given directories.
+    
+    Args:
+        directories: List of directory paths to search
+        extensions: List of file extensions to match (e.g. ['.png', '.jpg'])
+        recursive: Whether to search subdirectories
+        
+    Returns:
+        List of matching file paths
+    """
+    matching_files = []
+    
+    for directory in directories:
+        path = Path(directory)
+        if not path.exists():
+            logger.warning(f"Directory not found: {directory}")
+            continue
+            
+        # Get all files recursively or just in current directory
+        if recursive:
+            all_files = path.rglob("*")
+        else:
+            all_files = path.glob("*")
+            
+        # Filter by extensions
+        for file_path in all_files:
+            if file_path.suffix.lower() in extensions:
+                matching_files.append(str(file_path))
+                
+    return sorted(matching_files)  # Sort for consistent ordering

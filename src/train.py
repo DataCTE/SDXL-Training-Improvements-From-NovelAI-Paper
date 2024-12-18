@@ -7,7 +7,7 @@ from functools import partial
 
 from src.data import NovelAIDataset, NovelAIDatasetConfig
 from src.training.trainer import NovelAIDiffusionV3Trainer
-from src.utils.model.model import setup_model
+from src.utils.model.model import setup_model, setup_text_encoders
 from src.config.config import Config, TagWeighterConfig
 from src.utils.system.setup import verify_memory_optimizations, setup_memory_optimizations
 from src.utils.logging.metrics import setup_logging, log_system_info, cleanup_logging
@@ -104,9 +104,16 @@ def train(config_path: str):
         if is_main_process:
             log_system_info()
         
-        # Setup models
+        # Setup models and encoders
         logger.info("Setting up models...")
         unet, vae = setup_model(args, device, config)
+        
+        # Initialize text encoders and tokenizers
+        text_encoders, tokenizers = setup_text_encoders(
+            config.model.pretrained_model_name,
+            device=device,
+            subfolder="text_encoder"
+        )
         
         # Setup memory optimizations
         batch_size = config.training.batch_size
@@ -166,7 +173,10 @@ def train(config_path: str):
             max_consecutive_batch_samples=2,
             model_name=config.model.pretrained_model_name,
             tag_weighting=config.tag_weighting,  # Pass tag weighting config
-            max_token_length=config.data.max_token_length
+            max_token_length=config.data.max_token_length,
+            use_tag_weighting=config.data.use_tag_weighting,
+            tag_weight_ranges=config.data.tag_weight_ranges,
+            tag_weights_path=config.paths.tag_weights_path,  # Add path for saving weights
         )
         
         # Create async event loop for dataset operations
@@ -175,11 +185,22 @@ def train(config_path: str):
         
         # Initialize dataset with async context
         async def init_dataset():
+            # Create tag weighter if enabled
+            tag_weighter = None
+            if config.data.use_tag_weighting:
+                tag_weighter = TagWeighter(
+                    weight_ranges=config.data.tag_weight_ranges,
+                    save_path=config.paths.tag_weights_path
+                )
+                if config.paths.tag_weights_path and os.path.exists(config.paths.tag_weights_path):
+                    tag_weighter = TagWeighter.load(config.paths.tag_weights_path)
+            
             return await NovelAIDataset.create(
-                image_dirs=config.data.image_dirs,
                 config=dataset_config,
                 vae=vae,
-                device=device
+                text_encoders=text_encoders,  # Make sure these are passed
+                tokenizers=tokenizers,
+                tag_weighter=tag_weighter
             )
 
         try:

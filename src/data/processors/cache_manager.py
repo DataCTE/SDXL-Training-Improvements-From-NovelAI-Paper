@@ -1,330 +1,172 @@
 # src/data/processors/cache_manager.py
-from pathlib import Path
-import torch
-from typing import Dict, Any, Optional, List
+import os
 import logging
 import asyncio
-import aiofiles
-import io
+import torch
+from pathlib import Path
+from typing import Dict, Any, Optional, List, Tuple
 import gc
+from weakref import WeakValueDictionary
 
-# Internal imports from utils
-from src.data.processors.utils.system_utils import create_thread_pool, get_memory_usage_gb, MemoryCache
+from src.data.processors.utils.system_utils import get_gpu_memory_usage, cleanup_processor
+from src.data.processors.utils.file_utils import ensure_dir
+from src.config.config import CacheConfig
 
 logger = logging.getLogger(__name__)
 
 class CacheManager:
-    def __init__(self, cache_dir: str, max_workers: Optional[int] = None, use_caching: bool = True):
-        """Initialize cache manager.
+    """Manages caching of processed images and text embeddings."""
+    
+    def __init__(self, config: CacheConfig):
+        """Initialize cache manager with configuration."""
+        self.config = config
+        self.cache_dir = Path(config.cache_dir)
         
-        Args:
-            cache_dir: Directory for cache files
-            max_workers: Maximum number of worker threads
-            use_caching: Whether to enable caching
-        """
-        self.cache_dir = Path(cache_dir)
-        self.use_caching = use_caching
-        self.latent_cache = self.cache_dir / "latents"
-        self.text_cache = self.cache_dir / "text"
+        # Create cache directories
+        self.latents_dir = self.cache_dir / "latents"
+        self.text_dir = self.cache_dir / "text"
+        self.metadata_dir = self.cache_dir / "metadata"
         
-        # Create cache directories if caching is enabled
-        if self.use_caching:
-            for cache_dir in [self.latent_cache, self.text_cache]:
-                cache_dir.mkdir(parents=True, exist_ok=True)
+        for dir_path in [self.latents_dir, self.text_dir, self.metadata_dir]:
+            ensure_dir(dir_path)
             
-        # Initialize thread pool and memory cache
-        self.executor = create_thread_pool(max_workers)
-        self.memory_cache = MemoryCache(max_items=100)  # Reduced from 1000 to prevent memory buildup
-        
-        # Stats
-        self.total_saved = 0
-        self.cache_hits = 0
-        self.cache_misses = 0
+        # Initialize memory cache
+        self._memory_cache = WeakValueDictionary()
         
         logger.info(
-            f"Initialized cache manager:\n"
-            f"- Cache dir: {self.cache_dir}\n"
-            f"- Workers: {self.executor._max_workers}\n"
-            f"- Memory cache size: {self.memory_cache.max_items}\n"
-            f"- Caching enabled: {self.use_caching}"
+            f"Initialized CacheManager:\n"
+            f"- Cache directory: {self.cache_dir}\n"
+            f"- Memory cache enabled: {config.use_memory_cache}\n"
+            f"- Cache format: {config.cache_format}"
         )
 
     def get_cache_paths(self, image_path: str) -> Dict[str, Path]:
-        """Get cache file paths and check existence."""
-        stem = Path(image_path).stem
-        paths = {
-            'latent': self.latent_cache / f"{stem}.pt",
-            'text': self.text_cache / f"{stem}.pt"
-        }
-        return paths
-
-    async def save_latent_async(self, path: Path, tensor: torch.Tensor) -> None:
-        """Save latent tensor to disk immediately."""
-        try:
-            # Ensure tensor is on CPU and detached
-            if tensor.device.type != 'cpu':
-                tensor = tensor.detach().cpu()
-            
-            # Save tensor directly without buffering
-            torch.save(tensor, str(path), pickle_protocol=4)
-            
-            # Ensure file is written to disk
-            with open(path, 'rb') as f:
-                f.read(1)  # Force disk write
-            
-            # Clear reference and force garbage collection
-            del tensor
-            gc.collect()
-            torch.cuda.empty_cache()
-            
-        except Exception as e:
-            logger.error(f"Error saving latent to {path}: {e}")
-
-    async def save_text_data_async(self, path: Path, data: Dict) -> None:
-        """Save text data to disk immediately."""
-        try:
-            # Convert any tensors to CPU and detach
-            cpu_data = {}
-            for key, value in data.items():
-                if isinstance(value, torch.Tensor):
-                    cpu_data[key] = value.detach().cpu()
-                else:
-                    cpu_data[key] = value
-            
-            # Save data directly without buffering
-            torch.save(cpu_data, str(path), pickle_protocol=4)
-            
-            # Ensure file is written to disk
-            with open(path, 'rb') as f:
-                f.read(1)  # Force disk write
-            
-            # Clear references
-            del cpu_data
-            del data  # Also clear original data
-            gc.collect()
-            
-        except Exception as e:
-            logger.error(f"Error saving text data to {path}: {e}")
-
-    def load_latent(self, path: Path) -> torch.Tensor:
-        """Load latent tensor with memory caching and validation."""
-        # Try memory cache first
-        data = self.memory_cache.get(str(path))
-        if data is not None:
-            self.cache_hits += 1
-            return data.cpu()  # Always return CPU tensor
-            
-        try:
-            if not path.exists():
-                raise FileNotFoundError(f"Cache file not found: {path}")
-                
-            data = torch.load(path)
-            if not isinstance(data, torch.Tensor):
-                raise ValueError(f"Expected tensor, got {type(data)}")
-                
-            # Store CPU tensor in cache
-            data = data.cpu()
-            self.memory_cache.set(str(path), data)
-            self.cache_misses += 1
-            
-            return data
-            
-        except Exception as e:
-            logger.error(f"Error loading latent from {path}: {e}")
-            raise
-
-    def load_text_data(self, path: Path) -> Dict[str, Any]:
-        """Load text embedding data with memory caching."""
-        data = self.memory_cache.get(str(path))
-        if data is not None:
-            return self._ensure_cpu_tensors(data)
-            
-        try:
-            data = torch.load(path)
-            # Ensure all tensors are on CPU
-            data = self._ensure_cpu_tensors(data)
-            self.memory_cache.set(str(path), data)
-            return data
-        except Exception as e:
-            logger.error(f"Error loading text data from {path}: {e}")
-            raise
-
-    def _ensure_cpu_tensors(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Ensure all tensors in dictionary are on CPU."""
-        result = {}
-        for key, value in data.items():
-            if isinstance(value, torch.Tensor):
-                result[key] = value.cpu()
-            elif isinstance(value, dict):
-                result[key] = self._ensure_cpu_tensors(value)
-            else:
-                result[key] = value
-        return result
-
-    async def cleanup(self):
-        """Clean up resources and clear caches."""
-        try:
-            # Clear memory cache
-            self.memory_cache.clear()
-            
-            # Clear CUDA cache
-            torch.cuda.empty_cache()
-            
-            # Force garbage collection
-            gc.collect()
-            
-            logger.info("Successfully cleaned up cache manager resources")
-            
-        except Exception as e:
-            logger.error(f"Error during cache cleanup: {e}")
-
-    def clear_memory_cache(self):
-        """Clear the in-memory cache and force garbage collection."""
-        self.memory_cache.clear()
-        gc.collect()
-        torch.cuda.empty_cache()
-
-    def get_stats(self) -> Dict[str, Any]:
-        """Get detailed cache statistics."""
-        cache_stats = self.memory_cache.get_stats()
-        return {
-            **cache_stats,
-            "total_saved": self.total_saved,
-            "cache_hits": self.cache_hits,
-            "cache_misses": self.cache_misses,
-            "hit_rate": self.cache_hits / max(1, self.cache_hits + self.cache_misses),
-            "memory_usage_gb": get_memory_usage_gb()
-        }
-
-    async def get_cached_item(self, image_path: str) -> Optional[Dict[str, Any]]:
-        """Get cached item data for both latent and text asynchronously.
+        """Get cache paths for an image file."""
+        image_path = Path(image_path)
+        relative_path = image_path.stem
         
-        Args:
-            image_path: Path to the image file
-            
-        Returns:
-            Dict containing cached data if both latent and text exist, None otherwise
-        """
+        return {
+            'latent': self.latents_dir / f"{relative_path}.pt",
+            'text': self.text_dir / f"{relative_path}.pt",
+            'metadata': self.metadata_dir / f"{relative_path}.json"
+        }
+
+    async def cache_item(self, image_path: str, processed_item: Dict[str, Any]) -> None:
+        """Cache processed item data including tag weights."""
         try:
-            # Get cache paths
             cache_paths = self.get_cache_paths(image_path)
             
-            # Check if both cache files exist
-            if not (cache_paths['latent'].exists() and cache_paths['text'].exists()):
-                return None
+            # Extract data to cache
+            latents = processed_item.get('latents')
+            text_data = {
+                'prompt_embeds': processed_item['prompt_embeds'].cpu(),
+                'pooled_prompt_embeds': processed_item['pooled_prompt_embeds'].cpu()
+            }
+            if 'tag_weights' in processed_item:
+                text_data['tag_weights'] = processed_item['tag_weights'].cpu()
                 
-            # Load cached data asynchronously
-            latent, text_data = await asyncio.gather(
-                asyncio.to_thread(self.load_latent, cache_paths['latent']),
-                asyncio.to_thread(self.load_text_data, cache_paths['text'])
-            )
-            
-            # Return combined data
-            cached_item = {
-                'image_path': image_path,
-                'latent': latent,
-                'text_data': text_data,
-                'latent_cache': cache_paths['latent'],
-                'text_cache': cache_paths['text']
+            metadata = {
+                'original_size': processed_item.get('original_size'),
+                'crop_top_left': processed_item.get('crop_top_left'),
+                'target_size': (processed_item.get('width'), processed_item.get('height'))
             }
             
-            # Add tag weights if they exist in text data
-            if 'tag_weights' in text_data:
-                cached_item['tag_weights'] = text_data['tag_weights']
-            
-            return cached_item
-            
-        except Exception as e:
-            logger.debug(f"Cache miss for {image_path}: {str(e)}")
-            return None
-
-    async def cache_item(self, image_path: str, item: Dict[str, Any]) -> None:
-        """Write latents/text to files as needed."""
-        if not self.use_caching:
-            return
-            
-        try:
-            # Get cache paths
-            cache_paths = self.get_cache_paths(image_path)
-            
-            # Save latent immediately if present
-            if 'processed_image' in item and item['processed_image'] is not None:
-                await self.save_latent_async(
+            # Save latents
+            if latents is not None:
+                torch.save(
+                    latents.cpu(), 
                     cache_paths['latent'],
-                    item['processed_image']
+                    _use_new_zipfile_serialization=True
                 )
-                # Clear the tensor from the item dict after saving
-                del item['processed_image']
             
-            # Save text data immediately if present and not None
-            if 'text_data' in item and item['text_data'] is not None:
-                text_data = item['text_data'].copy()  # Make a copy to avoid modifying original
-                if 'tag_weights' in item and item['tag_weights'] is not None:
-                    text_data['tag_weights'] = item['tag_weights']
-                await self.save_text_data_async(
+            # Save text embeddings
+            if text_data is not None:
+                torch.save(
+                    text_data,
                     cache_paths['text'],
-                    text_data
+                    _use_new_zipfile_serialization=True
                 )
-                # Clear the data from the item dict after saving
-                del item['text_data']
-                if 'tag_weights' in item:
-                    del item['tag_weights']
             
-            # Update cache stats
-            self.total_saved += 1
+            # Save metadata
+            if any(metadata.values()):
+                import json
+                with open(cache_paths['metadata'], 'w') as f:
+                    json.dump(metadata, f)
             
-            # Clear memory cache periodically
-            if self.total_saved % 50 == 0:  # More frequent cleanup
-                self.memory_cache.clear()
-                gc.collect()
-                torch.cuda.empty_cache()
+            # Add to memory cache if enabled
+            if self.config.use_memory_cache:
+                cache_key = str(image_path)
+                self._memory_cache[cache_key] = {
+                    'latents': latents.cpu() if latents is not None else None,
+                    'text_data': text_data if text_data is not None else None,
+                    'metadata': metadata
+                }
                 
         except Exception as e:
             logger.error(f"Error caching item {image_path}: {e}")
 
-    async def cache_batch_items(self, items: List[Dict[str, Any]]) -> None:
-        """Cache a batch of items immediately after processing."""
-        if not self.use_caching:
-            return
-            
+    async def load_cached_item(self, image_path: str) -> Optional[Dict[str, Any]]:
+        """Load item from cache."""
         try:
-            # Process each item sequentially to avoid memory buildup
-            for item in items:
-                if 'image_path' not in item:
-                    continue
-                    
-                # Get cache paths
-                cache_paths = self.get_cache_paths(item['image_path'])
-                
-                # Save latent immediately if present and not None
-                if 'processed_image' in item and item['processed_image'] is not None:
-                    await self.save_latent_async(
-                        cache_paths['latent'],
-                        item['processed_image']
-                    )
-                    del item['processed_image']  # Clear after saving
-                
-                # Save text data immediately if present and not None
-                if 'text_data' in item and item['text_data'] is not None:
-                    text_data = item['text_data'].copy()
-                    if 'tag_weights' in item and item['tag_weights'] is not None:
-                        text_data['tag_weights'] = item['tag_weights']
-                    await self.save_text_data_async(
-                        cache_paths['text'],
-                        text_data
-                    )
-                    del item['text_data']  # Clear after saving
-                    if 'tag_weights' in item:
-                        del item['tag_weights']
-                
-                # Clear memory after each item
-                gc.collect()
-                torch.cuda.empty_cache()
+            # Check memory cache first
+            if self.config.use_memory_cache:
+                cached = self._memory_cache.get(str(image_path))
+                if cached is not None:
+                    return cached
             
-            # Final cleanup
-            self.memory_cache.clear()
+            cache_paths = self.get_cache_paths(image_path)
+            
+            if not all(p.exists() for p in cache_paths.values()):
+                return None
+                
+            # Load cached data
+            latents = torch.load(cache_paths['latent']) if cache_paths['latent'].exists() else None
+            text_data = torch.load(cache_paths['text']) if cache_paths['text'].exists() else None
+            
+            metadata = None
+            if cache_paths['metadata'].exists():
+                import json
+                with open(cache_paths['metadata']) as f:
+                    metadata = json.load(f)
+            
+            cached_item = {
+                'latents': latents,
+                'text_data': text_data,
+                'metadata': metadata
+            }
+            
+            # Add to memory cache
+            if self.config.use_memory_cache:
+                self._memory_cache[str(image_path)] = cached_item
+                
+            return cached_item
+            
+        except Exception as e:
+            logger.error(f"Error loading cached item {image_path}: {e}")
+            return None
+
+    async def cleanup(self):
+        """Clean up cache manager resources."""
+        try:
+            # Clear memory cache
+            self._memory_cache.clear()
+            
+            # Force garbage collection
             gc.collect()
             torch.cuda.empty_cache()
-                
+            
+            logger.info("Successfully cleaned up cache manager resources")
+            
         except Exception as e:
-            logger.error(f"Error caching batch items: {e}")
+            logger.error(f"Error during cache manager cleanup: {e}")
+
+    def __del__(self):
+        """Ensure cleanup when cache manager is deleted."""
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(self.cleanup())
+            else:
+                loop.run_until_complete(self.cleanup())
+        except Exception as e:
+            logger.error(f"Error during cache manager deletion: {e}")

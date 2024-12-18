@@ -1,7 +1,8 @@
 from dataclasses import dataclass, field
-from typing import List, Tuple, Optional, Literal, Union
+from typing import List, Tuple, Optional, Literal, Union, Dict
 import yaml
 import torch
+from pathlib import Path
 
 # Common default values
 DEFAULT_BATCH_SIZE = 64
@@ -207,9 +208,18 @@ class NovelAIDatasetConfig:
     proportion_empty_prompts: float = 0.0
     max_consecutive_batch_samples: int = 2
     max_token_length: int = DEFAULT_MAX_TOKEN_LENGTH
+    image_dirs: List[str] = field(default_factory=list)
     
     # Tag weighting settings
     tag_weighting: TagWeighterConfig = field(default_factory=TagWeighterConfig)
+    use_tag_weighting: bool = True
+    tag_weight_ranges: Dict[str, Tuple[float, float]] = field(default_factory=lambda: {
+        'character': (0.8, 1.2),
+        'style': (0.7, 1.3),
+        'quality': (0.6, 1.4),
+        'artist': (0.5, 1.5)
+    })
+    tag_weights_path: Optional[str] = None
 
     def __post_init__(self):
         """Convert and validate configuration."""
@@ -226,6 +236,15 @@ class NovelAIDatasetConfig:
         # Set min_bucket_resolution if not specified
         if self.min_bucket_resolution is None:
             self.min_bucket_resolution = min(self.min_image_size)
+
+        # Validate tag weighting settings
+        if self.use_tag_weighting and not self.tag_weight_ranges:
+            logger.warning("Tag weighting enabled but no ranges specified, using defaults")
+            
+        # Ensure tag weights path exists if specified
+        if self.tag_weights_path:
+            self.tag_weights_path = Path(self.tag_weights_path)
+            self.tag_weights_path.parent.mkdir(parents=True, exist_ok=True)
 
 @dataclass
 class DeviceConfig:
@@ -300,6 +319,7 @@ class TextProcessorConfig(DeviceConfig, CacheConfig):
 
     # Add this attribute to allow passing 'prefetch_factor' from your YAML
     prefetch_factor: int = DEFAULT_PREFETCH_FACTOR
+    proportion_empty_prompts: float = 0.0
 
 @dataclass
 class TextEmbedderConfig(DeviceConfig):

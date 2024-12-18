@@ -223,17 +223,24 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
                 torch.cuda.reset_peak_memory_stats()
                 start_mem = torch.cuda.memory_allocated() / 1024**2
             
-            # Process inputs - now using dataset's processed data directly
-            model_input = batch["model_input"].to(
-                device=self.device,
+            # Get model inputs and embeddings
+            model_input = batch["latents"].to(self.device, dtype=self.model_dtype, non_blocking=True)
+            prompt_embeds = batch["prompt_embeds"].to(self.device, non_blocking=True)
+            pooled_prompt_embeds = batch["pooled_prompt_embeds"].to(self.device, non_blocking=True)
+            
+            # Get SDXL conditioning
+            add_time_ids = get_add_time_ids(
+                original_sizes=batch["original_size"],
+                crops_coords_top_lefts=batch["crop_top_left"],
+                target_sizes=[(self.config.data.image_size[0], self.config.data.image_size[1])] * len(model_input),
                 dtype=self.model_dtype,
-                memory_format=torch.channels_last if self.config.system.channels_last else torch.contiguous_format,
-                non_blocking=True
+                device=self.device
             )
             
-            # Process embeddings - using dataset's processed embeddings
-            encoder_hidden_states = batch["text_embeds"].to(self.device, non_blocking=True)
-            pooled_embeds = batch["pooled_embeds"].to(self.device, non_blocking=True)
+            # Apply tag weights if available
+            if "tag_weights" in batch:
+                tag_weights = batch["tag_weights"].to(self.device, non_blocking=True)
+                prompt_embeds = prompt_embeds * tag_weights.unsqueeze(-1)
             
             # Sample timesteps
             timesteps = torch.randint(0, self.num_train_timesteps, (model_input.shape[0],), device=self.device)
@@ -262,24 +269,14 @@ class NovelAIDiffusionV3Trainer(torch.nn.Module):
             else:
                 scaled_input = noisy_latents
                 
-            # Get time embeddings
-            time_ids = get_add_time_ids(
-                original_sizes=batch["original_sizes"],
-                crops_coords_top_lefts=batch["crop_top_lefts"],
-                target_sizes=batch["target_sizes"],
-                batch_size=model_input.shape[0],
-                dtype=self.model_dtype,
-                device=self.device
-            )
-            
             # Forward pass
             model_pred = self.model(
                 scaled_input,
                 timesteps,
-                encoder_hidden_states=encoder_hidden_states,
+                encoder_hidden_states=prompt_embeds,
                 added_cond_kwargs={
-                    "text_embeds": pooled_embeds,
-                    "time_ids": time_ids
+                    "text_embeds": pooled_prompt_embeds,
+                    "time_ids": add_time_ids
                 },
                 return_dict=False
             )[0]

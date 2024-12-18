@@ -7,6 +7,8 @@ import time
 import traceback
 import gc
 import asyncio
+from PIL import Image
+from collections import defaultdict
 
 # Internal imports from utils
 from src.data.processors.utils.progress_utils import (
@@ -140,74 +142,48 @@ class AspectBatchSampler(Sampler[List[int]]):
     async def __aiter__(self) -> AsyncIterator[List[int]]:
         """Create and yield batches for current epoch efficiently."""
         try:
-            epoch_start = time.time()
-            logger.info(f"\nStarting epoch {self.epoch}")
-            
-            # Create progress tracker for this epoch
+            # Create progress tracker
             tracker = create_progress_tracker(
-                total_items=self.total_batches,
-                batch_size=self.batch_size,
-                device=self.dataset.device
+                total_items=len(self.dataset),
+                desc="Processing batches",
+                unit="images"
             )
             
-            # Shuffle buckets if needed
-            if self.shuffle:
-                self.bucket_manager.shuffle_buckets(self.epoch)
+            epoch_start = time.time()
+            active_buckets = set(self.bucket_manager.buckets.keys())
+            consecutive_samples = defaultdict(int)
             
-            # Track consecutive samples from each bucket
-            consecutive_samples = {key: 0 for key in self.bucket_manager.buckets}
-            active_buckets = set(key for key, bucket in self.bucket_manager.buckets.items() 
-                               if len(bucket) >= self.min_bucket_length)
-            
-            # Process buckets in order of remaining samples
-            while active_buckets:
-                # Find bucket with most remaining samples
-                max_remaining = -1
-                selected_key = None
+            while active_buckets and tracker.processed_items < tracker.total_items:
+                # Select bucket based on sampling strategy
+                selected_key = self._select_bucket(active_buckets, consecutive_samples)
+                bucket = self.bucket_manager.get_bucket_by_key(selected_key)
                 
-                for key in active_buckets:
-                    bucket = self.bucket_manager.buckets[key]
-                    remaining = bucket.remaining_samples()
+                if not bucket:
+                    active_buckets.remove(selected_key)
+                    continue
                     
-                    if remaining == 0:
-                        active_buckets.remove(key)
-                        continue
-                        
-                    if consecutive_samples[key] >= self.max_consecutive_batch_samples:
-                        continue
-                        
-                    if remaining > max_remaining:
-                        max_remaining = remaining
-                        selected_key = key
+                width, height = map(int, selected_key.split('x'))
                 
-                if selected_key is None:
-                    # Reset consecutive counts if all buckets hit limit
-                    if any(bucket.remaining_samples() > 0 
-                          for bucket in self.bucket_manager.buckets.values()):
-                        consecutive_samples = {key: 0 for key in self.bucket_manager.buckets}
-                        continue
-                    break
-                
-                # Get batch from selected bucket
-                bucket = self.bucket_manager.buckets[selected_key]
+                # Get batch from bucket
                 batch = bucket.get_next_batch(self.batch_size)
                 
                 if batch:
-                    consecutive_samples[selected_key] += 1
-                    for other_key in consecutive_samples:
-                        if other_key != selected_key:
-                            consecutive_samples[other_key] = 0
-                            
-                    # Get bucket dimensions for batch processing
-                    width, height = bucket.width, bucket.height
+                    # Create batch items with dimensions and original sizes
+                    batch_items = []
+                    for idx in batch:
+                        item = self.dataset.items[idx]
+                        img_path = item['image_path']
+                        # Get original image size for SDXL conditioning
+                        with Image.open(img_path) as img:
+                            original_size = (img.height, img.width)
+                        batch_items.append({
+                            **item,
+                            'original_size': original_size,
+                            'width': width,
+                            'height': height
+                        })
                     
-                    # Create batch items with dimensions
-                    batch_items = [
-                        {**self.dataset.items[idx], 'width': width, 'height': height}
-                        for idx in batch
-                    ]
-                    
-                    # Process batch using BatchProcessor
+                    # Process batch
                     try:
                         processed_items, batch_stats = await self.batch_processor.process_batch(
                             batch_items=batch_items,
@@ -216,47 +192,20 @@ class AspectBatchSampler(Sampler[List[int]]):
                             cache_manager=self.dataset.cache_manager
                         )
                         
-                        # Update progress tracker
                         if processed_items:
-                            update_tracker(
-                                tracker,
-                                processed=len(processed_items),
-                                cache_hits=batch_stats.get('cache_hits', 0),
-                                cache_misses=batch_stats.get('cache_misses', 0)
-                            )
-                            
-                            if batch_stats.get('errors', 0) > 0:
-                                for error_type, count in batch_stats.get('error_types', {}).items():
-                                    update_tracker(tracker, failed=count, error_type=error_type)
-                            
+                            update_tracker(tracker, **batch_stats)
                             yield batch
                             
-                            # Clear processed items and batch references
-                            del processed_items
-                            del batch_items
-                            gc.collect()
-                            torch.cuda.empty_cache()
-                            
-                        # Log progress periodically
-                        if tracker.should_log():
-                            extra_stats = {
-                                'active_buckets': len(active_buckets),
-                                'current_bucket': f"{width}x{height}",
-                                'consecutive_samples': consecutive_samples[selected_key],
-                                'error_types': tracker.error_types
-                            }
-                            log_progress(tracker, prefix="Batch Processing: ", extra_stats=extra_stats)
-                        
-                    except Exception as e:
-                        logger.error(f"Error processing batch: {str(e)}")
-                        logger.error(traceback.format_exc())
-                        update_tracker(tracker, failed=len(batch), error_type='batch_processing_error')
-                        
-                        # Clear any failed batch data
+                        # Memory cleanup
+                        del processed_items
                         del batch_items
                         gc.collect()
                         torch.cuda.empty_cache()
-                    
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing batch: {str(e)}")
+                        update_tracker(tracker, failed=len(batch), error_type='batch_processing_error')
+                        
                 elif not self.drop_last and bucket.remaining_samples() > 0:
                     # Handle final partial batch similarly to regular batch
                     final_batch = bucket.get_next_batch(bucket.remaining_samples())

@@ -28,7 +28,7 @@ class TextProcessor:
         text_embedder: TextEmbedder,
         tag_weighter: Optional[TagWeighter] = None
     ):
-        """Initialize text processor with consolidated config."""
+        """Initialize text processor with tag weighting support."""
         self.config = config
         self.text_embedder = text_embedder
         self.tag_weighter = tag_weighter
@@ -50,23 +50,22 @@ class TextProcessor:
         )
 
     async def process_text(self, text: str) -> Dict[str, Any]:
-        """Process text and extract embeddings."""
+        """Process text and extract embeddings with tag weights."""
         try:
-            # Get embeddings
+            # Parse tags and get embeddings
+            tag_dict = parse_tags(text)
             embeddings = self.text_embedder([text], self.config.proportion_empty_prompts)
             
-            # Parse tags if tag weighting is enabled
+            # Add tag weights if weighter is available
             if self.tag_weighter is not None:
-                tag_dict = parse_tags(text)
-                weights = []
+                # Update frequencies
                 for tag_class, tags in tag_dict.items():
                     for tag in tags:
-                        weight = self.tag_weighter.get_tag_weight(tag_class, tag)
-                        weights.append(weight)
+                        self.tag_weighter.update_frequencies(tag_class, tag)
                 
-                if weights:
-                    weight_tensor = torch.tensor(weights, device=self.config.device, dtype=torch.float32)
-                    embeddings['tag_weights'] = weight_tensor.cpu()
+                # Get weights tensor
+                weights_tensor = self.tag_weighter.get_weights_tensor(tag_dict)
+                embeddings['tag_weights'] = weights_tensor
             
             return embeddings
             

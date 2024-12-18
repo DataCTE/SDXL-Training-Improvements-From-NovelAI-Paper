@@ -9,6 +9,7 @@ import traceback
 from typing import Optional, Union
 from torch.nn.parallel import DistributedDataParallel
 from torch.distributed.fsdp import FullyShardedDataParallel
+from transformers import CLIPTextModel, CLIPTokenizer
 
 logger = logging.getLogger(__name__)
 
@@ -223,3 +224,27 @@ def configure_model_memory_format(
         logger.error(f"Failed to configure model memory format: {str(e)}")
         logger.error(f"Stack trace: {traceback.format_exc()}")
         raise
+
+def setup_text_encoders(model_name: str, device: torch.device, subfolder: str = "text_encoder"):
+    """Initialize SDXL text encoders and tokenizers."""
+    # Load text encoder 1
+    text_encoder_1 = CLIPTextModel.from_pretrained(
+        model_name, 
+        subfolder=subfolder
+    ).to(device)
+    tokenizer_1 = CLIPTokenizer.from_pretrained(
+        model_name,
+        subfolder="tokenizer"
+    )
+    
+    # Load text encoder 2
+    text_encoder_2 = CLIPTextModel.from_pretrained(
+        model_name,
+        subfolder=f"{subfolder}_2"
+    ).to(device)
+    tokenizer_2 = CLIPTokenizer.from_pretrained(
+        model_name,
+        subfolder="tokenizer_2"
+    )
+    
+    return (text_encoder_1, text_encoder_2), (tokenizer_1, tokenizer_2)

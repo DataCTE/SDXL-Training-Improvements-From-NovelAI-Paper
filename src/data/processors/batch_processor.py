@@ -247,99 +247,67 @@ class BatchProcessor(GenericBatchProcessor):
     async def process_batch(
         self,
         batch_items: List[Dict],
-        width: int,
-        height: int,
         cache_manager: Optional[CacheManager] = None
     ) -> Tuple[List[Dict], Dict[str, Any]]:
-        """Process a batch of items with improved async handling."""
+        """Process a batch of items with tag weight support."""
         try:
-            tracker = create_progress_tracker(
-                total_items=len(batch_items),
-                batch_size=min(8, self.config.batch_size),
-                device=self.config.device
-            )
-            
-            processed_items = []
-            processing_tasks = set()
-            
+            results = []
+            batch_stats = {
+                'processed': 0,
+                'cache_hits': 0,
+                'cache_misses': 0,
+                'errors': 0,
+                'error_types': {}
+            }
+
             async def process_item(item):
                 try:
-                    # Check cache first
-                    if cache_manager is not None:
-                        cache_paths = cache_manager.get_cache_paths(item['image_path'])
-                        if cache_paths['latent'].exists():
-                            return {
-                                'image_path': item['image_path'],
-                                'latent_cache': cache_paths['latent'],
-                                'text_cache': cache_paths['text']
-                            }
-                    
-                    # Process image and text concurrently
-                    img_future = asyncio.create_task(
-                        self._load_and_validate_image(item['image_path'])
-                    )
-                    text_future = asyncio.create_task(
-                        self.text_processor.process_text_file(
-                            Path(item['image_path']).with_suffix('.txt')
-                        )
-                    )
-                    
-                    img, text_result = await asyncio.gather(img_future, text_future)
-                    
-                    if img is None or text_result is None:
+                    # Process text with tag weighting
+                    text_result = await self.text_processor.process_text(item['text'])
+                    if text_result is None:
                         return None
                         
-                    # Process image tensor
-                    img_tensor = await self.image_processor.process_batch([img], width, height)
+                    # Process image
+                    img_result = await self.image_processor.process_image(
+                        item['image_path'],
+                        original_size=item['original_size']
+                    )
+                    if img_result is None:
+                        return None
                     
-                    if img_tensor and isinstance(img_tensor[0], torch.Tensor):
-                        processed_item = {
-                            **item,
-                            'processed_image': img_tensor[0].cpu(),
-                            'text_data': text_result[0],
-                            'tags': text_result[1]
-                        }
-                        
-                        # Cache results
-                        if cache_manager is not None:
-                            await cache_manager.cache_item(item['image_path'], processed_item)
-                            
-                        return {
-                            'image_path': item['image_path'],
-                            'latent_cache': cache_paths['latent'],
-                            'text_cache': cache_paths['text']
-                        }
+                    # Combine results including tag weights
+                    processed_item = {
+                        'image_path': item['image_path'],
+                        'latents': img_result['latents'],
+                        'prompt_embeds': text_result['prompt_embeds'],
+                        'pooled_prompt_embeds': text_result['pooled_prompt_embeds'],
+                        'original_size': item['original_size'],
+                        'crop_top_left': img_result['crop_top_left']
+                    }
                     
-                    return None
+                    # Add tag weights if available
+                    if 'tag_weights' in text_result:
+                        processed_item['tag_weights'] = text_result['tag_weights']
+                    
+                    return processed_item
                     
                 except Exception as e:
-                    logger.error(f"Error processing {item['image_path']}: {e}")
+                    logger.error(f"Error processing item: {e}")
                     return None
-            
-            # Process items in parallel with controlled concurrency
-            semaphore = asyncio.Semaphore(self.num_workers * 2)
-            
-            async def bounded_process(item):
-                async with semaphore:
-                    return await process_item(item)
-            
-            # Process all items
-            results = await asyncio.gather(
-                *[bounded_process(item) for item in batch_items]
-            )
+
+            # Process items concurrently
+            tasks = [process_item(item) for item in batch_items]
+            processed_items = await asyncio.gather(*tasks)
             
             # Filter valid results
-            processed_items = [r for r in results if r is not None]
+            results = [item for item in processed_items if item is not None]
             
             # Update stats
-            stats = {
-                'processed': len(processed_items),
-                'errors': len(batch_items) - len(processed_items),
-                'cache_hits': sum(1 for r in results if r is not None)
-            }
+            batch_stats['processed'] = len(results)
+            batch_stats['errors'] = len(batch_items) - len(results)
             
-            return processed_items, stats
-
+            return results, batch_stats
+            
         except Exception as e:
             logger.error(f"Batch processing error: {e}")
-            return [], {'processed': 0, 'errors': len(batch_items)}
+            return [], batch_stats

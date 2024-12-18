@@ -8,6 +8,7 @@ import logging
 import torch.nn.functional as F
 import asyncio
 import gc
+import random
 
 # Internal imports from utils
 from src.data.processors.utils.system_utils import get_gpu_memory_usage, get_optimal_workers, create_thread_pool, cleanup_processor
@@ -27,83 +28,91 @@ class ImageProcessor:
         bucket_manager: Optional[BucketManager] = None,
         vae = None
     ):
-        """Initialize with optional bucket manager for resolution-aware processing."""
+        """Initialize image processor with VAE and bucket manager."""
         self.config = config
         self.bucket_manager = bucket_manager
         
-        # Initialize VAE encoder if VAE is provided
+        # Initialize VAE encoder if provided
         self.vae_encoder = None
         if vae is not None:
             self.vae_encoder = VAEEncoder(vae=vae, config=config)
         
-        # Initialize thread pool for parallel processing
-        self.num_workers = min(
-            self.config.num_workers,
-            get_optimal_workers(memory_per_worker_gb=1.0)
-        )
-        self.executor = create_thread_pool(self.num_workers)
-        
         # Build transform pipeline
-        self.transform = self._build_transform()
+        self.transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=config.normalize_mean,
+                std=config.normalize_std
+            )
+        ])
         
-        # Pre-allocate reusable tensors on GPU with dynamic sizing
-        self.buffer_size = self._calculate_initial_buffer_size()
-        self.tensor_buffer = self._allocate_tensor_buffer()
+        # Initialize resize transforms
+        self.resize = transforms.Resize(
+            config.resolution,
+            interpolation=transforms.InterpolationMode.BILINEAR,
+            antialias=True
+        )
+        self.center_crop = transforms.CenterCrop(config.resolution)
+        self.random_crop = transforms.RandomCrop(config.resolution)
         
         logger.info(
             f"Initialized ImageProcessor:\n"
-            f"- Device: {config.device}\n"
-            f"- Dtype: {config.dtype}\n"
-            f"- Workers: {self.num_workers}\n"
-            f"- Buffer size: {self.buffer_size}\n"
-            f"- VAE: {'Yes' if self.vae_encoder is not None else 'No'}\n"
-            f"- Bucket Manager: {'Yes' if bucket_manager is not None else 'No'}"
+            f"- Resolution: {config.resolution}\n"
+            f"- Center crop: {config.center_crop}\n"
+            f"- Random flip: {config.random_flip}\n"
+            f"- VAE: {'Yes' if self.vae_encoder else 'No'}"
         )
 
-    def _calculate_initial_buffer_size(self) -> Tuple[int, int, int, int]:
-        """Calculate initial buffer size based on bucket manager if available."""
-        if self.bucket_manager is not None and len(self.bucket_manager.buckets) > 0:
-            # Use largest bucket dimensions
-            max_bucket = max(
-                self.bucket_manager.buckets.values(),
-                key=lambda b: b.resolution
-            )
-            return (
-                32,  # Initial batch size
-                3,   # RGB channels
-                max_bucket.width,
-                max_bucket.height
-            )
-            
-        # Fallback to default size if no buckets available
-        logger.debug("No buckets available yet; using default buffer size until buckets are created")
-        return (
-            32,  # Initial batch size
-            3,   # RGB channels
-            self.config.max_image_size[0],  # Use max size from config
-            self.config.max_image_size[1]
-        )
-
-    def _allocate_tensor_buffer(self) -> torch.Tensor:
-        """Allocate tensor buffer with memory optimization."""
+    async def process_image(self, image: Image.Image) -> Dict[str, Any]:
+        """Process a single image with SDXL-style augmentation."""
         try:
-            return torch.empty(
-                self.buffer_size,
-                dtype=self.config.dtype,
-                device=self.config.device
-            )
-        except RuntimeError as e:
-            if "out of memory" in str(e):
-                # Reduce buffer size and retry
-                self.buffer_size = (
-                    self.buffer_size[0] // 2,
-                    3,
-                    self.buffer_size[2],
-                    self.buffer_size[3]
+            # Convert to RGB
+            image = image.convert("RGB")
+            
+            # Get original size
+            original_size = (image.height, image.width)
+            
+            # Resize
+            image = self.resize(image)
+            
+            # Apply cropping
+            if self.config.center_crop:
+                y1 = max(0, int(round((image.height - self.config.resolution) / 2.0)))
+                x1 = max(0, int(round((image.width - self.config.resolution) / 2.0)))
+                image = self.center_crop(image)
+            else:
+                y1, x1, h, w = self.random_crop.get_params(
+                    image, (self.config.resolution, self.config.resolution)
                 )
-                logger.warning(f"Reduced buffer size to {self.buffer_size} due to OOM")
-                return self._allocate_tensor_buffer()
-            raise
+                image = transforms.functional.crop(image, y1, x1, h, w)
+            
+            # Random flip
+            if self.config.random_flip and random.random() < 0.5:
+                image = transforms.functional.hflip(image)
+            
+            # Convert to tensor and normalize
+            image = self.transform(image)
+            
+            # Get crop coordinates
+            crop_top_left = (y1, x1)
+            
+            result = {
+                "pixel_values": image,
+                "original_size": original_size,
+                "crop_top_left": crop_top_left
+            }
+            
+            # Encode with VAE if available
+            if self.vae_encoder is not None:
+                latents = await self.vae_encoder.encode_image(image)
+                if latents is not None:
+                    result["latents"] = latents
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error processing image: {str(e)[:200]}...")
+            return None
 
     def load_image(self, path: str) -> Optional[Image.Image]:
         """Load and validate an image using utility function."""
@@ -330,67 +339,6 @@ class ImageProcessor:
             img_tensor = self.transform(img).to(self.config.device, non_blocking=True)
             
         return img_tensor
-
-    async def process_image(self, img: Image.Image) -> Optional[torch.Tensor]:
-        """Process a single image asynchronously with VAE encoding and bucket optimization."""
-        try:
-            # Get image stats
-            stats = self.get_image_stats(img)
-            
-            # Find optimal size using bucket manager if available
-            width, height = self._get_optimal_size(stats['width'], stats['height'])
-            
-            # Log resize operation
-            if (width, height) != (stats['width'], stats['height']):
-                logger.debug(
-                    f"Resizing image from {stats['width']}x{stats['height']} "
-                    f"to {width}x{height}"
-                )
-            
-            # Preprocess image
-            processed = await asyncio.to_thread(
-                self.preprocess,
-                img,
-                width,
-                height
-            )
-            
-            # Process through VAE if available
-            if self.vae_encoder is not None:
-                try:
-                    # Clear cache before VAE encoding
-                    torch.cuda.empty_cache()
-                    processed = await self.vae_encoder.encode_image(processed)
-                    # Clear cache after VAE encoding
-                    torch.cuda.empty_cache()
-                except Exception as e:
-                    logger.error(f"Error in VAE encoding: {str(e)[:200]}...")
-                    return None
-            
-            return processed
-            
-        except Exception as e:
-            logger.error(f"Error processing image: {str(e)[:200]}...")
-            return None
-
-    def _default_resize(self, width: int, height: int) -> Tuple[int, int]:
-        """Default resize logic when no bucket manager is available."""
-        # Keep aspect ratio while fitting within max dimensions
-        aspect = width / height
-        
-        if width > self.config.max_image_size[0]:
-            width = self.config.max_image_size[0]
-            height = int(width / aspect)
-            
-        if height > self.config.max_image_size[1]:
-            height = self.config.max_image_size[1]
-            width = int(height * aspect)
-            
-        # Ensure minimum dimensions
-        width = max(width, self.config.min_image_size[0])
-        height = max(height, self.config.min_image_size[1])
-        
-        return width, height
 
     async def cleanup(self):
         await cleanup_processor(self)

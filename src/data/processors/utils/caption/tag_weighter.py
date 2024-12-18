@@ -1,361 +1,183 @@
-import torch
-import torch.nn.functional as F
-from typing import Dict, List, Optional, Tuple, Union
 import logging
-from dataclasses import dataclass
+from typing import Dict, List, Optional, Any
 from collections import defaultdict
+import json
+from pathlib import Path
+import torch
 import numpy as np
-import re
-import gc
-from src.config.config import TagWeighterConfig
-from weakref import WeakValueDictionary
-from src.utils.logging.metrics import log_error_with_context, log_metrics, log_system_metrics
-import time
-from src.data.processors.utils.batch_utils import get_gpu_memory_usage
 
 logger = logging.getLogger(__name__)
 
-def parse_tags(caption: str) -> Dict[str, List[str]]:
-    """Parse a caption string into categorized tags."""
-    tags: Dict[str, List[str]] = defaultdict(list)
-    
-    try:
-        # Find all bracketed sections
-        brackets = re.findall(r'\[(.*?)\]', caption)
-        
-        for bracket in brackets:
-            if '::' in bracket:
-                # Handle class-specific tags
-                tag_class, tag_list = bracket.split('::', 1)
-                tag_class = tag_class.strip()
-                for tag in tag_list.split(','):
-                    tag = tag.strip()
-                    if tag:
-                        tags[tag_class].append(tag)
-            else:
-                # Handle general tags without class
-                for tag in bracket.split(','):
-                    tag = tag.strip()
-                    if tag:
-                        tags['general'].append(tag)
-                        
-        return dict(tags)
-        
-    except Exception as e:
-        logger.error(f"Error parsing tags: {e}")
-        return {}
-    
 class TagWeighter:
-    def __init__(self, config: TagWeighterConfig):
-        """Initialize tag weighter with configuration."""
+    """Handles tag weighting and frequency tracking for captions."""
+    
+    def __init__(
+        self,
+        initial_weights: Optional[Dict[str, Dict[str, float]]] = None,
+        weight_ranges: Optional[Dict[str, tuple]] = None,
+        save_path: Optional[str] = None
+    ):
+        """Initialize tag weighter with optional initial weights and ranges."""
+        # Initialize frequency counters
+        self.tag_frequencies = defaultdict(lambda: defaultdict(int))
+        self.total_samples = 0
+        
+        # Initialize weights
+        self.tag_weights = initial_weights or {}
+        self.weight_ranges = weight_ranges or {
+            'character': (0.8, 1.2),
+            'style': (0.7, 1.3),
+            'quality': (0.6, 1.4),
+            'artist': (0.5, 1.5)
+        }
+        
+        self.save_path = Path(save_path) if save_path else None
+        
+        logger.info(
+            f"Initialized TagWeighter:\n"
+            f"- Weight ranges: {self.weight_ranges}\n"
+            f"- Initial weights: {len(self.tag_weights)} categories\n"
+            f"- Save path: {self.save_path or 'None'}"
+        )
+
+    def update_frequencies(self, tag_class: str, tag: str) -> None:
+        """Update frequency counters for a tag."""
+        self.tag_frequencies[tag_class][tag] += 1
+        self.total_samples += 1
+
+    def get_tag_weight(self, tag_class: str, tag: str) -> float:
+        """Get weight for a tag, calculating if needed."""
+        if tag_class not in self.tag_weights or tag not in self.tag_weights[tag_class]:
+            self._calculate_weight(tag_class, tag)
+        return self.tag_weights.get(tag_class, {}).get(tag, 1.0)
+
+    def _calculate_weight(self, tag_class: str, tag: str) -> None:
+        """Calculate weight for a tag based on frequency and class."""
         try:
-            self.config = config
-            self.tag_frequencies = defaultdict(lambda: defaultdict(int))
-            self.class_totals = defaultdict(int)
-            self._weight_cache = WeakValueDictionary() if config.use_cache else None
+            if tag_class not in self.tag_weights:
+                self.tag_weights[tag_class] = {}
+                
+            # Get frequency
+            freq = self.tag_frequencies[tag_class][tag]
+            if freq == 0 or self.total_samples == 0:
+                self.tag_weights[tag_class][tag] = 1.0
+                return
+                
+            # Calculate relative frequency
+            rel_freq = freq / self.total_samples
             
-            # Log initialization
-            logger.info(
-                f"Initialized TagWeighter:\n"
-                f"- Min weight: {config.min_weight}\n"
-                f"- Max weight: {config.max_weight}\n"
-                f"- Smoothing factor: {config.smoothing_factor}\n"
-                f"- Cache enabled: {config.use_cache}"
+            # Get weight range for class
+            min_weight, max_weight = self.weight_ranges.get(
+                tag_class, 
+                (0.5, 1.5)  # Default range
             )
-            log_system_metrics(prefix="TagWeighter initialization: ")
+            
+            # Calculate weight using inverse frequency
+            # More frequent tags get lower weights
+            weight_range = max_weight - min_weight
+            weight = max_weight - (weight_range * rel_freq)
+            
+            # Apply SDXL-style conditioning strength
+            # This helps balance the tag weights with SDXL's text conditioning
+            if tag_class == 'quality':
+                weight *= 1.2  # Boost quality tags slightly
+            elif tag_class == 'character':
+                weight *= 1.1  # Slight boost for character tags
+                
+            # Store calculated weight
+            self.tag_weights[tag_class][tag] = float(weight)
             
         except Exception as e:
-            log_error_with_context(e, "Error initializing tag weighter")
-            raise
+            logger.error(f"Error calculating weight for {tag_class}:{tag}: {e}")
+            self.tag_weights[tag_class][tag] = 1.0
 
-    def __del__(self):
-        """Cleanup when weighter is deleted."""
-        self.cleanup()
+    def get_weights_tensor(self, tag_dict: Dict[str, List[str]]) -> torch.Tensor:
+        """Convert tag dictionary to weight tensor for SDXL conditioning."""
+        weights = []
         
-    def cleanup(self):
-        """Clean up resources."""
-        try:
-            # Clear caches
-            if hasattr(self, '_weight_cache'):
-                self._weight_cache.clear()
-            if hasattr(self, '_tensor_cache'):
-                self._tensor_cache.clear()
-            if hasattr(self, 'tag_frequencies'):
-                self.tag_frequencies.clear()
-            if hasattr(self, 'class_totals'):
-                self.class_totals.clear()
+        for tag_class, tags in tag_dict.items():
+            for tag in tags:
+                weight = self.get_tag_weight(tag_class, tag)
+                weights.append(weight)
                 
-            # Force garbage collection
-            gc.collect()
+        if not weights:
+            return torch.ones(1, dtype=torch.float32)
             
-            # Clear CUDA cache if available
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        return torch.tensor(weights, dtype=torch.float32)
+
+    def save_weights(self) -> None:
+        """Save current weights to file."""
+        if self.save_path:
+            try:
+                save_data = {
+                    'weights': self.tag_weights,
+                    'frequencies': {
+                        k: dict(v) for k, v in self.tag_frequencies.items()
+                    },
+                    'total_samples': self.total_samples,
+                    'weight_ranges': self.weight_ranges
+                }
                 
-        except Exception as e:
-            logger.error(f"Error during cleanup: {e}")
-        
-    def update_frequencies(self, tags: Dict[str, List[str]]) -> None:
-        """Update tag frequency counters with metrics tracking."""
+                self.save_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(self.save_path, 'w') as f:
+                    json.dump(save_data, f, indent=2)
+                    
+                logger.info(f"Saved tag weights to {self.save_path}")
+                
+            except Exception as e:
+                logger.error(f"Error saving weights: {e}")
+
+    @classmethod
+    def load(cls, path: str) -> "TagWeighter":
+        """Load tag weighter from saved file."""
         try:
-            update_stats = {
-                'total_tags': 0,
-                'unique_tags': 0,
-                'tag_classes': 0
+            with open(path) as f:
+                data = json.load(f)
+                
+            weighter = cls(
+                initial_weights=data['weights'],
+                weight_ranges=data['weight_ranges'],
+                save_path=path
+            )
+            
+            # Restore frequencies
+            weighter.tag_frequencies.update(
+                {k: defaultdict(int, v) for k, v in data['frequencies'].items()}
+            )
+            weighter.total_samples = data['total_samples']
+            
+            logger.info(
+                f"Loaded TagWeighter from {path}:\n"
+                f"- Categories: {len(data['weights'])}\n"
+                f"- Total samples: {data['total_samples']:,}"
+            )
+            
+            return weighter
+            
+        except Exception as e:
+            logger.error(f"Error loading weights from {path}: {e}")
+            return cls()
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get statistics about tag weights and frequencies."""
+        stats = {
+            'total_samples': self.total_samples,
+            'categories': {},
+            'weight_ranges': self.weight_ranges
+        }
+        
+        for tag_class in self.tag_frequencies:
+            freqs = self.tag_frequencies[tag_class]
+            weights = self.tag_weights.get(tag_class, {})
+            
+            stats['categories'][tag_class] = {
+                'unique_tags': len(freqs),
+                'total_occurrences': sum(freqs.values()),
+                'avg_weight': np.mean(list(weights.values())) if weights else 1.0,
+                'min_weight': min(weights.values()) if weights else 1.0,
+                'max_weight': max(weights.values()) if weights else 1.0
             }
             
-            # Track new tags
-            new_tags = set()
-            
-            for tag_class, tag_list in tags.items():
-                self.class_totals[tag_class] += len(tag_list)
-                update_stats['tag_classes'] += 1
-                
-                for tag in tag_list:
-                    self.tag_frequencies[tag_class][tag] += 1
-                    update_stats['total_tags'] += 1
-                    if tag not in new_tags:
-                        new_tags.add(tag)
-                        update_stats['unique_tags'] += 1
-            
-            # Log update metrics periodically
-            if hasattr(self, '_update_counter'):
-                self._update_counter += 1
-            else:
-                self._update_counter = 1
-                
-            if self._update_counter % 1000 == 0:  # Log every 1000 updates
-                update_stats.update({
-                    'total_unique_tags': len(self._weight_cache),
-                    'memory_usage_mb': get_gpu_memory_usage() * 1024
-                })
-                log_metrics(update_stats, step=self._update_counter, step_type="tag_update")
-                
-        except Exception as e:
-            log_error_with_context(e, "Error updating tag frequencies")
-
-    def calculate_weights(
-        self,
-        tags: Dict[str, List[str]],
-        embeddings: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        """Calculate tag weights with detailed metrics."""
-        try:
-            weight_stats = {
-                'start_time': time.time(),
-                'total_tags': sum(len(tags_list) for tags_list in tags.values()),
-                'tag_classes': len(tags),
-                'cache_hits': 0,
-                'cache_misses': 0
-            }
-            
-            # Calculate base weights
-            weights = []
-            for tag_class, tag_list in tags.items():
-                class_total = self.class_totals[tag_class]
-                for tag in tag_list:
-                    # Try cache first if enabled
-                    if self.config.use_cache and self._weight_cache is not None:
-                        cache_key = f"{tag_class}:{tag}"
-                        cached_weight = self._weight_cache.get(cache_key)
-                        
-                        if cached_weight is not None:
-                            weights.append(cached_weight)
-                            weight_stats['cache_hits'] += 1
-                            continue
-                    
-                    # Calculate weight
-                    freq = self.tag_frequencies[tag_class][tag]
-                    weight = 1.0 / (freq + self.config.smoothing_factor)
-                    weights.append(weight)
-                    
-                    # Cache result if enabled
-                    if self.config.use_cache and self._weight_cache is not None:
-                        self._weight_cache[cache_key] = weight
-                    weight_stats['cache_misses'] += 1
-            
-            weights = torch.tensor(weights, device=self.config.device)
-            
-            # Apply similarity factor if embeddings provided
-            if embeddings is not None:
-                with torch.cuda.amp.autocast(dtype=self.config.dtype):
-                    similarity_factors = self.calculate_similarity_factor(embeddings, attention_mask)
-                    weight_stats['similarity_min'] = similarity_factors.min().item()
-                    weight_stats['similarity_max'] = similarity_factors.max().item()
-                    weight_stats['similarity_mean'] = similarity_factors.mean().item()
-                    
-                    # Use mean similarity as a modulation factor
-                    similarity_weights = 1.0 / (similarity_factors.mean(dim=-1) + self.config.smoothing_factor)
-                    weights = weights * similarity_weights
-                    
-                    # Clean up similarity tensors
-                    del similarity_factors
-                    del similarity_weights
-                    
-            # Normalize weights
-            weights = weights / weights.mean()
-            weights = weights.clamp(self.config.min_weight, self.config.max_weight)
-            
-            # Log final stats
-            weight_stats.update({
-                'duration': time.time() - weight_stats['start_time'],
-                'min_weight': weights.min().item(),
-                'max_weight': weights.max().item(),
-                'mean_weight': weights.mean().item(),
-                'std_weight': weights.std().item()
-            })
-            
-            # Log metrics periodically
-            if hasattr(self, '_weight_counter'):
-                self._weight_counter += 1
-            else:
-                self._weight_counter = 1
-                
-            if self._weight_counter % 100 == 0:
-                log_metrics(
-                    metrics=weight_stats, 
-                    step=self._weight_counter, 
-                    step_type="tag_weight",
-                    is_main_process=True,
-                    use_wandb=True
-                )
-            
-            return weights
-            
-        except Exception as e:
-            log_error_with_context(e, "Error calculating tag weights")
-            return torch.ones(len(tags), device=self.config.device)
-
-    def _get_cached_tensor(self, key: str, shape: tuple, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-        """Get or create tensor from cache."""
-        tensor = self._tensor_cache.get(key)
-        if tensor is None or tensor.shape != shape or tensor.dtype != dtype or tensor.device != device:
-            tensor = torch.empty(shape, dtype=dtype, device=device)
-            self._tensor_cache[key] = tensor
-        return tensor
-            
-    def calculate_similarity_factor(
-        self,
-        embeddings: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        """Calculate similarity factors between embeddings with proper masking."""
-        try:
-            batch_size, seq_len, hidden_dim = embeddings.shape
-            device = embeddings.device
-            
-            # Create attention mask if not provided
-            if attention_mask is None:
-                attention_mask = self._get_cached_tensor(
-                    'attention_mask',
-                    (batch_size, seq_len),
-                    embeddings.dtype,
-                    device
-                ).fill_(1)
-                
-            # Expand mask for attention
-            attention_mask = attention_mask.unsqueeze(1).expand(batch_size, seq_len, seq_len)
-            
-            # Calculate cosine similarity with proper masking
-            norm_embeddings = F.normalize(embeddings, p=2, dim=-1)
-            similarity = torch.bmm(norm_embeddings, norm_embeddings.transpose(1, 2))
-            
-            # Apply attention mask
-            masked_similarity = similarity * attention_mask
-            
-            # Calculate mean similarity per sequence
-            seq_lengths = attention_mask.sum(dim=-1, keepdim=True).clamp(min=1)
-            mean_similarity = masked_similarity.sum(dim=-1) / seq_lengths
-            
-            # Clean up intermediate tensors
-            del norm_embeddings
-            del similarity
-            del masked_similarity
-            del seq_lengths
-            
-            return mean_similarity
-            
-        except Exception as e:
-            logger.warning(f"Error calculating similarity factor: {e}")
-            # Return ones as fallback
-            return torch.ones((batch_size, seq_len), 
-                            device=embeddings.device,
-                            dtype=embeddings.dtype)
-        finally:
-            # Clear any remaining intermediate tensors
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                            
-    def weight_loss(
-        self,
-        loss: torch.Tensor,
-        tags: List[Dict[str, List[str]]],
-        embeddings: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        """Weight loss based on tags and optional embedding similarity."""
-        try:
-            batch_size = len(tags)
-            device = loss.device
-            weights = self._get_cached_tensor(
-                'weights',
-                (batch_size,),
-                self.config.dtype,
-                device
-            ).fill_(1)
-            
-            # Calculate tag-based weights
-            for i, sample_tags in enumerate(tags):
-                sample_weight = 1.0
-                for tag_class, tag_list in sample_tags.items():
-                    for tag in tag_list:
-                        tag_weight = self.get_tag_weight(tag_class, tag)
-                        sample_weight *= tag_weight
-                weights[i] = sample_weight
-                
-            # Apply similarity factor if embeddings provided
-            if embeddings is not None:
-                with torch.cuda.amp.autocast(dtype=self.config.dtype):
-                    similarity_factors = self.calculate_similarity_factor(embeddings, attention_mask)
-                    # Use mean similarity as a modulation factor
-                    similarity_weights = 1.0 / (similarity_factors.mean(dim=-1) + self.config.smoothing_factor)
-                    weights = weights * similarity_weights
-                    
-                    # Clean up similarity tensors
-                    del similarity_factors
-                    del similarity_weights
-                    
-            # Normalize weights
-            weights = weights / weights.mean()
-            weights = weights.clamp(self.config.min_weight, self.config.max_weight)
-            
-            # Apply weights to loss
-            weighted_loss = loss * weights
-            result = weighted_loss.mean()
-            
-            # Clean up intermediate tensors
-            del weights
-            del weighted_loss
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"Error weighting loss: {e}")
-            return loss.mean()
-            
-        finally:
-            # Final cleanup
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            
-    def reset_statistics(self):
-        """Reset all frequency counters and cache."""
-        self.tag_frequencies.clear()
-        self.class_totals.clear()
-        self._weight_cache.clear()
-        gc.collect()  # Force cleanup of cleared data
+        return stats
 
 

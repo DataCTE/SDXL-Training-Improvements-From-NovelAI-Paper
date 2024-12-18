@@ -22,251 +22,186 @@ from .processors.sampler import AspectBatchSampler
 from .processors.utils.caption.text_embedder import TextEmbedder
 from .processors.utils.caption.tag_weighter import TagWeighter
 from .processors.utils.thread_config import get_optimal_thread_config
-from .processors.utils import (
-    find_matching_files,
-    get_optimal_workers,
-    calculate_optimal_batch_size,
-    get_gpu_memory_usage,
-    validate_image_text_pair,
-    format_time
-)
-from .processors.utils.progress_utils import (
-    create_progress_tracker,
-)
-from src.utils.logging.metrics import log_metrics, log_system_info, log_error_with_context
+from .processors.utils.batch_utils import find_matching_files
+from .processors.utils.progress_utils import create_progress_tracker, update_tracker
+from .processors.utils.system_utils import get_gpu_memory_usage, cleanup_processor
 
 # Config import
-from src.config.config import NovelAIDatasetConfig, ImageProcessorConfig, TextProcessorConfig, TextEmbedderConfig, BucketConfig, BatchProcessorConfig
+from src.config.config import NovelAIDatasetConfig
 
 logger = logging.getLogger(__name__)
 
 class NovelAIDataset(Dataset):
+    """Dataset for training Stable Diffusion XL with aspect ratio bucketing."""
+    
     def __init__(
         self,
-        image_dirs: List[str],
         config: NovelAIDatasetConfig,
-        vae,
-        device: torch.device = torch.device('cuda')
+        vae = None,
+        text_encoders = None,
+        tokenizers = None
     ):
-        """Initialize basic attributes only."""
-        super().__init__()
+        """Initialize dataset - use create() for async initialization."""
         self.config = config
-        self.device = device
-        self.vae = vae.eval()
-        self.image_dirs = image_dirs
+        self.device = torch.device(config.device)
+        self.vae = vae
+        self.text_encoders = text_encoders
+        self.tokenizers = tokenizers
         self.items = []
         
-        # Initialize empty attributes that will be set in _initialize
-        self.text_embedder = None
-        self.tag_weighter = None
-        self.text_processor = None
-        self.bucket_manager = None
-        self.image_processor = None
-        self.cache_manager = None
-        self.batch_processor = None
-        self.sampler = None
-
     @classmethod
     async def create(
         cls,
-        image_dirs: List[str],
         config: NovelAIDatasetConfig,
-        vae,
-        device: torch.device = torch.device('cuda')
-    ):
+        vae = None,
+        text_encoders = None,
+        tokenizers = None
+    ) -> "NovelAIDataset":
         """Async factory method for initialization."""
-        self = cls(image_dirs, config, vae, device)
+        self = cls(config, vae, text_encoders, tokenizers)
         await self._initialize()
         return self
 
     async def _initialize(self):
-        """Async initialization of components."""
+        """Initialize dataset components and process data."""
         try:
-            # Get optimal configuration
-            thread_config = get_optimal_thread_config()
-            optimal_batch_size = calculate_optimal_batch_size(
-                device=self.device,
-                min_batch_size=self.config.min_bucket_size,
-                max_batch_size=32,
-                target_memory_usage=0.8
-            )
-            num_workers = get_optimal_workers(memory_per_worker_gb=1.0)
-
-            # Initialize components
-            self.text_embedder = TextEmbedder(
-                config=TextEmbedderConfig(
-                    model_name=self.config.model_name,
-                    device=self.device,
-                    max_length=self.config.max_token_length,
-                    enable_memory_efficient_attention=True,
-                    max_memory_usage=0.8
+            # Initialize tag weighter if configured
+            tag_weighter = None
+            if self.config.use_tag_weighting:
+                tag_weighter = TagWeighter(
+                    weight_ranges=self.config.tag_weight_ranges,
+                    save_path=self.config.tag_weights_path
                 )
-            )
-
-            self.tag_weighter = TagWeighter(config=self.config.tag_weighting)
+                if self.config.tag_weights_path and Path(self.config.tag_weights_path).exists():
+                    tag_weighter = TagWeighter.load(self.config.tag_weights_path)
             
+            # Initialize bucket manager
+            self.bucket_manager = BucketManager(self.config.bucket_config)
+            
+            # Initialize text embedder and processor
+            self.text_embedder = TextEmbedder(
+                tokenizers=self.tokenizers,
+                text_encoders=self.text_encoders,
+                config=self.config.text_embedder_config
+            )
             self.text_processor = TextProcessor(
-                config=TextProcessorConfig(
-                    device=self.device,
-                    batch_size=optimal_batch_size,
-                    max_token_length=self.config.max_token_length,
-                    use_caching=self.config.use_caching
-                ),
+                config=self.config.text_processor_config,
                 text_embedder=self.text_embedder,
-                tag_weighter=self.tag_weighter
+                tag_weighter=tag_weighter
             )
-
-            self.bucket_manager = BucketManager(
-                config=BucketConfig(
-                    max_image_size=self.config.max_image_size,
-                    min_image_size=self.config.min_image_size,
-                    bucket_step=self.config.bucket_step,
-                    min_bucket_resolution=self.config.min_bucket_resolution,
-                    max_aspect_ratio=self.config.max_aspect_ratio,
-                    bucket_tolerance=self.config.bucket_tolerance
-                )
-            )
-
+            
+            # Initialize image processor
             self.image_processor = ImageProcessor(
-                config=ImageProcessorConfig(
-                    dtype=next(self.vae.parameters()).dtype,
-                    device=self.device,
-                    max_image_size=self.config.max_image_size,
-                    min_image_size=self.config.min_image_size,
-                    enable_vae_slicing=True,
-                    vae_batch_size=optimal_batch_size,
-                    num_workers=num_workers,
-                    prefetch_factor=thread_config.prefetch_factor,
-                    enable_memory_efficient_attention=True,
-                    max_memory_usage=0.8
-                ),
+                config=self.config.image_processor_config,
                 bucket_manager=self.bucket_manager,
                 vae=self.vae
             )
-
-            self.cache_manager = CacheManager(
-                cache_dir=self.config.cache_dir,
-                max_workers=num_workers,
-                use_caching=self.config.use_caching
-            )
-
+            
+            # Initialize cache manager
+            self.cache_manager = CacheManager(self.config.cache_config)
+            
+            # Initialize batch processor
             self.batch_processor = BatchProcessor(
-                config=BatchProcessorConfig(
-                    device=self.device,
-                    batch_size=optimal_batch_size,
-                    prefetch_factor=thread_config.prefetch_factor,
-                    num_workers=num_workers,
-                    max_memory_usage=0.8,
-                    min_batch_size=1,
-                    max_batch_size=optimal_batch_size
-                ),
+                config=self.config.batch_processor_config,
                 image_processor=self.image_processor,
                 text_processor=self.text_processor,
                 cache_manager=self.cache_manager,
                 vae=self.vae
             )
-
+            
             # Process data
-            await self._process_data(self.image_dirs)
-
-            # Create sampler
+            await self._process_data(self.config.image_dirs)
+            
+            # Initialize sampler
             self.sampler = AspectBatchSampler(
                 dataset=self,
-                batch_size=optimal_batch_size,
-                shuffle=True,
-                drop_last=False,
-                max_consecutive_batch_samples=2,
-                min_bucket_length=self.config.min_bucket_size,
-                debug_mode=self.config.debug_mode,
-                prefetch_factor=thread_config.prefetch_factor
+                batch_size=self.config.batch_size,
+                bucket_manager=self.bucket_manager,
+                batch_processor=self.batch_processor
             )
-
-            logger.info(f"Dataset initialized with {len(self)} samples")
-
+            
         except Exception as e:
             logger.error(f"Dataset initialization failed: {e}")
-            await self.cleanup()
-            raise
-
-    def __len__(self):
-        return len(self.items)
-
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        """Get dataset item with cached data."""
-        item = self.items[idx]
-        
-        try:
-            # Load cached latent and ensure it's on CPU
-            latent = self.cache_manager.load_latent(item['latent_cache'])
-            if latent.device.type != 'cpu':
-                latent = latent.cpu()
-            
-            # Load cached text data and ensure tensors are on CPU
-            text_data = self.cache_manager.load_text_data(item['text_cache'])
-            text_data = self.cache_manager._ensure_cpu_tensors(text_data)
-            
-            result = {
-                **item,
-                'latent': latent,
-                'text_embeds': text_data['embeds'],
-                'pooled_embeds': text_data['pooled_embeds'],
-                'tags': text_data['tags'],
-                'tag_weights': text_data.get('tag_weights', None)
-            }
-            
-            # Clear references to original data
-            del latent
-            del text_data
-            
-            # Clear cache periodically
-            if idx % 100 == 0:
-                self.cache_manager.clear_memory_cache()
-                torch.cuda.empty_cache()
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"Error loading item {idx}: {e}")
             raise
 
     async def _process_data(self, image_dirs: List[str]):
         """Process all data with improved embedding handling."""
         try:
-            # Find all image files
-            image_files = await find_matching_files(image_dirs)
+            # Find all image files with supported extensions
+            image_files = await find_matching_files(
+                image_dirs,
+                extensions=['.png', '.jpg', '.jpeg', '.webp']
+            )
+            
+            # Create progress tracker
+            tracker = create_progress_tracker(
+                total_items=len(image_files),
+                desc="Processing dataset",
+                unit="images"
+            )
             
             # Process images and text in batches
-            for batch in chunks(image_files, self.config.batch_size):
+            for batch in self._get_batches(image_files, self.config.batch_size):
                 # Get text embeddings
                 text_files = [Path(f).with_suffix('.txt') for f in batch]
                 texts = [await asyncio.to_thread(f.read_text) for f in text_files if f.exists()]
                 
                 if texts:
-                    # Get embeddings for batch
-                    embeddings = await self.text_processor.process_batch(texts)
+                    # Process batch
+                    batch_items = []
+                    for img_path, text in zip(batch, texts):
+                        # Get original image size for SDXL conditioning
+                        with Image.open(img_path) as img:
+                            original_size = (img.height, img.width)
+                            
+                        batch_items.append({
+                            'image_path': img_path,
+                            'text': text,
+                            'original_size': original_size
+                        })
                     
-                    # Process images
-                    image_results = await self.image_processor.process_batch(batch)
+                    # Process batch
+                    processed_items, batch_stats = await self.batch_processor.process_batch(
+                        batch_items=batch_items,
+                        cache_manager=self.cache_manager
+                    )
                     
-                    # Combine results
-                    for img_result, embedding in zip(image_results, embeddings):
-                        if img_result is not None and embedding is not None:
-                            self.items.append({
-                                'image_path': img_result['image_path'],
-                                'latents': img_result['latents'],
-                                'prompt_embeds': embedding['prompt_embeds'],
-                                'pooled_prompt_embeds': embedding['pooled_prompt_embeds'],
-                                'tag_weights': embedding.get('tag_weights')
-                            })
+                    # Add successful items to dataset
+                    for item in processed_items:
+                        if item is not None:
+                            self.items.append(item)
+                            
+                    # Update progress
+                    update_tracker(tracker, **batch_stats)
                 
                 # Clear memory periodically
                 if len(self.items) % 1000 == 0:
                     gc.collect()
                     torch.cuda.empty_cache()
-                
+                    
         except Exception as e:
             logger.error(f"Error processing data: {e}")
             raise
+
+    def _get_batches(self, items: List[Any], batch_size: int):
+        """Yield batches of items."""
+        for i in range(0, len(items), batch_size):
+            yield items[i:i + batch_size]
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        """Get dataset item with lazy loading from cache."""
+        item = self.items[idx]
+        
+        # Load from cache if needed
+        if isinstance(item.get('latents'), (str, Path)):
+            cached = asyncio.run(self.cache_manager.load_cached_item(item['image_path']))
+            if cached:
+                item.update(cached)
+        
+        return item
+
+    def __len__(self) -> int:
+        return len(self.items)
 
     async def cleanup(self):
         """Clean up all resources."""
@@ -277,12 +212,10 @@ class NovelAIDataset(Dataset):
             await self.image_processor.cleanup()
             
             # Clean up cache manager
-            if hasattr(self.cache_manager, 'cleanup'):
-                await self.cache_manager.cleanup()
+            await self.cache_manager.cleanup()
             
             # Clear references to items
-            if hasattr(self, 'items'):
-                self.items.clear()
+            self.items.clear()
             
             # Clear sampler
             if hasattr(self, 'sampler'):
