@@ -114,23 +114,18 @@ class TextEmbedder:
 
     @torch.no_grad()
     def __call__(self, text: Union[str, List[str]], device: Optional[torch.device] = None, **kwargs) -> Dict[str, torch.Tensor]:
-        """Process text input and return embeddings.
-        
-        Args:
-            text: Input text or list of texts to process
-            device: Optional target device for the embeddings
-            **kwargs: Additional keyword arguments
-        
-        Returns:
-            Dictionary containing prompt_embeds and pooled_prompt_embeds
-        """
+        """Process text input and return embeddings."""
         try:
             # Convert single string to list
             if isinstance(text, str):
                 text = [text]
             
-            # Use provided device or fall back to default
-            target_device = device if device is not None else self.device
+            # Use provided device or fall back to config device
+            target_device = device if device is not None else self.config.device
+            
+            # Ensure encoders are on the correct device
+            self.text_encoder_one.to(target_device)
+            self.text_encoder_two.to(target_device)
             
             # Process with first encoder
             text_inputs_one = self.tokenizer_one(
@@ -139,7 +134,9 @@ class TextEmbedder:
                 max_length=self.tokenizer_one.model_max_length,
                 truncation=True,
                 return_tensors="pt"
-            ).to(target_device)
+            )
+            # Move inputs to device after tokenization
+            text_inputs_one = {k: v.to(target_device) for k, v in text_inputs_one.items()}
             
             text_inputs_two = self.tokenizer_two(
                 text,
@@ -147,31 +144,33 @@ class TextEmbedder:
                 max_length=self.tokenizer_two.model_max_length,
                 truncation=True,
                 return_tensors="pt"
-            ).to(target_device)
+            )
+            # Move inputs to device after tokenization
+            text_inputs_two = {k: v.to(target_device) for k, v in text_inputs_two.items()}
             
             # Get embeddings from both encoders
             with torch.no_grad():
                 prompt_embeds_one = self.text_encoder_one(
-                    text_inputs_one.input_ids,
-                    attention_mask=text_inputs_one.attention_mask,
+                    text_inputs_one["input_ids"],
+                    attention_mask=text_inputs_one["attention_mask"],
                     output_hidden_states=True
                 ).hidden_states[-2]  # Use second to last hidden state
                 
                 prompt_embeds_two = self.text_encoder_two(
-                    text_inputs_two.input_ids,
-                    attention_mask=text_inputs_two.attention_mask,
+                    text_inputs_two["input_ids"],
+                    attention_mask=text_inputs_two["attention_mask"],
                     output_hidden_states=True
                 ).hidden_states[-2]  # Use second to last hidden state
                 
                 # Get pooled outputs - ensure same dimensions
                 pooled_prompt_embeds_one = self.text_encoder_one(
-                    text_inputs_one.input_ids,
-                    attention_mask=text_inputs_one.attention_mask,
+                    text_inputs_one["input_ids"],
+                    attention_mask=text_inputs_one["attention_mask"],
                 ).last_hidden_state.mean(dim=1)  # Average over sequence length
                 
                 pooled_prompt_embeds_two = self.text_encoder_two(
-                    text_inputs_two.input_ids,
-                    attention_mask=text_inputs_two.attention_mask,
+                    text_inputs_two["input_ids"],
+                    attention_mask=text_inputs_two["attention_mask"],
                 ).last_hidden_state.mean(dim=1)  # Average over sequence length
             
             # Concatenate embeddings
