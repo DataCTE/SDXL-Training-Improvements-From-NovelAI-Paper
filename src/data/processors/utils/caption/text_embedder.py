@@ -1,94 +1,55 @@
 import torch
-import gc
-from transformers import AutoTokenizer, PretrainedConfig
-from typing import Dict, List, Union, Optional, Any
-import random
-import warnings
 import logging
-import torch.amp
-import time
-from weakref import WeakValueDictionary
-from src.data.processors.utils.batch_utils import get_gpu_memory_usage
-from src.utils.logging.metrics import log_error_with_context, log_metrics, log_system_metrics
+import warnings
+from transformers import AutoTokenizer, PretrainedConfig, CLIPTextModel, CLIPTextModelWithProjection
+from typing import Dict, List, Union, Optional
+import random
 from src.config.config import TextEmbedderConfig
-import traceback
 import numpy as np
-
 
 logger = logging.getLogger(__name__)
 
 def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: str, subfolder: str = "text_encoder"):
     """Load the correct text encoder class based on config."""
-    # Temporarily suppress the specific warning
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message="You are using a model of type clip_text_model")
-        
-        text_encoder_config = PretrainedConfig.from_pretrained(
-            pretrained_model_name_or_path, subfolder=subfolder
-        )
-        model_class = text_encoder_config.architectures[0]
+    text_encoder_config = PretrainedConfig.from_pretrained(
+        pretrained_model_name_or_path, 
+        subfolder=subfolder
+    )
+    model_class = text_encoder_config.architectures[0]
 
-        if model_class == "CLIPTextModel":
-            from transformers import CLIPTextModel
-            return CLIPTextModel
-        elif model_class == "CLIPTextModelWithProjection":
-            from transformers import CLIPTextModelWithProjection
-            return CLIPTextModelWithProjection
-        else:
-            raise ValueError(f"{model_class} is not supported.")
-
-def setup_memory_efficient_attention(model: torch.nn.Module) -> bool:
-    """Enable memory efficient attention using xformers if available."""
-    try:
-        import xformers
-        import xformers.ops
-        
-        # Check if model supports attention processor setting
-        if hasattr(model, "set_attention_processor"):
-            from diffusers.models.attention_processor import XFormersAttnProcessor
-            model.set_attention_processor(XFormersAttnProcessor())
-            logger.info("Enabled xformers attention processor")
-            return True
-            
-        # Fallback to legacy method
-        elif hasattr(model, "enable_xformers_memory_efficient_attention"):
-            model.enable_xformers_memory_efficient_attention()
-            logger.info("Enabled legacy xformers attention")
-            return True
-            
-        else:
-            logger.warning("Model does not support xformers attention")
-            return False
-            
-    except ImportError:
-        logger.warning("xformers not available, using standard attention")
-        return False
-    except Exception as e:
-        logger.warning(f"Error setting up xformers: {e}")
-        return False
+    if model_class == "CLIPTextModel":
+        return CLIPTextModel
+    elif model_class == "CLIPTextModelWithProjection":
+        return CLIPTextModelWithProjection
+    else:
+        raise ValueError(f"{model_class} is not supported.")
 
 class TextEmbedder:
-    def __init__(self, config: TextEmbedderConfig, tokenizers=None, text_encoders=None):
+    def __init__(self, config: TextEmbedderConfig):
         """Initialize text embedder with both encoders."""
         self.config = config
-        self.tokenizers = tokenizers  # Store tokenizers if needed
-        self.text_encoders = text_encoders  # Store text encoders if needed
         
         # Load tokenizers
         self.tokenizer_one = AutoTokenizer.from_pretrained(
             config.model_name,
             subfolder="tokenizer",
-            use_fast=config.use_fast_tokenizer
+            use_fast=False
         )
         self.tokenizer_two = AutoTokenizer.from_pretrained(
             config.model_name,
             subfolder="tokenizer_2",
-            use_fast=config.use_fast_tokenizer
+            use_fast=False
         )
         
         # Load text encoders
-        text_encoder_cls_one = self._import_model_class_from_model_name(config.model_name, "text_encoder")
-        text_encoder_cls_two = self._import_model_class_from_model_name(config.model_name, "text_encoder_2")
+        text_encoder_cls_one = import_model_class_from_model_name_or_path(
+            config.model_name, 
+            subfolder="text_encoder"
+        )
+        text_encoder_cls_two = import_model_class_from_model_name_or_path(
+            config.model_name,
+            subfolder="text_encoder_2"
+        )
         
         self.text_encoder_one = text_encoder_cls_one.from_pretrained(
             config.model_name,
@@ -109,8 +70,7 @@ class TextEmbedder:
             f"Initialized TextEmbedder:\n"
             f"- Model: {config.model_name}\n"
             f"- Device: {config.device}\n"
-            f"- Dtype: {config.dtype}\n"
-            f"- Max length: {config.max_length}"
+            f"- Dtype: {config.dtype}"
         )
 
     @torch.no_grad()
@@ -178,73 +138,23 @@ class TextEmbedder:
             }
             
         except Exception as e:
-            logger.error(f"Error in text embedding:\n  Type: {type(e).__name__}\n  Message: {str(e)}\n\nTraceback:\n  {traceback.format_exc()}")
+            logger.error(f"Error in text embedding: {str(e)}")
             raise
 
-    def _import_model_class_from_model_name(self, pretrained_model_name: str, subfolder: str = "text_encoder"):
-        """Import the correct text encoder class."""
-        config = PretrainedConfig.from_pretrained(pretrained_model_name, subfolder=subfolder)
-        model_class = config.architectures[0]
+    def encode_prompt_batch(self, batch, caption_column: str, proportion_empty_prompts: float = 0, is_train: bool = True):
+        """Process a batch of prompts and return embeddings."""
+        prompt_embeds_list = []
+        prompt_batch = batch[caption_column]
 
-        if model_class == "CLIPTextModel":
-            from transformers import CLIPTextModel
-            return CLIPTextModel
-        elif model_class == "CLIPTextModelWithProjection":
-            from transformers import CLIPTextModelWithProjection
-            return CLIPTextModelWithProjection
-        else:
-            raise ValueError(f"{model_class} is not supported.")
+        # Handle empty prompts for classifier-free guidance
+        captions = []
+        for caption in prompt_batch:
+            if random.random() < proportion_empty_prompts:
+                captions.append("")
+            elif isinstance(caption, str):
+                captions.append(caption)
+            elif isinstance(caption, (list, np.ndarray)):
+                # take a random caption if there are multiple
+                captions.append(random.choice(caption) if is_train else caption[0])
 
-@torch.no_grad()
-def encode_prompt(batch, text_encoders, tokenizers, proportion_empty_prompts, caption_column, is_train=True):
-    """Process text input and return embeddings for SDXL."""
-    prompt_embeds_list = []
-    prompt_batch = batch[caption_column]
-
-    # Handle empty prompts for classifier-free guidance
-    captions = []
-    for caption in prompt_batch:
-        if random.random() < proportion_empty_prompts:
-            captions.append("")
-        elif isinstance(caption, str):
-            captions.append(caption)
-        elif isinstance(caption, (list, np.ndarray)):
-            # take a random caption if there are multiple
-            captions.append(random.choice(caption) if is_train else caption[0])
-
-    with torch.no_grad():
-        for tokenizer, text_encoder in zip(tokenizers, text_encoders):
-            # Tokenize the text
-            text_inputs = tokenizer(
-                captions,
-                padding="max_length",
-                max_length=tokenizer.model_max_length,
-                truncation=True,
-                return_tensors="pt",
-            ).to(text_encoder.device)
-            
-            # Get text encoder output
-            encoder_output = text_encoder(
-                text_inputs.input_ids,
-                output_hidden_states=True,
-                return_dict=False,
-            )
-            
-            # Get the pooled output for the first text encoder
-            pooled_prompt_embeds = encoder_output[0]  # First element is pooled output
-            
-            # Get the hidden states
-            prompt_embeds = encoder_output[-1][-2]  # Second to last hidden state
-            
-            # Reshape prompt embeds
-            bs_embed, seq_len, _ = prompt_embeds.shape
-            prompt_embeds = prompt_embeds.view(bs_embed, seq_len, -1)
-            prompt_embeds_list.append(prompt_embeds)
-
-    # Concatenate the embeddings from both text encoders
-    prompt_embeds = torch.concat(prompt_embeds_list, dim=-1)
-    
-    return {
-        "prompt_embeds": prompt_embeds.cpu(),
-        "pooled_prompt_embeds": pooled_prompt_embeds.cpu()
-    }
+        return self(captions)
