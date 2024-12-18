@@ -107,7 +107,7 @@ class VAEEncoder:
         """
         if torch.cuda.is_available():
             dummy_input = torch.zeros(
-                (1, 3, test_warmup_size=128, test_warmup_size=128),
+                (1, 3, test_warmup_size"128", test_warmup_size="128"),
                 device=self.config.device
             )
             with torch.no_grad(), torch.cuda.amp.autocast(
