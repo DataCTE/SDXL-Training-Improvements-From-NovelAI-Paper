@@ -229,18 +229,26 @@ class NovelAIDataset(Dataset):
     async def _process_data(self, image_dirs: List[str]) -> None:
         """Process all data files asynchronously with progress tracking."""
         try:
+            # Calculate optimal batch size
+            optimal_batch_size = calculate_optimal_batch_size(
+                device=self.device,
+                min_batch_size=self.config.min_bucket_size,
+                max_batch_size=32,
+                target_memory_usage=0.8
+            )
+
             # Find all image files asynchronously
             image_files = []
             for image_dir in image_dirs:
                 async for found_file in find_matching_files(
                     image_dir, 
                     ['.jpg', '.jpeg', '.png'],
-                    batch_size=self.config.batch_size
+                    batch_size=optimal_batch_size
                 ):
                     image_files.append(found_file)
                     
                     # Yield control periodically
-                    if len(image_files) % (self.config.batch_size * 2) == 0:
+                    if len(image_files) % (optimal_batch_size * 2) == 0:
                         await asyncio.sleep(0)
                 
             if not image_files:
@@ -249,14 +257,14 @@ class NovelAIDataset(Dataset):
             # Create tracker with total files
             tracker = create_progress_tracker(
                 total_items=len(image_files),
-                batch_size=self.config.batch_size,
+                batch_size=optimal_batch_size,
                 device=self.device
             )
 
             # Process files in batches
             processed_items = []
-            for i in range(0, len(image_files), self.config.batch_size):
-                batch_files = image_files[i:i + self.config.batch_size]
+            for i in range(0, len(image_files), optimal_batch_size):
+                batch_files = image_files[i:i + optimal_batch_size]
                 batch_items = [{'image_path': f} for f in batch_files]
                 
                 # Process batch
@@ -281,7 +289,7 @@ class NovelAIDataset(Dataset):
                     extra_stats = {
                         'processed': len(processed_items),
                         'memory': f"{get_gpu_memory_usage(self.device):.1%}",
-                        'batch_size': self.config.batch_size
+                        'batch_size': optimal_batch_size
                     }
                     log_progress(tracker, prefix="Processing dataset: ", extra_stats=extra_stats)
 
