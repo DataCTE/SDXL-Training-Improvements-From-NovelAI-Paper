@@ -1,4 +1,4 @@
-from typing import List, Optional, Iterator, Dict, AsyncIterator
+from typing import List, Optional, Iterator, Dict, AsyncIterator, Any
 import torch
 from torch.utils.data import Sampler
 import logging
@@ -23,6 +23,7 @@ from src.data.processors.bucket import BucketManager
 from src.data.processors.utils.thread_config import get_optimal_thread_config
 from src.data.processors.batch_processor import BatchProcessor
 from src.data.processors.utils.system_utils import cleanup_processor
+from src.config.config import NovelAIDatasetConfig
 
 logger = logging.getLogger(__name__)
 
@@ -39,10 +40,29 @@ class AspectBatchSampler(Sampler[List[int]]):
         min_bucket_length: int = 1,
         debug_mode: bool = False,
         prefetch_factor: Optional[int] = None,
-        bucket_manager: Optional[BucketManager] = None
+        bucket_manager: Optional[BucketManager] = None,
+        config: Optional['NovelAIDatasetConfig'] = None  # Add config parameter
     ):
         """Initialize using dataset's bucket information and optimal thread configuration."""
         super().__init__(dataset)
+        
+        # Use config if provided, otherwise use parameters
+        if config:
+            self.batch_size = config.batch_size
+            self.shuffle = config.shuffle
+            self.drop_last = config.drop_last
+            self.max_consecutive_batch_samples = config.max_consecutive_batch_samples
+            self.min_bucket_length = config.min_bucket_length
+            self.debug_mode = config.debug_mode
+            self.prefetch_factor = config.prefetch_factor
+        else:
+            self.batch_size = batch_size
+            self.shuffle = shuffle
+            self.drop_last = drop_last
+            self.max_consecutive_batch_samples = max_consecutive_batch_samples
+            self.min_bucket_length = min_bucket_length
+            self.debug_mode = debug_mode
+            self.prefetch_factor = prefetch_factor
         
         # Get optimal thread configuration
         thread_config = get_optimal_thread_config()
@@ -186,11 +206,10 @@ class AspectBatchSampler(Sampler[List[int]]):
                     
                     # Process batch
                     try:
-                        processed_items, batch_stats = await self.batch_processor.process_batch(
+                        processed_items, batch_stats = await self._process_batch_with_retry(
                             batch_items=batch_items,
                             width=width,
-                            height=height,
-                            cache_manager=self.dataset.cache_manager
+                            height=height
                         )
                         
                         if processed_items:
@@ -217,11 +236,10 @@ class AspectBatchSampler(Sampler[List[int]]):
                             for idx in final_batch
                         ]
                         try:
-                            processed_items, batch_stats = await self.batch_processor.process_batch(
+                            processed_items, batch_stats = await self._process_batch_with_retry(
                                 batch_items=batch_items,
                                 width=width,
-                                height=height,
-                                cache_manager=self.dataset.cache_manager
+                                height=height
                             )
                             
                             if processed_items:
@@ -301,3 +319,72 @@ class AspectBatchSampler(Sampler[List[int]]):
 
     def __len__(self) -> int:
         return self.total_batches
+
+    def _manage_memory(self):
+        """Manage memory usage during batch processing."""
+        if hasattr(self.dataset, 'cache_manager'):
+            self.dataset.cache_manager.clear_unused_cache()
+        
+        # Force garbage collection
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+    async def _process_batch_with_memory_management(self, batch_items, width, height):
+        """Process batch with memory management."""
+        try:
+            processed_items, batch_stats = await self.batch_processor.process_batch(
+                batch_items=batch_items,
+                width=width,
+                height=height,
+                cache_manager=self.dataset.cache_manager
+            )
+            
+            # Clear memory after processing
+            self._manage_memory()
+            
+            return processed_items, batch_stats
+            
+        except Exception as e:
+            logger.error(f"Error processing batch: {str(e)}")
+            self._manage_memory()
+            raise
+
+    async def _process_batch_with_retry(self, batch_items, width, height, max_retries=3):
+        """Process batch with retry logic."""
+        for attempt in range(max_retries):
+            try:
+                return await self._process_batch_with_memory_management(
+                    batch_items=batch_items,
+                    width=width,
+                    height=height
+                )
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    logger.error(f"Failed to process batch after {max_retries} attempts")
+                    raise
+                logger.warning(f"Retry {attempt + 1}/{max_retries} after error: {str(e)}")
+                await asyncio.sleep(1 * (attempt + 1))  # Exponential backoff
+                self._manage_memory()
+
+# Add detailed progress tracking
+class BatchProgress:
+    def __init__(self, total_items: int, desc: str = "Processing batches"):
+        self.tracker = create_progress_tracker(total_items, desc)
+        self.start_time = time.time()
+        self.batch_times: List[float] = []
+        self.memory_usage: List[float] = []
+        
+    def update(self, batch_size: int, batch_stats: Dict[str, Any]):
+        self.tracker.update(batch_size)
+        self.batch_times.append(time.time() - self.start_time)
+        if torch.cuda.is_available():
+            self.memory_usage.append(torch.cuda.memory_allocated() / torch.cuda.max_memory_allocated())
+            
+    def get_stats(self) -> Dict[str, Any]:
+        return {
+            "processed_items": self.tracker.processed_items,
+            "avg_batch_time": sum(self.batch_times) / len(self.batch_times) if self.batch_times else 0,
+            "avg_memory_usage": sum(self.memory_usage) / len(self.memory_usage) if self.memory_usage else 0,
+            "total_time": time.time() - self.start_time
+        }
