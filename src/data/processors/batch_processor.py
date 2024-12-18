@@ -262,11 +262,14 @@ class BatchProcessor(GenericBatchProcessor):
 
             async def process_item(item):
                 try:
-                    # Process text with tag weighting
+                    # text_result returns a tuple, e.g., (prompt_embeds, pooled_prompt_embeds, tag_weights)
                     text_result = await self.text_processor.process_text(item['text'])
                     if text_result is None:
                         return None
-                        
+
+                    # Instead of text_result['prompt_embeds'], properly unpack the tuple, e.g.:
+                    prompt_embeds, pooled_prompt_embeds, tag_weights = text_result
+
                     # Process image
                     img_result = await self.image_processor.process_image(
                         item['image_path'],
@@ -274,23 +277,22 @@ class BatchProcessor(GenericBatchProcessor):
                     )
                     if img_result is None:
                         return None
-                    
-                    # Combine results including tag weights
+
                     processed_item = {
                         'image_path': item['image_path'],
                         'latents': img_result['latents'],
-                        'prompt_embeds': text_result['prompt_embeds'],
-                        'pooled_prompt_embeds': text_result['pooled_prompt_embeds'],
+                        'prompt_embeds': prompt_embeds,
+                        'pooled_prompt_embeds': pooled_prompt_embeds,
                         'original_size': item['original_size'],
                         'crop_top_left': img_result['crop_top_left']
                     }
-                    
-                    # Add tag weights if available
-                    if 'tag_weights' in text_result:
-                        processed_item['tag_weights'] = text_result['tag_weights']
-                    
+
+                    # Optionally include tag_weights
+                    if tag_weights is not None:
+                        processed_item['tag_weights'] = tag_weights
+
                     return processed_item
-                    
+
                 except Exception as e:
                     logger.error(f"Error processing item: {e}")
                     return None
