@@ -35,8 +35,8 @@ def get_system_resources() -> SystemResources:
     try:
         resources = SystemResources(
             cpu_count=psutil.cpu_count(logical=True),
-            total_memory=psutil.virtual_memory().total / (1024**3),  # GB
-            available_memory=psutil.virtual_memory().available / (1024**3),  # GB
+            total_memory_gb=psutil.virtual_memory().total / (1024**3),  # GB
+            available_memory_gb=psutil.virtual_memory().available / (1024**3),  # GB
             gpu_memory_total=None,
             gpu_memory_used=None
         )
@@ -56,14 +56,32 @@ def get_system_resources() -> SystemResources:
         log_error_with_context(e, "Error getting system resources")
         raise
 
-def get_optimal_workers(memory_per_worker_gb: float = 2.0) -> int:
-    """Calculate optimal number of worker threads based on system resources."""
-    resources = get_system_resources()
-    return min(
-        resources.cpu_count,
-        max(1, int(resources.available_memory_gb / memory_per_worker_gb)),
-        get_optimal_cpu_threads().num_threads
-    )
+def get_optimal_workers(memory_per_worker_gb: float = 1.0) -> int:
+    """Calculate optimal number of worker processes based on system resources."""
+    try:
+        resources = get_system_resources()
+        
+        # Calculate workers based on CPU cores
+        cpu_workers = max(1, resources.cpu_count - 1)  # Leave one core free
+        
+        # Calculate workers based on available memory
+        memory_workers = max(1, int(resources.available_memory_gb / memory_per_worker_gb))
+        
+        # Use the minimum of CPU and memory-based workers
+        optimal_workers = min(cpu_workers, memory_workers)
+        
+        logger.info(
+            f"Calculated optimal workers:\n"
+            f"- CPU-based: {cpu_workers}\n"
+            f"- Memory-based: {memory_workers}\n"
+            f"- Final: {optimal_workers}"
+        )
+        
+        return optimal_workers
+        
+    except Exception as e:
+        logger.error(f"Error calculating optimal workers: {e}")
+        return max(1, (psutil.cpu_count(logical=True) or 2) - 1)
 
 def get_gpu_memory_usage(device: torch.device) -> float:
     """Get current GPU memory usage as a fraction."""
