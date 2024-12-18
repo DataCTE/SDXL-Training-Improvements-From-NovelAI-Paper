@@ -12,17 +12,18 @@ logger = logging.getLogger(__name__)
 class ProgressStats:
     """Progress tracking statistics."""
     total_items: int
-    start_time: float = field(default_factory=time.time)
-    processed_items: int = 0
-    failed_items: int = 0
-    last_log_time: float = field(default_factory=time.time)
-    last_memory_check: float = field(default_factory=time.time)
-    memory_usage_gb: float = 0.0
-    error_types: Dict[str, int] = field(default_factory=dict)
-    cache_hits: int = 0
-    cache_misses: int = 0
     batch_size: Optional[int] = None
     device: Optional[torch.device] = None
+    desc: Optional[str] = None
+    processed_items: int = 0
+    failed_items: int = 0
+    cache_hits: int = 0
+    cache_misses: int = 0
+    memory_usage_gb: Optional[float] = None
+    error_types: Dict[str, int] = field(default_factory=dict)
+    start_time: float = field(default_factory=time.time)
+    last_log_time: float = field(default_factory=time.time)
+    last_memory_check: float = field(default_factory=time.time)
     
     @property
     def elapsed(self) -> float:
@@ -84,13 +85,15 @@ class ProgressStats:
 def create_progress_tracker(
     total_items: int,
     batch_size: Optional[int] = None,
-    device: Optional[torch.device] = None
+    device: Optional[torch.device] = None,
+    desc: Optional[str] = None
 ) -> ProgressStats:
     """Create a new progress tracker with optional batch and device info."""
     return ProgressStats(
         total_items=total_items,
         batch_size=batch_size,
-        device=device
+        device=device,
+        desc=desc
     )
 
 def update_tracker(
