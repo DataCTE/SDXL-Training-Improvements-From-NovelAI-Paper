@@ -3,7 +3,9 @@ from typing import List, Tuple, Optional, Literal, Union, Dict
 import yaml
 import torch
 from pathlib import Path
-
+import traceback
+import logging
+logger = logging.getLogger(__name__)
 # Common default values
 DEFAULT_BATCH_SIZE = 64
 DEFAULT_NUM_WORKERS = 32
