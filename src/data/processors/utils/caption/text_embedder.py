@@ -31,23 +31,35 @@ def import_model_class_from_model_name_or_path(
         raise ValueError(f"{model_class} is not supported.")
 
 class TextEmbedder:
-    def __init__(self, config: TextEmbedderConfig):
-        """Initialize text embedder with both encoders."""
+    def __init__(self, config: TextEmbedderConfig, tokenizers: Optional[Dict[str, Any]] = None):
+        """Initialize text embedder with both encoders.
+        
+        Args:
+            config: Configuration for the text embedder
+            tokenizers: Optional pre-initialized tokenizers
+        """
         self.config = config
         
-        # Load tokenizers
-        self.tokenizer_one = AutoTokenizer.from_pretrained(
-            config.model_name,
-            subfolder="tokenizer",
-            use_fast=False,
-            revision=config.revision
-        )
-        self.tokenizer_two = AutoTokenizer.from_pretrained(
-            config.model_name,
-            subfolder="tokenizer_2",
-            use_fast=False,
-            revision=config.revision
-        )
+        # Load or use provided tokenizers
+        if tokenizers is not None:
+            self.tokenizer_one = tokenizers.get("tokenizer_one")
+            self.tokenizer_two = tokenizers.get("tokenizer_two")
+            logger.info("Using provided tokenizers")
+        else:
+            # Load tokenizers from config
+            self.tokenizer_one = AutoTokenizer.from_pretrained(
+                config.model_name,
+                subfolder="tokenizer",
+                use_fast=False,
+                revision=config.revision
+            )
+            self.tokenizer_two = AutoTokenizer.from_pretrained(
+                config.model_name,
+                subfolder="tokenizer_2",
+                use_fast=False,
+                revision=config.revision
+            )
+            logger.info("Initialized new tokenizers")
         
         # Load text encoders
         text_encoder_cls_one = import_model_class_from_model_name_or_path(
