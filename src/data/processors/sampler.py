@@ -46,6 +46,10 @@ class AspectBatchSampler(Sampler[List[int]]):
         """Initialize using dataset's bucket information and optimal thread configuration."""
         super().__init__(dataset)
         
+        # Validate dataset has items
+        if not hasattr(dataset, 'items') or len(dataset.items) == 0:
+            raise ValueError("Dataset must contain items before initializing sampler")
+        
         # Use config if provided, otherwise use parameters
         if config:
             self.batch_size = config.batch_size
@@ -68,14 +72,31 @@ class AspectBatchSampler(Sampler[List[int]]):
         thread_config = get_optimal_thread_config()
         self.prefetch_factor = prefetch_factor or thread_config.prefetch_factor
         
+        # Validate dataset has required processors
+        if not hasattr(dataset, 'image_processor'):
+            raise ValueError("Dataset must have an image processor")
+        if not hasattr(dataset, 'text_processor'):
+            raise ValueError("Dataset must have a text processor")
+        if not hasattr(dataset, 'cache_manager'):
+            raise ValueError("Dataset must have a cache manager")
+        if not hasattr(dataset, 'vae'):
+            raise ValueError("Dataset must have a VAE model")
+        if not hasattr(dataset, 'config'):
+            raise ValueError("Dataset must have a configuration")
+        
         # Initialize batch processor with optimal configuration
-        self.batch_processor = BatchProcessor(
-            config=dataset.config.batch_processor_config,  # Use config from dataset
-            image_processor=dataset.image_processor,
-            text_processor=dataset.text_processor,  # Add text processor
-            cache_manager=dataset.cache_manager,
-            vae=dataset.vae
-        )
+        try:
+            self.batch_processor = BatchProcessor(
+                config=dataset.config.batch_processor_config,
+                image_processor=dataset.image_processor,
+                text_processor=dataset.text_processor,
+                cache_manager=dataset.cache_manager,
+                vae=dataset.vae
+            )
+        except Exception as e:
+            logger.error(f"Failed to initialize batch processor: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
         
         # Validate inputs
         if batch_size < 1:
@@ -88,12 +109,6 @@ class AspectBatchSampler(Sampler[List[int]]):
         # Store weak references to avoid memory leaks
         from weakref import proxy
         self.dataset = proxy(dataset)
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-        self.drop_last = drop_last
-        self.max_consecutive_batch_samples = max_consecutive_batch_samples
-        self.min_bucket_length = min_bucket_length
-        self.debug_mode = debug_mode
         
         # Get bucket manager from dataset
         if not hasattr(dataset, 'bucket_manager') or not isinstance(dataset.bucket_manager, BucketManager):
@@ -109,10 +124,19 @@ class AspectBatchSampler(Sampler[List[int]]):
         
         try:
             # Assign samples to buckets
+            if len(dataset.items) == 0:
+                raise ValueError("No items to assign to buckets")
+            
             self.bucket_manager.assign_to_buckets(dataset.items, shuffle=shuffle)
+            
+            # Validate buckets were created
+            if len(self.bucket_manager.buckets) == 0:
+                raise ValueError("No valid buckets were created from dataset items")
             
             # Calculate number of batches
             self.total_batches = self._calculate_total_batches()
+            if self.total_batches == 0:
+                raise ValueError("No valid batches could be created from buckets")
             
             # Log initialization stats
             self._log_initialization_stats()
