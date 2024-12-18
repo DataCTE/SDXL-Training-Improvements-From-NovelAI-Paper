@@ -34,7 +34,7 @@ from .processors.utils.progress_utils import (
 )
 
 # Config import
-from src.config.config import NovelAIDatasetConfig, ImageProcessorConfig, TextProcessorConfig, TextEmbedderConfig
+from src.config.config import NovelAIDatasetConfig, ImageProcessorConfig, TextProcessorConfig, TextEmbedderConfig, BucketConfig
 
 logger = logging.getLogger(__name__)
 
@@ -99,12 +99,14 @@ class NovelAIDataset(Dataset):
             
             # Initialize bucket manager
             self.bucket_manager = BucketManager(
-                max_image_size=config.max_image_size,
-                min_image_size=config.min_image_size,
-                bucket_step=config.bucket_step,
-                min_bucket_resolution=config.min_bucket_resolution,
-                max_aspect_ratio=config.max_aspect_ratio,
-                bucket_tolerance=config.bucket_tolerance
+                config=BucketConfig(
+                    max_image_size=config.max_image_size,
+                    min_image_size=config.min_image_size,
+                    bucket_step=config.bucket_step,
+                    min_bucket_resolution=config.min_bucket_resolution,
+                    max_aspect_ratio=config.max_aspect_ratio,
+                    bucket_tolerance=config.bucket_tolerance
+                )
             )
             
             # Log initialization progress

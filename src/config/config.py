@@ -278,6 +278,11 @@ class VAEEncoderConfig(DeviceConfig):
 
 @dataclass
 class BucketConfig:
+    max_image_size: Tuple[int, int] = DEFAULT_MAX_IMAGE_SIZE
+    min_image_size: Tuple[int, int] = DEFAULT_MIN_IMAGE_SIZE
+    bucket_step: int = 8
+    min_bucket_resolution: int = 65536
+    max_aspect_ratio: float = 2.0
     bucket_tolerance: float = 0.2
 
 @dataclass
