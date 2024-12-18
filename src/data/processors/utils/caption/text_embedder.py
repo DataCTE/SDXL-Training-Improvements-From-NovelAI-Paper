@@ -12,6 +12,7 @@ from src.data.processors.utils.batch_utils import get_gpu_memory_usage
 from src.utils.logging.metrics import log_error_with_context, log_metrics, log_system_metrics
 from src.config.config import TextEmbedderConfig
 import traceback
+import numpy as np
 
 
 logger = logging.getLogger(__name__)
@@ -123,10 +124,6 @@ class TextEmbedder:
             # Use provided device or fall back to config device
             target_device = device if device is not None else self.config.device
             
-            # Ensure encoders are on the correct device
-            self.text_encoder_one.to(target_device)
-            self.text_encoder_two.to(target_device)
-            
             # Process with first encoder
             text_inputs_one = self.tokenizer_one(
                 text,
@@ -134,9 +131,7 @@ class TextEmbedder:
                 max_length=self.tokenizer_one.model_max_length,
                 truncation=True,
                 return_tensors="pt"
-            )
-            # Move inputs to device after tokenization
-            text_inputs_one = {k: v.to(target_device) for k, v in text_inputs_one.items()}
+            ).to(target_device)
             
             text_inputs_two = self.tokenizer_two(
                 text,
@@ -144,42 +139,42 @@ class TextEmbedder:
                 max_length=self.tokenizer_two.model_max_length,
                 truncation=True,
                 return_tensors="pt"
-            )
-            # Move inputs to device after tokenization
-            text_inputs_two = {k: v.to(target_device) for k, v in text_inputs_two.items()}
+            ).to(target_device)
             
             # Get embeddings from both encoders
             with torch.no_grad():
-                prompt_embeds_one = self.text_encoder_one(
-                    text_inputs_one["input_ids"],
-                    attention_mask=text_inputs_one["attention_mask"],
-                    output_hidden_states=True
-                ).hidden_states[-2]  # Use second to last hidden state
+                # First text encoder
+                encoder_output_one = self.text_encoder_one(
+                    text_inputs_one.input_ids,
+                    attention_mask=text_inputs_one.attention_mask,
+                    output_hidden_states=True,
+                    return_dict=False,
+                )
+                pooled_prompt_embeds_one = encoder_output_one[0]  # First element is pooled output
+                prompt_embeds_one = encoder_output_one[-1][-2]  # Second to last hidden state
                 
-                prompt_embeds_two = self.text_encoder_two(
-                    text_inputs_two["input_ids"],
-                    attention_mask=text_inputs_two["attention_mask"],
-                    output_hidden_states=True
-                ).hidden_states[-2]  # Use second to last hidden state
+                # Second text encoder
+                encoder_output_two = self.text_encoder_two(
+                    text_inputs_two.input_ids,
+                    attention_mask=text_inputs_two.attention_mask,
+                    output_hidden_states=True,
+                    return_dict=False,
+                )
+                pooled_prompt_embeds_two = encoder_output_two[0]  # First element is pooled output
+                prompt_embeds_two = encoder_output_two[-1][-2]  # Second to last hidden state
                 
-                # Get pooled outputs - ensure same dimensions
-                pooled_prompt_embeds_one = self.text_encoder_one(
-                    text_inputs_one["input_ids"],
-                    attention_mask=text_inputs_one["attention_mask"],
-                ).last_hidden_state.mean(dim=1)  # Average over sequence length
-                
-                pooled_prompt_embeds_two = self.text_encoder_two(
-                    text_inputs_two["input_ids"],
-                    attention_mask=text_inputs_two["attention_mask"],
-                ).last_hidden_state.mean(dim=1)  # Average over sequence length
+                # Reshape prompt embeds if needed
+                bs_embed, seq_len, _ = prompt_embeds_one.shape
+                prompt_embeds_one = prompt_embeds_one.view(bs_embed, seq_len, -1)
+                prompt_embeds_two = prompt_embeds_two.view(bs_embed, seq_len, -1)
             
             # Concatenate embeddings
             prompt_embeds = torch.cat([prompt_embeds_one, prompt_embeds_two], dim=-1)
             pooled_prompt_embeds = torch.cat([pooled_prompt_embeds_one, pooled_prompt_embeds_two], dim=-1)
             
             return {
-                "prompt_embeds": prompt_embeds,
-                "pooled_prompt_embeds": pooled_prompt_embeds
+                "prompt_embeds": prompt_embeds.cpu(),
+                "pooled_prompt_embeds": pooled_prompt_embeds.cpu()
             }
             
         except Exception as e:
@@ -199,3 +194,57 @@ class TextEmbedder:
             return CLIPTextModelWithProjection
         else:
             raise ValueError(f"{model_class} is not supported.")
+
+@torch.no_grad()
+def encode_prompt(batch, text_encoders, tokenizers, proportion_empty_prompts, caption_column, is_train=True):
+    """Process text input and return embeddings for SDXL."""
+    prompt_embeds_list = []
+    prompt_batch = batch[caption_column]
+
+    # Handle empty prompts for classifier-free guidance
+    captions = []
+    for caption in prompt_batch:
+        if random.random() < proportion_empty_prompts:
+            captions.append("")
+        elif isinstance(caption, str):
+            captions.append(caption)
+        elif isinstance(caption, (list, np.ndarray)):
+            # take a random caption if there are multiple
+            captions.append(random.choice(caption) if is_train else caption[0])
+
+    with torch.no_grad():
+        for tokenizer, text_encoder in zip(tokenizers, text_encoders):
+            # Tokenize the text
+            text_inputs = tokenizer(
+                captions,
+                padding="max_length",
+                max_length=tokenizer.model_max_length,
+                truncation=True,
+                return_tensors="pt",
+            ).to(text_encoder.device)
+            
+            # Get text encoder output
+            encoder_output = text_encoder(
+                text_inputs.input_ids,
+                output_hidden_states=True,
+                return_dict=False,
+            )
+            
+            # Get the pooled output for the first text encoder
+            pooled_prompt_embeds = encoder_output[0]  # First element is pooled output
+            
+            # Get the hidden states
+            prompt_embeds = encoder_output[-1][-2]  # Second to last hidden state
+            
+            # Reshape prompt embeds
+            bs_embed, seq_len, _ = prompt_embeds.shape
+            prompt_embeds = prompt_embeds.view(bs_embed, seq_len, -1)
+            prompt_embeds_list.append(prompt_embeds)
+
+    # Concatenate the embeddings from both text encoders
+    prompt_embeds = torch.concat(prompt_embeds_list, dim=-1)
+    
+    return {
+        "prompt_embeds": prompt_embeds.cpu(),
+        "pooled_prompt_embeds": pooled_prompt_embeds.cpu()
+    }
