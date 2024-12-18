@@ -39,7 +39,8 @@ class NovelAIDataset(Dataset):
         config: NovelAIDatasetConfig,
         vae = None,
         text_encoders = None,
-        tokenizers = None
+        tokenizers = None,
+        tag_weighter = None
     ):
         """Initialize dataset - use create() for async initialization."""
         self.config = config
@@ -47,6 +48,7 @@ class NovelAIDataset(Dataset):
         self.vae = vae
         self.text_encoders = text_encoders
         self.tokenizers = tokenizers
+        self.tag_weighter = tag_weighter
         self.items = []
         
     @classmethod
@@ -55,10 +57,11 @@ class NovelAIDataset(Dataset):
         config: NovelAIDatasetConfig,
         vae = None,
         text_encoders = None,
-        tokenizers = None
+        tokenizers = None,
+        tag_weighter = None
     ) -> "NovelAIDataset":
         """Async factory method for initialization."""
-        self = cls(config, vae, text_encoders, tokenizers)
+        self = cls(config, vae, text_encoders, tokenizers, tag_weighter)
         await self._initialize()
         return self
 
