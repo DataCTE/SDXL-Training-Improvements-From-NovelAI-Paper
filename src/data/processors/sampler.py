@@ -70,12 +70,11 @@ class AspectBatchSampler(Sampler[List[int]]):
         
         # Initialize batch processor with optimal configuration
         self.batch_processor = BatchProcessor(
+            config=dataset.config.batch_processor_config,  # Use config from dataset
             image_processor=dataset.image_processor,
+            text_processor=dataset.text_processor,  # Add text processor
             cache_manager=dataset.cache_manager,
-            vae=dataset.vae,
-            device=dataset.device,
-            batch_size=batch_size,
-            prefetch_factor=self.prefetch_factor
+            vae=dataset.vae
         )
         
         # Validate inputs
