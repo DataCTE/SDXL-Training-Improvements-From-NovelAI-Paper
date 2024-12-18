@@ -218,8 +218,9 @@ class ImageProcessorConfig(DeviceConfig):
     
 @dataclass
 class CacheConfig:
-    use_caching: bool = True
+    use_memory_cache: bool = True
     cache_dir: str = DEFAULT_CACHE_DIR
+    cache_format: str = "pt"
 
 @dataclass
 class ImageSizeConfig:
