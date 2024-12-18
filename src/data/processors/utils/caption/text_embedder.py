@@ -3,7 +3,7 @@ import logging
 import warnings
 import traceback
 from transformers import AutoTokenizer, PretrainedConfig, CLIPTextModel, CLIPTextModelWithProjection
-from typing import Dict, List, Union, Optional, Any
+from typing import Dict, List, Union, Optional, Any, Tuple
 import random
 import numpy as np
 from src.config.config import TextEmbedderConfig
@@ -34,22 +34,25 @@ class TextEmbedder:
     def __init__(
         self, 
         config: TextEmbedderConfig, 
-        tokenizers: Optional[Dict[str, Any]] = None,
-        text_encoders: Optional[Dict[str, Any]] = None
+        tokenizers: Optional[Union[Dict[str, Any], Tuple[Any, Any]]] = None,
+        text_encoders: Optional[Union[Dict[str, Any], Tuple[Any, Any]]] = None
     ):
         """Initialize text embedder with both encoders.
         
         Args:
             config: Configuration for the text embedder
-            tokenizers: Optional pre-initialized tokenizers
-            text_encoders: Optional pre-initialized text encoders
+            tokenizers: Optional pre-initialized tokenizers (dict or tuple)
+            text_encoders: Optional pre-initialized text encoders (dict or tuple)
         """
         self.config = config
         
         # Load or use provided tokenizers
         if tokenizers is not None:
-            self.tokenizer_one = tokenizers.get("tokenizer_one")
-            self.tokenizer_two = tokenizers.get("tokenizer_two")
+            if isinstance(tokenizers, dict):
+                self.tokenizer_one = tokenizers.get("tokenizer_one")
+                self.tokenizer_two = tokenizers.get("tokenizer_two")
+            else:  # Assume tuple
+                self.tokenizer_one, self.tokenizer_two = tokenizers
             logger.info("Using provided tokenizers")
         else:
             # Load tokenizers from config
@@ -69,8 +72,11 @@ class TextEmbedder:
         
         # Load or use provided text encoders
         if text_encoders is not None:
-            self.text_encoder_one = text_encoders.get("text_encoder_one")
-            self.text_encoder_two = text_encoders.get("text_encoder_two")
+            if isinstance(text_encoders, dict):
+                self.text_encoder_one = text_encoders.get("text_encoder_one")
+                self.text_encoder_two = text_encoders.get("text_encoder_two")
+            else:  # Assume tuple
+                self.text_encoder_one, self.text_encoder_two = text_encoders
             logger.info("Using provided text encoders")
         else:
             # Load text encoders from config
