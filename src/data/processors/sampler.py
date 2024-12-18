@@ -72,7 +72,6 @@ class AspectBatchSampler(Sampler[List[int]]):
         self.batch_processor = BatchProcessor(
             image_processor=dataset.image_processor,
             cache_manager=dataset.cache_manager,
-            text_embedder=dataset.text_embedder,
             vae=dataset.vae,
             device=dataset.device,
             batch_size=batch_size,
