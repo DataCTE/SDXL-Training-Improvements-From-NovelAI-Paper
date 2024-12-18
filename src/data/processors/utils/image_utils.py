@@ -1,10 +1,10 @@
 from PIL import Image
 import torch
 import logging
-from typing import Tuple, Optional, Dict
+from typing import Tuple, Optional, Dict, Any
 from pathlib import Path
 import gc
-from src.config.config import VAEEncoderConfig
+from src.config.config import VAEEncoderConfig, DEFAULT_MIN_IMAGE_SIZE, DEFAULT_MAX_IMAGE_SIZE
 from src.utils.logging.metrics import log_error_with_context, log_metrics
 import os
 
@@ -12,63 +12,46 @@ logger = logging.getLogger(__name__)
 
 def load_and_validate_image(
     path: str,
-    config: VAEEncoderConfig,
-    required_modes: Tuple[str, ...] = ('RGB', 'RGBA')
+    config: Any,
+    min_size: Optional[Tuple[int, int]] = None,
+    max_size: Optional[Tuple[int, int]] = None
 ) -> Optional[Image.Image]:
-    """Load and validate an image file using config settings."""
+    """Load and validate image with size constraints."""
     try:
-        with Image.open(path) as temp_img:
-            # Track image stats
-            stats = {
-                'original_size': temp_img.size,
-                'original_mode': temp_img.mode,
-                'file_size': os.path.getsize(path) / 1024  # KB
-            }
+        # Use provided size constraints or fall back to config or defaults
+        min_image_size = min_size or getattr(config, 'min_image_size', DEFAULT_MIN_IMAGE_SIZE)
+        max_image_size = max_size or getattr(config, 'max_image_size', DEFAULT_MAX_IMAGE_SIZE)
+        
+        # Load image
+        image = Image.open(path)
+        
+        # Convert to RGB if needed
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
             
-            # Validate mode
-            if temp_img.mode not in required_modes:
-                stats['mode_conversion'] = f"{temp_img.mode} -> RGB"
-                temp_img = temp_img.convert('RGB')
-                
-            # Validate dimensions
-            width, height = temp_img.size
-            if width < config.min_image_size[0] or height < config.min_image_size[1]:
-                logger.debug(f"Image too small: {width}x{height} < {config.min_image_size}")
-                stats['validation_error'] = 'size_too_small'
-                return None
-                
-            if width > config.max_image_size[0] or height > config.max_image_size[1]:
-                logger.debug(f"Image too large: {width}x{height} > {config.max_image_size}")
-                stats['validation_error'] = 'size_too_large'
-                return None
-                
-            # Make a copy and log stats
-            img = temp_img.copy()
-            stats.update({
-                'final_size': img.size,
-                'final_mode': img.mode,
-                'aspect_ratio': width / height
-            })
+        # Get dimensions
+        width, height = image.size
+        
+        # Validate size
+        if width < min_image_size[0] or height < min_image_size[1]:
+            logger.warning(
+                f"Image too small: {path} ({width}x{height}), "
+                f"minimum size: {min_image_size}"
+            )
+            return None
             
-            # Log metrics periodically (every 100 images)
-            if hasattr(load_and_validate_image, '_counter'):
-                load_and_validate_image._counter += 1
-            else:
-                load_and_validate_image._counter = 1
-                
-            if load_and_validate_image._counter % 100 == 0:
-                log_metrics(stats, step=load_and_validate_image._counter, step_type="image")
-                
-            return img
+        if width > max_image_size[0] or height > max_image_size[1]:
+            logger.warning(
+                f"Image too large: {path} ({width}x{height}), "
+                f"maximum size: {max_image_size}"
+            )
+            return None
             
+        return image
+        
     except Exception as e:
         log_error_with_context(e, f"Error loading image {path}")
         return None
-        
-    finally:
-        # Force garbage collection if we had any failed operations
-        if 'img' not in locals():
-            gc.collect()
 
 def resize_image(
     img: Image.Image,

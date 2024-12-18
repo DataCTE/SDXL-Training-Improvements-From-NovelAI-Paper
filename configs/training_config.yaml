@@ -136,6 +136,8 @@ batch_processor:
   backoff_factor: 1.5
   cleanup_interval: 1000
   high_memory_threshold: 0.95
+  min_image_size: [256, 256]
+  max_image_size: [2048, 2048]
 
 # Image bucketing
 bucket:

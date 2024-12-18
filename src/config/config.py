@@ -251,21 +251,25 @@ class ImageSizeConfig:
     bucket_tolerance: float = 0.2
 
 @dataclass
-class BatchProcessorConfig(DeviceConfig):
+class BatchProcessorConfig:
+    """Configuration for batch processing."""
     batch_size: int = DEFAULT_BATCH_SIZE
     prefetch_factor: int = DEFAULT_PREFETCH_FACTOR
     log_interval: float = 5.0
     num_workers: int = DEFAULT_NUM_WORKERS
-    
-    # Batch size adjustment settings
     min_batch_size: int = 1
-    max_batch_size: int = 64
+    max_batch_size: int = DEFAULT_BATCH_SIZE
     memory_check_interval: float = 30.0
     memory_growth_factor: float = 0.7
     retry_count: int = 3
     backoff_factor: float = 1.5
     cleanup_interval: int = 1000
     high_memory_threshold: float = 0.95
+    # Add image size constraints
+    min_image_size: Tuple[int, int] = DEFAULT_MIN_IMAGE_SIZE
+    max_image_size: Tuple[int, int] = DEFAULT_MAX_IMAGE_SIZE
+    device: torch.device = torch.device('cuda')
+    dtype: torch.dtype = torch.float32
 
 @dataclass
 class VAEEncoderConfig(DeviceConfig):

@@ -9,8 +9,14 @@ from typing import Dict, Any, Optional, List
 import traceback
 from src.config.config import Config
 import sys
-import time
-import torch.distributed as dist
+
+
+try:
+    import pynvml
+    pynvml.nvmlInit()
+    PYNVML_AVAILABLE = True
+except ImportError:
+    PYNVML_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -267,7 +273,6 @@ def log_system_metrics(
     
     try:
         if include_memory:
-            import psutil
             process = psutil.Process()
             metrics.update({
                 "cpu_percent": process.cpu_percent(),
@@ -278,9 +283,22 @@ def log_system_metrics(
         if include_gpu and torch.cuda.is_available():
             metrics.update({
                 "gpu_memory_allocated_gb": torch.cuda.memory_allocated() / (1024**3),
-                "gpu_memory_reserved_gb": torch.cuda.memory_reserved() / (1024**3),
-                "gpu_utilization": torch.cuda.utilization()
+                "gpu_memory_reserved_gb": torch.cuda.memory_reserved() / (1024**3)
             })
+            
+            # Add NVML metrics if available
+            if PYNVML_AVAILABLE:
+                try:
+                    handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                    info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                    metrics.update({
+                        "gpu_memory_total_gb": info.total / (1024**3),
+                        "gpu_memory_used_gb": info.used / (1024**3),
+                        "gpu_memory_free_gb": info.free / (1024**3),
+                        "gpu_utilization": pynvml.nvmlDeviceGetUtilizationRates(handle).gpu
+                    })
+                except Exception as e:
+                    logger.warning(f"Error getting NVML metrics: {e}")
             
         # Log formatted metrics
         if metrics:

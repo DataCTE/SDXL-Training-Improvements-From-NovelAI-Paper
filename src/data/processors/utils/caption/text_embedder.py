@@ -39,15 +39,30 @@ def setup_memory_efficient_attention(model: torch.nn.Module) -> bool:
     """Enable memory efficient attention using xformers if available."""
     try:
         import xformers
-        if hasattr(model, "enable_xformers_memory_efficient_attention"):
-            model.enable_xformers_memory_efficient_attention()
-            logger.info("Enabled xformers memory efficient attention")
+        import xformers.ops
+        
+        # Check if model supports attention processor setting
+        if hasattr(model, "set_attention_processor"):
+            from diffusers.models.attention_processor import XFormersAttnProcessor
+            model.set_attention_processor(XFormersAttnProcessor())
+            logger.info("Enabled xformers attention processor")
             return True
+            
+        # Fallback to legacy method
+        elif hasattr(model, "enable_xformers_memory_efficient_attention"):
+            model.enable_xformers_memory_efficient_attention()
+            logger.info("Enabled legacy xformers attention")
+            return True
+            
         else:
             logger.warning("Model does not support xformers attention")
             return False
+            
     except ImportError:
         logger.warning("xformers not available, using standard attention")
+        return False
+    except Exception as e:
+        logger.warning(f"Error setting up xformers: {e}")
         return False
 
 class TextEmbedder:
@@ -180,15 +195,40 @@ class TextEmbedder:
         try:
             batch_stats = {
                 'batch_size': len(prompts),
-                'empty_prompts': int(len(prompts) * proportion_empty_prompts),
                 'start_memory': get_gpu_memory_usage(self.config.device),
                 'start_time': time.time()
             }
             
             # Process text through both encoders
             with torch.cuda.amp.autocast(dtype=self.config.dtype):
-                text_embeddings = self._get_prompt_embeds(prompts, proportion_empty_prompts)
-                pooled_embeddings = self._get_pooled_embeds(prompts, proportion_empty_prompts)
+                # Process with first encoder
+                text_embeddings_1 = self._process_batch(
+                    prompts,
+                    self.tokenizer_one,
+                    self.text_encoder_one,
+                    0,
+                    len(prompts)
+                )
+                
+                # Process with second encoder
+                text_embeddings_2 = self._process_batch(
+                    prompts,
+                    self.tokenizer_two,
+                    self.text_encoder_two,
+                    0,
+                    len(prompts)
+                )
+                
+                # Combine embeddings
+                text_embeddings = torch.cat([
+                    text_embeddings_1['prompt_embeds'],
+                    text_embeddings_2['prompt_embeds']
+                ], dim=-1)
+                
+                pooled_embeddings = torch.cat([
+                    text_embeddings_1['pooled_prompt_embeds'],
+                    text_embeddings_2['pooled_prompt_embeds']
+                ], dim=-1)
             
             # Update stats
             batch_stats.update({
@@ -207,7 +247,7 @@ class TextEmbedder:
                 step=batch_stats['batch_size'], 
                 step_type="text_embed",
                 is_main_process=True,
-                use_wandb=True  # Enable wandb logging for text embedding metrics
+                use_wandb=True
             )
             
             return {
