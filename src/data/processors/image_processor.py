@@ -498,3 +498,33 @@ class ImageProcessor:
             self.use_pinned_memory = False
             self.tensor_cache = WeakValueDictionary()
             logger.info("Running in CPU mode, memory optimizations disabled")
+
+    async def _async_load(self, image_path):
+        """Asynchronously load an image."""
+        try:
+            if isinstance(image_path, (str, Path)):
+                # Use PIL for image loading
+                from PIL import Image
+                return Image.open(image_path).convert('RGB')
+            return image_path
+        except Exception as e:
+            self.logger.error(f"Error loading image: {str(e)}")
+            raise
+
+    async def _async_preprocess(self, image):
+        """Asynchronously preprocess an image."""
+        try:
+            # Run CPU-bound preprocessing in thread pool
+            loop = asyncio.get_event_loop()
+            if self.thread_pool:
+                return await loop.run_in_executor(
+                    self.thread_pool,
+                    self.preprocess,
+                    image,
+                    self.config.width,
+                    self.config.height
+                )
+            return self.preprocess(image, self.config.width, self.config.height)
+        except Exception as e:
+            self.logger.error(f"Error preprocessing image: {str(e)}")
+            raise
