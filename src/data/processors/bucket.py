@@ -64,8 +64,16 @@ class BucketManager:
     def __init__(self, config: BucketConfig):
         """Initialize with consolidated config."""
         self.config = config
-        self.max_width, self.max_height = config.max_image_size
-        self.min_width, self.min_height = config.min_image_size
+        
+        # Extract config values
+        self.max_width, self.max_height = config.max_size
+        self.min_width, self.min_height = config.min_size
+        self.step = config.step
+        self.min_resolution = config.min_resolution
+        self.max_ar = config.max_ar
+        self.tolerance = config.tolerance
+        self.target_resolutions = config.target_resolutions
+        self.max_ar_error = config.max_ar_error
         
         self.buckets: Dict[str, ImageBucket] = WeakValueDictionary()
         self.total_samples = 0

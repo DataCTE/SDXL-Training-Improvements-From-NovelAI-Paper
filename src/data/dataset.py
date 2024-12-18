@@ -145,9 +145,9 @@ class NovelAIDataset(Dataset):
             tag_frequency_threshold: int = 5
             tag_weight_smoothing: float = 0.1
 
-            # Add this attribute to allow passing 'prefetch_factor' from your YAML
-            prefetch_factor: int = DEFAULT_PREFETCH_FACTOR
-            proportion_empty_prompts: float = 0.0"""
+    # Add this attribute to allow passing 'prefetch_factor' from your YAML
+    prefetch_factor: int = DEFAULT_PREFETCH_FACTOR
+    proportion_empty_prompts: float = 0.0"""
 
             # TextProcessor
             self.text_processor = TextProcessor(
