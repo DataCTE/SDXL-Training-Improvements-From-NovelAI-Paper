@@ -14,41 +14,41 @@ def load_and_validate_image(
     path: str,
     config: Any,
     min_size: Optional[Tuple[int, int]] = None,
-    max_size: Optional[Tuple[int, int]] = None
+    max_size: Optional[Tuple[int, int]] = None,
+    required_modes: Optional[Tuple[str, ...]] = None
 ) -> Optional[Image.Image]:
-    """Load and validate image with size constraints."""
+    """Load and validate image with size constraints, optionally enforcing specific modes."""
     try:
-        # Use provided size constraints or fall back to config or defaults
-        min_image_size = min_size or getattr(config, 'min_image_size', DEFAULT_MIN_IMAGE_SIZE)
-        max_image_size = max_size or getattr(config, 'max_image_size', DEFAULT_MAX_IMAGE_SIZE)
-        
-        # Load image
+        min_image_size = min_size or getattr(config, 'min_image_size', (256, 256))
+        max_image_size = max_size or getattr(config, 'max_image_size', (2048, 2048))
+
         image = Image.open(path)
-        
-        # Convert to RGB if needed
-        if image.mode != 'RGB':
-            image = image.convert('RGB')
-            
-        # Get dimensions
+
+        if required_modes and image.mode not in required_modes:
+            # Convert if possible, or simply log a warning
+            if 'RGB' in required_modes:
+                image = image.convert('RGB')
+            else:
+                logger.warning(f"Image mode {image.mode} not in {required_modes}")
+                return None
+
         width, height = image.size
-        
-        # Validate size
         if width < min_image_size[0] or height < min_image_size[1]:
             logger.warning(
                 f"Image too small: {path} ({width}x{height}), "
                 f"minimum size: {min_image_size}"
             )
             return None
-            
+
         if width > max_image_size[0] or height > max_image_size[1]:
             logger.warning(
                 f"Image too large: {path} ({width}x{height}), "
                 f"maximum size: {max_image_size}"
             )
             return None
-            
+
         return image
-        
+
     except Exception as e:
         log_error_with_context(e, f"Error loading image {path}")
         return None
