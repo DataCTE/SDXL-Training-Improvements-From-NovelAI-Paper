@@ -80,7 +80,8 @@ class ImageProcessor:
         """
         Load and validate an image using a utility function, in a separate thread if needed.
         """
-        return load_and_validate_image(path_or_str)
+        # Use asyncio.to_thread since load_and_validate_image is synchronous
+        return await asyncio.to_thread(load_and_validate_image, path_or_str)
 
     async def process_image(
         self,
@@ -95,8 +96,8 @@ class ImageProcessor:
         """
         try:
             if isinstance(image, (str, Path)):
-                # Use an async thread for loading
-                image = await asyncio.to_thread(self.load_image, image)
+                # Fix: await the load_image directly instead of using asyncio.to_thread
+                image = await self.load_image(image)
                 if image is None:
                     raise ValueError("Failed to load image")
 
