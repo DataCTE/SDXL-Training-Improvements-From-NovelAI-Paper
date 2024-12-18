@@ -27,7 +27,7 @@ from .processors.utils.progress_utils import create_progress_tracker, update_tra
 from .processors.utils.system_utils import get_gpu_memory_usage, cleanup_processor
 
 # Config import
-from src.config.config import NovelAIDatasetConfig
+from src.config.config import NovelAIDatasetConfig, BucketConfig
 
 logger = logging.getLogger(__name__)
 
@@ -78,8 +78,16 @@ class NovelAIDataset(Dataset):
                 if self.config.tag_weights_path and Path(self.config.tag_weights_path).exists():
                     tag_weighter = TagWeighter.load(self.config.tag_weights_path)
             
-            # Initialize bucket manager
-            self.bucket_manager = BucketManager(self.config.bucket_config)
+            # Initialize bucket manager with proper config
+            bucket_config = BucketConfig(
+                max_image_size=self.config.max_image_size,
+                min_image_size=self.config.min_image_size,
+                bucket_step=self.config.bucket_step,
+                min_bucket_resolution=self.config.min_bucket_resolution or min(self.config.min_image_size),
+                max_aspect_ratio=self.config.max_aspect_ratio,
+                bucket_tolerance=self.config.bucket_tolerance
+            )
+            self.bucket_manager = BucketManager(bucket_config)
             
             # Initialize text embedder and processor
             self.text_embedder = TextEmbedder(
