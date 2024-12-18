@@ -200,6 +200,26 @@ class PathsConfig:
     tag_weights_path: Optional[str] = "tag_weights.json"
 
 @dataclass
+class TextEmbedderConfig(DeviceConfig):
+    max_length: int = DEFAULT_MAX_TOKEN_LENGTH
+    batch_size: int = DEFAULT_BATCH_SIZE
+    model_name: str = DEFAULT_MODEL_NAME
+    
+    # Model settings
+    use_fast_tokenizer: bool = True
+    low_cpu_mem_usage: bool = True
+    
+    # Performance settings
+    growth_factor: float = 0.3
+    proportion_empty_prompts: float = 0.0
+    
+    # Subfolder settings
+    tokenizer_subfolder: str = "tokenizer"
+    tokenizer_2_subfolder: str = "tokenizer_2"
+    text_encoder_subfolder: str = "text_encoder"
+    text_encoder_2_subfolder: str = "text_encoder_2"
+
+@dataclass
 class NovelAIDatasetConfig:
     model_name: str = DEFAULT_MODEL_NAME
     image_size: Tuple[int, int] = DEFAULT_IMAGE_SIZE
@@ -235,8 +255,11 @@ class NovelAIDatasetConfig:
         'quality': (0.6, 1.4),
         'artist': (0.5, 1.5)
     })
-    tag_weights_path: Optional[str] = None
-    text_embedder_config: Dict[str, Any] = None
+    tag_weights_path: Optional[str] = "./latents/latent_weights.json"
+    text_embedder_config: TextEmbedderConfig = field(default_factory=lambda: TextEmbedderConfig(
+        model_name="stabilityai/stable-diffusion-xl-base-1.0",
+        # Add other parameters as needed
+    ))
 
     def __post_init__(self):
         """Convert and validate configuration."""
