@@ -22,6 +22,8 @@ logger = logging.getLogger(__name__)
 def train(config_path: str):
     """Main training function with improved setup and error handling."""
     is_main_process = True
+    loop = None
+    dataset = None
     
     try:
         # Parse arguments first
@@ -216,11 +218,15 @@ def train(config_path: str):
                     loop.run_until_complete(dataset.batch_processor.cleanup())
                     
         except Exception as e:
-            raise e
+            logger.error(f"Training error: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
         finally:
-            # Cleanup dataset resources
-            loop.run_until_complete(dataset.cleanup())
-            loop.close()
+            # Cleanup dataset resources if it was initialized
+            if dataset is not None:
+                loop.run_until_complete(dataset.cleanup())
+            if loop is not None and not loop.is_closed():
+                loop.close()
             
     except Exception as e:
         logger.error(f"Training failed: {str(e)}")

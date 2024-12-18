@@ -66,11 +66,16 @@ def get_gpu_memory_usage(device: torch.device) -> float:
         return torch.cuda.memory_reserved() / torch.cuda.get_device_properties(device).total_memory
     return 0.0
 
-def create_thread_pool(num_workers: Optional[int] = None, memory_per_worker_gb: float = 2.0) -> ThreadPoolExecutor:
-    """Create thread pool with optimal number of workers."""
-    if num_workers is None:
-        num_workers = get_optimal_workers(memory_per_worker_gb)
-    return ThreadPoolExecutor(max_workers=num_workers)
+def create_thread_pool(num_workers: int, **kwargs) -> ThreadPoolExecutor:
+    """Create a thread pool with proper error handling."""
+    try:
+        return ThreadPoolExecutor(
+            max_workers=num_workers,
+            thread_name_prefix='batch_worker'
+        )
+    except TypeError:
+        # Fallback for Python versions that don't support thread_name_prefix
+        return ThreadPoolExecutor(max_workers=num_workers)
 
 def adjust_batch_size(
     current_batch_size: int,
