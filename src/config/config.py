@@ -317,6 +317,15 @@ class GlobalConfig:
     cache: CacheConfig = field(default_factory=CacheConfig)
     image: ImageSizeConfig = field(default_factory=ImageSizeConfig)
 
+    def __post_init__(self):
+        # Convert any nested dictionaries into their respective dataclass instances
+        if isinstance(self.device, dict):
+            self.device = DeviceConfig(**self.device)
+        if isinstance(self.cache, dict):
+            self.cache = CacheConfig(**self.cache)
+        if isinstance(self.image, dict):
+            self.image = ImageSizeConfig(**self.image)
+
 @dataclass
 class Config:
     model: ModelConfig
