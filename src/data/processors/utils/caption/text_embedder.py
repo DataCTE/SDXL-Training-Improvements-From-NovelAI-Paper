@@ -136,6 +136,8 @@ class TextEmbedder:
             
             # Use provided device or fall back to config device
             target_device = device if device is not None else self.config.device
+            if not isinstance(target_device, torch.device):
+                target_device = torch.device(target_device)
             
             # Ensure encoders are on the correct device
             self.text_encoder_one = self.text_encoder_one.to(target_device)
@@ -149,9 +151,11 @@ class TextEmbedder:
                 truncation=True,
                 return_tensors="pt"
             )
+            
             # Move inputs to device and ensure correct dtype
             text_inputs_one = {
-                k: v.to(target_device, dtype=torch.long) if k == "input_ids" else v.to(target_device)
+                k: v.to(device=target_device, dtype=torch.long) if k == "input_ids" 
+                else v.to(device=target_device)
                 for k, v in text_inputs_one.items()
             }
             
@@ -162,9 +166,11 @@ class TextEmbedder:
                 truncation=True,
                 return_tensors="pt"
             )
+            
             # Move inputs to device and ensure correct dtype
             text_inputs_two = {
-                k: v.to(target_device, dtype=torch.long) if k == "input_ids" else v.to(target_device)
+                k: v.to(device=target_device, dtype=torch.long) if k == "input_ids" 
+                else v.to(device=target_device)
                 for k, v in text_inputs_two.items()
             }
             
