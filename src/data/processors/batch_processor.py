@@ -8,6 +8,7 @@ import asyncio
 import time
 import gc
 from multiprocessing import cpu_count
+import concurrent.futures
 
 # Internal imports from utils
 from src.data.processors.utils.batch_utils import (
@@ -37,8 +38,10 @@ from src.data.processors.image_processor import ImageProcessor
 logger = logging.getLogger(__name__)
 
 class BatchProcessor(GenericBatchProcessor):
-    """Process batches of images and text with GPU optimization."""
-    
+    """
+    Process batches of images and text with GPU optimization and chunking.
+    """
+
     def __init__(
         self,
         config: BatchProcessorConfig,
@@ -47,34 +50,36 @@ class BatchProcessor(GenericBatchProcessor):
         cache_manager: CacheManager,
         vae
     ):
-        """Initialize with consolidated config."""
-        # Initialize components
+        """
+        Initialize with consolidated config.
+        """
+        self.logger = logging.getLogger(__name__)
         self.config = config
         self.image_processor = image_processor
         self.text_processor = text_processor
         self.cache_manager = cache_manager
         self.vae = vae
-        
-        # Create thread pool for async operations
+
+        # Max concurrency for item-level tasks
         self.num_workers = min(
             get_optimal_workers(),
             config.num_workers or cpu_count()
         )
-        
-        # Initialize async queues
+
+        # Initialize internal queues
         self.process_queue = asyncio.Queue(maxsize=self.config.batch_size * 2)
         self.result_queue = asyncio.Queue(maxsize=self.config.batch_size * 2)
-        
-        # Create thread pool with proper shutdown
+
+        # Create thread pool for asynchronous operations
         self.thread_pool = create_thread_pool(
             self.num_workers,
             thread_name_prefix='batch_worker'
         )
-        
+
         # Track active tasks
         self.active_tasks = set()
-        
-        logger.info(
+
+        self.logger.info(
             f"Initialized BatchProcessor:\n"
             f"- Device: {config.device}\n"
             f"- Batch size: {config.batch_size}\n"
@@ -83,164 +88,173 @@ class BatchProcessor(GenericBatchProcessor):
             f"- Max memory usage: {config.max_memory_usage:.1%}"
         )
 
-    async def _load_and_validate_image(self, image_path: str) -> Optional[Image.Image]:
-        """Load and validate an image file."""
+    async def _load_and_validate_image(self, image_path: str):
+        """
+        Load and validate an image file asynchronously.
+        """
         try:
             img_path = Path(image_path)
             return await asyncio.to_thread(
                 load_and_validate_image,
                 img_path,
-                config=self.config  # Pass the config to use its image size settings
+                config=self.config  # If your load_and_validate_image uses self.config
             )
         except Exception as e:
-            logger.error(f"Error loading image {image_path}: {str(e)[:200]}...")
+            self.logger.error(f"Error loading image {image_path}: {str(e)}")
             return None
 
     async def process_dataset(
         self,
         items: List[str],
-        progress_callback: Optional[Callable[[int, Dict[str, Any]], None]] = None
-    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-        """Process entire dataset with chunking and progress tracking."""
+        progress_callback: Optional[callable] = None
+    ):
+        """
+        Process an entire dataset of item paths. 
+        Items are chunked, processed in parallel, and results aggregated.
+        """
+        import math
+        from src.data.processors.utils.progress_utils import (
+            create_progress_tracker,
+            update_tracker,
+            log_progress
+        )
+
         # Create progress tracker with batch info
         tracker = create_progress_tracker(
             total_items=len(items),
             batch_size=self.config.batch_size,
             device=self.config.device
         )
-        
-        async def process_chunk(chunk: List[str], chunk_id: int) -> Tuple[List[Dict], Dict[str, Any]]:
-            """Process a single chunk of items."""
-            chunk_items = []
-            chunk_stats = {
-                'total': 0,
-                'errors': 0,
-                'skipped': 0,
-                'cache_hits': 0,
-                'cache_misses': 0,
-                'error_types': {},
-                'processed_items': []
-            }
-            
-            # Process items in parallel using thread pool
-            async def process_item(item_path: str) -> Optional[Dict]:
-                try:
-                    # Check cache first
-                    cache_result = await self.cache_manager.get_cached_item(item_path)
-                    if cache_result is not None:
-                        chunk_stats['cache_hits'] += 1
-                        return cache_result
-                        
-                    # Load and validate image
-                    img = await self._load_and_validate_image(item_path)
-                    if img is None:
-                        chunk_stats['skipped'] += 1
-                        update_tracker(tracker, failed=1, error_type='invalid_image')
-                        return None
-                        
-                    # Process image
-                    processed_image = await self.image_processor.process_image(img)
-                    if processed_image is None:
-                        chunk_stats['skipped'] += 1
-                        update_tracker(tracker, failed=1, error_type='image_processing_failed')
-                        return None
-                        
-                    # Process text
-                    text_path = Path(item_path).with_suffix('.txt')
-                    text_result = await self.text_processor.process_text_file(text_path)
-                    if text_result is None:
-                        chunk_stats['error_types']['text_processing_failed'] = \
-                            chunk_stats['error_types'].get('text_processing_failed', 0) + 1
-                        update_tracker(tracker, failed=1, error_type='text_processing_failed')
-                        return None
-                        
-                    text_data, tags = text_result
-                    
-                    # Create item
-                    item = {
-                        'image_path': item_path,
-                        'processed_image': processed_image,
-                        'text_data': text_data,
-                        'tags': tags
-                    }
-                    
-                    # Cache item
-                    await self.cache_manager.cache_item(item_path, item)
-                    
-                    chunk_stats['total'] += 1
-                    chunk_stats['cache_misses'] += 1
-                    update_tracker(tracker, processed=1, cache_misses=1)
-                    return item
-                    
-                except Exception as e:
-                    logger.error(f"Error processing {item_path}: {str(e)[:200]}...")
-                    chunk_stats['errors'] += 1
-                    chunk_stats['error_types'][type(e).__name__] = \
-                        chunk_stats['error_types'].get(type(e).__name__, 0) + 1
-                    update_tracker(tracker, failed=1, error_type=type(e).__name__)
-                    return None
-            
-            # Process chunk items in parallel
-            tasks = [process_item(item_path) for item_path in chunk]
-            results = await asyncio.gather(*tasks)
-            
-            # Filter out None results and extend chunk items
-            chunk_items.extend([r for r in results if r is not None])
-            chunk_stats['processed_items'] = chunk_items
-            
-            return chunk_items, chunk_stats
-        
-        # Process chunks
-        processed_items, final_stats = await process_in_chunks(
-            items=items,
-            chunk_size=self.config.batch_size,
-            process_fn=process_chunk,
-            progress_callback=lambda n, chunk_stats: self._handle_progress(
-                n, chunk_stats, tracker, progress_callback
-            )
-        )
-        
-        return processed_items, final_stats
-        
-    def _handle_progress(
-        self,
-        n: int,
-        chunk_stats: Dict[str, Any],
-        tracker: ProgressStats,
-        progress_callback: Optional[Callable] = None
-    ) -> None:
-        """Handle progress updates and callbacks."""
-        # Add extra monitoring stats
-        extra_stats = {
-            'processed': len(chunk_stats.get('processed_items', [])),
-            'errors': chunk_stats.get('errors', 0),
-            'skipped': chunk_stats.get('skipped', 0),
-            'error_types': chunk_stats.get('error_types', {}),
-            'gpu_memory': f"{get_gpu_memory_usage(self.config.device):.1%}",
-            'batch_size': self.config.batch_size
+
+        # Helper to chunk item paths
+        def chunker(seq, size):
+            for pos in range(0, len(seq), size):
+                yield seq[pos:pos + size]
+
+        all_results = []
+        for chunk_id, chunk_items in enumerate(chunker(items, self.config.batch_size)):
+            results_chunk, stats_chunk = await self._process_chunk(chunk_items, tracker)
+            all_results.extend(results_chunk)
+
+            # Fire optional progress callback
+            if progress_callback:
+                progress_callback(len(all_results), stats_chunk)
+
+            # Print progress occasionally
+            if chunk_id % 10 == 0:
+                log_progress(tracker, prefix=f"Batch {chunk_id}")
+
+        # Finalize
+        final_stats = {
+            'processed': tracker.processed_items,
+            'failed': tracker.failed_items,
+            'cache_hits': tracker.cache_hits,
+            'cache_misses': tracker.cache_misses,
+            'error_types': tracker.error_types
         }
-        
-        # Update tracker
-        update_tracker(
-            stats=tracker,
-            processed=n,
-            failed=chunk_stats.get('errors', 0),
-            cache_hits=chunk_stats.get('cache_hits', 0),
-            cache_misses=chunk_stats.get('cache_misses', 0)
-        )
-        
-        # Call progress callback if provided
-        if progress_callback is not None:
+        return all_results, final_stats
+
+    async def _process_chunk(self, chunk: List[str], tracker):
+        """
+        Process a chunk of item paths concurrently.
+        """
+        import torch
+        import asyncio
+        from pathlib import Path
+        from src.data.processors.utils.progress_utils import update_tracker
+
+        chunk_results = []
+        chunk_stats = {
+            'total': 0,
+            'errors': 0,
+            'skipped': 0,
+            'cache_hits': 0,
+            'cache_misses': 0,
+            'error_types': {},
+            'processed_items': []
+        }
+
+        async def process_item(item_path: str):
             try:
-                progress_callback(n, extra_stats)
+                # Check cache
+                cache_result = await self.cache_manager.load_cached_item(item_path)
+                if cache_result is not None:
+                    chunk_stats['cache_hits'] += 1
+                    update_tracker(tracker, processed=1, cache_hits=1)
+                    return cache_result
+
+                # Load/validate image
+                img = await self._load_and_validate_image(item_path)
+                if img is None:
+                    chunk_stats['skipped'] += 1
+                    update_tracker(tracker, failed=1, error_type='invalid_image')
+                    return None
+
+                # Process image
+                processed_image = await self.image_processor.process_image(img)
+                if not processed_image:
+                    chunk_stats['skipped'] += 1
+                    update_tracker(tracker, failed=1, error_type='image_processing_failed')
+                    return None
+
+                # Process text
+                text_path = Path(item_path).with_suffix('.txt')
+                text_result = await self.text_processor.process_text_file(text_path)
+                if not text_result:
+                    chunk_stats['errors'] += 1
+                    update_tracker(tracker, failed=1, error_type='text_processing_failed')
+                    return None
+
+                text_data, tags = text_result
+
+                # Create final item
+                item = {
+                    'image_path': item_path,
+                    'processed_image': processed_image,
+                    'text_data': text_data,
+                    'tags': tags
+                }
+
+                # Cache item
+                await self.cache_manager.cache_item(item_path, item)
+
+                chunk_stats['total'] += 1
+                chunk_stats['cache_misses'] += 1
+                update_tracker(tracker, processed=1, cache_misses=1)
+                return item
+
             except Exception as e:
-                logger.error(f"Error in progress callback: {e}")
+                chunk_stats['errors'] += 1
+                etype = type(e).__name__
+                chunk_stats['error_types'][etype] = chunk_stats['error_types'].get(etype, 0) + 1
+                update_tracker(tracker, failed=1, error_type=etype)
+                self.logger.error(f"Error processing item {item_path}: {str(e)}")
+                return None
+
+        item_tasks = [asyncio.create_task(process_item(p)) for p in chunk]
+        processed_batch = await asyncio.gather(*item_tasks)
+
+        # Gather valid items
+        for item in processed_batch:
+            if item is not None:
+                chunk_results.append(item)
+
+        return chunk_results, chunk_stats
 
     async def cleanup(self):
-        """Clean up resources asynchronously."""
-        await cleanup_processor(self)
+        """
+        Optional cleanup for thread pools, GPU caches, etc.
+        """
+        import gc
+        import torch
+        self.logger.info("BatchProcessor cleanup invoked.")
+        self.thread_pool.shutdown(wait=True)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def __del__(self):
+        import asyncio
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
@@ -248,80 +262,4 @@ class BatchProcessor(GenericBatchProcessor):
             else:
                 loop.run_until_complete(self.cleanup())
         except Exception as e:
-            logger.error(f"Error during batch processor deletion: {e}")
-
-    async def process_batch(
-        self,
-        batch_items: List[Dict],
-        cache_manager: Optional[CacheManager] = None
-    ) -> Tuple[List[Dict], Dict[str, Any]]:
-        """Process a batch of items with tag weight support."""
-        try:
-            results = []
-            batch_stats = {
-                'processed': 0,
-                'cache_hits': 0,
-                'cache_misses': 0,
-                'errors': 0,
-                'error_types': {}
-            }
-
-            async def process_item(item):
-                try:
-                    text_result = await self.text_processor.process_text(item['text'])
-                    if text_result is None:
-                        return None
-
-                    # Adjust to handle either two or three returned values safely
-                    if len(text_result) == 3:
-                        prompt_embeds, pooled_prompt_embeds, tag_weights = text_result
-                    elif len(text_result) == 2:
-                        prompt_embeds, pooled_prompt_embeds = text_result
-                        tag_weights = None
-                    else:
-                        logger.error("Unexpected number of items in text_result.")
-                        return None
-
-                    # Process image
-                    img_result = await self.image_processor.process_image(
-                        item['image_path'],
-                        original_size=item['original_size']
-                    )
-                    if img_result is None:
-                        return None
-
-                    processed_item = {
-                        'image_path': item['image_path'],
-                        'latents': img_result.get('latents'),
-                        'prompt_embeds': prompt_embeds,
-                        'pooled_prompt_embeds': pooled_prompt_embeds,
-                        'original_size': item['original_size'],
-                        'crop_top_left': img_result.get('crop_top_left', None)
-                    }
-
-                    # Optionally set tag_weights if present
-                    if tag_weights is not None:
-                        processed_item['tag_weights'] = tag_weights
-
-                    return processed_item
-
-                except Exception as e:
-                    logger.error(f"Error processing item: {e}")
-                    return None
-
-            # Process items concurrently
-            tasks = [process_item(item) for item in batch_items]
-            processed_items = await asyncio.gather(*tasks)
-            
-            # Filter valid results
-            results = [item for item in processed_items if item is not None]
-            
-            # Update stats
-            batch_stats['processed'] = len(results)
-            batch_stats['errors'] = len(batch_items) - len(results)
-            
-            return results, batch_stats
-            
-        except Exception as e:
-            logger.error(f"Batch processing error: {e}")
-            return [], batch_stats
+            self.logger.error(f"BatchProcessor destructor error: {e}")

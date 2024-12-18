@@ -4,7 +4,7 @@ import logging
 import asyncio
 import torch
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, List, Tuple, Union
 import gc
 from collections import OrderedDict
 import json
@@ -19,24 +19,14 @@ logger = logging.getLogger(__name__)
 
 class CacheManager:
     """
-    Manages caching of processed items (latents, text, metadata).
-    Adjusted to reduce overhead and concurrency overhead.
-    If I/O is your bottleneck, ensure you have fast SSD or scale read concurrency.
+    Faster CacheManager with orjson, single thread pool, and minimal disk checks.
     """
 
-    def __init__(self, config):
-        import logging
-        import concurrent.futures
-        import os
-        from pathlib import Path
-        from collections import OrderedDict
-        from src.data.processors.utils.file_utils import ensure_dir
-
+    def __init__(self, config: CacheConfig, io_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None):
         self.logger = logging.getLogger(__name__)
         self.config = config
         self.cache_dir = Path(config.cache_dir)
 
-        # Make subdirs
         subdirs = ["latents", "text", "metadata"]
         for sd in subdirs:
             ensure_dir(self.cache_dir / sd)
@@ -45,17 +35,19 @@ class CacheManager:
         self.text_dir = self.cache_dir / "text"
         self.metadata_dir = self.cache_dir / "metadata"
 
-        # Memory caches
         self._memory_cache = OrderedDict()
         self._metadata_memory_cache = OrderedDict()
         self._max_memory_items = getattr(config, "max_memory_items", 1000)
 
-        # I/O thread pool
-        worker_count = min(32, (os.cpu_count() or 8))
-        self._io_pool = concurrent.futures.ThreadPoolExecutor(
-            max_workers=worker_count,
-            thread_name_prefix="cache_io_"
-        )
+        # Possibly reuse an external thread pool to reduce overhead
+        if io_pool is not None:
+            self._io_pool = io_pool
+        else:
+            worker_count = min(16, (os.cpu_count() or 8))
+            self._io_pool = concurrent.futures.ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix="cache_io_"
+            )
 
         self._save_options = {
             '_use_new_zipfile_serialization': True,
@@ -63,75 +55,63 @@ class CacheManager:
         }
 
         self.logger.info(
-            f"CacheManager init\n"
-            f"Cache directory: {self.cache_dir}\n"
-            f"Memory cache: {config.use_memory_cache}\n"
-            f"Max memory items: {self._max_memory_items}\n"
-            f"I/O workers: {worker_count}"
+            f"CacheManager init: {self.cache_dir}\n"
+            f"Memory cache: {config.use_memory_cache}, max items: {self._max_memory_items}\n"
+            f"Thread workers: {self._io_pool._max_workers}"
         )
 
-    def get_cache_paths(self, image_path):
-        """
-        Return existing or potential cache paths for latents, text, metadata.
-        """
-        from pathlib import Path
+    def get_cache_paths(self, image_path: Union[str, Path]) -> dict:
         image_path = Path(image_path)
         name = image_path.stem
-        paths = {
+        return {
             'latent': self.latents_dir / f"{name}.pt",
             'text': self.text_dir / f"{name}.pt",
             'metadata': self.metadata_dir / f"{name}.json"
         }
-        return paths
 
-    async def cache_item(self, image_path, processed_item):
+    async def cache_item(self, image_path: Union[str, Path], processed_item: dict):
         """
         Save latents, text embeddings, metadata in parallel if present.
         """
-        import asyncio
-        import torch
-        from concurrent.futures import wait
-
-        tasks = []
         paths = self.get_cache_paths(image_path)
 
         latents = processed_item.get('latents')
         text_data = self._prepare_text_data(processed_item)
         metadata = self._prepare_metadata(processed_item)
 
-        if latents is not None and torch.is_tensor(latents):
+        tasks = []
+        if latents is not None and isinstance(latents, torch.Tensor):
             tasks.append(self._io_pool.submit(torch.save, latents.cpu(), paths['latent'], **self._save_options))
-
         if text_data:
             tasks.append(self._io_pool.submit(torch.save, text_data, paths['text'], **self._save_options))
-
         if any(metadata.values()):
             tasks.append(self._io_pool.submit(self._save_json, paths['metadata'], metadata))
 
         if tasks:
-            await asyncio.get_event_loop().run_in_executor(None, lambda: wait(tasks))
+            await asyncio.get_event_loop().run_in_executor(None, lambda: [t.result() for t in tasks])
 
-        # Update memory caches
+        # Memory cache
         if self.config.use_memory_cache:
             self._update_memory_cache(image_path, latents, text_data, metadata)
 
-    def _prepare_text_data(self, item):
+    def _prepare_text_data(self, item: dict):
         import torch
         text_data = {}
         for key in ['prompt_embeds', 'pooled_prompt_embeds', 'tag_weights']:
-            if key in item and torch.is_tensor(item[key]):
+            if key in item and isinstance(item[key], torch.Tensor):
                 text_data[key] = item[key].cpu()
         return text_data
 
-    def _prepare_metadata(self, item):
+    def _prepare_metadata(self, item: dict):
+        # Minimal example, expand if needed
         return {
             'original_size': item.get('original_size'),
             'crop_top_left': item.get('crop_top_left'),
             'target_size': (item.get('width'), item.get('height'))
         }
 
-    def _save_json(self, path, data):
-        import json
+    def _save_json(self, path: Path, data: dict):
+        """Use orjson if available, else fallback to normal JSON."""
         try:
             import orjson
             with open(path, 'wb') as f:
@@ -140,33 +120,22 @@ class CacheManager:
             with open(path, 'w') as f:
                 json.dump(data, f, separators=(',', ':'))
 
-    def _update_memory_cache(self, image_path, latents, text_data, metadata):
-        from collections import OrderedDict
-        import torch
+    def _update_memory_cache(self, image_path: Union[str, Path], latents, text_data, metadata):
         cache_key = str(image_path)
         if len(self._memory_cache) >= self._max_memory_items:
             self._memory_cache.popitem(last=False)
-        latents_cpu = latents.cpu() if latents is not None and torch.is_tensor(latents) else None
         self._memory_cache[cache_key] = {
-            'latents': latents_cpu,
+            'latents': latents.cpu() if latents is not None and isinstance(latents, torch.Tensor) else None,
             'text_data': text_data,
             'metadata': metadata
         }
         if any(metadata.values()):
             self._metadata_memory_cache[cache_key] = metadata
 
-    async def load_cached_item(self, image_path):
-        """
-        Load latents, text, metadata in parallel from local disk if present.
-        """
-        import asyncio
-        import torch
-        from concurrent.futures import wait
-        from pathlib import Path
-
+    async def load_cached_item(self, image_path: Union[str, Path]):
         cache_key = str(image_path)
         if self.config.use_memory_cache and cache_key in self._memory_cache:
-            # LRU move to end
+            # LRU logic
             self._memory_cache.move_to_end(cache_key)
             if cache_key in self._metadata_memory_cache:
                 self._memory_cache[cache_key]['metadata'] = self._metadata_memory_cache[cache_key]
@@ -198,16 +167,18 @@ class CacheManager:
             'metadata': metadata
         }
 
+        # Store in memory if enabled
         if self.config.use_memory_cache:
             self._memory_cache[cache_key] = out
             if metadata:
                 self._metadata_memory_cache[cache_key] = metadata
             if len(self._memory_cache) > self._max_memory_items:
                 self._memory_cache.popitem(last=False)
+
         return out
 
-    def _load_json(self, path):
-        import json
+    def _load_json(self, path: Path):
+        """Same fallback logic: try orjson first."""
         try:
             import orjson
             with open(path, 'rb') as f:
@@ -217,8 +188,6 @@ class CacheManager:
                 return json.load(f)
 
     async def cleanup(self):
-        import gc
-        import torch
         self._memory_cache.clear()
         self._metadata_memory_cache.clear()
         self._io_pool.shutdown(wait=True)
@@ -228,8 +197,7 @@ class CacheManager:
         self.logger.info("CacheManager cleanup done.")
 
     def __del__(self):
-        import asyncio, logging
-        logger = logging.getLogger(__name__)
+        import asyncio
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
