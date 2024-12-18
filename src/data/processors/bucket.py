@@ -67,194 +67,114 @@ class BucketManager:
         self.max_width, self.max_height = config.max_image_size
         self.min_width, self.min_height = config.min_image_size
         
-        # Initialize buckets with WeakValueDictionary to help prevent memory leaks
         self.buckets: Dict[str, ImageBucket] = WeakValueDictionary()
-        self._create_buckets()
-        
-        # State tracking
         self.total_samples = 0
         self.epoch = 0
         self.rng = np.random.RandomState()
-        
-        logger.info(
-            f"Initialized BucketManager:\n"
-            f"- Size range: {config.min_image_size} to {config.max_image_size}\n"
-            f"- Bucket step: {config.bucket_step}\n"
-            f"- Total buckets: {len(self.buckets)}"
-        )
+
+        logger.info("Initialized empty BucketManager (no step-based creation).")
     
     def _validate_dimensions(self, width: int, height: int) -> Tuple[int, int]:
-        """Validate and adjust dimensions to constraints."""
-        # Optionally round them to multiples of bucket_step, etc.
-        width = round(width / self.config.bucket_step) * self.config.bucket_step
-        height = round(height / self.config.bucket_step) * self.config.bucket_step
-        
-        # Enforce min/max dimensions
+        """Round dimensions to multiples of config.bucket_step; clamp to min/max."""
+        step = self.config.bucket_step
+        width = round(width / step) * step
+        height = round(height / step) * step
+
         width = max(min(width, self.max_width), self.min_width)
         height = max(min(height, self.max_height), self.min_height)
-        
         return width, height
     
-    def _create_buckets(self) -> None:
-        """Generate bucket resolutions, but do not forcibly fail if none are created."""
-        logger.debug(
-            f"Creating buckets with:\n"
-            f"- step={self.config.bucket_step}\n"
-            f"- min_res={self.config.min_bucket_resolution}\n"
-            f"- max_aspect_ratio={self.config.max_aspect_ratio}"
-        )
-        seen_resolutions = set()
-        
-        # Keep track of every skip with detailed messages
-        skip_details: List[str] = []
+    def create_buckets_from_dataset(
+        self,
+        items: List[Dict],
+        min_count_for_bucket: int = 1
+    ) -> None:
+        """
+        Dynamically create buckets based on the actual images in 'items'.
+        Each item must have 'width' and 'height' fields.
+        Only create a bucket if that resolution has at least 'min_count_for_bucket' images.
+        """
+        resolution_counts = {}
+        skip_details = []
 
-        def add_bucket(width: int, height: int) -> None:
-            """Helper to add bucket if valid."""
-            original_w, original_h = width, height
-            width, height = self._validate_dimensions(width, height)
-            resolution = width * height
-            aspect = width / height if height else 0
-            bucket_key = f"{width}x{height}"
+        for i, item in enumerate(items):
+            orig_w = item.get("width")
+            orig_h = item.get("height")
+            if not orig_w or not orig_h:
+                skip_details.append(f"Item {i} missing width/height: {item}")
+                continue
 
-            # Build a prefix for logs that includes original & final
-            dimension_info = (
-                f"[orig={original_w}x{original_h}, final={width}x{height}, "
-                f"res={resolution}, aspect={aspect:.3f}]"
-            )
+            w, h = self._validate_dimensions(orig_w, orig_h)
+            aspect = w / h if h else 0
+            resolution = w * h
 
-            if bucket_key in seen_resolutions:
-                skip_details.append(
-                    f"Duplicate: {bucket_key} {dimension_info}"
-                )
-                return
-            
-            # If resolution is below min requirement
             if resolution < self.config.min_bucket_resolution:
                 skip_details.append(
-                    f"Under min resolution: {resolution} < {self.config.min_bucket_resolution} {dimension_info}"
+                    f"Skip item {i}: under min resolution {resolution} < {self.config.min_bucket_resolution} "
+                    f"[orig={orig_w}x{orig_h}, final={w}x{h}, aspect={aspect:.3f}]"
                 )
-                return
+                continue
 
-            # Check aspect ratio
-            if aspect > self.config.max_aspect_ratio or aspect < (1.0 / self.config.max_aspect_ratio):
+            if aspect > self.config.max_aspect_ratio or aspect < (1 / self.config.max_aspect_ratio):
                 skip_details.append(
-                    f"Wrong aspect ratio: {aspect:.3f} not in "
-                    f"[{1/self.config.max_aspect_ratio:.3f}, {self.config.max_aspect_ratio:.3f}] {dimension_info}"
+                    f"Skip item {i}: aspect {aspect:.3f} not in "
+                    f"[{1/self.config.max_aspect_ratio:.3f}, {self.config.max_aspect_ratio:.3f}] "
+                    f"[orig={orig_w}x{orig_h}, final={w}x{h}, res={resolution}]"
                 )
-                return
+                continue
 
-            # Bucket is valid, so add it
-            self.buckets[bucket_key] = ImageBucket(width=width, height=height)
-            seen_resolutions.add(bucket_key)
-            logger.debug(f"Added bucket: {bucket_key} {dimension_info}")
+            bucket_key = f"{w}x{h}"
+            resolution_counts[bucket_key] = resolution_counts.get(bucket_key, 0) + 1
 
-        # Example loop generating potential widths/heights
-        current_width = self.min_width
-        while current_width <= self.max_width:
-            current_height = self.min_height
-            while current_height <= self.max_height:
-                add_bucket(current_width, current_height)
+        for key, count in resolution_counts.items():
+            if count >= min_count_for_bucket:
+                w_str, h_str = key.split("x")
+                w, h = int(w_str), int(h_str)
+                self.buckets[key] = ImageBucket(width=w, height=h)
 
-                current_height += self.config.bucket_step
-            current_width += self.config.bucket_step
+        if skip_details:
+            logger.debug("Skipped items:\n" + "\n".join(skip_details))
 
-        # Clear intermediate data
-        seen_resolutions.clear()
-        gc.collect()
-            
-        num_buckets = len(self.buckets)
-        logger.info(f"Created {num_buckets} buckets")
+        logger.info(f"Created {len(self.buckets)} dynamic buckets from dataset.")
 
-        if num_buckets == 0:
-            # We do NOT raise an error, but we do log a detailed summary
-            if skip_details:
-                logger.error(
-                    "No buckets created. Detailed skip reasons:\n"
-                    + "\n".join(skip_details)
-                )
-            else:
-                logger.error("No buckets created, but no skip details were recorded.")
-            # No forced fail, just letting code proceed so you get a full log
+        # If zero buckets, raise an error with skip info
+        if len(self.buckets) == 0:
+            err_msg = "No dynamic buckets created. Detailed skip reasons:\n" + "\n".join(skip_details)
+            logger.error(err_msg)
+            raise ValueError(err_msg)
     
     def find_bucket(self, width: int, height: int) -> Optional[ImageBucket]:
-        """Find best bucket for given dimensions."""
-        if width <= 0 or height <= 0:
-            return None
-            
-        # Validate and adjust dimensions
-        width, height = self._validate_dimensions(width, height)
-        bucket_key = f"{width}x{height}"
-            
-        # Return exact match if exists
-        if bucket_key in self.buckets:
-            return self.buckets[bucket_key]
-            
-        # Calculate aspect ratio
-        aspect = width / height
-        if aspect > self.config.max_aspect_ratio or aspect < (1/self.config.max_aspect_ratio):
-            return None
-            
-        # Find closest bucket by resolution and aspect ratio
-        min_diff = float('inf')
-        best_bucket = None
-        target_res = width * height
-        
-        for key, bucket in self.buckets.items():
-            # Check aspect ratio first
-            ratio_diff = abs(np.log(aspect) - np.log(bucket.aspect_ratio))
-            if ratio_diff > self.config.bucket_tolerance:
-                continue
-                
-            # Then check resolution
-            res_diff = abs(target_res - bucket.resolution)
-            if res_diff < min_diff:
-                min_diff = res_diff
-                best_bucket = bucket
-                
-        return best_bucket
+        """Return the matching bucket for given dimensions, if any."""
+        w, h = self._validate_dimensions(width, height)
+        bucket_key = f"{w}x{h}"
+        return self.buckets.get(bucket_key, None)
     
     def assign_to_buckets(self, items: List[Dict], shuffle: bool = True) -> None:
-        """Assign items to buckets and optionally shuffle."""
-        # Reset state
+        """Assign items to existing buckets (created via create_buckets_from_dataset)."""
         self.total_samples = 0
         for bucket in self.buckets.values():
             bucket.clear()
-        
-        # Assign items to buckets
+
         for idx, item in enumerate(items):
-            width = item.get('width')
-            height = item.get('height')
-            if not width or not height:
+            w = item.get("width")
+            h = item.get("height")
+            if not w or not h:
                 continue
-                
-            bucket = self.find_bucket(width, height)
-            if bucket is not None:
+
+            bucket = self.find_bucket(w, h)
+            if bucket:
                 bucket.add_index(idx)
                 self.total_samples += 1
-        
-        # Shuffle if requested
+
         if shuffle:
             self.shuffle_buckets()
-        
-        # Clear memory after assignment
+
         gc.collect()
     
-    def shuffle_buckets(self, epoch: Optional[int] = None) -> None:
-        """Shuffle indices within each bucket."""
-        if epoch is not None:
-            self.rng.seed(epoch)
-            
+    def shuffle_buckets(self):
+        """Shuffle indices in each bucket."""
         for bucket in self.buckets.values():
-            if len(bucket.indices) > 0:
-                indices = np.array(bucket.indices)
-                self.rng.shuffle(indices)
-                bucket.indices = indices.tolist()
-                bucket.used_samples = 0
-                
-                # Clear numpy array
-                del indices
-        
-        # Clear memory after shuffling
+            self.rng.shuffle(bucket.indices)
         gc.collect()
     
     def get_bucket_by_key(self, key: str) -> Optional[ImageBucket]:
