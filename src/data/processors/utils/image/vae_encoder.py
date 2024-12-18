@@ -162,17 +162,24 @@ class VAEEncoder:
             cache_key = self._get_cache_key(images)
             cached_latents = self.latent_cache.get(cache_key)
             if cached_latents is not None:
-                return cached_latents
+                # Ensure cached latents are on the correct device
+                if keep_on_gpu:
+                    return cached_latents.to(self.config.device)
+                return cached_latents.cpu()
 
             # Process in optimal chunks
             chunks = self._get_optimal_chunks(images)
             latents = await self._process_chunks_parallel(chunks, keep_on_gpu)
 
-            # Only cache if we got valid results
             if latents is not None:
-                self.latent_cache[cache_key] = latents
+                # Cache CPU version of latents
+                self.latent_cache[cache_key] = latents.cpu()
+                # Return on requested device
+                if keep_on_gpu:
+                    return latents.to(self.config.device)
+                return latents.cpu()
 
-            return latents
+            return None
 
         except Exception as e:
             logger.error(f"VAE encoding error: {str(e)}")
@@ -206,20 +213,32 @@ class VAEEncoder:
         """Combine processed chunks back into a single tensor."""
         if not results:
             return None
-        return torch.cat(results, dim=0)
+        try:
+            combined = torch.cat(results, dim=0)
+            return combined
+        except Exception as e:
+            logger.error(f"Error combining results: {e}")
+            return None
 
     @torch.compile(fullgraph=True, dynamic=False)
     def _process_chunk(self, chunk, keep_on_gpu):
         """Optimized chunk processing with TorchDynamo."""
         try:
+            # Ensure chunk is on the correct device
+            chunk = chunk.to(self.config.device)
+            
             with torch.cuda.amp.autocast(dtype=torch.bfloat16):
                 latents = self.vae.encode(chunk).latent_dist.sample()
+                
+                # Handle device placement
                 if not keep_on_gpu:
                     latents = latents.cpu()
+                    
                 return latents
+                
         except Exception as e:
             logger.error(f"Error processing chunk: {e}")
-            raise
+            return None  # Changed from raise to return None for consistency
 
     def _get_optimal_chunks(self, images):
         """Get optimal chunk sizes based on hardware and model."""
