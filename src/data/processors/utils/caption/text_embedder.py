@@ -124,18 +124,7 @@ class TextEmbedder:
         clean_caption: bool = False,
         **kwargs
     ) -> Dict[str, torch.Tensor]:
-        """Process text input and return embeddings.
-        
-        Args:
-            text: Input text or list of texts
-            device: Optional target device
-            num_images_per_prompt: Number of images to generate per prompt
-            clean_caption: Whether to clean/preprocess the captions
-            **kwargs: Additional arguments
-            
-        Returns:
-            Dictionary containing prompt_embeds and pooled_prompt_embeds
-        """
+        """Process text input and return embeddings."""
         try:
             # Convert single string to list
             if isinstance(text, str):
@@ -148,6 +137,10 @@ class TextEmbedder:
             # Use provided device or fall back to config device
             target_device = device if device is not None else self.config.device
             
+            # Ensure encoders are on the correct device
+            self.text_encoder_one = self.text_encoder_one.to(target_device)
+            self.text_encoder_two = self.text_encoder_two.to(target_device)
+            
             # Process with first encoder
             text_inputs_one = self.tokenizer_one(
                 text,
@@ -155,7 +148,9 @@ class TextEmbedder:
                 max_length=self.tokenizer_one.model_max_length,
                 truncation=True,
                 return_tensors="pt"
-            ).to(target_device)
+            )
+            # Move inputs to device
+            text_inputs_one = {k: v.to(target_device) for k, v in text_inputs_one.items()}
             
             text_inputs_two = self.tokenizer_two(
                 text,
@@ -163,14 +158,16 @@ class TextEmbedder:
                 max_length=self.tokenizer_two.model_max_length,
                 truncation=True,
                 return_tensors="pt"
-            ).to(target_device)
+            )
+            # Move inputs to device
+            text_inputs_two = {k: v.to(target_device) for k, v in text_inputs_two.items()}
             
             # Get embeddings from both encoders
             with torch.no_grad():
                 # First text encoder
                 encoder_output_one = self.text_encoder_one(
-                    text_inputs_one.input_ids,
-                    attention_mask=text_inputs_one.attention_mask,
+                    text_inputs_one["input_ids"],
+                    attention_mask=text_inputs_one["attention_mask"],
                     output_hidden_states=True,
                     return_dict=False,
                 )
@@ -179,8 +176,8 @@ class TextEmbedder:
                 
                 # Second text encoder
                 encoder_output_two = self.text_encoder_two(
-                    text_inputs_two.input_ids,
-                    attention_mask=text_inputs_two.attention_mask,
+                    text_inputs_two["input_ids"],
+                    attention_mask=text_inputs_two["attention_mask"],
                     output_hidden_states=True,
                     return_dict=False,
                 )
@@ -201,6 +198,7 @@ class TextEmbedder:
                 prompt_embeds = prompt_embeds.repeat(num_images_per_prompt, 1, 1)
                 pooled_prompt_embeds = pooled_prompt_embeds.repeat(num_images_per_prompt, 1)
             
+            # Move results to CPU before returning
             return {
                 "prompt_embeds": prompt_embeds.cpu(),
                 "pooled_prompt_embeds": pooled_prompt_embeds.cpu()
