@@ -324,6 +324,7 @@ class TextEmbedderConfig(DeviceConfig):
 @dataclass
 class NovelAIDatasetConfig:
     model_name: str = DEFAULT_MODEL_NAME
+    image_dirs: List[str] = field(default_factory=list)
     image_size: Tuple[int, int] = DEFAULT_IMAGE_SIZE
     max_image_size: Tuple[int, int] = DEFAULT_MAX_IMAGE_SIZE
     min_image_size: Union[Tuple[int, int], int] = DEFAULT_MIN_IMAGE_SIZE
@@ -388,6 +389,13 @@ class NovelAIDatasetConfig:
         if self.tag_weights_path:
             self.tag_weights_path = Path(self.tag_weights_path)
             self.tag_weights_path.parent.mkdir(parents=True, exist_ok=True)
+
+        
+        """Validate configuration after initialization."""
+        if not self.image_dirs:
+            logger.warning("No image directories specified in NovelAIDatasetConfig")
+
+
 
 
 
@@ -474,16 +482,20 @@ class Config:
         self.data.max_aspect_ratio = self.global_config.image.max_aspect_ratio
         self.data.bucket_tolerance = self.global_config.image.bucket_tolerance
 
-        # Apply image size settings to NovelAIDatasetConfig
-        if hasattr(self, 'novel_ai'):
-            self.novel_ai.image_size = self.global_config.image.target_size
-            self.novel_ai.max_image_size = self.global_config.image.max_size
-            self.novel_ai.min_image_size = self.global_config.image.min_size
-            self.novel_ai.max_dim = self.global_config.image.max_dim
-            self.novel_ai.bucket_step = self.global_config.image.bucket_step
-            self.novel_ai.min_bucket_resolution = self.global_config.image.min_bucket_resolution
-            self.novel_ai.max_aspect_ratio = self.global_config.image.max_aspect_ratio
-            self.novel_ai.bucket_tolerance = self.global_config.image.bucket_tolerance
+        # Create NovelAIDatasetConfig if not exists and copy settings
+        if not hasattr(self, 'novel_ai'):
+            self.novel_ai = NovelAIDatasetConfig()
+        
+        # Copy image directories and settings from DataConfig to NovelAIDatasetConfig
+        self.novel_ai.image_dirs = self.data.image_dirs
+        self.novel_ai.image_size = self.global_config.image.target_size
+        self.novel_ai.max_image_size = self.global_config.image.max_size
+        self.novel_ai.min_image_size = self.global_config.image.min_size
+        self.novel_ai.max_dim = self.global_config.image.max_dim
+        self.novel_ai.bucket_step = self.global_config.image.bucket_step
+        self.novel_ai.min_bucket_resolution = self.global_config.image.min_bucket_resolution
+        self.novel_ai.max_aspect_ratio = self.global_config.image.max_aspect_ratio
+        self.novel_ai.bucket_tolerance = self.global_config.image.bucket_tolerance
 
         # Apply bucket settings
         self.bucket.bucket_tolerance = self.global_config.image.bucket_tolerance
