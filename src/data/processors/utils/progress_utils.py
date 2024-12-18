@@ -180,5 +180,9 @@ def log_progress(
                 step_type="progress"
             )
             
+            # New console print for direct feedback:
+            progress_percentage = f"{stats.progress * 100:.2f}%"
+            print(f"{prefix}Progress: {progress_percentage} | Processed: {stats.processed_items}/{stats.total_items}")
+            
         except Exception as e:
             log_error_with_context(e, "Error logging progress")
