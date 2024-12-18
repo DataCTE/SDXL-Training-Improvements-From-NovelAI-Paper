@@ -113,12 +113,24 @@ class TextEmbedder:
         )
 
     @torch.no_grad()
-    def __call__(self, text: Union[str, List[str]], **kwargs) -> Dict[str, torch.Tensor]:
-        """Process text input and return embeddings."""
+    def __call__(self, text: Union[str, List[str]], device: Optional[torch.device] = None, **kwargs) -> Dict[str, torch.Tensor]:
+        """Process text input and return embeddings.
+        
+        Args:
+            text: Input text or list of texts to process
+            device: Optional target device for the embeddings
+            **kwargs: Additional keyword arguments
+        
+        Returns:
+            Dictionary containing prompt_embeds and pooled_prompt_embeds
+        """
         try:
             # Convert single string to list
             if isinstance(text, str):
                 text = [text]
+            
+            # Use provided device or fall back to default
+            target_device = device if device is not None else self.device
             
             # Process with first encoder
             text_inputs_one = self.tokenizer_one(
@@ -127,7 +139,7 @@ class TextEmbedder:
                 max_length=self.tokenizer_one.model_max_length,
                 truncation=True,
                 return_tensors="pt"
-            ).to(self.device)
+            ).to(target_device)
             
             text_inputs_two = self.tokenizer_two(
                 text,
@@ -135,7 +147,7 @@ class TextEmbedder:
                 max_length=self.tokenizer_two.model_max_length,
                 truncation=True,
                 return_tensors="pt"
-            ).to(self.device)
+            ).to(target_device)
             
             # Get embeddings from both encoders
             with torch.no_grad():
