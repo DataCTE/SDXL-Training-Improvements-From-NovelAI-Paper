@@ -12,6 +12,7 @@ import gc
 import random
 from concurrent.futures import ThreadPoolExecutor
 import multiprocessing
+from weakref import WeakValueDictionary
 
 # Internal imports from utils
 from src.data.processors.utils.system_utils import get_gpu_memory_usage, get_optimal_workers, create_thread_pool, cleanup_processor
@@ -471,3 +472,27 @@ class ImageProcessor:
         self.current_batch = []
         
         logger.info(f"Initialized parallel processing with {num_workers} workers")
+
+    def _init_memory_pools(self):
+        """Initialize memory pools for efficient tensor allocation."""
+        if torch.cuda.is_available():
+            # Initialize pinned memory pool
+            self.pinned_memory_pool = torch.cuda.get_allocator()
+            torch.cuda.empty_cache()
+            
+            # Set up tensor cache for frequently reused sizes
+            self.tensor_cache = WeakValueDictionary()
+            
+            # Configure memory allocator
+            if hasattr(torch.cuda, 'memory_stats'):
+                torch.cuda.memory_stats(device=self.config.device)
+                torch.cuda.reset_peak_memory_stats()
+            
+            # Set memory allocation strategy
+            torch.cuda.set_per_process_memory_fraction(0.95)  # Use up to 95% of available memory
+            
+            logger.info("Initialized CUDA memory pools and caching")
+        else:
+            self.pinned_memory_pool = None
+            self.tensor_cache = WeakValueDictionary()
+            logger.info("Running in CPU mode, memory pools disabled")
