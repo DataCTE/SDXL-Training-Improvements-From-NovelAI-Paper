@@ -4,7 +4,7 @@ from typing import Dict, Optional, Any, Callable
 from dataclasses import dataclass, field
 import torch
 from src.utils.logging.metrics import log_error_with_context, log_metrics
-from src.data.processors.utils.batch_utils import get_gpu_memory_usage
+from src.data.processors.utils.system_utils import get_gpu_memory_usage
 
 logger = logging.getLogger(__name__)
 
