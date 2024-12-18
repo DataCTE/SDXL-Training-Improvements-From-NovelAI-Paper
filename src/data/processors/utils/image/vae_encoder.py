@@ -7,7 +7,7 @@ from weakref import WeakValueDictionary
 from src.config.config import VAEEncoderConfig  # Import the new config class
 from src.utils.logging.metrics import log_error_with_context, log_metrics, log_system_metrics
 from src.data.processors.utils.batch_utils import get_gpu_memory_usage
-from transformers import AutoencoderKL
+from diffusers import AutoencoderKL
 
 # Add this function
 def is_xformers_available():
