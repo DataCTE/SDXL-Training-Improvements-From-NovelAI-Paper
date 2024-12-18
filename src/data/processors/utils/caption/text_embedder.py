@@ -66,10 +66,11 @@ def setup_memory_efficient_attention(model: torch.nn.Module) -> bool:
         return False
 
 class TextEmbedder:
-    def __init__(self, config: TextEmbedderConfig, tokenizers=None):
+    def __init__(self, config: TextEmbedderConfig, tokenizers=None, text_encoders=None):
         """Initialize text embedder with both encoders."""
         self.config = config
         self.tokenizers = tokenizers  # Store tokenizers if needed
+        self.text_encoders = text_encoders  # Store text encoders if needed
         
         # Load tokenizers
         self.tokenizer_one = AutoTokenizer.from_pretrained(
