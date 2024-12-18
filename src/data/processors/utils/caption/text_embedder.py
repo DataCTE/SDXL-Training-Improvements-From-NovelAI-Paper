@@ -31,12 +31,18 @@ def import_model_class_from_model_name_or_path(
         raise ValueError(f"{model_class} is not supported.")
 
 class TextEmbedder:
-    def __init__(self, config: TextEmbedderConfig, tokenizers: Optional[Dict[str, Any]] = None):
+    def __init__(
+        self, 
+        config: TextEmbedderConfig, 
+        tokenizers: Optional[Dict[str, Any]] = None,
+        text_encoders: Optional[Dict[str, Any]] = None
+    ):
         """Initialize text embedder with both encoders.
         
         Args:
             config: Configuration for the text embedder
             tokenizers: Optional pre-initialized tokenizers
+            text_encoders: Optional pre-initialized text encoders
         """
         self.config = config
         
@@ -61,32 +67,39 @@ class TextEmbedder:
             )
             logger.info("Initialized new tokenizers")
         
-        # Load text encoders
-        text_encoder_cls_one = import_model_class_from_model_name_or_path(
-            config.model_name, 
-            subfolder="text_encoder",
-            revision=config.revision
-        )
-        text_encoder_cls_two = import_model_class_from_model_name_or_path(
-            config.model_name,
-            subfolder="text_encoder_2",
-            revision=config.revision
-        )
-        
-        self.text_encoder_one = text_encoder_cls_one.from_pretrained(
-            config.model_name,
-            subfolder="text_encoder",
-            torch_dtype=config.dtype,
-            revision=config.revision,
-            variant=config.variant
-        )
-        self.text_encoder_two = text_encoder_cls_two.from_pretrained(
-            config.model_name,
-            subfolder="text_encoder_2",
-            torch_dtype=config.dtype,
-            revision=config.revision,
-            variant=config.variant
-        )
+        # Load or use provided text encoders
+        if text_encoders is not None:
+            self.text_encoder_one = text_encoders.get("text_encoder_one")
+            self.text_encoder_two = text_encoders.get("text_encoder_two")
+            logger.info("Using provided text encoders")
+        else:
+            # Load text encoders from config
+            text_encoder_cls_one = import_model_class_from_model_name_or_path(
+                config.model_name, 
+                subfolder="text_encoder",
+                revision=config.revision
+            )
+            text_encoder_cls_two = import_model_class_from_model_name_or_path(
+                config.model_name,
+                subfolder="text_encoder_2",
+                revision=config.revision
+            )
+            
+            self.text_encoder_one = text_encoder_cls_one.from_pretrained(
+                config.model_name,
+                subfolder="text_encoder",
+                torch_dtype=config.dtype,
+                revision=config.revision,
+                variant=config.variant
+            )
+            self.text_encoder_two = text_encoder_cls_two.from_pretrained(
+                config.model_name,
+                subfolder="text_encoder_2",
+                torch_dtype=config.dtype,
+                revision=config.revision,
+                variant=config.variant
+            )
+            logger.info("Initialized new text encoders")
         
         # Move to device and eval mode
         self.text_encoder_one.to(config.device).eval()
