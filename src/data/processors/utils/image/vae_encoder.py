@@ -58,40 +58,17 @@ class VAEEncoder:
         dtype = getattr(torch, self.config.forced_dtype, torch.float32)
         self.vae.to(device=self.config.device, dtype=dtype)
         
-        # Conditionally enable slicing or xformers
-        if self.config.enable_vae_slicing:
-            self.vae.enable_slicing()
-        
-        if self.config.enable_xformers_attention and is_xformers_available():
-            self.vae.enable_xformers_memory_efficient_attention()
-        
-        logging.debug(
-            f"Initialized VAEEncoder with device={self.config.device}, dtype={dtype}, "
-            f"slicing={self.config.enable_vae_slicing}, xformers={self.config.enable_xformers_attention}"
-        )
-
-        # Add tensor cache for frequently used sizes
-        self._tensor_cache = WeakValueDictionary()
-        
-        # Add batch processing queue
-        self.batch_queue_size = getattr(config, 'batch_queue_size', 32)
-        self.processing_queue = []
-        
-        # Enable memory optimizations
+        # Enable optimizations
         self._enable_optimizations()
-        
-        # Enable flash attention if available
         self._setup_flash_attention()
-        
-        # Setup tensor parallel processing
         self._setup_tensor_parallel()
         
-        # Initialize prefetch queue for latent caching
+        # Initialize caching
         self.prefetch_queue = asyncio.Queue(maxsize=64)
-        self.latent_cache = LRUCache(maxsize=1024)  # Add import for LRU cache
+        self.latent_cache = LRUCache(maxsize=1024)
         
-        # Initialize memory pool for efficient allocation
-        self.memory_pool = torch.cuda.graph.CUDAGraph() if torch.cuda.is_available() else None
+        # Initialize static shapes for optimization
+        self._static_shapes = set()
 
     def _enable_optimizations(self):
         """Enable all available optimizations for faster processing."""
