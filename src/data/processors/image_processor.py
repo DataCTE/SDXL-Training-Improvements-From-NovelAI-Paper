@@ -1,7 +1,7 @@
 # src/data/processors/image_processor.py
 import torch
 from PIL import Image
-from typing import Tuple, List, Optional, Dict, Any
+from typing import Tuple, List, Optional, Dict, Any, Union, Path
 from torchvision import transforms
 import numpy as np
 import logging
@@ -63,56 +63,76 @@ class ImageProcessor:
             f"- VAE: {'Yes' if self.vae_encoder else 'No'}"
         )
 
-    async def process_image(self, image: Image.Image) -> Dict[str, Any]:
+    async def process_image(
+        self,
+        image: Union[str, Path, Image.Image],
+        target_size: Optional[Tuple[int, int]] = None,
+        original_size: Optional[Tuple[int, int]] = None,
+        **kwargs
+    ) -> Dict[str, Any]:
         """Process a single image with SDXL-style augmentation."""
         try:
+            # Load image if path provided
+            if isinstance(image, (str, Path)):
+                image = self._load_image(image)
+            if image is None:
+                raise ValueError("Failed to load image")
+            
             # Convert to RGB
             image = image.convert("RGB")
             
-            # Get original size
-            original_size = (image.height, image.width)
+            # Get original size if not provided
+            if original_size is None:
+                original_size = (image.height, image.width)
             
-            # Resize
-            image = self.resize(image)
+            # Determine target size
+            if target_size is None:
+                if self.bucket_manager is not None:
+                    target_size = self.bucket_manager.get_target_size(image.size)
+                else:
+                    target_size = self.config.resolution
+            
+            # Resize image
+            image = self._resize_image(image, target_size[0], target_size[1])
             
             # Apply cropping
             if self.config.center_crop:
-                y1 = max(0, int(round((image.height - self.config.resolution) / 2.0)))
-                x1 = max(0, int(round((image.width - self.config.resolution) / 2.0)))
+                y1 = max(0, int(round((image.height - self.config.resolution[0]) / 2.0)))
+                x1 = max(0, int(round((image.width - self.config.resolution[1]) / 2.0)))
                 image = self.center_crop(image)
+                crop_top_left = (y1, x1)
             else:
                 y1, x1, h, w = self.random_crop.get_params(
-                    image, (self.config.resolution, self.config.resolution)
+                    image, (self.config.resolution[0], self.config.resolution[1])
                 )
                 image = transforms.functional.crop(image, y1, x1, h, w)
+                crop_top_left = (y1, x1)
             
             # Random flip
             if self.config.random_flip and random.random() < 0.5:
                 image = transforms.functional.hflip(image)
             
             # Convert to tensor and normalize
-            image = self.transform(image)
-            
-            # Get crop coordinates
-            crop_top_left = (y1, x1)
+            image_tensor = self.transform(image)
             
             result = {
-                "pixel_values": image,
+                "pixel_values": image_tensor,
                 "original_size": original_size,
+                "target_size": target_size,
                 "crop_top_left": crop_top_left
             }
             
-            # Encode with VAE if available
+            # Get VAE encoding if available
             if self.vae_encoder is not None:
-                latents = await self.vae_encoder.encode_image(image)
-                if latents is not None:
+                with torch.no_grad():
+                    latents = self.vae_encoder.encode(image_tensor.unsqueeze(0)).latent_dist.sample()
                     result["latents"] = latents
             
             return result
             
         except Exception as e:
-            logger.error(f"Error processing image: {str(e)[:200]}...")
-            return None
+            logger.error(f"Error processing image: {str(e)}")
+            raise
 
     def load_image(self, path: str) -> Optional[Image.Image]:
         """Load and validate an image using utility function."""
