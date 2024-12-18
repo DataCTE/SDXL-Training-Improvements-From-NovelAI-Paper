@@ -69,13 +69,7 @@ class TextEmbedder:
         self.config = config
         
         # Calculate optimal batch size
-        self.batch_size = calculate_optimal_batch_size(
-            config=config,
-            min_batch_size=1,
-            max_batch_size=config.batch_size,
-            target_memory_usage=config.max_memory_usage,
-            growth_factor=config.growth_factor
-        )
+        self.batch_size = calculate_optimal_batch_size(config.batch_size)
         
         # Initialize tensor cache
         self._tensor_cache = WeakValueDictionary()
