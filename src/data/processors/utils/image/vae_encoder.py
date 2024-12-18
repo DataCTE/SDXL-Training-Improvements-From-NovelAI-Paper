@@ -90,9 +90,32 @@ class VAEEncoder:
         self._setup_flash_attention()
         self._setup_tensor_parallel()
 
+        # Increase sub-batch size for large images/datasets if memory allows
+        self.inference_chunk_size = getattr(config, "inference_chunk_size", 8)
+
         # Initialize caching
         self.latent_cache = LRUCache(maxsize=1024)
         self._static_shapes = set()
+
+        # Optional: Warm-up the VAE once for faster subsequent calls
+        self._warmup_vae()
+
+    def _warmup_vae(self):
+        """
+        Optional warm-up by running a dummy forward pass 
+        so that PyTorch compiles/caches CUDA kernels.
+        """
+        if torch.cuda.is_available():
+            dummy_input = torch.zeros(
+                (1, 3, self.config.test_warmup_size, self.config.test_warmup_size),
+                device=self.config.device
+            )
+            with torch.no_grad(), torch.cuda.amp.autocast(
+                enabled=True, dtype=torch.bfloat16
+            ):
+                _ = self.vae.encode(dummy_input).latent_dist.sample()
+            torch.cuda.synchronize()
+            logger.info("VAE warm-up completed for faster subsequent inference.")
 
     def _setup_vae(self):
         """Setup VAE model with proper configuration."""

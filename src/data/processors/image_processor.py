@@ -58,13 +58,24 @@ class ImageProcessor:
             self.vae_encoder = VAEEncoder(vae=vae, config=config)
 
         # Build transform pipeline
-        self.transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=config.normalize_mean,
-                std=config.normalize_std
+        if hasattr(torch, 'compile'):
+            self.transform = torch.compile(
+                transforms.Compose([
+                    transforms.ToTensor(),
+                    transforms.Normalize(
+                        mean=config.normalize_mean,
+                        std=config.normalize_std
+                    )
+                ])
             )
-        ])
+        else:
+            self.transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=config.normalize_mean,
+                    std=config.normalize_std
+                )
+            ])
 
         # Initialize resize transforms
         self.resize = transforms.Resize(
@@ -99,6 +110,12 @@ class ImageProcessor:
 
         # Initialize memory pools
         self._init_memory_pools()
+
+        # Increase batch size if your GPU can handle it
+        self.batch_size = getattr(self.config, 'batch_size', 16)
+
+        # Potential new attribute to define how many images to load at once in a load batch
+        self.load_batch_size = getattr(self.config, "load_batch_size", 64)
 
         self.logger.info(
             f"Initialized ImageProcessor:\n"
@@ -264,52 +281,61 @@ class ImageProcessor:
         Optimized batch processing with parallel preprocessing and optional VAE encoding.
         """
         try:
-            batch_size = len(images)
-            if batch_size == 0:
-                return []
+            # If dealing with a lot of images, we can chunk them
+            results = []
+            for start in range(0, len(images), self.load_batch_size):
+                chunk = images[start : start + self.load_batch_size]
 
-            # Process images in parallel using thread pool
-            preprocessing_tasks = [
-                self.thread_pool.submit(self.preprocess, img, width, height)
-                for img in images
-            ]
+                # Process images in parallel using thread pool
+                preprocessing_tasks = [
+                    self.thread_pool.submit(self.preprocess, img, width, height)
+                    for img in chunk
+                ]
 
-            # Gather results maintaining order
-            processed = []
-            for future in preprocessing_tasks:
-                try:
-                    tensor = await asyncio.wrap_future(future)
-                    if tensor is not None:
-                        processed.append(tensor)
-                except Exception as e:
-                    self.logger.error(f"Preprocessing error: {e}")
+                # Gather results maintaining order
+                processed = []
+                for future in preprocessing_tasks:
+                    try:
+                        tensor = await asyncio.wrap_future(future)
+                        if tensor is not None:
+                            processed.append(tensor)
+                    except Exception as e:
+                        self.logger.error(f"Preprocessing error: {e}")
 
-            if not processed:
-                return []
+                if not processed:
+                    continue
 
-            # Stack tensors efficiently
-            batch_tensor = torch.stack(processed, dim=0)
-            del processed
+                # Stack sub-batch
+                batch_tensor = torch.stack(processed, dim=0)
+                del processed
 
-            # Process through VAE if available
-            if self.vae_encoder is not None:
-                try:
-                    encoded = await self.vae_encoder.encode_images(
-                        batch_tensor,
-                        keep_on_gpu=keep_on_gpu
-                    )
-                    del batch_tensor
-                    return encoded
-                except Exception as e:
-                    self.logger.error(f"VAE encoding error: {e}")
-                    return None
+                # VAE encoding if available
+                encoded_subbatch = None
+                if self.vae_encoder is not None:
+                    try:
+                        encoded_subbatch = await self.vae_encoder.encode_images(
+                            batch_tensor,
+                            keep_on_gpu=keep_on_gpu
+                        )
+                        del batch_tensor
+                    except Exception as e:
+                        self.logger.error(f"VAE encoding error: {e}")
 
-            return batch_tensor
+                results.append(encoded_subbatch if encoded_subbatch is not None else batch_tensor)
+
+            # Concat all sub-batches if you want a single result
+            if results:
+                final = []
+                for item in results:
+                    if item is not None:
+                        final.append(item)
+                # Keep memory usage in mind for large merges
+                return torch.cat(final, dim=0) if len(final) > 1 else final[0]
+
+            return []
 
         except Exception as e:
             self.logger.error(f"Batch processing error: {e}")
-            if 'batch_tensor' in locals():
-                del batch_tensor
             torch.cuda.empty_cache()
             return None
 
