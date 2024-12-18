@@ -166,12 +166,12 @@ class ImageProcessor:
             img_obj = img_or_path
         return self.preprocess(img_obj)
 
-    async def process_image(self, img_or_path, skip_vae=False, keep_on_gpu=False):
+    async def process_image(self, image, skip_vae=False, keep_on_gpu=False):
         """
         Single-image version. Usually slower for big datasets.
         Batch calls are recommended for better throughput.
         """
-        res = await self.process_batch([img_or_path], skip_vae=skip_vae, keep_on_gpu=keep_on_gpu)
+        res = await self.process_batch([image], skip_vae=skip_vae, keep_on_gpu=keep_on_gpu)
         if res is None or res.shape[0] == 0:
             return {}
         # Return the first
