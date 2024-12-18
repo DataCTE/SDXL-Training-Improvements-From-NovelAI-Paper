@@ -276,7 +276,7 @@ class NovelAIDataset(Dataset):
             # Update tracker with total files
             tracker = create_progress_tracker(
                 total_items=len(image_files),
-                batch_size=4,  # Use very small batches
+                batch_size=8,  # Slightly larger batch size for better throughput
                 device=self.device
             )
             
@@ -321,11 +321,10 @@ class NovelAIDataset(Dataset):
                     log_progress(tracker, prefix="Processing dataset: ", extra_stats=extra_stats)
                 
                 # Clear memory periodically
-                if i % 50 == 0:  # More frequent cleanup
+                if i % 100 == 0:  # Clean up less often for performance
                     self.cache_manager.clear_memory_cache()
                     torch.cuda.empty_cache()
                     gc.collect()
-                    await asyncio.sleep(0.1)  # Small delay to allow memory to clear
                 
                 # Clear batch references
                 del batch_processed

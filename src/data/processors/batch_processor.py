@@ -246,7 +246,7 @@ class BatchProcessor(GenericBatchProcessor):
             )
             
             processed_items = []
-            sub_batch_size = min(8, self.config.batch_size)
+            sub_batch_size = min(16, self.config.batch_size)
 
             for i in range(0, len(batch_items), sub_batch_size):
                 sub_batch = batch_items[i:i + sub_batch_size]
@@ -314,7 +314,6 @@ class BatchProcessor(GenericBatchProcessor):
                             update_tracker(tracker, processed=1)
 
                             del img, img_tensor, processed_item
-                            await asyncio.sleep(0.01)
 
                     except Exception as e:
                         logger.error(f"Error processing item {item['image_path']}: {e}")
@@ -322,7 +321,6 @@ class BatchProcessor(GenericBatchProcessor):
 
                 # Clear cache after each sub-batch
                 torch.cuda.empty_cache()
-                await asyncio.sleep(0.01)
 
             return processed_items, tracker.get_stats()
 
