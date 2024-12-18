@@ -113,7 +113,7 @@ class ImageProcessor:
             }
 
             if self.vae_encoder is not None:
-                latents = self.vae_encoder.encode_batch(image_tensor.unsqueeze(0))
+                latents = await self.vae_encoder.encode_batch(image_tensor.unsqueeze(0))
                 result["latents"] = latents.cpu()
 
             return result
