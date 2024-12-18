@@ -235,9 +235,9 @@ class ImageSizeConfig:
 @dataclass
 class BatchProcessorConfig:
     """Configuration for batch processing."""
-    batch_size: int
-    prefetch_factor: int
-    num_workers: int
+    batch_size: int = DEFAULT_BATCH_SIZE
+    prefetch_factor: int = DEFAULT_PREFETCH_FACTOR
+    num_workers: int = DEFAULT_NUM_WORKERS
     device: Optional[torch.device] = None
     max_memory_usage: float = 0.8
     memory_check_interval: float = 30.0
