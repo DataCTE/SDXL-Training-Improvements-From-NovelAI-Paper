@@ -9,7 +9,7 @@ import gc
 # Internal imports from processors
 from .processors.text_processor import TextProcessor
 from .processors.batch_processor import BatchProcessor
-from .processors.image_processor import ImageProcessor, ImageProcessorConfig
+from .processors.image_processor import ImageProcessor
 from .processors.cache_manager import CacheManager
 from .processors.bucket import BucketManager
 from .processors.sampler import AspectBatchSampler
@@ -21,12 +21,9 @@ from .processors.utils.thread_config import get_optimal_thread_config
 from .processors.utils import (
     find_matching_files,
     ensure_dir,
-    get_file_size,
     get_optimal_workers,
     get_system_resources,
-    log_system_info,
     calculate_optimal_batch_size,
-    format_time,
     get_gpu_memory_usage,
     log_progress
 )
@@ -34,11 +31,10 @@ from .processors.utils.progress_utils import (
     create_progress_tracker,
     update_tracker,
     log_progress,
-    format_time
 )
 
 # Config import
-from src.config.config import NovelAIDatasetConfig, TagWeighterConfig
+from src.config.config import NovelAIDatasetConfig, ImageProcessorConfig
 
 logger = logging.getLogger(__name__)
 
@@ -125,11 +121,11 @@ class NovelAIDataset(Dataset):
                 device=device,
                 max_image_size=config.max_image_size,
                 min_image_size=config.min_image_size,
-                enable_memory_efficient_attention=True,
                 enable_vae_slicing=True,
                 vae_batch_size=optimal_batch_size,
                 num_workers=num_workers,
                 prefetch_factor=thread_config.prefetch_factor,
+                enable_memory_efficient_attention=True,
                 max_memory_usage=0.8
             ),
             bucket_manager=self.bucket_manager,

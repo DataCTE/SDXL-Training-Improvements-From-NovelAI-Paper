@@ -196,6 +196,7 @@ class NovelAIDatasetConfig:
     cache_dir: str = DEFAULT_CACHE_DIR
     text_cache_dir: str = "text_cache"
     use_caching: bool = True
+    skip_cached_latents: bool = True
     
     # Dataset settings
     proportion_empty_prompts: float = 0.0
@@ -403,4 +404,16 @@ class Config:
     def get_vae_config(self) -> VAEModelConfig:
         """Helper method to easily access VAE config"""
         return self.model.vae
+    
+@dataclass
+class ImageProcessorConfig(DeviceConfig):
+    """Configuration for image processor."""
+    max_image_size: Tuple[int, int] = DEFAULT_MAX_IMAGE_SIZE
+    min_image_size: Tuple[int, int] = DEFAULT_MIN_IMAGE_SIZE
+    enable_vae_slicing: bool = True
+    vae_batch_size: int = DEFAULT_BATCH_SIZE
+    num_workers: int = DEFAULT_NUM_WORKERS
+    prefetch_factor: int = DEFAULT_PREFETCH_FACTOR
+    # We can let the parent DeviceConfig handle max_memory_usage, etc.,
+    # but you can add them here if you prefer to override default values.
     
