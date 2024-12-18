@@ -68,6 +68,14 @@ class ImageProcessor:
         self.always_on_gpu = getattr(config, "always_on_gpu", False)
         self.use_pinned_memory = getattr(config, "use_pinned_memory", False)
         
+        # Add processing pools and queues
+        self.num_workers = get_optimal_workers()
+        self.thread_pool = create_thread_pool(self.num_workers)
+        self.preprocessing_queue = asyncio.Queue(maxsize=32)
+        
+        # Enable torch optimizations
+        self._enable_optimizations()
+
         self.logger.info(
             f"Initialized ImageProcessor:\n"
             f"- Resolution: {config.resolution}\n"
@@ -75,6 +83,16 @@ class ImageProcessor:
             f"- Random flip: {config.random_flip}\n"
             f"- VAE: {'Yes' if self.vae_encoder else 'No'}"
         )
+
+    def _enable_optimizations(self):
+        """Enable performance optimizations."""
+        if torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+        
+        # Pre-compile transforms for faster processing
+        self.transform = torch.jit.script(self.transform)
+        self.resize = torch.jit.script(self.resize)
 
     async def load_image(self, path_or_str) -> "Image.Image":
         """
@@ -155,92 +173,56 @@ class ImageProcessor:
         height: int,
         keep_on_gpu: bool = False
     ) -> List[torch.Tensor]:
-        """
-        Process a batch of images with sub-batching, optional VAE encoding, and inference_mode.
-        Demonstrates dynamic approach for sub-batch sizing if desired.
-        """
-        processed_tensors = []
-
-        batch_size = len(images)
-        if batch_size == 0:
-            return processed_tensors
-
+        """Optimized batch processing with parallel preprocessing."""
         try:
-            # Basic sub-batching example (could be made adaptive)
-            sub_batch_size = getattr(self.config, "vae_batch_size", 8)
+            batch_size = len(images)
+            if batch_size == 0:
+                return []
 
-            for i in range(0, batch_size, sub_batch_size):
-                sub_batch = images[i : i + sub_batch_size]
+            # Process images in parallel using thread pool
+            preprocessing_tasks = [
+                self.thread_pool.submit(self.preprocess, img, width, height)
+                for img in images
+            ]
 
-                # Preprocess in parallel threads
-                preprocessing_tasks = [
-                    asyncio.to_thread(self.preprocess, img, width, height)
-                    for img in sub_batch
-                ]
+            # Gather results maintaining order
+            processed = []
+            for future in preprocessing_tasks:
+                try:
+                    tensor = await asyncio.wrap_future(future)
+                    if tensor is not None:
+                        processed.append(tensor)
+                except Exception as e:
+                    self.logger.error(f"Preprocessing error: {e}")
 
-                sub_processed = await asyncio.gather(*preprocessing_tasks)
-                sub_processed = [t for t in sub_processed if t is not None]
+            if not processed:
+                return []
 
-                if sub_processed:
-                    # Combine into a single tensor
-                    batch_tensor = torch.stack(sub_processed).to(self.config.device, non_blocking=True)
-                    del sub_processed
+            # Stack tensors efficiently
+            batch_tensor = torch.stack(processed, dim=0)
+            del processed
 
-                    # Encode with VAE if available
-                    if self.vae_encoder is not None:
-                        try:
-                            encoded = await self.vae_encoder.encode_images(
-                                batch_tensor,
-                                keep_on_gpu=(keep_on_gpu or self.always_on_gpu)
-                            )
-                            if encoded is not None:
-                                if not (keep_on_gpu or self.always_on_gpu):
-                                    encoded = encoded.to("cpu", non_blocking=True)
-                                # Split back into single images
-                                if encoded.dim() == 3:
-                                    processed_tensors.append(encoded)
-                                else:
-                                    for single_latent in encoded:
-                                        processed_tensors.append(single_latent)
-                            else:
-                                # Fallback: fill with zeros if there's an error
-                                for _ in range(batch_tensor.shape[0]):
-                                    processed_tensors.append(
-                                        torch.zeros(
-                                            (4, height // 8, width // 8),
-                                            dtype=self.config.dtype,
-                                            device="cpu"
-                                        )
-                                    )
-                            del encoded
-                        except Exception as e:
-                            self.logger.error(f"VAE encoding error: {str(e)[:200]}...")
-                            # Fallback: fill with zeros
-                            for _ in range(batch_tensor.shape[0]):
-                                processed_tensors.append(
-                                    torch.zeros(
-                                        (4, height // 8, width // 8),
-                                        dtype=self.config.dtype,
-                                        device="cpu"
-                                    )
-                                )
-                    else:
-                        # No VAE => move preprocessed tensors to CPU
-                        for tensor in batch_tensor:
-                            processed_tensors.append(tensor.cpu())
-
+            # Process through VAE if available
+            if self.vae_encoder is not None:
+                try:
+                    encoded = await self.vae_encoder.encode_images(
+                        batch_tensor,
+                        keep_on_gpu=keep_on_gpu
+                    )
                     del batch_tensor
+                    return encoded
+                except Exception as e:
+                    self.logger.error(f"VAE encoding error: {e}")
+                    return None
 
-            return processed_tensors
+            return batch_tensor
 
         except Exception as e:
-            self.logger.error(f"Batch processing error: {str(e)[:200]}...")
-            if 'sub_processed' in locals():
-                del sub_processed
+            self.logger.error(f"Batch processing error: {e}")
             if 'batch_tensor' in locals():
                 del batch_tensor
             torch.cuda.empty_cache()
-            raise
+            return None
 
     def preprocess(self, img: "Image.Image", width: int, height: int) -> torch.Tensor:
         """

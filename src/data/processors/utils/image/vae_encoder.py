@@ -8,6 +8,7 @@ from src.config.config import VAEEncoderConfig  # Import the new config class
 from src.utils.logging.metrics import log_error_with_context, log_metrics, log_system_metrics
 from src.data.processors.utils.batch_utils import get_gpu_memory_usage
 from diffusers import AutoencoderKL
+import asyncio
 
 # Add this function
 def is_xformers_available():
@@ -47,6 +48,33 @@ class VAEEncoder:
             f"Initialized VAEEncoder with device={self.config.device}, dtype={dtype}, "
             f"slicing={self.config.enable_vae_slicing}, xformers={self.config.enable_xformers_attention}"
         )
+
+        # Add tensor cache for frequently used sizes
+        self._tensor_cache = WeakValueDictionary()
+        
+        # Add batch processing queue
+        self.batch_queue_size = getattr(config, 'batch_queue_size', 32)
+        self.processing_queue = []
+        
+        # Enable memory optimizations
+        self._enable_optimizations()
+
+    def _enable_optimizations(self):
+        """Enable all available optimizations for faster processing."""
+        if torch.cuda.is_available():
+            # Enable TF32 for faster processing on Ampere GPUs
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            
+            # Set optimal cudnn algorithms
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.enabled = True
+
+        # Always enable VAE slicing for memory efficiency
+        self.vae.enable_slicing()
+        
+        if self.config.enable_xformers_attention and is_xformers_available():
+            self.vae.enable_xformers_memory_efficient_attention()
 
     async def cleanup(self):
         """Clean up resources."""
@@ -105,13 +133,7 @@ class VAEEncoder:
 
     @torch.inference_mode()
     async def encode_images(self, images: "torch.Tensor", keep_on_gpu: bool = False) -> "torch.Tensor":
-        """
-        Unified chunk-based method to encode images to latents with adaptive sub-batching.
-        Uses inference_mode for reduced overhead and pre-allocates the output tensor.
-        Fixes the issue with cpu(non_blocking=True) by using to('cpu', non_blocking=True).
-        """
-        import torch
-
+        """Optimized batch encoding with dynamic batching and prefetching."""
         try:
             if images.dim() == 3:
                 images = images.unsqueeze(0)
@@ -120,71 +142,93 @@ class VAEEncoder:
             if batch_size == 0:
                 return None
 
-            # Pin memory for faster CPU→GPU transfers
+            # Use pinned memory for faster transfers
             if images.device.type == 'cpu':
                 images = images.pin_memory()
 
-            # Ensure contiguous
-            images = images.contiguous(memory_format=torch.contiguous_format)
-
-            # Get an example latent for shape inference
-            sample_chunk = images[0:1].to(self.vae.device)
-            with torch.cuda.amp.autocast(dtype=self.vae.dtype):
-                sample_dist = self.vae.encode(sample_chunk).latent_dist
-                sample_latent = sample_dist.sample() * self.vae.config.scaling_factor
-
-            latent_shape = [batch_size] + list(sample_latent.shape[1:])
-
-            # Pre-allocate latents on GPU or CPU depending on user preference
+            # Pre-allocate output tensor using cache
+            latent_shape = self._get_latent_shape(images)
             out_device = self.vae.device if keep_on_gpu else "cpu"
-            latents_out = torch.empty(size=latent_shape, dtype=sample_latent.dtype, device=out_device)
+            latents_out = self._get_cached_tensor(
+                f"latents_{latent_shape}_{out_device}",
+                latent_shape,
+                self.vae.dtype
+            )
 
-            # Adaptive sub-batch start
-            sub_batch_size = getattr(self.config, 'vae_batch_size', 8)
-            index = 0
+            # Process in optimal sub-batches
+            sub_batch_size = self._get_optimal_batch_size(images)
+            
+            async def process_sub_batch(start_idx):
+                end_idx = min(start_idx + sub_batch_size, batch_size)
+                chunk = images[start_idx:end_idx].to(
+                    self.vae.device,
+                    non_blocking=True
+                )
+                
+                with torch.cuda.amp.autocast(dtype=self.vae.dtype):
+                    dist = self.vae.encode(chunk).latent_dist
+                    chunk_latents = dist.sample() * self.vae.config.scaling_factor
 
-            def reduce_sub_batch_size():
-                nonlocal sub_batch_size
-                sub_batch_size = max(sub_batch_size // 2, 1)
-                self.logger.warning(f"Reduced sub-batch size to {sub_batch_size} due to OOM")
+                # Efficient copy to output
+                if keep_on_gpu:
+                    latents_out[start_idx:end_idx].copy_(
+                        chunk_latents,
+                        non_blocking=True
+                    )
+                else:
+                    latents_out[start_idx:end_idx].copy_(
+                        chunk_latents.to("cpu", non_blocking=True),
+                        non_blocking=True
+                    )
 
-            with torch.cuda.amp.autocast(dtype=self.vae.dtype):
-                while index < batch_size:
-                    end = min(index + sub_batch_size, batch_size)
-                    chunk = images[index:end].to(self.vae.device, non_blocking=True)
-                    try:
-                        dist = self.vae.encode(chunk).latent_dist
-                        chunk_latents = dist.sample() * self.vae.config.scaling_factor
+            # Process sub-batches concurrently
+            tasks = [
+                process_sub_batch(i)
+                for i in range(0, batch_size, sub_batch_size)
+            ]
+            await asyncio.gather(*tasks)
 
-                        # Copy into pre-allocated output
-                        if keep_on_gpu:
-                            latents_out[index:end].copy_(chunk_latents, non_blocking=True)
-                        else:
-                            latents_out[index:end].copy_(
-                                chunk_latents.to("cpu", non_blocking=True),
-                                non_blocking=True
-                            )
-
-                        index = end
-
-                    except RuntimeError as re:
-                        if "out of memory" in str(re).lower():
-                            torch.cuda.empty_cache()
-                            reduce_sub_batch_size()
-                            # If there's no more to reduce, raise
-                            if sub_batch_size == 1:
-                                raise
-                        else:
-                            self.logger.error(f"Unexpected VAE encoding error: {str(re)[:200]}")
-                            raise
-
-            # If only 1 image, squeeze batch dimension
             if batch_size == 1:
                 return latents_out.squeeze(0)
-
             return latents_out
 
         except Exception as e:
-            self.logger.error(f"VAE encoding error: {str(e)[:200]}...")
+            logger.error(f"VAE encoding error: {str(e)[:200]}")
             torch.cuda.empty_cache()
             return None
+
+    def _get_optimal_batch_size(self, images: torch.Tensor) -> int:
+        """Determine optimal batch size based on available memory and image size."""
+        try:
+            if not torch.cuda.is_available():
+                return self.config.vae_batch_size
+
+            total_memory = torch.cuda.get_device_properties(self.vae.device).total_memory
+            free_memory = torch.cuda.memory_reserved(self.vae.device)
+            
+            # Calculate memory per image
+            sample_latent = self.vae.encode(images[0:1]).latent_dist.sample()
+            bytes_per_image = sample_latent.element_size() * sample_latent.nelement()
+            
+            # Leave 20% memory buffer
+            safe_memory = int(free_memory * 0.8)
+            optimal_size = max(1, safe_memory // bytes_per_image)
+            
+            return min(optimal_size, self.config.vae_batch_size)
+
+        except Exception as e:
+            logger.warning(f"Error calculating optimal batch size: {e}")
+            return self.config.vae_batch_size
+
+    def _get_cached_tensor(self, key: str, shape: tuple, dtype: torch.dtype) -> torch.Tensor:
+        """Get or create tensor from cache."""
+        tensor = self._tensor_cache.get(key)
+        if tensor is None or tensor.shape != shape or tensor.dtype != dtype:
+            tensor = torch.empty(shape, dtype=dtype, device=self.vae.device)
+            self._tensor_cache[key] = tensor
+        return tensor
+
+    def _get_latent_shape(self, images: torch.Tensor) -> tuple:
+        """Calculate latent shape without encoding."""
+        b, c, h, w = images.shape
+        return (b, 4, h // 8, w // 8)
