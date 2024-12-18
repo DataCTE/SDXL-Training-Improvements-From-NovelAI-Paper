@@ -105,6 +105,7 @@ def update_tracker(
     failed: int = 0,
     cache_hits: int = 0,
     cache_misses: int = 0,
+    errors: int = 0,
     memory_gb: Optional[float] = None,
     error_type: Optional[str] = None
 ) -> None:
@@ -113,12 +114,12 @@ def update_tracker(
     stats.failed_items += failed
     stats.cache_hits += cache_hits
     stats.cache_misses += cache_misses
+    stats.error_types[error_type] = stats.error_types.get(error_type, 0) + 1
     
     if memory_gb is not None:
         stats.memory_usage_gb = memory_gb
         
-    if error_type:
-        stats.error_types[error_type] = stats.error_types.get(error_type, 0) + 1
+    stats.errors += errors
 
 def format_time(seconds: float) -> str:
     """Format time in seconds to human readable string."""

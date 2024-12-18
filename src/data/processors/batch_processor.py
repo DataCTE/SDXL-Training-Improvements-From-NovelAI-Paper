@@ -221,7 +221,13 @@ class BatchProcessor(GenericBatchProcessor):
         }
         
         # Update tracker
-        update_tracker(tracker, processed=n)
+        update_tracker(
+            stats=tracker,
+            processed=n,
+            failed=chunk_stats.get('errors', 0),
+            cache_hits=chunk_stats.get('cache_hits', 0),
+            cache_misses=chunk_stats.get('cache_misses', 0)
+        )
         
         # Call progress callback if provided
         if progress_callback is not None:
