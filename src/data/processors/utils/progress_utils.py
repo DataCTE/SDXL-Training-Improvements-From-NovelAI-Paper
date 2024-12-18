@@ -22,6 +22,7 @@ class ProgressStats:
     cache_misses: int = 0
     memory_usage_gb: Optional[float] = None
     error_types: Dict[str, int] = field(default_factory=dict)
+    errors: int = 0
     start_time: float = field(default_factory=time.time)
     last_log_time: float = field(default_factory=time.time)
     last_memory_check: float = field(default_factory=time.time)
@@ -107,15 +108,24 @@ def update_tracker(
     cache_misses: int = 0,
     errors: int = 0,
     memory_gb: Optional[float] = None,
-    error_type: Optional[str] = None
+    error_type: Optional[str] = None,
+    error_types: Optional[Dict[str, int]] = None
 ) -> None:
     """Update progress tracker with new statistics."""
     stats.processed_items += processed
     stats.failed_items += failed
     stats.cache_hits += cache_hits
     stats.cache_misses += cache_misses
-    stats.error_types[error_type] = stats.error_types.get(error_type, 0) + 1
-    
+
+    # Optionally track a single error type for logging
+    if error_type:
+        stats.error_types[error_type] = stats.error_types.get(error_type, 0) + 1
+
+    # If you'd like to accumulate multiple error types at once:
+    if error_types:
+        for etype, count in error_types.items():
+            stats.error_types[etype] = stats.error_types.get(etype, 0) + count
+
     if memory_gb is not None:
         stats.memory_usage_gb = memory_gb
         
