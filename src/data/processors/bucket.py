@@ -137,7 +137,7 @@ class BucketManager:
 
         if len(self.buckets) == 0:
             # Create a fallback bucket to avoid an empty bucket list
-            fallback_w, fallback_h = 256, 256
+            fallback_w, fallback_h = 1024, 1024
             logger.warning(
                 f"No dynamic buckets created; adding fallback bucket "
                 f"[{fallback_w}x{fallback_h}] to prevent empty bucket list."

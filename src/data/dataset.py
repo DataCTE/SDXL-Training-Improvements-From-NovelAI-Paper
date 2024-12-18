@@ -5,6 +5,7 @@ from torch.utils.data import Dataset
 import logging
 import asyncio
 import gc
+from PIL import Image
 
 # Internal imports from processors
 from .processors.text_processor import TextProcessor
@@ -224,6 +225,35 @@ class NovelAIDataset(Dataset):
         logger.info(f"BucketManager has {len(self.bucket_manager.buckets)} buckets after init")
 
         # If none are created, consider adjusting min_bucket_resolution, aspect ratio, etc.
+        if not self.bucket_manager.buckets:
+            logger.warning("No buckets created! Check min_bucket_resolution and max_aspect_ratio settings.")
+
+        # Gather existing image files
+        all_image_paths = []
+        for image_dir in image_dirs:
+            found_files = find_matching_files(image_dir, [".jpg", ".jpeg", ".png"])
+            all_image_paths.extend(found_files)
+
+        # Build a quick list of (width, height) for each image
+        # If you have a specialized routine for reading dims, call it here
+        image_dimensions = []
+        for path in all_image_paths:
+            # Minimal example: open image with PIL just to get size
+            with Image.open(path) as img:
+                width, height = img.size
+            image_dimensions.append({"width": width, "height": height})
+
+        # Create dynamic buckets from actual image sizes
+        self.bucket_manager.create_buckets_from_dataset(
+            items=image_dimensions, 
+            min_count_for_bucket=1
+        )
+
+        logger.info(
+            f"BucketManager has {len(self.bucket_manager.buckets)} buckets after creation "
+            f"from real image dimensions"
+        )
+
         if not self.bucket_manager.buckets:
             logger.warning("No buckets created! Check min_bucket_resolution and max_aspect_ratio settings.")
 
