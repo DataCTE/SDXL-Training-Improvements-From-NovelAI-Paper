@@ -341,6 +341,7 @@ class NovelAIDatasetConfig:
     image_processor_config: Dict[str, Any] = field(default_factory=dict)
     text_processor_config: Dict[str, Any] = field(default_factory=dict)
     text_embedder_config: 'TextEmbedderConfig' = field(default_factory=lambda: TextEmbedderConfig())
+    batch_size: int = DEFAULT_BATCH_SIZE
 
     def __post_init__(self):
         # Convert image sizes to tuples if needed
