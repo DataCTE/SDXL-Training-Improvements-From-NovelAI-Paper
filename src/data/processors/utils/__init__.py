@@ -37,7 +37,6 @@ from .progress_utils import (
 
 from .batch_utils import (
     BatchProcessor,
-    create_tensor_buffer,
     process_in_chunks
 )
 
@@ -74,6 +73,5 @@ __all__ = [
     
     # Batch utilities
     'BatchProcessor',
-    'create_tensor_buffer',
     'process_in_chunks'
 ]

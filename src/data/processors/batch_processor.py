@@ -13,13 +13,11 @@ from multiprocessing import cpu_count
 from src.data.processors.utils.batch_utils import (
     BatchProcessor as GenericBatchProcessor,
     process_in_chunks,
-    calculate_optimal_batch_size
 )
 from src.data.processors.utils.system_utils import (
     create_thread_pool,
     get_optimal_workers,
     get_gpu_memory_usage,
-    get_memory_usage_gb,
     cleanup_processor
 )
 from src.data.processors.utils.progress_utils import (
