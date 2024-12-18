@@ -219,14 +219,81 @@ class NovelAIDatasetConfig:
             self.min_bucket_resolution = min(self.min_image_size)
 
 @dataclass
-class BatchConfig:
-    """Configuration for batch processing."""
-    batch_size: int
-    device: torch.device
+class DeviceConfig:
+    """Base configuration for device and memory settings."""
+    device: torch.device = torch.device('cuda')
     dtype: torch.dtype = torch.float16
     max_memory_usage: float = 0.9
+    enable_memory_efficient_attention: bool = True
+
+@dataclass
+class CacheConfig:
+    """Base configuration for caching."""
+    use_caching: bool = True
+    cache_dir: str = "cache"
+
+@dataclass
+class ImageSizeConfig:
+    """Base configuration for image dimensions."""
+    max_image_size: Tuple[int, int] = (2048, 2048)
+    min_image_size: Tuple[int, int] = (256, 256)
+
+@dataclass
+class BatchProcessorConfig(DeviceConfig):
+    """Configuration for batch processing."""
+    batch_size: int = 32
     prefetch_factor: int = 2
     log_interval: float = 5.0
+    num_workers: int = 16
+    
+    # Batch size adjustment settings
+    min_batch_size: int = 1
+    max_batch_size: int = 64
+    memory_check_interval: float = 30.0
+    memory_growth_factor: float = 0.7
+    retry_count: int = 3
+    backoff_factor: float = 1.5
+    cleanup_interval: int = 1000
+    high_memory_threshold: float = 0.95
+
+@dataclass
+class VAEEncoderConfig(DeviceConfig, ImageSizeConfig):
+    """Configuration for VAE encoding and image processing."""
+    enable_vae_slicing: bool = True
+    vae_batch_size: int = 32
+    num_workers: int = 16
+    prefetch_factor: int = 2
+    
+    # Image normalization settings
+    normalize_mean: Tuple[float, ...] = (0.5, 0.5, 0.5)
+    normalize_std: Tuple[float, ...] = (0.5, 0.5, 0.5)
+
+@dataclass
+class BucketConfig(ImageSizeConfig):
+    """Configuration for image bucketing."""
+    bucket_step: int = 64
+    min_bucket_resolution: int = 2048 * 2048
+    max_aspect_ratio: float = 4.0
+    bucket_tolerance: float = 0.2
+
+@dataclass
+class TextProcessorConfig(DeviceConfig, CacheConfig):
+    """Configuration for text processing."""
+    num_workers: int = 16
+    batch_size: int = 32
+    max_token_length: int = 77
+    
+    # Tag weighting settings
+    enable_tag_weighting: bool = True
+    tag_frequency_threshold: int = 5
+    tag_weight_smoothing: float = 0.1
+
+@dataclass
+class GlobalConfig:
+    """Global configuration settings shared across all components."""
+    image_sizes: ImageSizeConfig = field(default_factory=ImageSizeConfig)
+    device: DeviceConfig = field(default_factory=DeviceConfig)
+    cache: CacheConfig = field(default_factory=CacheConfig)
 
 @dataclass
 class Config:
@@ -237,6 +304,26 @@ class Config:
     scoring: ScoringConfig
     system: SystemConfig
     paths: PathsConfig
+    global_config: GlobalConfig  # Add global config
+    vae_encoder: VAEEncoderConfig
+    batch_processor: BatchProcessorConfig
+    bucket: BucketConfig
+    text_processor: TextProcessorConfig
+
+    def __post_init__(self):
+        """Apply global settings to components."""
+        # Apply device settings
+        for component in [self.vae_encoder, self.batch_processor, self.text_processor]:
+            component.device = self.global_config.device.device
+            component.dtype = self.global_config.device.dtype
+            component.max_memory_usage = self.global_config.device.max_memory_usage
+            component.enable_memory_efficient_attention = self.global_config.device.enable_memory_efficient_attention
+
+        # Apply image size settings where needed
+        self.vae_encoder.max_image_size = self.global_config.image_sizes.max_image_size
+        self.vae_encoder.min_image_size = self.global_config.image_sizes.min_image_size
+        self.bucket.max_image_size = self.global_config.image_sizes.max_image_size
+        self.bucket.min_image_size = self.global_config.image_sizes.min_image_size
 
     @classmethod
     def from_yaml(cls, path: str) -> 'Config':
@@ -264,7 +351,12 @@ class Config:
                 tag_weighting=TagWeighterConfig(**config_dict['tag_weighting']),
                 scoring=ScoringConfig(**config_dict['scoring']),
                 system=SystemConfig(**config_dict['system']),
-                paths=PathsConfig(**config_dict['paths'])
+                paths=PathsConfig(**config_dict['paths']),
+                global_config=GlobalConfig(**config_dict['global_config']),
+                vae_encoder=VAEEncoderConfig(**config_dict['vae_encoder']),
+                batch_processor=BatchProcessorConfig(**config_dict['batch_processor']),
+                bucket=BucketConfig(**config_dict['bucket']),
+                text_processor=TextProcessorConfig(**config_dict['text_processor'])
             )
         except Exception as e:
             raise ValueError(f"Error loading config from {path}: {str(e)}") from e

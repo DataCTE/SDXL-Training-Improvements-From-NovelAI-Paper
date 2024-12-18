@@ -3,7 +3,6 @@ import torch
 from PIL import Image
 from typing import Tuple, List, Optional, Dict, Any
 from torchvision import transforms
-from dataclasses import dataclass
 import numpy as np
 import logging
 import torch.nn.functional as F
@@ -13,33 +12,18 @@ import gc
 # Internal imports from utils
 from src.data.processors.utils.system_utils import get_gpu_memory_usage, get_optimal_workers, create_thread_pool
 from src.data.processors.utils.image_utils import load_and_validate_image, resize_image, get_image_stats
-from src.data.processors.utils.image.vae_encoder import VAEEncoder, VAEEncoderConfig
-
+from src.data.processors.utils.image.vae_encoder import VAEEncoder
+from src.config.config import VAEEncoderConfig  # Import the consolidated config
 
 # Internal imports from processors
 from src.data.processors.bucket import BucketManager
 
 logger = logging.getLogger(__name__)
 
-@dataclass
-class ImageProcessorConfig:
-    dtype: torch.dtype = torch.float16
-    normalize_mean: Tuple[float, ...] = (0.5, 0.5, 0.5)
-    normalize_std: Tuple[float, ...] = (0.5, 0.5, 0.5)
-    device: torch.device = torch.device('cuda')
-    enable_memory_efficient_attention: bool = True
-    enable_vae_slicing: bool = True
-    vae_batch_size: int = 32
-    num_workers: int = 16
-    prefetch_factor: int = 2
-    max_memory_usage: float = 0.9
-    max_image_size: Tuple[int, int] = (2048, 2048)
-    min_image_size: Tuple[int, int] = (256, 256)
-
 class ImageProcessor:
     def __init__(
         self,
-        config: ImageProcessorConfig,
+        config: VAEEncoderConfig,
         bucket_manager: Optional[BucketManager] = None,
         vae = None
     ):
@@ -50,17 +34,7 @@ class ImageProcessor:
         # Initialize VAE encoder if VAE is provided
         self.vae_encoder = None
         if vae is not None:
-            self.vae_encoder = VAEEncoder(
-                vae=vae,
-                config=VAEEncoderConfig(
-                    device=config.device,
-                    dtype=config.dtype,
-                    enable_memory_efficient_attention=config.enable_memory_efficient_attention,
-                    enable_vae_slicing=config.enable_vae_slicing,
-                    vae_batch_size=config.vae_batch_size,
-                    max_memory_usage=config.max_memory_usage
-                )
-            )
+            self.vae_encoder = VAEEncoder(vae=vae, config=config)
         
         # Initialize thread pool for parallel processing
         self.num_workers = min(
@@ -135,8 +109,7 @@ class ImageProcessor:
         """Load and validate an image using utility function."""
         return load_and_validate_image(
             path,
-            min_size=self.config.min_image_size,
-            max_size=self.config.max_image_size,
+            config=self.config,
             required_modes=('RGB', 'RGBA')
         )
 

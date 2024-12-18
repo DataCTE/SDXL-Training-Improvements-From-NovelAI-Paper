@@ -1,31 +1,18 @@
 import torch
 import logging
 from typing import Optional
-from dataclasses import dataclass
 import asyncio
 import gc
 from weakref import WeakValueDictionary
-
-from src.data.processors.utils.batch_utils import adjust_batch_size
-from src.data.processors.utils.system_utils import get_gpu_memory_usage
+from src.config.config import VAEEncoderConfig  # Import the new config class
 
 logger = logging.getLogger(__name__)
-
-@dataclass
-class VAEEncoderConfig:
-    """Configuration for VAE encoding."""
-    device: torch.device = torch.device('cuda')
-    dtype: torch.dtype = torch.float16
-    enable_memory_efficient_attention: bool = True
-    enable_vae_slicing: bool = True
-    vae_batch_size: int = 32
-    max_memory_usage: float = 0.9
 
 class VAEEncoder:
     """Handles VAE encoding with memory optimization and async support."""
     
     def __init__(self, vae, config: VAEEncoderConfig):
-        """Initialize VAE encoder."""
+        """Initialize VAE encoder with consolidated config."""
         self.vae = vae
         self.config = config
         self._tensor_cache = WeakValueDictionary()

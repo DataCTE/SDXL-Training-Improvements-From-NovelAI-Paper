@@ -10,7 +10,6 @@ import gc
 
 # Internal imports from utils
 from src.data.processors.utils.batch_utils import (
-    BatchConfig,
     BatchProcessor as GenericBatchProcessor,
     process_in_chunks,
     calculate_optimal_batch_size
@@ -28,6 +27,7 @@ from src.data.processors.utils.progress_utils import (
     ProgressStats
 )
 from src.data.processors.utils.image_utils import load_and_validate_image
+from src.config.config import BatchProcessorConfig  # Import the new config
 
 # Internal imports from processors
 from src.data.processors.cache_manager import CacheManager
@@ -41,53 +41,33 @@ class BatchProcessor(GenericBatchProcessor):
     
     def __init__(
         self,
+        config: BatchProcessorConfig,
         image_processor: ImageProcessor,
         text_processor: TextProcessor,
         cache_manager: CacheManager,
-        vae,
-        device: torch.device,
-        batch_size: Optional[int] = None,
-        prefetch_factor: int = 2,
-        max_memory_usage: float = 0.9,
-        num_workers: Optional[int] = None
+        vae
     ):
-        # Calculate optimal batch size and workers if not provided
-        self.batch_size = batch_size or calculate_optimal_batch_size(
-            device=device,
-            min_batch_size=1,
-            max_batch_size=8,
-            target_memory_usage=max_memory_usage
-        )
-        self.num_workers = num_workers or get_optimal_workers()
-        
-        # Create thread pool for async operations
-        self.thread_pool = create_thread_pool(self.num_workers)
-        
+        """Initialize with consolidated config."""
         # Initialize components
+        self.config = config
         self.image_processor = image_processor
         self.text_processor = text_processor
         self.cache_manager = cache_manager
         self.vae = vae
-        self.device = device
-        self.prefetch_factor = prefetch_factor
-        self.max_memory_usage = max_memory_usage
         
-        # Create batch config
-        self.batch_config = BatchConfig(
-            batch_size=self.batch_size,
-            device=device,
-            max_memory_usage=max_memory_usage,
-            prefetch_factor=prefetch_factor
-        )
+        # Create thread pool for async operations
+        self.num_workers = get_optimal_workers()
+        self.thread_pool = create_thread_pool(self.num_workers)
         
         logger.info(
             f"Initialized BatchProcessor:\n"
-            f"- Device: {device}\n"
-            f"- Batch size: {self.batch_size}\n"
+            f"- Device: {config.device}\n"
+            f"- Batch size: {config.batch_size}\n"
             f"- Workers: {self.num_workers}\n"
-            f"- Prefetch factor: {prefetch_factor}"
+            f"- Prefetch factor: {config.prefetch_factor}\n"
+            f"- Max memory usage: {config.max_memory_usage:.1%}"
         )
-        
+
     async def _load_and_validate_image(self, image_path: str) -> Optional[Image.Image]:
         """Load and validate an image file."""
         try:
@@ -95,8 +75,7 @@ class BatchProcessor(GenericBatchProcessor):
             return await asyncio.to_thread(
                 load_and_validate_image,
                 img_path,
-                min_size=(256, 256),  # Minimum size for processing
-                max_size=(2048, 2048)  # Maximum size supported
+                config=self.config  # Pass the config to use its image size settings
             )
         except Exception as e:
             logger.error(f"Error loading image {image_path}: {str(e)[:200]}...")
@@ -111,8 +90,8 @@ class BatchProcessor(GenericBatchProcessor):
         # Create progress tracker with batch info
         tracker = create_progress_tracker(
             total_items=len(items),
-            batch_size=self.batch_size,
-            device=self.device
+            batch_size=self.config.batch_size,
+            device=self.config.device
         )
         
         async def process_chunk(chunk: List[str], chunk_id: int) -> Tuple[List[Dict], Dict[str, Any]]:
@@ -199,7 +178,7 @@ class BatchProcessor(GenericBatchProcessor):
         # Process chunks
         processed_items, final_stats = await process_in_chunks(
             items=items,
-            chunk_size=self.batch_size,
+            chunk_size=self.config.batch_size,
             process_fn=process_chunk,
             progress_callback=lambda n, chunk_stats: self._handle_progress(
                 n, chunk_stats, tracker, progress_callback
@@ -222,8 +201,8 @@ class BatchProcessor(GenericBatchProcessor):
             'errors': chunk_stats.get('errors', 0),
             'skipped': chunk_stats.get('skipped', 0),
             'error_types': chunk_stats.get('error_types', {}),
-            'gpu_memory': f"{get_gpu_memory_usage(self.device):.1%}",
-            'batch_size': self.batch_size
+            'gpu_memory': f"{get_gpu_memory_usage(self.config.device):.1%}",
+            'batch_size': self.config.batch_size
         }
         
         # Update tracker
@@ -254,7 +233,7 @@ class BatchProcessor(GenericBatchProcessor):
                 await self.cache_manager.cleanup()
             
             # Clear CUDA cache
-            if self.device.type == 'cuda':
+            if self.config.device.type == 'cuda':
                 torch.cuda.empty_cache()
                 
             logger.info("Successfully cleaned up batch processor resources")
@@ -274,14 +253,14 @@ class BatchProcessor(GenericBatchProcessor):
         try:
             tracker = create_progress_tracker(
                 total_items=len(batch_items),
-                batch_size=min(4, self.batch_size),
-                device=self.device
+                batch_size=min(4, self.config.batch_size),
+                device=self.config.device
             )
             
             processed_items = []
             
             # Process in very small sub-batches
-            sub_batch_size = min(4, self.batch_size)
+            sub_batch_size = min(4, self.config.batch_size)
             for i in range(0, len(batch_items), sub_batch_size):
                 sub_batch = batch_items[i:i + sub_batch_size]
                 

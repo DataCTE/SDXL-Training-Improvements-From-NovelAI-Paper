@@ -6,6 +6,7 @@ import heapq
 from collections import defaultdict
 import gc
 from weakref import WeakValueDictionary
+from src.config.config import BucketConfig
 
 logger = logging.getLogger(__name__)
 
@@ -60,21 +61,11 @@ class ImageBucket:
 class BucketManager:
     """Manager for creating and assigning image buckets."""
     
-    def __init__(
-        self,
-        max_image_size: Tuple[int, int] = (2048, 2048),
-        min_image_size: Tuple[int, int] = (256, 256),
-        bucket_step: int = 64,
-        min_bucket_resolution: int = 2048 * 2048,  # 2048x2048=
-        max_aspect_ratio: float = 4.0,
-        bucket_tolerance: float = 0.2
-    ):
-        self.max_width, self.max_height = max_image_size
-        self.min_width, self.min_height = min_image_size
-        self.bucket_step = bucket_step
-        self.min_bucket_resolution = min_bucket_resolution
-        self.max_aspect_ratio = max_aspect_ratio
-        self.bucket_tolerance = bucket_tolerance
+    def __init__(self, config: BucketConfig):
+        """Initialize with consolidated config."""
+        self.config = config
+        self.max_width, self.max_height = config.max_image_size
+        self.min_width, self.min_height = config.min_image_size
         
         # Initialize buckets with WeakValueDictionary to help prevent memory leaks
         self.buckets: Dict[str, ImageBucket] = WeakValueDictionary()
@@ -87,16 +78,16 @@ class BucketManager:
         
         logger.info(
             f"Initialized BucketManager:\n"
-            f"- Size range: {min_image_size} to {max_image_size}\n"
-            f"- Bucket step: {bucket_step}\n"
+            f"- Size range: {config.min_image_size} to {config.max_image_size}\n"
+            f"- Bucket step: {config.bucket_step}\n"
             f"- Total buckets: {len(self.buckets)}"
         )
     
     def _validate_dimensions(self, width: int, height: int) -> Tuple[int, int]:
         """Validate and adjust dimensions to constraints."""
         # Round to bucket step
-        width = round(width / self.bucket_step) * self.bucket_step
-        height = round(height / self.bucket_step) * self.bucket_step
+        width = round(width / self.config.bucket_step) * self.config.bucket_step
+        height = round(height / self.config.bucket_step) * self.config.bucket_step
         
         # Enforce minimum dimensions
         width = max(width, self.min_width)
@@ -121,11 +112,11 @@ class BucketManager:
             # Skip if we've seen this resolution or it's below minimum
             if bucket_key in seen_resolutions:
                 return
-            if resolution < self.min_bucket_resolution:
+            if resolution < self.config.min_bucket_resolution:
                 return
                 
             aspect = width / height
-            if aspect > self.max_aspect_ratio or aspect < (1/self.max_aspect_ratio):
+            if aspect > self.config.max_aspect_ratio or aspect < (1/self.config.max_aspect_ratio):
                 return
                 
             self.buckets[bucket_key] = ImageBucket(width=width, height=height)
@@ -145,18 +136,18 @@ class BucketManager:
                 
                 # Use larger steps for higher resolutions to avoid too many buckets
                 if current_height >= 2048:
-                    current_height += self.bucket_step * 4
+                    current_height += self.config.bucket_step * 4
                 elif current_height >= 1024:
-                    current_height += self.bucket_step * 2
+                    current_height += self.config.bucket_step * 2
                 else:
-                    current_height += self.bucket_step
+                    current_height += self.config.bucket_step
                     
             if current_width >= 2048:
-                current_width += self.bucket_step * 4
+                current_width += self.config.bucket_step * 4
             elif current_width >= 1024:
-                current_width += self.bucket_step * 2
+                current_width += self.config.bucket_step * 2
             else:
-                current_width += self.bucket_step
+                current_width += self.config.bucket_step
         
         # Clear temporary set
         seen_resolutions.clear()
@@ -179,7 +170,7 @@ class BucketManager:
             
         # Calculate aspect ratio
         aspect = width / height
-        if aspect > self.max_aspect_ratio or aspect < (1/self.max_aspect_ratio):
+        if aspect > self.config.max_aspect_ratio or aspect < (1/self.config.max_aspect_ratio):
             return None
             
         # Find closest bucket by resolution and aspect ratio
@@ -190,7 +181,7 @@ class BucketManager:
         for key, bucket in self.buckets.items():
             # Check aspect ratio first
             ratio_diff = abs(np.log(aspect) - np.log(bucket.aspect_ratio))
-            if ratio_diff > self.bucket_tolerance:
+            if ratio_diff > self.config.bucket_tolerance:
                 continue
                 
             # Then check resolution
@@ -284,9 +275,9 @@ class BucketManager:
             if width <= 0 or height <= 0:
                 return False
             aspect = width / height
-            return (aspect <= self.max_aspect_ratio and 
-                    aspect >= 1/self.max_aspect_ratio and
-                    width * height >= self.min_bucket_resolution)
+            return (aspect <= self.config.max_aspect_ratio and 
+                    aspect >= 1/self.config.max_aspect_ratio and
+                    width * height >= self.config.min_bucket_resolution)
         except (ValueError, TypeError):
             return False
 

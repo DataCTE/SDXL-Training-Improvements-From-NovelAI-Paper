@@ -15,6 +15,7 @@ from src.data.processors.utils.progress_utils import (
     update_tracker,
     log_progress
 )
+from src.config.config import TextProcessorConfig
 
 logger = logging.getLogger(__name__)
 
@@ -23,25 +24,29 @@ class TextProcessor:
     
     def __init__(
         self,
+        config: TextProcessorConfig,
         text_embedder: TextEmbedder,
-        tag_weighter: Optional[TagWeighter] = None,
-        num_workers: Optional[int] = None,
-        device: Optional[torch.device] = None
+        tag_weighter: Optional[TagWeighter] = None
     ):
-        """Initialize text processor."""
+        """Initialize text processor with consolidated config."""
+        self.config = config
         self.text_embedder = text_embedder
         self.tag_weighter = tag_weighter
-        self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
         # Initialize thread pool for parallel processing
-        self.num_workers = num_workers or get_optimal_workers()
+        self.num_workers = min(
+            self.config.num_workers,
+            get_optimal_workers()
+        )
         self.executor = create_thread_pool(self.num_workers)
         
         logger.info(
             f"Initialized TextProcessor:\n"
-            f"- Device: {self.device}\n"
+            f"- Device: {config.device}\n"
             f"- Workers: {self.num_workers}\n"
-            f"- Tag Weighter: {'Yes' if tag_weighter else 'No'}"
+            f"- Batch size: {config.batch_size}\n"
+            f"- Tag Weighter: {'Yes' if tag_weighter else 'No'}\n"
+            f"- Max token length: {config.max_token_length}"
         )
 
     async def process_text(self, text: str) -> Tuple[Dict[str, Any], List[str]]:
@@ -70,7 +75,7 @@ class TextProcessor:
                 if weights:
                     weight_tensor = torch.tensor(
                         weights, 
-                        device=self.device, 
+                        device=self.config.device, 
                         dtype=torch.float32
                     )
                     text_data['tag_weights'] = weight_tensor.cpu()
@@ -95,7 +100,6 @@ class TextProcessor:
     async def process_batch(
         self,
         texts: List[str],
-        batch_size: int = 32,
         cache_manager: Optional[CacheManager] = None
     ) -> List[Tuple[Dict[str, Any], List[str]]]:
         """Process a batch of texts in parallel with immediate caching."""
@@ -104,13 +108,13 @@ class TextProcessor:
         # Create progress tracker
         tracker = create_progress_tracker(
             total_items=len(texts),
-            batch_size=batch_size,
-            device=self.device
+            batch_size=self.config.batch_size,
+            device=self.config.device
         )
         
         # Process in smaller batches to manage memory
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i:i + batch_size]
+        for i in range(0, len(texts), self.config.batch_size):
+            batch = texts[i:i + self.config.batch_size]
             batch_results = []
             
             # Process batch items in parallel
@@ -126,22 +130,23 @@ class TextProcessor:
                             text_data[key] = value.cpu()
                             del value
                     
-                    # Create cache item
-                    cache_item = {
-                        'text_path': getattr(batch[j], 'filename', f'text_{i+j}'),
-                        'text_data': text_data,
-                        'tags': tags
-                    }
-                    batch_results.append(cache_item)
+                    # Create cache item if caching is enabled
+                    if self.config.use_caching and cache_manager is not None:
+                        cache_item = {
+                            'text_path': getattr(batch[j], 'filename', f'text_{i+j}'),
+                            'text_data': text_data,
+                            'tags': tags
+                        }
+                        batch_results.append(cache_item)
+                    
                     results.append((text_data, tags))
                     update_tracker(tracker, processed=1)
                 else:
                     update_tracker(tracker, failed=1, error_type='text_processing_failed')
             
-            # Cache batch results immediately if cache manager is provided
-            if cache_manager is not None and batch_results:
+            # Cache batch results if enabled
+            if self.config.use_caching and cache_manager is not None and batch_results:
                 await cache_manager.cache_batch_items(batch_results)
-                # Clear batch results after caching
                 del batch_results[:]
             
             # Clear memory after each batch
@@ -155,7 +160,7 @@ class TextProcessor:
                     'successful': len(results),
                     'failed': tracker.failed_items,
                     'error_types': tracker.error_types,
-                    'memory_usage': f"{get_gpu_memory_usage(self.device):.1%}"
+                    'memory_usage': f"{get_gpu_memory_usage(self.config.device):.1%}"
                 }
                 log_progress(tracker, prefix="Processing texts: ", extra_stats=extra_stats)
         

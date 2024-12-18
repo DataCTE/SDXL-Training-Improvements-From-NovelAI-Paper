@@ -4,16 +4,16 @@ import logging
 from typing import Tuple, Optional, Dict
 from pathlib import Path
 import gc
+from src.config.config import VAEEncoderConfig
 
 logger = logging.getLogger(__name__)
 
 def load_and_validate_image(
     path: str,
-    min_size: Tuple[int, int] = (32, 32),
-    max_size: Tuple[int, int] = (2048, 2048),
+    config: VAEEncoderConfig,
     required_modes: Tuple[str, ...] = ('RGB', 'RGBA')
 ) -> Optional[Image.Image]:
-    """Load and validate an image file."""
+    """Load and validate an image file using config settings."""
     img = None
     try:
         with Image.open(path) as temp_img:
@@ -21,14 +21,14 @@ def load_and_validate_image(
             if temp_img.mode not in required_modes:
                 temp_img = temp_img.convert('RGB')
                 
-            # Validate dimensions
+            # Validate dimensions using config values
             width, height = temp_img.size
-            if width < min_size[0] or height < min_size[1]:
-                logger.debug(f"Image too small: {width}x{height} < {min_size}")
+            if width < config.min_image_size[0] or height < config.min_image_size[1]:
+                logger.debug(f"Image too small: {width}x{height} < {config.min_image_size}")
                 return None
                 
-            if width > max_size[0] or height > max_size[1]:
-                logger.debug(f"Image too large: {width}x{height} > {max_size}")
+            if width > config.max_image_size[0] or height > config.max_image_size[1]:
+                logger.debug(f"Image too large: {width}x{height} > {config.max_image_size}")
                 return None
                 
             # Make a copy to ensure file is closed

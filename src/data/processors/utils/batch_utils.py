@@ -10,7 +10,7 @@ from .progress_utils import (
     update_tracker,
     log_progress
 )
-from src.config.config import BatchConfig
+from src.config.config import BatchProcessorConfig
 import gc
 from weakref import WeakValueDictionary
 
@@ -20,61 +20,46 @@ T = TypeVar('T')  # Generic type for batch items
 R = TypeVar('R')  # Generic type for processed results
 
 def calculate_optimal_batch_size(
-    device: torch.device,
-    min_batch_size: int = 1,
-    max_batch_size: int = 32,
-    target_memory_usage: float = 0.9,
-    growth_factor: float = 0.7
+    config: BatchProcessorConfig
 ) -> int:
-    """Calculate optimal batch size based on available GPU memory.
-    
-    Args:
-        device: torch device
-        min_batch_size: minimum batch size
-        max_batch_size: maximum batch size
-        target_memory_usage: target GPU memory usage (0-1)
-        growth_factor: how aggressively to grow batch size (0-1)
-        
-    Returns:
-        Optimal batch size
-    """
-    if device.type != "cuda":
-        return min(8, max_batch_size)  # Default CPU batch size
+    """Calculate optimal batch size based on available GPU memory."""
+    if config.device.type != "cuda":
+        return min(8, config.max_batch_size)  # Default CPU batch size
         
     try:
-        current_memory = get_gpu_memory_usage(device)
+        current_memory = get_gpu_memory_usage(config.device)
         available_memory = 1 - current_memory
         
         if available_memory <= 0:
             logger.warning("No available GPU memory, using minimum batch size")
-            return min_batch_size
+            return config.min_batch_size
             
         # Calculate batch size based on available memory
-        memory_ratio = available_memory / target_memory_usage
+        memory_ratio = available_memory / config.max_memory_usage
         optimal_size = int(min(
-            max_batch_size,
+            config.max_batch_size,
             max(
-                min_batch_size,
-                memory_ratio * max_batch_size * growth_factor
+                config.min_batch_size,
+                memory_ratio * config.max_batch_size * config.memory_growth_factor
             )
         ))
         
         logger.info(
             f"Calculated optimal batch size: {optimal_size} "
-            f"(memory usage: {current_memory:.1%}, target: {target_memory_usage:.1%})"
+            f"(memory usage: {current_memory:.1%}, target: {config.max_memory_usage:.1%})"
         )
         return optimal_size
         
     except Exception as e:
         logger.warning(f"Error calculating optimal batch size: {e}, using default")
-        return min(8, max_batch_size)
+        return min(8, config.max_batch_size)
 
 class BatchProcessor:
     """Generic batch processor with GPU optimization and progress tracking."""
     
     def __init__(
         self,
-        config: BatchConfig,
+        config: BatchProcessorConfig,
         executor: ThreadPoolExecutor,
         name: str = "BatchProcessor"
     ):
@@ -118,7 +103,7 @@ class BatchProcessor:
     def _should_adjust_batch_size(self) -> bool:
         """Check if it's time to adjust batch size."""
         current_time = time.time()
-        if current_time - self.last_memory_check >= 30:  # Check every 30 seconds
+        if current_time - self.last_memory_check >= self.config.memory_check_interval:
             self.last_memory_check = current_time
             return True
         return False
@@ -131,15 +116,15 @@ class BatchProcessor:
         current_memory = get_gpu_memory_usage(self.config.device)
         
         # Force cleanup if memory usage is too high
-        if current_memory > 0.95:  # 95% memory usage
+        if current_memory > self.config.high_memory_threshold:
             logger.warning("High memory usage detected, forcing cleanup")
             self.cleanup()
             current_memory = get_gpu_memory_usage(self.config.device)
             
         self.config.batch_size = adjust_batch_size(
             current_batch_size=self.config.batch_size,
-            max_batch_size=64,
-            min_batch_size=1,
+            max_batch_size=self.config.max_batch_size,
+            min_batch_size=self.config.min_batch_size,
             current_memory_usage=current_memory,
             max_memory_usage=self.config.max_memory_usage
         )

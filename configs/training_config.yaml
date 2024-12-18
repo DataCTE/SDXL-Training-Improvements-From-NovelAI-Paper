@@ -58,8 +58,6 @@ data:
     "/workspace/photo-concept-bucket/train"
   ]
   image_size: [1024, 1024]
-  max_image_size: [2048, 2048]
-  min_image_size: [256, 256]
   max_dim: 2048
   bucket_step: 8
   min_bucket_size: 16
@@ -73,12 +71,10 @@ data:
   use_caching: true
   
   # VAE settings
-  vae_batch_size: 32
-  vae_image_size: [256, 256]
   vae_validation_split: 0.1
   
   # DataLoader settings
-  num_workers: 16
+  num_workers: 32
   pin_memory: true
   persistent_workers: true
   shuffle: true
@@ -113,3 +109,65 @@ paths:
   output_dir: "outputs"
   vae_checkpoints_dir: "vae_checkpoints"
   vae_samples_dir: "vae_samples"
+
+# Global configuration settings
+global_config:
+  # Image size settings
+  image_sizes:
+    max_image_size: [2048, 2048]
+    min_image_size: [256, 256]
+  
+  # Device settings
+  device:
+    device: "cuda"
+    dtype: "float16"
+    max_memory_usage: 0.9
+    enable_memory_efficient_attention: true
+  
+  # Cache settings
+  cache:
+    use_caching: true
+    cache_dir: "cache"
+
+# VAE encoder configuration section
+vae_encoder:
+  enable_vae_slicing: true
+  vae_batch_size: 32
+  num_workers: 16
+  prefetch_factor: 2
+  normalize_mean: [0.5, 0.5, 0.5]
+  normalize_std: [0.5, 0.5, 0.5]
+
+# Bucket configuration section
+bucket:
+  bucket_step: 64
+  min_bucket_resolution: 4194304  # 2048 * 2048
+  max_aspect_ratio: 4.0
+  bucket_tolerance: 0.2
+
+# Batch processor configuration section
+batch_processor:
+  <<: *device_base
+  batch_size: 32
+  prefetch_factor: 2
+  log_interval: 5.0
+  num_workers: 16
+  min_batch_size: 1
+  max_batch_size: 64
+  memory_check_interval: 30.0
+  memory_growth_factor: 0.7
+  retry_count: 3
+  backoff_factor: 1.5
+  cleanup_interval: 1000
+  high_memory_threshold: 0.95
+
+# Text processor configuration section
+text_processor:
+  <<: *device_base
+  <<: *cache_base
+  num_workers: 16
+  batch_size: 32
+  max_token_length: 77
+  enable_tag_weighting: true
+  tag_frequency_threshold: 5
+  tag_weight_smoothing: 0.1
