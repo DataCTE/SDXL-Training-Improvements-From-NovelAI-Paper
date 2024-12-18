@@ -58,11 +58,14 @@ class CacheManager:
             
             # Extract data to cache
             latents = processed_item.get('latents')
-            text_data = {
-                'prompt_embeds': processed_item['prompt_embeds'].cpu(),
-                'pooled_prompt_embeds': processed_item['pooled_prompt_embeds'].cpu()
-            }
-            if 'tag_weights' in processed_item:
+            
+            # Handle text embeddings - ensure they're tensors before calling cpu()
+            text_data = {}
+            if 'prompt_embeds' in processed_item and torch.is_tensor(processed_item['prompt_embeds']):
+                text_data['prompt_embeds'] = processed_item['prompt_embeds'].cpu()
+            if 'pooled_prompt_embeds' in processed_item and torch.is_tensor(processed_item['pooled_prompt_embeds']):
+                text_data['pooled_prompt_embeds'] = processed_item['pooled_prompt_embeds'].cpu()
+            if 'tag_weights' in processed_item and torch.is_tensor(processed_item['tag_weights']):
                 text_data['tag_weights'] = processed_item['tag_weights'].cpu()
                 
             metadata = {
@@ -71,8 +74,8 @@ class CacheManager:
                 'target_size': (processed_item.get('width'), processed_item.get('height'))
             }
             
-            # Save latents to disk so they're not lost
-            if latents is not None:
+            # Save latents to disk if they exist and are tensors
+            if latents is not None and torch.is_tensor(latents):
                 logger.debug(f"Saving latents for {image_path} to {cache_paths['latent']}")
                 torch.save(
                     latents.cpu(),
@@ -80,8 +83,8 @@ class CacheManager:
                     _use_new_zipfile_serialization=True
                 )
             
-            # Save text embeddings
-            if text_data is not None:
+            # Save text embeddings if we have any
+            if text_data:
                 logger.debug(f"Saving text data for {image_path} to {cache_paths['text']}")
                 torch.save(
                     text_data,
@@ -100,13 +103,18 @@ class CacheManager:
             if self.config.use_memory_cache:
                 cache_key = str(image_path)
                 self._memory_cache[cache_key] = {
-                    'latents': latents.cpu() if latents is not None else None,
-                    'text_data': text_data if text_data is not None else None,
+                    'latents': latents.cpu() if (latents is not None and torch.is_tensor(latents)) else None,
+                    'text_data': text_data if text_data else None,
                     'metadata': metadata
                 }
                 
         except Exception as e:
             logger.error(f"Error caching item {image_path}: {e}")
+            # Log more details about the error
+            logger.debug(f"Processed item keys: {processed_item.keys()}")
+            logger.debug(f"Latents type: {type(processed_item.get('latents'))}")
+            if 'latents' in processed_item:
+                logger.debug(f"Is latents tensor? {torch.is_tensor(processed_item['latents'])}")
 
     async def load_cached_item(self, image_path: str) -> Optional[Dict[str, Any]]:
         """Load item from cache."""
