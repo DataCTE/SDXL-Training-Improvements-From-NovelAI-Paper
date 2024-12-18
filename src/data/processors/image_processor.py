@@ -29,8 +29,8 @@ class ImageProcessorConfig:
     device: torch.device = torch.device('cuda')
     enable_memory_efficient_attention: bool = True
     enable_vae_slicing: bool = True
-    vae_batch_size: int = 8
-    num_workers: int = 4
+    vae_batch_size: int = 32
+    num_workers: int = 16
     prefetch_factor: int = 2
     max_memory_usage: float = 0.9
     max_image_size: Tuple[int, int] = (2048, 2048)

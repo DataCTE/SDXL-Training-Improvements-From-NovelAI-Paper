@@ -8,7 +8,7 @@ import torch
 
 @dataclass
 class VAEModelConfig:
-    latent_channels: int = 16
+    latent_channels: int = 3
     kl_divergence_weight: float = 0.1
     lpips_weight: float = 1.0
     discriminator_weight: float = 0.1
@@ -91,12 +91,12 @@ class DataConfig:
     max_token_length: int = 77  # Default CLIP token length
     
     # VAE settings
-    vae_batch_size: int = 8
+    vae_batch_size: int = 32
     vae_image_size: Tuple[int, int] = (256, 256)
     vae_validation_split: float = 0.1
     
     # DataLoader settings
-    num_workers: int = 8
+    num_workers: int = 16
     pin_memory: bool = True
     persistent_workers: bool = True
     shuffle: bool = True

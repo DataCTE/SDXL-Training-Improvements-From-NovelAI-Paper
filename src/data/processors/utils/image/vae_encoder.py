@@ -18,7 +18,7 @@ class VAEEncoderConfig:
     dtype: torch.dtype = torch.float16
     enable_memory_efficient_attention: bool = True
     enable_vae_slicing: bool = True
-    vae_batch_size: int = 8
+    vae_batch_size: int = 32
     max_memory_usage: float = 0.9
 
 class VAEEncoder:
