@@ -6,7 +6,6 @@ import torch
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
 import gc
-from weakref import WeakValueDictionary
 
 from src.data.processors.utils.system_utils import get_gpu_memory_usage, cleanup_processor
 from src.data.processors.utils.file_utils import ensure_dir
@@ -30,13 +29,15 @@ class CacheManager:
         for dir_path in [self.latents_dir, self.text_dir, self.metadata_dir]:
             ensure_dir(dir_path)
             
-        # Initialize memory cache
-        self._memory_cache = WeakValueDictionary()
+        # Initialize memory cache as regular dict since we're caching dictionaries
+        self._memory_cache = {}
+        self._max_memory_items = getattr(config, 'max_memory_items', 1000)
         
         logger.info(
             f"Initialized CacheManager:\n"
             f"- Cache directory: {self.cache_dir}\n"
             f"- Memory cache enabled: {config.use_memory_cache}\n"
+            f"- Max memory items: {self._max_memory_items}\n"
             f"- Cache format: {config.cache_format}"
         )
 
@@ -99,18 +100,25 @@ class CacheManager:
                 with open(cache_paths['metadata'], 'w') as f:
                     json.dump(metadata, f)
             
-            # Add to memory cache if enabled
+            # Add to memory cache if enabled, with size limit
             if self.config.use_memory_cache:
                 cache_key = str(image_path)
-                self._memory_cache[cache_key] = {
+                cached_item = {
                     'latents': latents.cpu() if (latents is not None and torch.is_tensor(latents)) else None,
                     'text_data': text_data if text_data else None,
                     'metadata': metadata
                 }
                 
+                # Implement LRU-like behavior
+                if len(self._memory_cache) >= self._max_memory_items:
+                    # Remove oldest item
+                    oldest_key = next(iter(self._memory_cache))
+                    del self._memory_cache[oldest_key]
+                
+                self._memory_cache[cache_key] = cached_item
+                
         except Exception as e:
             logger.error(f"Error caching item {image_path}: {e}")
-            # Log more details about the error
             logger.debug(f"Processed item keys: {processed_item.keys()}")
             logger.debug(f"Latents type: {type(processed_item.get('latents'))}")
             if 'latents' in processed_item:
