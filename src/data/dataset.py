@@ -299,11 +299,8 @@ class NovelAIDataset(Dataset):
             raise
 
     async def _process_data(self, image_dirs: List[str]) -> None:
-        """Process all data files asynchronously with progress tracking."""
+        """Process all data files with improved async handling."""
         try:
-            # Create initial progress tracker
-            tracker = create_progress_tracker(0, device=self.device)
-            
             # Find all image files
             image_files = []
             for image_dir in image_dirs:
@@ -313,22 +310,22 @@ class NovelAIDataset(Dataset):
             if not image_files:
                 raise ValueError(f"No valid image files found in {image_dirs}")
                 
-            # Update tracker with total files
+            # Create tracker
             tracker = create_progress_tracker(
                 total_items=len(image_files),
-                batch_size=8,  # Slightly larger batch size for better throughput
+                batch_size=self.config.batch_size,
                 device=self.device
             )
             
-            # Process files in small batches
+            # Process in optimized batch sizes
+            batch_size = min(32, self.config.batch_size)
             processed_items = []
-            for i in range(0, len(image_files), 4):  # Process 4 files at a time
-                batch_files = image_files[i:i + 4]
-                
-                # Create batch items
+            
+            for i in range(0, len(image_files), batch_size):
+                batch_files = image_files[i:i + batch_size]
                 batch_items = [{'image_path': f} for f in batch_files]
                 
-                # Process batch using BatchProcessor (which handles caching)
+                # Process batch
                 batch_processed, stats = await self.batch_processor.process_batch(
                     batch_items=batch_items,
                     width=self.config.image_size[0],
@@ -336,46 +333,30 @@ class NovelAIDataset(Dataset):
                     cache_manager=self.cache_manager
                 )
                 
-                # Store only paths and metadata, not tensors
-                for item in batch_processed:
-                    processed_items.append({
-                        'image_path': item['image_path'],
-                        'latent_cache': item['latent_cache'],
-                        'text_cache': item['text_cache']
-                    })
+                processed_items.extend(batch_processed)
                 
-                # Update progress and stats
-                update_tracker(tracker, processed=len(batch_processed))
-                
-                if stats.get('errors', 0) > 0:
-                    for error_type, count in stats.get('error_types', {}).items():
-                        update_tracker(tracker, failed=count, error_type=error_type)
+                # Update progress
+                update_tracker(
+                    tracker,
+                    processed=len(batch_processed),
+                    failed=stats.get('errors', 0)
+                )
                 
                 # Log progress periodically
                 if tracker.should_log():
                     extra_stats = {
                         'processed': len(processed_items),
                         'memory': f"{get_gpu_memory_usage(self.device):.1%}",
-                        'errors': tracker.failed_items
+                        'batch_size': batch_size
                     }
                     log_progress(tracker, prefix="Processing dataset: ", extra_stats=extra_stats)
                 
-                # Clear memory periodically
-                if i % 100 == 0:  # Clean up less often for performance
+                # Periodic cleanup
+                if i % (batch_size * 4) == 0:
                     self.cache_manager.clear_memory_cache()
                     torch.cuda.empty_cache()
-                    gc.collect()
-                
-                # Clear batch references
-                del batch_processed
             
-            # Store only paths and metadata
             self.items = processed_items
-            
-            # Final cleanup
-            self.cache_manager.clear_memory_cache()
-            torch.cuda.empty_cache()
-            gc.collect()
             
         except Exception as e:
             logger.error(f"Error processing dataset: {e}")
