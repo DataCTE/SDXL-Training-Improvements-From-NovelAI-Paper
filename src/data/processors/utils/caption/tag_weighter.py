@@ -35,24 +35,38 @@ class TagWeighter:
     
     def __init__(
         self,
+        config: Optional[TagWeighterConfig] = None,
         initial_weights: Optional[Dict[str, Dict[str, float]]] = None,
         weight_ranges: Optional[Dict[str, tuple]] = None,
         save_path: Optional[str] = None
     ):
-        """Initialize tag weighter with optional initial weights and ranges."""
+        """Initialize tag weighter with configuration."""
+        # Initialize from config if provided
+        if config:
+            self.tag_weights = initial_weights or {}
+            self.weight_ranges = weight_ranges or {
+                'character': (config.min_weight, config.max_weight),
+                'style': (config.min_weight, config.max_weight),
+                'quality': (config.min_weight, config.max_weight),
+                'artist': (config.min_weight, config.max_weight)
+            }
+            self.default_weight = config.default_weight
+            self.smoothing_factor = config.smoothing_factor
+        else:
+            # Use default initialization
+            self.tag_weights = initial_weights or {}
+            self.weight_ranges = weight_ranges or {
+                'character': (0.8, 1.2),
+                'style': (0.7, 1.3),
+                'quality': (0.6, 1.4),
+                'artist': (0.5, 1.5)
+            }
+            self.default_weight = 1.0
+            self.smoothing_factor = 1e-4
+
         # Initialize frequency counters
         self.tag_frequencies = defaultdict(lambda: defaultdict(int))
         self.total_samples = 0
-        
-        # Initialize weights
-        self.tag_weights = initial_weights or {}
-        self.weight_ranges = weight_ranges or {
-            'character': (0.8, 1.2),
-            'style': (0.7, 1.3),
-            'quality': (0.6, 1.4),
-            'artist': (0.5, 1.5)
-        }
-        
         self.save_path = Path(save_path) if save_path else None
         
         logger.info(
