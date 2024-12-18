@@ -219,51 +219,51 @@ class TextEmbedder:
                     len(prompts)
                 )
                 
-                # Ensure pooled embeddings have same dimensions before concatenating
+                # Get prompt embeddings
+                prompt_embeds_1 = text_embeddings_1['prompt_embeds']
+                prompt_embeds_2 = text_embeddings_2['prompt_embeds']
+                
+                # Get pooled embeddings
                 pooled_1 = text_embeddings_1['pooled_prompt_embeds']
                 pooled_2 = text_embeddings_2['pooled_prompt_embeds']
                 
-                # Add batch dimension if needed
-                if pooled_1.dim() == 2:
+                # Ensure all tensors have correct batch dimension
+                if prompt_embeds_1.dim() == 2:
+                    prompt_embeds_1 = prompt_embeds_1.unsqueeze(0)
+                if prompt_embeds_2.dim() == 2:
+                    prompt_embeds_2 = prompt_embeds_2.unsqueeze(0)
+                if pooled_1.dim() == 1:
                     pooled_1 = pooled_1.unsqueeze(0)
-                if pooled_2.dim() == 2:
+                if pooled_2.dim() == 1:
                     pooled_2 = pooled_2.unsqueeze(0)
                 
-                # Combine embeddings
-                text_embeddings = torch.cat([
-                    text_embeddings_1['prompt_embeds'],
-                    text_embeddings_2['prompt_embeds']
-                ], dim=-1)
+                # Ensure pooled embeddings have matching dimensions
+                if pooled_1.size(1) != pooled_2.size(1):
+                    # Resize smaller tensor to match larger one
+                    target_size = max(pooled_1.size(1), pooled_2.size(1))
+                    if pooled_1.size(1) < target_size:
+                        pooled_1 = pooled_1.expand(-1, target_size, -1)
+                    if pooled_2.size(1) < target_size:
+                        pooled_2 = pooled_2.expand(-1, target_size, -1)
                 
+                # Combine embeddings along last dimension
+                text_embeddings = torch.cat([prompt_embeds_1, prompt_embeds_2], dim=-1)
                 pooled_embeddings = torch.cat([pooled_1, pooled_2], dim=-1)
-            
-            # Update stats
-            batch_stats.update({
-                'end_memory': get_gpu_memory_usage(self.config.device),
-                'duration': time.time() - batch_stats['start_time'],
-                'memory_change': (
-                    get_gpu_memory_usage(self.config.device) - 
-                    batch_stats['start_memory']
-                ),
-                'avg_token_length': sum(len(p.split()) for p in prompts) / len(prompts)
-            })
-            
-            # Log metrics
-            log_metrics(
-                metrics=batch_stats, 
-                step=batch_stats['batch_size'], 
-                step_type="text_embed",
-                is_main_process=True,
-                use_wandb=True
-            )
-            
-            return {
-                "prompt_embeds": text_embeddings,
-                "pooled_prompt_embeds": pooled_embeddings
-            }
-            
+                
+                # Update stats
+                batch_stats.update({
+                    'end_memory': get_gpu_memory_usage(self.config.device),
+                    'duration': time.time() - batch_stats['start_time']
+                })
+                
+                return {
+                    "prompt_embeds": text_embeddings,
+                    "pooled_prompt_embeds": pooled_embeddings
+                }
+                
         except Exception as e:
             log_error_with_context(e, "Error in text embedding")
+            # Return empty tensors on error
             return {
                 "prompt_embeds": torch.empty(0, device=self.config.device),
                 "pooled_prompt_embeds": torch.empty(0, device=self.config.device)
