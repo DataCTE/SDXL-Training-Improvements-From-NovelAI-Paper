@@ -27,7 +27,7 @@ from .processors.utils.progress_utils import create_progress_tracker, update_tra
 from .processors.utils.system_utils import get_gpu_memory_usage, cleanup_processor
 
 # Config import
-from src.config.config import NovelAIDatasetConfig, BucketConfig
+from src.config.config import NovelAIDatasetConfig, BucketConfig, TextProcessorConfig
 
 logger = logging.getLogger(__name__)
 
@@ -95,8 +95,12 @@ class NovelAIDataset(Dataset):
                 text_encoders=self.text_encoders,
                 config=self.config.text_embedder_config
             )
+            
+            # Ensure text_processor_config is converted to TextProcessorConfig
+            text_processor_config = TextProcessorConfig(**self.config.text_processor_config)  # Convert to dataclass
+            
             self.text_processor = TextProcessor(
-                config=self.config.text_processor_config,
+                config=text_processor_config,  # Pass the dataclass instance
                 text_embedder=self.text_embedder,
                 tag_weighter=tag_weighter
             )
