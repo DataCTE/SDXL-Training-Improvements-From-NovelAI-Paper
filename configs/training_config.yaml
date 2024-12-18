@@ -1,7 +1,7 @@
 # ===== Training Configuration =====
 training:
   # Core training settings
-  batch_size: 32
+  batch_size: 64
   num_epochs: 10
   learning_rate: 4.0e-7
   gradient_accumulation_steps: 4
@@ -92,8 +92,9 @@ global_config:
 # ===== Processing Components =====
 # Text processing
 text_processor:
-  num_workers: 16
-  batch_size: 32
+  num_workers: 32
+  batch_size: 64
+  prefetch_factor: 4
   max_token_length: 77
   enable_tag_weighting: true
   tag_frequency_threshold: 5
@@ -101,7 +102,7 @@ text_processor:
 
 text_embedder:
   max_length: 77
-  batch_size: 32
+  batch_size: 64
   model_name: "stabilityai/stable-diffusion-xl-base-1.0"
   use_fast_tokenizer: true
   low_cpu_mem_usage: true
@@ -115,18 +116,18 @@ text_embedder:
 # Image processing
 vae_encoder:
   enable_vae_slicing: true
-  vae_batch_size: 32
-  num_workers: 16
-  prefetch_factor: 2
+  vae_batch_size: 64
+  num_workers: 32
+  prefetch_factor: 4
   normalize_mean: [0.5, 0.5, 0.5]
   normalize_std: [0.5, 0.5, 0.5]
 
 # Batch processing
 batch_processor:
-  batch_size: 32
-  prefetch_factor: 2
+  batch_size: 64
+  prefetch_factor: 4
   log_interval: 5.0
-  num_workers: 16
+  num_workers: 32
   min_batch_size: 1
   max_batch_size: 64
   memory_check_interval: 30.0
