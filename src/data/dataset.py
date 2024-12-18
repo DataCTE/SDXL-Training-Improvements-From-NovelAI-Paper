@@ -34,7 +34,7 @@ from .processors.utils.progress_utils import (
 )
 
 # Config import
-from src.config.config import NovelAIDatasetConfig, ImageProcessorConfig
+from src.config.config import NovelAIDatasetConfig, ImageProcessorConfig, TextEmbedderConfig
 
 logger = logging.getLogger(__name__)
 
