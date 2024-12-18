@@ -404,3 +404,12 @@ class ImageProcessor:
                 loop.run_until_complete(self.cleanup())
         except Exception as e:
             logger.error(f"Error during image processor deletion: {e}")
+
+    def recalc_buffer_size(self) -> None:
+        """
+        Recalculate buffer dimensions based on newly available buckets,
+        then re-allocate the tensor buffer.
+        """
+        self.buffer_size = self._calculate_initial_buffer_size()
+        self.tensor_buffer = self._allocate_tensor_buffer()
+        logger.info(f"Recalculated buffer size: {self.buffer_size}")

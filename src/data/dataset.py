@@ -249,6 +249,9 @@ class NovelAIDataset(Dataset):
             min_count_for_bucket=1
         )
 
+        # Recalculate image processor buffer now that buckets exist
+        self.image_processor.recalc_buffer_size()
+
         logger.info(
             f"BucketManager has {len(self.bucket_manager.buckets)} buckets after creation "
             f"from real image dimensions"
