@@ -118,6 +118,7 @@ class DataConfig:
     max_dim: int = 4194304
     bucket_step: int = 8
     min_bucket_size: int = 16
+    batch_size: int = DEFAULT_BATCH_SIZE
     min_bucket_resolution: Optional[int] = None
     bucket_tolerance: float = 0.2
     max_aspect_ratio: float = 2.0
