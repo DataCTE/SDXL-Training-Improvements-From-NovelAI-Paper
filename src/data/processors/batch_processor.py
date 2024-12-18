@@ -246,7 +246,7 @@ class BatchProcessor(GenericBatchProcessor):
             )
             
             processed_items = []
-            sub_batch_size = min(16, self.config.batch_size)
+            sub_batch_size = min(32, self.config.batch_size)
 
             for i in range(0, len(batch_items), sub_batch_size):
                 sub_batch = batch_items[i:i + sub_batch_size]
@@ -319,8 +319,9 @@ class BatchProcessor(GenericBatchProcessor):
                         logger.error(f"Error processing item {item['image_path']}: {e}")
                         update_tracker(tracker, failed=1, error_type=type(e).__name__)
 
-                # Clear cache after each sub-batch
-                torch.cuda.empty_cache()
+                # Call empty cache less often for performance
+                if i % (sub_batch_size * 4) == 0:
+                    torch.cuda.empty_cache()
 
             return processed_items, tracker.get_stats()
 
