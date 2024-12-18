@@ -12,7 +12,7 @@ class ThreadConfig:
 def get_optimal_thread_config() -> ThreadConfig:
     """Calculate optimal thread configuration using 90% of CPU resources"""
     cpu_count = multiprocessing.cpu_count()
-    num_threads = max(1, int(cpu_count * 0.9))
+    num_threads = max(1, int(cpu_count * 0.95))
     
     return ThreadConfig(
         num_threads=num_threads,

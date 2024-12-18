@@ -9,7 +9,7 @@ import gc
 from src.data.processors.cache_manager import CacheManager
 from src.data.processors.utils.caption.text_embedder import TextEmbedder
 from src.data.processors.utils.caption.tag_weighter import parse_tags, TagWeighter
-from src.data.processors.utils.system_utils import get_optimal_workers, create_thread_pool, get_gpu_memory_usage
+from src.data.processors.utils.system_utils import get_optimal_workers, create_thread_pool, get_gpu_memory_usage, cleanup_processor
 from src.data.processors.utils.progress_utils import (
     create_progress_tracker,
     update_tracker,
@@ -86,10 +86,6 @@ class TextProcessor:
                 if isinstance(value, torch.Tensor):
                     text_data[key] = value.cpu()
                     del value
-            
-            # Clear memory
-            gc.collect()
-            torch.cuda.empty_cache()
             
             return text_data, list(tag_dict.values())
             
@@ -203,37 +199,9 @@ class TextProcessor:
             return None
 
     async def cleanup(self):
-        """Clean up resources."""
-        try:
-            # Clean up thread pool
-            if hasattr(self, 'executor'):
-                self.executor.shutdown(wait=True)
-            
-            # Clean up text embedder
-            if hasattr(self.text_embedder, 'cleanup'):
-                await self.text_embedder.cleanup()
-            
-            # Clean up tag weighter
-            if self.tag_weighter and hasattr(self.tag_weighter, 'cleanup'):
-                await self.tag_weighter.cleanup()
-            
-            # Clear any remaining tensors
-            for attr_name in dir(self):
-                attr = getattr(self, attr_name)
-                if isinstance(attr, torch.Tensor):
-                    delattr(self, attr_name)
-            
-            # Clear CUDA cache and force garbage collection
-            torch.cuda.empty_cache()
-            gc.collect()
-            
-            logger.info("Successfully cleaned up text processor resources")
-            
-        except Exception as e:
-            logger.error(f"Error during cleanup: {str(e)}")
+        await cleanup_processor(self)
 
     def __del__(self):
-        """Ensure cleanup when object is deleted."""
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():

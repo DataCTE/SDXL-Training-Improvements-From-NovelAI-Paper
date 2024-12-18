@@ -74,10 +74,8 @@ def find_matching_files(
             for file_path in directory.glob(f"{pattern}{ext}"):
                 if not require_text_pair or os.path.splitext(file_path.name)[0] in text_files:
                     batch.append(str(file_path))
-                    if len(batch) >= batch_size:
-                        yield from batch
-                        batch.clear()
-                        gc.collect()  # Help clean up path strings
+                    if len(batch) >= batch_size * 5:
+                        gc.collect()
                         
             # Yield remaining files
             if batch:
@@ -89,7 +87,6 @@ def find_matching_files(
             
     # Clear text files set
     text_files.clear()
-    gc.collect()
 
 def safe_file_write(path: str, data: bytes) -> bool:
     """Write file atomically using temporary file with proper cleanup."""
@@ -149,10 +146,6 @@ def cleanup_temp_files(
                     tmp_file.unlink()
                     count += 1
                     
-                    # Periodic GC to prevent memory buildup during large cleanups
-                    if count % 1000 == 0:
-                        gc.collect()
-                        
             except Exception as e:
                 logger.error(f"Error deleting {tmp_file}: {e}")
                 

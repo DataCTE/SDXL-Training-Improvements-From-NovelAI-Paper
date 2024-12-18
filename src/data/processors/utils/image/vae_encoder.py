@@ -65,7 +65,7 @@ class VAEEncoder:
         latents_list = []
         
         try:
-            sub_batch_size = min(8, batch_size)
+            sub_batch_size = min(64, batch_size)
             
             # Define synchronous encoding function
             def _encode_sub_batch(sub_batch):
@@ -80,11 +80,9 @@ class VAEEncoder:
                 sub_batch = pixel_values[i:i+sub_batch_size]
                 
                 try:
-                    # Run encoding in thread pool and await result
                     latents = await asyncio.to_thread(_encode_sub_batch, sub_batch)
                     latents_list.append(latents)
                     del sub_batch
-                    
                 except RuntimeError as e:
                     logger.error(f"Error encoding sub-batch {i}: {str(e)[:200]}...")
                     latents_list.append(torch.zeros(
@@ -93,9 +91,6 @@ class VAEEncoder:
                         device=self.config.device
                     ))
                 
-                if i % (sub_batch_size * 4) == 0:
-                    torch.cuda.empty_cache()
-            
             result = torch.cat(latents_list, dim=0)
             del latents_list
             return result

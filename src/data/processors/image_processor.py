@@ -10,7 +10,7 @@ import asyncio
 import gc
 
 # Internal imports from utils
-from src.data.processors.utils.system_utils import get_gpu_memory_usage, get_optimal_workers, create_thread_pool
+from src.data.processors.utils.system_utils import get_gpu_memory_usage, get_optimal_workers, create_thread_pool, cleanup_processor
 from src.data.processors.utils.image_utils import load_and_validate_image, resize_image, get_image_stats
 from src.data.processors.utils.image.vae_encoder import VAEEncoder
 from src.config.config import VAEEncoderConfig  # Import the consolidated config
@@ -163,9 +163,9 @@ class ImageProcessor:
 
     @torch.no_grad()
     async def process_batch(
-        self, 
-        images: List[Image.Image], 
-        width: int, 
+        self,
+        images: List[Image.Image],
+        width: int,
         height: int
     ) -> List[torch.Tensor]:
         """Process a batch of images with optimized speed and memory management."""
@@ -176,29 +176,26 @@ class ImageProcessor:
         processed_tensors = []
         
         try:
-            # Calculate optimal batch size
             available_memory = torch.cuda.get_device_properties(self.config.device).total_memory
             memory_per_image = width * height * 4 * 4
+            
             optimal_batch_size = min(
-                max(4, int(available_memory * 0.3 / memory_per_image)),
-                16,
+                max(8, int(available_memory * 0.4 / memory_per_image)),
+                128,
                 batch_size
             )
             
             for i in range(0, batch_size, optimal_batch_size):
                 sub_batch = images[i:i + optimal_batch_size]
                 
-                # Process images in parallel
                 preprocessing_tasks = [
                     asyncio.to_thread(self.preprocess, img, width, height)
                     for img in sub_batch
                 ]
-                
                 sub_processed = await asyncio.gather(*preprocessing_tasks)
                 sub_processed = [t for t in sub_processed if t is not None]
                 
                 if sub_processed:
-                    # Move tensors to GPU directly without pinning
                     batch_tensor = torch.stack(sub_processed).to(
                         self.config.device, 
                         non_blocking=True
@@ -207,21 +204,17 @@ class ImageProcessor:
                     
                     if self.vae_encoder is not None:
                         try:
-                            # Process through VAE
                             encoded = await self.vae_encoder.encode_batch(batch_tensor)
-                            
-                            # Move results to CPU
                             for tensor in encoded:
                                 processed_tensors.append(tensor.cpu())
                             del encoded
-                            
                         except Exception as e:
                             logger.error(f"VAE encoding error: {str(e)[:200]}...")
                             for _ in range(len(batch_tensor)):
                                 processed_tensors.append(
-                                    torch.zeros((4, height//8, width//8), 
-                                    dtype=self.config.dtype, 
-                                    device='cpu')
+                                    torch.zeros((4, height//8, width//8),
+                                                dtype=self.config.dtype,
+                                                device='cpu')
                                 )
                     else:
                         for tensor in batch_tensor:
@@ -229,10 +222,6 @@ class ImageProcessor:
                     
                     del batch_tensor
                     
-                    # Cleanup periodically
-                    if i % (optimal_batch_size * 2) == 0:
-                        torch.cuda.empty_cache()
-            
             return processed_tensors
             
         except Exception as e:
@@ -404,35 +393,9 @@ class ImageProcessor:
         return width, height
 
     async def cleanup(self):
-        """Clean up resources."""
-        try:
-            # Clean up thread pool
-            if hasattr(self, 'executor'):
-                self.executor.shutdown(wait=True)
-            
-            # Clean up VAE encoder
-            if self.vae_encoder and hasattr(self.vae_encoder, 'cleanup'):
-                await self.vae_encoder.cleanup()
-            
-            # Clear tensor buffer
-            if hasattr(self, 'tensor_buffer'):
-                del self.tensor_buffer
-            
-            # Clear transform pipeline
-            if hasattr(self, 'transform'):
-                del self.transform
-            
-            # Clear CUDA cache and force garbage collection
-            torch.cuda.empty_cache()
-            gc.collect()
-            
-            logger.info("Successfully cleaned up image processor resources")
-            
-        except Exception as e:
-            logger.error(f"Error during cleanup: {str(e)}")
+        await cleanup_processor(self)
 
     def __del__(self):
-        """Ensure cleanup when object is deleted."""
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():

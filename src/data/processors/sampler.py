@@ -20,6 +20,7 @@ from src.data.processors.utils.progress_utils import (
 from src.data.processors.bucket import BucketManager
 from src.data.processors.utils.thread_config import get_optimal_thread_config
 from src.data.processors.batch_processor import BatchProcessor
+from src.data.processors.utils.system_utils import cleanup_processor
 
 logger = logging.getLogger(__name__)
 
@@ -335,28 +336,7 @@ class AspectBatchSampler(Sampler[List[int]]):
 
     async def cleanup(self):
         """Clean up sampler resources."""
-        try:
-            # Clean up batch processor
-            if hasattr(self, 'batch_processor'):
-                await self.batch_processor.cleanup()
-                del self.batch_processor
-            
-            # Clear bucket references
-            if hasattr(self, 'bucket_manager'):
-                del self.bucket_manager
-            
-            # Clear dataset reference
-            if hasattr(self, 'dataset'):
-                del self.dataset
-            
-            # Clear any remaining data
-            gc.collect()
-            torch.cuda.empty_cache()
-            
-            logger.info("Successfully cleaned up sampler resources")
-            
-        except Exception as e:
-            logger.error(f"Error during sampler cleanup: {e}")
+        await cleanup_processor(self)
 
     def __del__(self):
         """Ensure cleanup when sampler is deleted."""

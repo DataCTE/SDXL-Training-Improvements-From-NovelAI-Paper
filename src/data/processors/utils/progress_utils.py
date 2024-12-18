@@ -130,25 +130,26 @@ def log_progress(
     callback: Optional[Callable[[Dict[str, Any]], None]] = None
 ) -> None:
     """Log progress with optional extra statistics and callback."""
-    progress_msg = (
-        f"{prefix}Progress: {stats.processed_items}/{stats.total_items} "
-        f"({stats.progress*100:.1f}%)\n"
-        f"Performance:\n"
-        f"- Processing rate: {stats.rate:.1f} items/s\n"
-        f"- Memory usage: {stats.memory_usage_gb:.1f}GB\n"
-        f"- Failed items: {stats.failed_items}\n"
-        f"- Cache hits/misses: {stats.cache_hits}/{stats.cache_misses}\n"
-        f"- Elapsed: {format_time(stats.elapsed)}\n"
-        f"- ETA: {format_time(stats.eta_seconds)}"
-    )
-    
-    if extra_stats:
-        stats_msg = "\nExtra stats:\n" + "\n".join(
-            f"- {k}: {v}" for k, v in extra_stats.items()
+    if stats.should_log(interval=10.0):
+        progress_msg = (
+            f"{prefix}Progress: {stats.processed_items}/{stats.total_items} "
+            f"({stats.progress*100:.1f}%)\n"
+            f"Performance:\n"
+            f"- Processing rate: {stats.rate:.1f} items/s\n"
+            f"- Memory usage: {stats.memory_usage_gb:.1f}GB\n"
+            f"- Failed items: {stats.failed_items}\n"
+            f"- Cache hits/misses: {stats.cache_hits}/{stats.cache_misses}\n"
+            f"- Elapsed: {format_time(stats.elapsed)}\n"
+            f"- ETA: {format_time(stats.eta_seconds)}"
         )
-        progress_msg += stats_msg
         
-    logger.info(progress_msg)
-    
-    if callback:
-        callback(stats.get_stats())
+        if extra_stats:
+            stats_msg = "\nExtra stats:\n" + "\n".join(
+                f"- {k}: {v}" for k, v in extra_stats.items()
+            )
+            progress_msg += stats_msg
+            
+        logger.info(progress_msg)
+        
+        if callback:
+            callback(stats.get_stats())

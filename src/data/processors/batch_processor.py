@@ -18,7 +18,8 @@ from src.data.processors.utils.system_utils import (
     create_thread_pool,
     get_optimal_workers,
     get_gpu_memory_usage,
-    get_memory_usage_gb
+    get_memory_usage_gb,
+    cleanup_processor
 )
 from src.data.processors.utils.progress_utils import (
     log_progress,
@@ -217,30 +218,17 @@ class BatchProcessor(GenericBatchProcessor):
 
     async def cleanup(self):
         """Clean up resources asynchronously."""
+        await cleanup_processor(self)
+
+    def __del__(self):
         try:
-            # Clean up thread pool
-            if hasattr(self, 'thread_pool'):
-                self.thread_pool.shutdown(wait=True)
-            
-            # Clean up processors
-            if hasattr(self.image_processor, 'cleanup'):
-                await self.image_processor.cleanup()
-            if hasattr(self.text_processor, 'cleanup'):
-                await self.text_processor.cleanup()
-            
-            # Clean up cache manager
-            if hasattr(self.cache_manager, 'cleanup'):
-                await self.cache_manager.cleanup()
-            
-            # Clear CUDA cache
-            if self.config.device.type == 'cuda':
-                torch.cuda.empty_cache()
-                
-            logger.info("Successfully cleaned up batch processor resources")
-            
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(self.cleanup())
+            else:
+                loop.run_until_complete(self.cleanup())
         except Exception as e:
-            logger.error(f"Error during cleanup: {str(e)}")
-            # Don't re-raise as this is cleanup code
+            logger.error(f"Error during batch processor deletion: {e}")
 
     async def process_batch(
         self,
@@ -253,14 +241,14 @@ class BatchProcessor(GenericBatchProcessor):
         try:
             tracker = create_progress_tracker(
                 total_items=len(batch_items),
-                batch_size=min(4, self.config.batch_size),
+                batch_size=min(8, self.config.batch_size),
                 device=self.config.device
             )
             
             processed_items = []
             
-            # Process in very small sub-batches
-            sub_batch_size = min(4, self.config.batch_size)
+            # Process in somewhat larger sub-batches
+            sub_batch_size = min(8, self.config.batch_size)
             for i in range(0, len(batch_items), sub_batch_size):
                 sub_batch = batch_items[i:i + sub_batch_size]
                 
@@ -333,8 +321,6 @@ class BatchProcessor(GenericBatchProcessor):
                             del img
                             del img_tensor
                             del processed_item
-                            gc.collect()
-                            torch.cuda.empty_cache()
                             await asyncio.sleep(0.01)
                             
                     except Exception as e:
@@ -342,8 +328,7 @@ class BatchProcessor(GenericBatchProcessor):
                         update_tracker(tracker, failed=1, error_type=type(e).__name__)
                     
                     # Clear memory after each item
-                    gc.collect()
-                    torch.cuda.empty_cache()
+                    await asyncio.sleep(0.01)
                 
                 # Clear CUDA cache after each sub-batch
                 torch.cuda.empty_cache()

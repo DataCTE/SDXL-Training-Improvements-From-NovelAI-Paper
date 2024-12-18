@@ -197,7 +197,7 @@ class MemoryCache:
     def _auto_cleanup(self) -> None:
         """Periodically force garbage collection."""
         current_time = time.time()
-        if current_time - self._last_cleanup > 300:  # Every 5 minutes
+        if current_time - self._last_cleanup > 600:
             self.clear(force_gc=True)
             self._last_cleanup = current_time
     
@@ -233,3 +233,43 @@ class MemoryCache:
             "hit_rate": self.hits / total if total > 0 else 0,
             "memory_usage_mb": get_memory_usage_gb() * 1024
         } 
+
+async def cleanup_processor(obj):
+    try:
+        # Thread pool
+        if hasattr(obj, 'executor'):
+            obj.executor.shutdown(wait=True)
+
+        # VAE encoder memory
+        if hasattr(obj, 'vae_encoder'):
+            if hasattr(obj.vae_encoder, 'cleanup'):
+                await obj.vae_encoder.cleanup()
+
+        # Text embedder
+        if hasattr(obj, 'text_embedder'):
+            if hasattr(obj.text_embedder, 'cleanup'):
+                await obj.text_embedder.cleanup()
+
+        # Tag weighter
+        if hasattr(obj, 'tag_weighter'):
+            if hasattr(obj.tag_weighter, 'cleanup'):
+                await obj.tag_weighter.cleanup()
+        
+        # Transform / buffer cleanup
+        if hasattr(obj, 'transform'):
+            del obj.transform
+        if hasattr(obj, 'tensor_buffer'):
+            del obj.tensor_buffer
+
+        # Other references
+        for attr_name in dir(obj):
+            ref = getattr(obj, attr_name)
+            if isinstance(ref, torch.Tensor):
+                del ref
+        
+        # Clear caches
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        gc.collect()
+    
+    except Exception as e:
+        logger.error(f"Cleanup error: {str(e)}") 

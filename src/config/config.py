@@ -3,8 +3,21 @@ from typing import List, Tuple, Optional, Literal, Union
 import yaml
 import torch
 
+# Common default values
+DEFAULT_BATCH_SIZE = 32
+DEFAULT_NUM_WORKERS = 16
+DEFAULT_PREFETCH_FACTOR = 2
+DEFAULT_MODEL_NAME = "stabilityai/stable-diffusion-xl-base-1.0"
+DEFAULT_MAX_TOKEN_LENGTH = 77
+DEFAULT_CACHE_DIR = "cache"
+DEFAULT_IMAGE_SIZE = (1024, 1024)
+DEFAULT_MAX_IMAGE_SIZE = (2048, 2048)
+DEFAULT_MIN_IMAGE_SIZE = (256, 256)
 
-
+# Common learning rates
+DEFAULT_LR = 4.0e-7
+DEFAULT_VAE_LR = 4.5e-5
+DEFAULT_DISC_LR = 4.5e-5
 
 @dataclass
 class VAEModelConfig:
@@ -24,20 +37,20 @@ class ModelConfig:
     rho: float = 7.0
     num_timesteps: int = 1000
     min_snr_gamma: float = 0.1
-    pretrained_model_name: str = "stabilityai/stable-diffusion-xl-base-1.0"
+    pretrained_model_name: str = DEFAULT_MODEL_NAME
     hidden_size: int = 768
     cross_attention_dim: int = 2048
 
 @dataclass
 class TrainingConfig:
-    batch_size: int = 32
+    batch_size: int = DEFAULT_BATCH_SIZE
     gradient_accumulation_steps: int = 4
-    learning_rate: float = 4.0e-7
-    vae_learning_rate: float = 4.5e-5
+    learning_rate: float = DEFAULT_LR
+    vae_learning_rate: float = DEFAULT_VAE_LR
     vae_warmup_steps: int = 1000
     vae_min_lr: float = 1e-6
     use_discriminator: bool = True
-    discriminator_learning_rate: float = 4.5e-5
+    discriminator_learning_rate: float = DEFAULT_DISC_LR
     num_epochs: int = 10
     save_steps: int = 1000
     log_steps: int = 10
@@ -72,10 +85,10 @@ class TrainingConfig:
 @dataclass
 class DataConfig:
     image_dirs: List[str]
-    image_size: Tuple[int, int] = (1024, 1024)
-    max_image_size: Tuple[int, int] = (2048, 2048)
-    min_image_size: Union[Tuple[int, int], int] = (256, 256)
-    max_dim: int = 2048
+    image_size: Tuple[int, int] = DEFAULT_IMAGE_SIZE
+    max_image_size: Tuple[int, int] = DEFAULT_MAX_IMAGE_SIZE
+    min_image_size: Union[Tuple[int, int], int] = DEFAULT_MIN_IMAGE_SIZE
+    max_dim: int = 4194304
     bucket_step: int = 8
     min_bucket_size: int = 16
     min_bucket_resolution: Optional[int] = None
@@ -83,20 +96,20 @@ class DataConfig:
     max_aspect_ratio: float = 2.0
     
     # Cache settings
-    cache_dir: str = "latent_cache"
+    cache_dir: str = DEFAULT_CACHE_DIR
     text_cache_dir: str = "text_cache"
     use_caching: bool = True
     
     # Text settings
-    max_token_length: int = 77  # Default CLIP token length
+    max_token_length: int = DEFAULT_MAX_TOKEN_LENGTH
     
     # VAE settings
-    vae_batch_size: int = 32
+    vae_batch_size: int = DEFAULT_BATCH_SIZE
     vae_image_size: Tuple[int, int] = (256, 256)
     vae_validation_split: float = 0.1
     
     # DataLoader settings
-    num_workers: int = 16
+    num_workers: int = DEFAULT_NUM_WORKERS
     pin_memory: bool = True
     persistent_workers: bool = True
     shuffle: bool = True
@@ -138,15 +151,13 @@ class ScoringConfig:
 @dataclass
 class SystemConfig:
     # Essential settings
-    enable_xformers: bool = True  # Only memory optimization we'll keep
-    gradient_checkpointing: bool = True  # Essential for SDXL
-    mixed_precision: str = "bf16"  # Essential for training
-    gradient_accumulation_steps: int = 4  # Essential for training
-    channels_last: bool = True  # Memory format optimization
+    enable_xformers: bool = True
+    gradient_checkpointing: bool = True
+    mixed_precision: str = "bf16"
+    gradient_accumulation_steps: int = 4
+    channels_last: bool = True
     
     def __init__(self, **kwargs):
-        """Initialize with support for legacy fields."""
-        # List of fields we want to keep
         valid_fields = {
             'enable_xformers',
             'gradient_checkpointing',
@@ -154,11 +165,7 @@ class SystemConfig:
             'gradient_accumulation_steps',
             'channels_last'
         }
-        
-        # Filter to only keep essential fields
         valid_kwargs = {k: v for k, v in kwargs.items() if k in valid_fields}
-        
-        # Set attributes
         for key, value in valid_kwargs.items():
             setattr(self, key, value)
 
@@ -172,14 +179,10 @@ class PathsConfig:
 
 @dataclass
 class NovelAIDatasetConfig:
-    """Configuration for NovelAI dataset."""
-    # Required parameter first
-    model_name: str  # Required for text embedder
-    
-    # Optional parameters with defaults after
-    image_size: Tuple[int, int] = (1024, 1024)
-    max_image_size: Tuple[int, int] = (2048, 2048)
-    min_image_size: Union[Tuple[int, int], int] = (256, 256)
+    model_name: str = DEFAULT_MODEL_NAME
+    image_size: Tuple[int, int] = DEFAULT_IMAGE_SIZE
+    max_image_size: Tuple[int, int] = DEFAULT_MAX_IMAGE_SIZE
+    min_image_size: Union[Tuple[int, int], int] = DEFAULT_MIN_IMAGE_SIZE
     max_dim: int = 2048
     
     # Bucket settings
@@ -190,14 +193,14 @@ class NovelAIDatasetConfig:
     max_aspect_ratio: float = 2.0
     
     # Cache settings
-    cache_dir: str = "cache"
+    cache_dir: str = DEFAULT_CACHE_DIR
     text_cache_dir: str = "text_cache"
     use_caching: bool = True
     
     # Dataset settings
     proportion_empty_prompts: float = 0.0
     max_consecutive_batch_samples: int = 2
-    max_token_length: int = 77  # Default CLIP token length
+    max_token_length: int = DEFAULT_MAX_TOKEN_LENGTH
     
     # Tag weighting settings
     tag_weighting: TagWeighterConfig = field(default_factory=TagWeighterConfig)
@@ -220,7 +223,6 @@ class NovelAIDatasetConfig:
 
 @dataclass
 class DeviceConfig:
-    """Base configuration for device and memory settings."""
     device: torch.device = torch.device('cuda')
     dtype: torch.dtype = torch.float16
     max_memory_usage: float = 0.9
@@ -228,23 +230,26 @@ class DeviceConfig:
 
 @dataclass
 class CacheConfig:
-    """Base configuration for caching."""
     use_caching: bool = True
-    cache_dir: str = "cache"
+    cache_dir: str = DEFAULT_CACHE_DIR
 
 @dataclass
 class ImageSizeConfig:
-    """Base configuration for image dimensions."""
-    max_image_size: Tuple[int, int] = (2048, 2048)
-    min_image_size: Tuple[int, int] = (256, 256)
+    max_size: Tuple[int, int] = DEFAULT_MAX_IMAGE_SIZE
+    min_size: Tuple[int, int] = DEFAULT_MIN_IMAGE_SIZE
+    target_size: Tuple[int, int] = DEFAULT_IMAGE_SIZE
+    max_dim: int = 4194304
+    bucket_step: int = 64
+    min_bucket_resolution: int = 256 * 256
+    max_aspect_ratio: float = 4.0
+    bucket_tolerance: float = 0.2
 
 @dataclass
 class BatchProcessorConfig(DeviceConfig):
-    """Configuration for batch processing."""
-    batch_size: int = 32
-    prefetch_factor: int = 2
+    batch_size: int = DEFAULT_BATCH_SIZE
+    prefetch_factor: int = DEFAULT_PREFETCH_FACTOR
     log_interval: float = 5.0
-    num_workers: int = 16
+    num_workers: int = DEFAULT_NUM_WORKERS
     
     # Batch size adjustment settings
     min_batch_size: int = 1
@@ -257,31 +262,25 @@ class BatchProcessorConfig(DeviceConfig):
     high_memory_threshold: float = 0.95
 
 @dataclass
-class VAEEncoderConfig(DeviceConfig, ImageSizeConfig):
-    """Configuration for VAE encoding and image processing."""
+class VAEEncoderConfig(DeviceConfig):
     enable_vae_slicing: bool = True
-    vae_batch_size: int = 32
-    num_workers: int = 16
-    prefetch_factor: int = 2
+    vae_batch_size: int = DEFAULT_BATCH_SIZE
+    num_workers: int = DEFAULT_NUM_WORKERS
+    prefetch_factor: int = DEFAULT_PREFETCH_FACTOR
     
     # Image normalization settings
     normalize_mean: Tuple[float, ...] = (0.5, 0.5, 0.5)
     normalize_std: Tuple[float, ...] = (0.5, 0.5, 0.5)
 
 @dataclass
-class BucketConfig(ImageSizeConfig):
-    """Configuration for image bucketing."""
-    bucket_step: int = 64
-    min_bucket_resolution: int = 2048 * 2048
-    max_aspect_ratio: float = 4.0
+class BucketConfig:
     bucket_tolerance: float = 0.2
 
 @dataclass
 class TextProcessorConfig(DeviceConfig, CacheConfig):
-    """Configuration for text processing."""
-    num_workers: int = 16
-    batch_size: int = 32
-    max_token_length: int = 77
+    num_workers: int = DEFAULT_NUM_WORKERS
+    batch_size: int = DEFAULT_BATCH_SIZE
+    max_token_length: int = DEFAULT_MAX_TOKEN_LENGTH
     
     # Tag weighting settings
     enable_tag_weighting: bool = True
@@ -290,17 +289,16 @@ class TextProcessorConfig(DeviceConfig, CacheConfig):
 
 @dataclass
 class TextEmbedderConfig(DeviceConfig):
-    """Configuration for text embedding."""
-    max_length: int = 77  # Default CLIP token length
-    batch_size: int = 32
-    model_name: str = "stabilityai/stable-diffusion-xl-base-1.0"
+    max_length: int = DEFAULT_MAX_TOKEN_LENGTH
+    batch_size: int = DEFAULT_BATCH_SIZE
+    model_name: str = DEFAULT_MODEL_NAME
     
     # Model settings
     use_fast_tokenizer: bool = True
     low_cpu_mem_usage: bool = True
     
     # Performance settings
-    growth_factor: float = 0.3  # Conservative growth for text embedding
+    growth_factor: float = 0.3
     proportion_empty_prompts: float = 0.0
     
     # Subfolder settings
@@ -311,10 +309,9 @@ class TextEmbedderConfig(DeviceConfig):
 
 @dataclass
 class GlobalConfig:
-    """Global configuration settings shared across all components."""
-    image_sizes: ImageSizeConfig = field(default_factory=ImageSizeConfig)
     device: DeviceConfig = field(default_factory=DeviceConfig)
     cache: CacheConfig = field(default_factory=CacheConfig)
+    image: ImageSizeConfig = field(default_factory=ImageSizeConfig)
 
 @dataclass
 class Config:
@@ -342,11 +339,29 @@ class Config:
             component.max_memory_usage = self.global_config.device.max_memory_usage
             component.enable_memory_efficient_attention = self.global_config.device.enable_memory_efficient_attention
 
-        # Apply image size settings where needed
-        self.vae_encoder.max_image_size = self.global_config.image_sizes.max_image_size
-        self.vae_encoder.min_image_size = self.global_config.image_sizes.min_image_size
-        self.bucket.max_image_size = self.global_config.image_sizes.max_image_size
-        self.bucket.min_image_size = self.global_config.image_sizes.min_image_size
+        # Apply image size settings to DataConfig
+        self.data.image_size = self.global_config.image.target_size
+        self.data.max_image_size = self.global_config.image.max_size
+        self.data.min_image_size = self.global_config.image.min_size
+        self.data.max_dim = self.global_config.image.max_dim
+        self.data.bucket_step = self.global_config.image.bucket_step
+        self.data.min_bucket_resolution = self.global_config.image.min_bucket_resolution
+        self.data.max_aspect_ratio = self.global_config.image.max_aspect_ratio
+        self.data.bucket_tolerance = self.global_config.image.bucket_tolerance
+
+        # Apply image size settings to NovelAIDatasetConfig
+        if hasattr(self, 'novel_ai'):
+            self.novel_ai.image_size = self.global_config.image.target_size
+            self.novel_ai.max_image_size = self.global_config.image.max_size
+            self.novel_ai.min_image_size = self.global_config.image.min_size
+            self.novel_ai.max_dim = self.global_config.image.max_dim
+            self.novel_ai.bucket_step = self.global_config.image.bucket_step
+            self.novel_ai.min_bucket_resolution = self.global_config.image.min_bucket_resolution
+            self.novel_ai.max_aspect_ratio = self.global_config.image.max_aspect_ratio
+            self.novel_ai.bucket_tolerance = self.global_config.image.bucket_tolerance
+
+        # Apply bucket settings
+        self.bucket.bucket_tolerance = self.global_config.image.bucket_tolerance
 
     @classmethod
     def from_yaml(cls, path: str) -> 'Config':

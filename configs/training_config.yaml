@@ -1,36 +1,31 @@
-# Model configuration
-model:
-  sigma_data: 1.0
-  sigma_min: 0.002
-  sigma_max: 20000.0
-  rho: 7.0
-  num_timesteps: 1000
-  min_snr_gamma: 0.1
-  pretrained_model_name: "stabilityai/stable-diffusion-xl-base-1.0"
-
-# Training configuration
+# ===== Training Configuration =====
 training:
+  # Core training settings
   batch_size: 32
-  gradient_accumulation_steps: 4
+  num_epochs: 10
   learning_rate: 4.0e-7
+  gradient_accumulation_steps: 4
+  
+  # VAE training settings
   vae_learning_rate: 4.5e-5
   vae_warmup_steps: 1000
   vae_min_lr: 1e-6
+  vae_validation_split: 0.1
   use_discriminator: true
   discriminator_learning_rate: 4.5e-5
-  num_epochs: 10
-  save_steps: 1000
-  log_steps: 10
-  mixed_precision: "bf16"
+  
+  # Optimizer settings
   weight_decay: 1.0e-2
   optimizer_eps: 1.0e-8
   optimizer_betas: [0.9, 0.999]
+  max_grad_norm: 1.0
   
-  # Learning rate scheduler settings
+  # Learning rate scheduler
   lr_scheduler: "none"  # Options: "cosine", "linear", "none"
   max_train_steps: null  # Will be calculated from num_epochs if not set
   warmup_steps: 0
   
+  # Prediction and timestep settings
   prediction_type: "v_prediction"
   timestep_bias_strategy: "none"
   timestep_bias_multiplier: 1.0
@@ -38,85 +33,40 @@ training:
   timestep_bias_end: 1000
   timestep_bias_portion: 0.25
   snr_gamma: 5.0
-  max_grad_norm: 1.0
+  
+  # Checkpointing and logging
+  save_steps: 1000
+  log_steps: 10
   early_stopping_patience: 5
   early_stopping_threshold: 0.01
   
-  # Add wandb settings
+  # Wandb settings
   use_wandb: true
   wandb_project: "sdxl-training"
   wandb_run_name: null
   wandb_tags: []
 
-# Data configuration
-data:
-  image_dirs: [
-    "/workspace/collage",
-    "/workspace/upscaled",
-    "/workspace/High-quality-photo10k",
-    "/workspace/LAION_220k_GPT4Vision_captions",
-    "/workspace/photo-concept-bucket/train"
-  ]
-  image_size: [1024, 1024]
-  max_dim: 2048
-  bucket_step: 8
-  min_bucket_size: 16
-  min_bucket_resolution: null
-  bucket_tolerance: 0.2
-  max_aspect_ratio: 2.0
-  
-  # Cache settings
-  cache_dir: "latent_cache"
-  text_cache_dir: "text_cache"
-  use_caching: true
-  
-  # VAE settings
-  vae_validation_split: 0.1
-  
-  # DataLoader settings
-  num_workers: 32
-  pin_memory: true
-  persistent_workers: true
-  shuffle: true
-  proportion_empty_prompts: 0.0
+# ===== Model Configuration =====
+model:
+  pretrained_model_name: "stabilityai/stable-diffusion-xl-base-1.0"
+  sigma_data: 1.0
+  sigma_min: 0.002
+  sigma_max: 20000.0
+  rho: 7.0
+  num_timesteps: 1000
+  min_snr_gamma: 0.1
+  hidden_size: 768
+  cross_attention_dim: 2048
 
-# Tag weighting configuration
-tag_weighting:
-  default_weight: 1.0
-  min_weight: 0.1
-  max_weight: 3.0
-  smoothing_factor: 0.0001
-  dtype: "float32"
-
-# Scoring configuration
-scoring:
-  aesthetic_score: 6.0
-  crop_score: 3.0
-
-# System configuration
+# ===== System Configuration =====
 system:
-  # Essential settings only
-  enable_xformers: true  # Memory-efficient attention
-  gradient_checkpointing: true  # Essential for SDXL
-  mixed_precision: "bf16"  # Essential for training
-  gradient_accumulation_steps: 4  # Essential for training
-  channels_last: true  # Memory format optimization
+  mixed_precision: "bf16"
+  enable_xformers: true
+  gradient_checkpointing: true
+  channels_last: true
 
-# Paths configuration
-paths:
-  checkpoints_dir: "checkpoints"
-  logs_dir: "logs"
-  output_dir: "outputs"
-  vae_checkpoints_dir: "vae_checkpoints"
-  vae_samples_dir: "vae_samples"
-
-# Global configuration settings
+# ===== Global Settings =====
 global_config:
-  # Image size settings
-  image_sizes:
-    max_image_size: [2048, 2048]
-    min_image_size: [256, 256]
-  
   # Device settings
   device:
     device: "cuda"
@@ -124,12 +74,45 @@ global_config:
     max_memory_usage: 0.9
     enable_memory_efficient_attention: true
   
+  # Image settings
+  image:
+    max_size: [2048, 2048]
+    min_size: [256, 256]
+    target_size: [1024, 1024]  # Default training size
+    max_dim: 4194304
+    bucket_step: 64  # Step size for bucket dimensions
+    min_bucket_resolution: 65536  # 256 * 256
+    max_aspect_ratio: 4.0  # Maximum width/height ratio
+  
   # Cache settings
   cache:
     use_caching: true
     cache_dir: "cache"
 
-# VAE encoder configuration section
+# ===== Processing Components =====
+# Text processing
+text_processor:
+  num_workers: 16
+  batch_size: 32
+  max_token_length: 77
+  enable_tag_weighting: true
+  tag_frequency_threshold: 5
+  tag_weight_smoothing: 0.1
+
+text_embedder:
+  max_length: 77
+  batch_size: 32
+  model_name: "stabilityai/stable-diffusion-xl-base-1.0"
+  use_fast_tokenizer: true
+  low_cpu_mem_usage: true
+  growth_factor: 0.3
+  proportion_empty_prompts: 0.0
+  tokenizer_subfolder: "tokenizer"
+  tokenizer_2_subfolder: "tokenizer_2"
+  text_encoder_subfolder: "text_encoder"
+  text_encoder_2_subfolder: "text_encoder_2"
+
+# Image processing
 vae_encoder:
   enable_vae_slicing: true
   vae_batch_size: 32
@@ -138,16 +121,8 @@ vae_encoder:
   normalize_mean: [0.5, 0.5, 0.5]
   normalize_std: [0.5, 0.5, 0.5]
 
-# Bucket configuration section
-bucket:
-  bucket_step: 64
-  min_bucket_resolution: 4194304  # 2048 * 2048
-  max_aspect_ratio: 4.0
-  bucket_tolerance: 0.2
-
-# Batch processor configuration section
+# Batch processing
 batch_processor:
-  <<: *device_base
   batch_size: 32
   prefetch_factor: 2
   log_interval: 5.0
@@ -161,33 +136,43 @@ batch_processor:
   cleanup_interval: 1000
   high_memory_threshold: 0.95
 
-# Text processor configuration section
-text_processor:
-  <<: *device_base
-  <<: *cache_base
-  num_workers: 16
-  batch_size: 32
-  max_token_length: 77
-  enable_tag_weighting: true
-  tag_frequency_threshold: 5
-  tag_weight_smoothing: 0.1
+# Image bucketing
+bucket:
+  bucket_tolerance: 0.2
 
-# Text embedder configuration section
-text_embedder:
-  max_length: 77
-  batch_size: 32
-  model_name: "stabilityai/stable-diffusion-xl-base-1.0"
-  
-  # Model settings
-  use_fast_tokenizer: true
-  low_cpu_mem_usage: true
-  
-  # Performance settings
-  growth_factor: 0.3
+# ===== Data Configuration =====
+data:
+  image_dirs: [
+    "/workspace/collage",
+    "/workspace/upscaled",
+    "/workspace/High-quality-photo10k",
+    "/workspace/LAION_220k_GPT4Vision_captions",
+    "/workspace/photo-concept-bucket/train"
+  ]
+  num_workers: 32
+  pin_memory: true
+  persistent_workers: true
+  shuffle: true
   proportion_empty_prompts: 0.0
-  
-  # Subfolder settings
-  tokenizer_subfolder: "tokenizer"
-  tokenizer_2_subfolder: "tokenizer_2"
-  text_encoder_subfolder: "text_encoder"
-  text_encoder_2_subfolder: "text_encoder_2"
+
+# ===== Auxiliary Configuration =====
+# Tag weighting
+tag_weighting:
+  default_weight: 1.0
+  min_weight: 0.1
+  max_weight: 3.0
+  smoothing_factor: 0.0001
+  dtype: "float32"
+
+# Scoring
+scoring:
+  aesthetic_score: 6.0
+  crop_score: 3.0
+
+# Paths
+paths:
+  checkpoints_dir: "checkpoints"
+  logs_dir: "logs"
+  output_dir: "outputs"
+  vae_checkpoints_dir: "vae_checkpoints"
+  vae_samples_dir: "vae_samples"
