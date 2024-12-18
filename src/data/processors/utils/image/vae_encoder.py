@@ -160,17 +160,18 @@ class VAEEncoder:
         try:
             # Check cache
             cache_key = self._get_cache_key(images)
-            if cached_latents := self.latent_cache.get(cache_key):
+            cached_latents = self.latent_cache.get(cache_key)
+            if cached_latents is not None:
                 return cached_latents
 
             # Process in optimal chunks
             chunks = self._get_optimal_chunks(images)
             latents = await self._process_chunks_parallel(chunks, keep_on_gpu)
 
+            # Only cache if we got valid results
             if latents is not None:
-                # Cache results
                 self.latent_cache[cache_key] = latents
-                
+
             return latents
 
         except Exception as e:
@@ -189,12 +190,17 @@ class VAEEncoder:
                 result = await asyncio.get_event_loop().run_in_executor(
                     None, self._process_chunk, chunk, keep_on_gpu
                 )
-                results.append(result)
-            return self._combine_results(results)
+                if result is not None:
+                    results.append(result)
+            
+            # Only combine if we have results
+            if results:
+                return self._combine_results(results)
+            return None
 
         except Exception as e:
             logger.error(f"Error in parallel chunk processing: {e}")
-            raise
+            return None
 
     def _combine_results(self, results):
         """Combine processed chunks back into a single tensor."""
@@ -287,10 +293,12 @@ class VAEEncoder:
 
     def _get_cache_key(self, images: torch.Tensor) -> str:
         """
-        Generate a simple cache key based on shape, dtype, device, and possibly data hash.
-        Note: This is just a sample approach - ensure the key is robust enough for your use case.
+        Generate a cache key based on tensor properties.
+        Now returns a string instead of potentially returning a tensor.
         """
-        shape_str = "_".join([str(dim) for dim in images.shape])
+        shape_str = "_".join(str(dim) for dim in images.shape)
         dtype_str = str(images.dtype)
         device_str = str(images.device)
-        return f"{shape_str}_{dtype_str}_{device_str}"
+        # Add a hash of the first few values to help distinguish different images
+        data_hash = hash(str(images[:, :, 0, 0].cpu().numpy().tobytes()[:1024]))
+        return f"{shape_str}_{dtype_str}_{device_str}_{data_hash}"
