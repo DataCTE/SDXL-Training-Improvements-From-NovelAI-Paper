@@ -72,11 +72,13 @@ class NovelAIDataset(Dataset):
             
             # Initialize components with progress tracking
             self.text_embedder = TextEmbedder(
-                pretrained_model_name_or_path=config.model_name,
-                device=device,
-                max_length=config.max_token_length,
-                enable_memory_efficient_attention=True,
-                max_memory_usage=0.8
+                config=TextEmbedderConfig(
+                    model_name=config.model_name,
+                    device=device,
+                    max_length=config.max_token_length,
+                    enable_memory_efficient_attention=True,
+                    max_memory_usage=0.8
+                )
             )
             update_tracker(tracker, processed=1)
 
