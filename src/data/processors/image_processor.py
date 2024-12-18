@@ -76,6 +76,15 @@ class ImageProcessor:
         # Enable torch optimizations
         self._enable_optimizations()
 
+        # Initialize hardware-optimized transforms
+        self._init_hardware_optimized_transforms()
+        
+        # Setup parallel processing pools
+        self._setup_parallel_processing()
+        
+        # Initialize memory pools
+        self._init_memory_pools()
+
         self.logger.info(
             f"Initialized ImageProcessor:\n"
             f"- Resolution: {config.resolution}\n"
@@ -370,3 +379,67 @@ class ImageProcessor:
         except Exception as e:
             self.logger.error(f"Failed to allocate tensor buffer: {e}")
             return None
+
+    def _init_hardware_optimized_transforms(self):
+        """Initialize hardware-optimized transforms."""
+        if torch.cuda.is_available():
+            # Use CuPy for faster image processing
+            import cupy as cp
+            self.use_gpu_transforms = True
+            self.gpu_transform = self._create_gpu_transform_pipeline()
+        else:
+            self.use_gpu_transforms = False
+
+    def _create_gpu_transform_pipeline(self):
+        """Create GPU-accelerated transform pipeline."""
+        @torch.compile
+        def gpu_transform(x):
+            # Optimized GPU transforms
+            x = self._gpu_normalize(x)
+            x = self._gpu_resize(x)
+            return x
+        return gpu_transform
+
+    @torch.compile(fullgraph=True)
+    def _gpu_normalize(self, x):
+        """Hardware-optimized normalization."""
+        return (x - self.norm_mean) / self.norm_std
+
+    async def process_image(self, image: Union[str, Path, "Image.Image"], **kwargs):
+        """Process image with hardware optimizations."""
+        try:
+            # Use parallel loading and processing
+            image_data = await self._parallel_load_and_preprocess(image)
+            
+            # Apply hardware-optimized transforms
+            if self.use_gpu_transforms:
+                image_tensor = await self._gpu_process_image(image_data)
+            else:
+                image_tensor = await self._cpu_process_image(image_data)
+
+            # Optimize memory transfers
+            if kwargs.get('keep_on_gpu', False):
+                image_tensor = image_tensor.to(
+                    self.config.device,
+                    non_blocking=True,
+                    memory_format=torch.channels_last
+                )
+
+            return self._create_result_dict(image_tensor, **kwargs)
+
+        except Exception as e:
+            logger.error(f"Error processing image: {str(e)}")
+            raise
+
+    async def _parallel_load_and_preprocess(self, image):
+        """Load and preprocess in parallel."""
+        async with asyncio.TaskGroup() as group:
+            load_task = group.create_task(self._async_load(image))
+            prep_task = group.create_task(self._async_preprocess(await load_task))
+        return await prep_task
+
+    @torch.compile
+    def _gpu_process_image(self, image_data):
+        """Process image using GPU acceleration."""
+        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+            return self.gpu_transform(image_data)
