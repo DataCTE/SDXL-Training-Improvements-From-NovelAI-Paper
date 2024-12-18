@@ -32,28 +32,20 @@ class VAEEncoder:
         self.vae.requires_grad_(False)
         self.vae.eval()
         
-        # Move to device and set dtype
-        self.vae.to(
-            device=config.device,
-            dtype=torch.float32  # VAE always uses float32 to avoid NaN losses
-        )
+        # Move to device and set dtype from config with fallback
+        dtype = getattr(torch, self.config.forced_dtype, torch.float32)
+        self.vae.to(device=self.config.device, dtype=dtype)
         
-        # Enable memory optimizations
-        if config.enable_vae_slicing:
+        # Conditionally enable slicing or xformers
+        if self.config.enable_vae_slicing:
             self.vae.enable_slicing()
-            
-        if config.enable_memory_efficient_attention:
-            if is_xformers_available():
-                self.vae.enable_xformers_memory_efficient_attention()
-            else:
-                logger.warning("xformers not available, using standard attention")
-                
-        logger.info(
-            f"Initialized VAE Encoder:\n"
-            f"- Device: {config.device}\n"
-            f"- Dtype: float32\n" 
-            f"- Slicing: {config.enable_vae_slicing}\n"
-            f"- Memory efficient attention: {config.enable_memory_efficient_attention}"
+        
+        if self.config.enable_xformers_attention and is_xformers_available():
+            self.vae.enable_xformers_memory_efficient_attention()
+        
+        logging.debug(
+            f"Initialized VAEEncoder with device={self.config.device}, dtype={dtype}, "
+            f"slicing={self.config.enable_vae_slicing}, xformers={self.config.enable_xformers_attention}"
         )
 
     @torch.no_grad()
@@ -109,56 +101,16 @@ class VAEEncoder:
         return tensor
 
     @torch.no_grad()
-    async def encode_batch(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        """Encode images through VAE with optimized batch processing."""
-        try:
-            batch_stats = {
-                'batch_size': pixel_values.shape[0],
-                'start_memory': get_gpu_memory_usage(self.config.device),
-                'start_time': time.time()
-            }
-            
-            batch_size = pixel_values.shape[0]
-            latents_list = []
-            
-            sub_batch_size = min(128, batch_size)
-            
-            compute_stream = torch.cuda.Stream()
-            
-            for i in range(0, batch_size, sub_batch_size):
-                end_idx = min(i + sub_batch_size, batch_size)
-                sub_batch = pixel_values[i:end_idx]
-                
-                with torch.cuda.stream(compute_stream):
-                    latents = self.vae.encode(sub_batch).latent_dist.sample()
-                    latents = latents * self.vae.config.scaling_factor
-                    latents_list.append(latents)
-                    
-                # Update stats
-                batch_stats.update({
-                    'sub_batches_processed': i // sub_batch_size + 1,
-                    'total_sub_batches': (batch_size + sub_batch_size - 1) // sub_batch_size
-                })
-                
-            result = torch.cat(latents_list, dim=0)
-            
-            # Log final stats
-            batch_stats.update({
-                'end_memory': get_gpu_memory_usage(self.config.device),
-                'duration': time.time() - batch_stats['start_time'],
-                'memory_change': (
-                    get_gpu_memory_usage(self.config.device) - 
-                    batch_stats['start_memory']
-                )
-            })
-            
-            log_metrics(batch_stats, step=batch_stats['batch_size'], step_type="vae_encode")
-            
-            return result
-            
-        except Exception as e:
-            log_error_with_context(e, "Error in VAE batch encoding")
-            raise
+    async def encode_batch(self, images: torch.Tensor) -> torch.Tensor:
+        start_time = time.time()
+        images = images.to(self.config.device)
+        latents = self.vae.encode(images).latent_dist.sample()
+        # Additional logging
+        logging.debug(
+            f"Encoded batch of shape {images.shape} into latents of shape {latents.shape} "
+            f"in {time.time() - start_time:.3f}s"
+        )
+        return latents * self.vae.config.scaling_factor
 
     async def encode_image(self, image_tensor: torch.Tensor) -> Optional[torch.Tensor]:
         """Encode a single image through VAE asynchronously."""

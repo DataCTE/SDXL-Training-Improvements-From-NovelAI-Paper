@@ -73,64 +73,51 @@ class ImageProcessor:
     ) -> Dict[str, Any]:
         """Process a single image with SDXL-style augmentation."""
         try:
-            # Load image if path provided
             if isinstance(image, (str, Path)):
-                image = self._load_image(image)
-            if image is None:
-                raise ValueError("Failed to load image")
-            
+                # Use async thread for loading
+                image = await asyncio.to_thread(self.load_image, image)
+                if image is None:
+                    raise ValueError("Failed to load image")
+
             # Convert to RGB
             image = image.convert("RGB")
-            
-            # Get original size if not provided
-            if original_size is None:
-                original_size = (image.height, image.width)
-            
+
             # Determine target size
-            if target_size is None:
-                if self.bucket_manager is not None:
-                    target_size = self.bucket_manager.get_target_size(image.size)
-                else:
-                    target_size = self.config.resolution
-            
-            # Resize image
-            image = self._resize_image(image, target_size[0], target_size[1])
-            
-            # Apply cropping
-            if self.config.center_crop:
-                y1 = max(0, int(round((image.height - self.config.resolution[0]) / 2.0)))
-                x1 = max(0, int(round((image.width - self.config.resolution[1]) / 2.0)))
-                image = self.center_crop(image)
-                crop_top_left = (y1, x1)
+            if not target_size and self.bucket_manager:
+                target_size = self.bucket_manager.get_target_size(image.size)
             else:
+                target_size = target_size or self.config.resolution
+
+            # Crop mode selection
+            if self.config.crop_mode == "center":
+                image = self.center_crop(image)
+            elif self.config.crop_mode == "random":
+                # random_crop usage
                 y1, x1, h, w = self.random_crop.get_params(
                     image, (self.config.resolution[0], self.config.resolution[1])
                 )
                 image = transforms.functional.crop(image, y1, x1, h, w)
-                crop_top_left = (y1, x1)
-            
+            # If "none", skip cropping entirely
+
             # Random flip
             if self.config.random_flip and random.random() < 0.5:
                 image = transforms.functional.hflip(image)
-            
+
             # Convert to tensor and normalize
-            image_tensor = self.transform(image)
-            
+            image_tensor = self.transform(image).to(self.config.device, non_blocking=True)
+
             result = {
-                "pixel_values": image_tensor,
-                "original_size": original_size,
+                "pixel_values": image_tensor.cpu(),  # Or keep on GPU if needed
+                "original_size": original_size or (image.height, image.width),
                 "target_size": target_size,
-                "crop_top_left": crop_top_left
             }
-            
-            # Get VAE encoding if available
+
             if self.vae_encoder is not None:
-                with torch.no_grad():
-                    latents = self.vae_encoder.encode(image_tensor.unsqueeze(0)).latent_dist.sample()
-                    result["latents"] = latents
-            
+                latents = self.vae_encoder.encode_batch(image_tensor.unsqueeze(0))
+                result["latents"] = latents.cpu()
+
             return result
-            
+
         except Exception as e:
             logger.error(f"Error processing image: {str(e)}")
             raise

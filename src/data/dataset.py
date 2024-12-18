@@ -47,7 +47,14 @@ class NovelAIDataset(Dataset):
         if not self.config.image_dirs:
             raise ValueError("No image directories specified in dataset config")
             
-        self.device = next(vae.parameters()).device  # Get device from VAE model
+        # Safely find the device
+        if vae is not None and any(p.device.type == "cuda" for p in vae.parameters()):
+            self.device = next(vae.parameters()).device
+        else:
+            # Fallback to CPU or config device if no VAE or GPU found
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            logger.warning(f"No VAE GPU device found; defaulting to: {self.device}")
+
         self.vae = vae
         self.text_encoders = text_encoders
         self.tokenizers = tokenizers
@@ -71,17 +78,19 @@ class NovelAIDataset(Dataset):
     async def _initialize(self):
         """Initialize dataset components and process data."""
         try:
+            logger.debug("Starting dataset initialization...")
+            
             # Initialize tag weighter if configured
-            tag_weighter = None
+            tag_weighter_loaded = None
             if self.config.use_tag_weighting:
-                tag_weighter = TagWeighter(
+                tag_weighter_loaded = TagWeighter(
                     weight_ranges=self.config.tag_weight_ranges,
                     save_path=self.config.tag_weights_path
                 )
                 if self.config.tag_weights_path and Path(self.config.tag_weights_path).exists():
-                    tag_weighter = TagWeighter.load(self.config.tag_weights_path)
+                    tag_weighter_loaded = TagWeighter.load(self.config.tag_weights_path)
             
-            # Initialize bucket manager with proper config
+            # Create bucket manager
             bucket_config = BucketConfig(
                 max_image_size=self.config.max_image_size,
                 min_image_size=self.config.min_image_size,
@@ -92,7 +101,7 @@ class NovelAIDataset(Dataset):
             )
             self.bucket_manager = BucketManager(bucket_config)
             
-            # Initialize text embedder and processor
+            # Create text embedder
             self.text_embedder = TextEmbedder(
                 tokenizers=self.tokenizers,
                 text_encoders=self.text_encoders,
@@ -104,7 +113,7 @@ class NovelAIDataset(Dataset):
             self.text_processor = TextProcessor(
                 config=text_processor_config,
                 text_embedder=self.text_embedder,
-                tag_weighter=tag_weighter
+                tag_weighter=tag_weighter_loaded
             )
             
             # Initialize image processor
@@ -115,7 +124,7 @@ class NovelAIDataset(Dataset):
                 vae=self.vae
             )
             
-            # Initialize cache manager
+            # Create cache manager
             self.cache_manager = CacheManager(self.config.cache_config)
             
             # Initialize batch processor
@@ -127,16 +136,13 @@ class NovelAIDataset(Dataset):
                 vae=self.vae
             )
             
-            # Process data BEFORE initializing sampler
+            # Process all data
             await self._process_data(self.config.image_dirs)
             
-            # Validate items were loaded
-            if len(self.items) == 0:
+            if not self.items:
                 raise ValueError("No valid items were loaded from the specified image directories")
             
-            logger.info(f"Loaded {len(self.items)} items from dataset")
-            
-            # Now initialize sampler after data is processed
+            # Now create the sampler
             self.sampler = AspectBatchSampler(
                 dataset=self,
                 batch_size=self.config.batch_size,
@@ -149,25 +155,29 @@ class NovelAIDataset(Dataset):
                 bucket_manager=self.bucket_manager
             )
             
+            logger.info(f"Dataset initialization completed: loaded {len(self.items)} items")
+            
         except Exception as e:
             logger.error(f"Dataset initialization failed: {e}")
             raise
 
     async def _process_data(self, image_dirs: List[str]):
-        """Process all data with improved embedding handling."""
+        """
+        Process all data by delegating image loading and
+        transformations to ImageProcessor.
+        """
         try:
-            # Validate image directories
             if not image_dirs:
                 raise ValueError("No image directories specified in config")
             
-            # Check if directories exist
+            # Check directory existence
             for dir_path in image_dirs:
                 if not Path(dir_path).exists():
                     logger.error(f"Image directory does not exist: {dir_path}")
                     raise ValueError(f"Image directory does not exist: {dir_path}")
                 logger.info(f"Processing directory: {dir_path}")
 
-            # Find all image files with supported extensions
+            # Find all image files
             image_files = await find_matching_files(
                 image_dirs,
                 extensions=['.png', '.jpg', '.jpeg', '.webp']
@@ -186,76 +196,85 @@ class NovelAIDataset(Dataset):
                 unit="images"
             )
             
-            # Process images and text in batches
             processed_count = 0
-            skipped_count = 0
-            error_count = 0
+            missing_text_count = 0
+            file_read_errors = 0
+            image_errors = 0
             
+            # Batch iteration
             for batch in self._get_batches(image_files, self.config.batch_size):
-                # Get text embeddings
+                # Collect text in parallel
                 text_files = [Path(f).with_suffix('.txt') for f in batch]
                 texts = []
                 for f, img_path in zip(text_files, batch):
                     if f.exists():
                         try:
+                            # Read text on a thread to avoid blocking
                             text = await asyncio.to_thread(f.read_text)
                             texts.append(text)
                         except Exception as e:
                             logger.warning(f"Failed to read text file {f}: {e}")
-                            skipped_count += 1
+                            file_read_errors += 1
                     else:
                         logger.warning(f"Missing text file for image: {img_path}")
-                        skipped_count += 1
+                        missing_text_count += 1
+                        texts.append("")  # Optionally allow empty text
                 
-                if texts:
-                    # Process batch
-                    batch_items = []
-                    for img_path, text in zip(batch, texts):
-                        try:
-                            # Get original image size for SDXL conditioning
-                            with Image.open(img_path) as img:
-                                original_size = (img.height, img.width)
-                                
-                            batch_items.append({
-                                'image_path': img_path,
-                                'text': text,
-                                'original_size': original_size
-                            })
-                        except Exception as e:
-                            logger.warning(f"Failed to process image {img_path}: {e}")
-                            error_count += 1
+                # Use ImageProcessor instead of manually opening images
+                batch_items = []
+                for img_path, text in zip(batch, texts):
+                    # Let the processor handle loading and transformations
+                    # Optionally pass original_size=None for dynamic inference
+                    processed_image = await self.image_processor.process_image(
+                        image=img_path,
+                        original_size=None  # or manually pass if you have prior info
+                    )
+                    if processed_image is None:
+                        logger.warning(f"Skipping corrupted or missing image: {img_path}")
+                        continue
+
+                    batch_items.append({
+                        "image_path": img_path,
+                        "pixel_values": processed_image["pixel_values"],
+                        "latents": processed_image.get("latents"),
+                        "original_size": processed_image["original_size"],
+                        "text": text
+                    })
+
+                if not batch_items:
+                    continue
+
+                # Process the batch
+                try:
+                    processed_items, batch_stats = await self.batch_processor.process_batch(
+                        batch_items=batch_items,
+                        cache_manager=self.cache_manager
+                    )
+                    for item in processed_items:
+                        if item is not None:
+                            self.items.append(item)
+                            processed_count += 1
                     
-                    if batch_items:
-                        try:
-                            # Process batch
-                            processed_items, batch_stats = await self.batch_processor.process_batch(
-                                batch_items=batch_items,
-                                cache_manager=self.cache_manager
-                            )
-                            
-                            # Add successful items to dataset
-                            for item in processed_items:
-                                if item is not None:
-                                    self.items.append(item)
-                                    processed_count += 1
-                                    
-                            # Update progress
-                            update_tracker(tracker, **batch_stats)
-                        except Exception as e:
-                            logger.error(f"Batch processing failed: {e}")
-                            error_count += len(batch_items)
+                    # Update tracker
+                    update_tracker(tracker, **batch_stats)
+                    
+                except Exception as e:
+                    logger.error(f"Batch processing failed: {e}")
+                    image_errors += len(batch_items)
                 
-                # Clear memory periodically
-                if len(self.items) % 1000 == 0:
+                # Periodic memory cleanup
+                if len(self.items) % 8000 == 0:
                     gc.collect()
-                    torch.cuda.empty_cache()
+                    if self.device.type == "cuda":
+                        torch.cuda.empty_cache()
             
-            # Log final statistics
-            logger.info(f"Dataset processing completed:")
-            logger.info(f"- Total files found: {len(image_files)}")
-            logger.info(f"- Successfully processed: {processed_count}")
-            logger.info(f"- Skipped (missing text): {skipped_count}")
-            logger.info(f"- Failed to process: {error_count}")
+            # Final logging
+            logger.info("Dataset processing completed:")
+            logger.info(f"- Total image files: {len(image_files)}")
+            logger.info(f"- Processed successfully: {processed_count}")
+            logger.info(f"- Missing text files: {missing_text_count}")
+            logger.info(f"- Text file read errors: {file_read_errors}")
+            logger.info(f"- Image processing errors: {image_errors}")
             
             if processed_count == 0:
                 raise ValueError("No valid items were processed from the image directories")
@@ -272,13 +291,11 @@ class NovelAIDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """Get dataset item with lazy loading from cache."""
         item = self.items[idx]
-        
-        # Load from cache if needed
         if isinstance(item.get('latents'), (str, Path)):
+            # Potentially run in the current loop or handle properly if the environment is async
             cached = asyncio.run(self.cache_manager.load_cached_item(item['image_path']))
             if cached:
                 item.update(cached)
-        
         return item
 
     def __len__(self) -> int:
@@ -287,28 +304,22 @@ class NovelAIDataset(Dataset):
     async def cleanup(self):
         """Clean up all resources."""
         try:
-            # Clean up all processors
             await self.batch_processor.cleanup()
             await self.text_processor.cleanup()
             await self.image_processor.cleanup()
-            
-            # Clean up cache manager
             await self.cache_manager.cleanup()
-            
-            # Clear references to items
+
             self.items.clear()
-            
-            # Clear sampler
+
             if hasattr(self, 'sampler'):
                 del self.sampler
-            
-            # Clear CUDA cache and force garbage collection
+
             if self.device.type == 'cuda':
                 torch.cuda.empty_cache()
             gc.collect()
-                
+
             logger.info("Successfully cleaned up all dataset resources")
-            
+
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
 

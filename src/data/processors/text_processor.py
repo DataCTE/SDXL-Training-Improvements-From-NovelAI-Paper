@@ -49,35 +49,39 @@ class TextProcessor:
             f"- Max token length: {config.max_token_length}"
         )
 
-    async def process_text(self, text: str) -> Dict[str, Any]:
+    async def process_text(self, text: str) -> Tuple[Dict[str, Any], Dict[str, List[str]]]:
         """Process text and extract embeddings with tag weights."""
         try:
-            # Parse tags and get embeddings
+            # Parse tags
             tag_dict = parse_tags(text)
-            embeddings = self.text_embedder([text], self.config.proportion_empty_prompts)
             
-            # Add tag weights if weighter is available
+            # Embed text (using named args for clarity, including device)
+            embeddings = self.text_embedder(
+                text=[text],
+                device=self.config.device,
+                clean_caption=False  # or as needed
+            )
+            
+            # Optionally add tag weights
             if self.tag_weighter is not None:
-                # Update frequencies
                 for tag_class, tags in tag_dict.items():
-                    for tag in tags:
-                        self.tag_weighter.update_frequencies(tag_class, tag)
-                
-                # Get weights tensor
+                    for t in tags:
+                        self.tag_weighter.update_frequencies(tag_class, t)
                 weights_tensor = self.tag_weighter.get_weights_tensor(tag_dict)
-                embeddings['tag_weights'] = weights_tensor
+                embeddings["tag_weights"] = weights_tensor
             
-            return embeddings
-            
+            # Now return both embeddings and the tag_dict
+            return embeddings, tag_dict
+
         except Exception as e:
             logger.error(f"Error processing text: {str(e)[:200]}...")
-            return None
+            return None, {}
 
     async def process_batch(
         self,
         texts: List[str],
         cache_manager: Optional[CacheManager] = None
-    ) -> List[Tuple[Dict[str, Any], List[str]]]:
+    ) -> List[Tuple[Dict[str, Any], Dict[str, List[str]]]]:
         """Process a batch of texts in parallel with immediate caching."""
         results = []
         
@@ -88,92 +92,88 @@ class TextProcessor:
             device=self.config.device
         )
         
-        # Process in smaller batches to manage memory
+        # Process in smaller batches
         for i in range(0, len(texts), self.config.batch_size):
             batch = texts[i:i + self.config.batch_size]
-            batch_results = []
-            
-            # Process batch items in parallel
             tasks = [self.process_text(text) for text in batch]
             text_results = await asyncio.gather(*tasks)
             
-            # Process results and prepare for caching
+            batch_results_for_cache = []
             for j, (text_data, tags) in enumerate(text_results):
                 if text_data is not None:
-                    # Move tensors to CPU immediately
+                    # Move tensors to CPU
                     for key, value in text_data.items():
                         if isinstance(value, torch.Tensor):
-                            text_data[key] = value.cpu()
-                            del value
+                            text_data[key] = value.to("cpu")
                     
-                    # Create cache item if caching is enabled
+                    # Cache item if enabled
                     if self.config.use_caching and cache_manager is not None:
                         cache_item = {
-                            'text_path': getattr(batch[j], 'filename', f'text_{i+j}'),
-                            'text_data': text_data,
-                            'tags': tags
+                            "text_path": getattr(batch[j], "filename", f"text_{i+j}"),
+                            "text_data": text_data,
+                            "tags": tags
                         }
-                        batch_results.append(cache_item)
+                        batch_results_for_cache.append(cache_item)
                     
                     results.append((text_data, tags))
                     update_tracker(tracker, processed=1)
                 else:
-                    update_tracker(tracker, failed=1, error_type='text_processing_failed')
+                    update_tracker(tracker, failed=1, error_type="text_processing_failed")
             
-            # Cache batch results if enabled
-            if self.config.use_caching and cache_manager is not None and batch_results:
-                await cache_manager.cache_batch_items(batch_results)
-                del batch_results[:]
+            # Cache batch results
+            if self.config.use_caching and cache_manager and batch_results_for_cache:
+                await cache_manager.cache_batch_items(batch_results_for_cache)
             
-            # Clear memory after each batch
-            gc.collect()
-            torch.cuda.empty_cache()
+            # Clear memory less frequently or conditionally
+            if (i // self.config.batch_size) % 5 == 0:
+                gc.collect()
+                torch.cuda.empty_cache()
+            
             await asyncio.sleep(0.01)
-            
-            # Log progress
             if tracker.should_log():
-                extra_stats = {
-                    'successful': len(results),
-                    'failed': tracker.failed_items,
-                    'error_types': tracker.error_types,
-                    'memory_usage': f"{get_gpu_memory_usage(self.config.device):.1%}"
-                }
-                log_progress(tracker, prefix="Processing texts: ", extra_stats=extra_stats)
+                log_progress(
+                    tracker,
+                    prefix="Processing texts: ",
+                    extra_stats={
+                        "successful": len(results),
+                        "failed": tracker.failed_items,
+                        "error_types": tracker.error_types,
+                        "memory_usage": f"{get_gpu_memory_usage(self.config.device):.1%}"
+                    }
+                )
         
         return results
 
     async def process_text_file(
         self,
         text_path: Path
-    ) -> Optional[Tuple[Dict[str, Any], List[str]]]:
+    ) -> Optional[Tuple[Dict[str, Any], Dict[str, List[str]]]]:
         """Process text from a file without caching."""
         try:
             if not text_path.exists():
                 logger.error(f"Text file not found: {text_path}")
                 return None
-                
-            # Read text file
-            text = await asyncio.to_thread(
-                lambda: text_path.read_text(encoding='utf-8')
+            
+            # Read file text
+            text_content = await asyncio.to_thread(
+                lambda: text_path.read_text(encoding="utf-8")
             )
             
-            # Process text and tags
-            text_data, tags = await self.process_text(text)
+            # Process text
+            text_data, tags = await self.process_text(text_content)
             
             if text_data is not None:
-                # Move tensors to CPU and clear GPU memory
+                # Move to CPU
                 for key, value in text_data.items():
                     if isinstance(value, torch.Tensor):
-                        text_data[key] = value.cpu()
-                        del value
-                
-                # Clear text data after processing
-                del text
+                        text_data[key] = value.to("cpu")
+
+                del text_content
                 gc.collect()
                 torch.cuda.empty_cache()
             
             return text_data, tags
-            
+        
         except Exception as e:
             logger.error(f"Error processing text file {text_path}: {str(e)[:200]}...")
             return None
