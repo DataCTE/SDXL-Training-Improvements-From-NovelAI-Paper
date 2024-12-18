@@ -230,6 +230,7 @@ class ImageProcessorConfig(DeviceConfig):
     random_flip: bool = True  # or
     forced_dtype: str = "float32"
     enable_xformers_attention: bool = True
+    crop_mode: str = "none"  
 
     
 @dataclass
