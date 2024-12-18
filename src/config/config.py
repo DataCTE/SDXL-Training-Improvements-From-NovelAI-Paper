@@ -307,6 +307,10 @@ class BucketConfig:
     min_bucket_resolution: int = 65536
     max_aspect_ratio: float = 2.0
     bucket_tolerance: float = 0.2
+    target_resolutions: List[Tuple[int, int]] = field(
+        default_factory=lambda: DEFAULT_TARGET_RESOLUTIONS
+    )
+    max_ar_error: float = DEFAULT_MAX_AR_ERROR
 
 @dataclass
 class TextProcessorConfig(DeviceConfig, CacheConfig):
