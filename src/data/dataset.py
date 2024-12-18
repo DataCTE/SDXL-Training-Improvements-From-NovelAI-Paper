@@ -23,7 +23,7 @@ from .processors.utils.caption.text_embedder import TextEmbedder
 from .processors.utils.caption.tag_weighter import TagWeighter
 from .processors.utils.thread_config import get_optimal_thread_config
 from .processors.utils.batch_utils import find_matching_files
-from .processors.utils.progress_utils import create_progress_tracker, update_tracker
+from .processors.utils.progress_utils import create_progress_tracker, update_tracker, log_progress
 from .processors.utils.system_utils import get_gpu_memory_usage, cleanup_processor
 
 # Config import
@@ -263,6 +263,14 @@ class NovelAIDataset(Dataset):
                         cache_hits=batch_stats.get('cache_hits', 0),
                         cache_misses=batch_stats.get('cache_misses', 0),
                         error_types=batch_stats.get('error_types', None)
+                    )
+                    
+                    # Explicitly log progress to console after updating tracker
+                    log_progress(
+                        stats=tracker,
+                        prefix="Dataset Processing",
+                        extra_stats={"batch_size": len(batch)},
+                        log_interval=5
                     )
                     
                 except Exception as e:
