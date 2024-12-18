@@ -173,15 +173,28 @@ class VAEEncoder:
             return None
 
     async def _process_chunks_parallel(self, chunks, keep_on_gpu):
-        """Process chunks in parallel with advanced optimizations."""
-        async with asyncio.TaskGroup() as group:
-            tasks = [
-                group.create_task(self._process_chunk(chunk, keep_on_gpu))
-                for chunk in chunks
-            ]
+        """
+        Process chunks in parallel with advanced optimizations.
 
-        results = [t.result() for t in tasks]
-        return self._combine_results(results)
+        Wrapped in a try/except block to handle TaskGroup exceptions
+        and avoid "unhandled errors in a TaskGroup (1 sub-exception)."
+        """
+        try:
+            # gather results from each chunk in parallel
+            async with asyncio.TaskGroup() as group:
+                tasks = [
+                    group.create_task(self._process_chunk(chunk, keep_on_gpu))
+                    for chunk in chunks
+                ]
+            # If we reach here, all tasks have successfully completed
+            results = [t.result() for t in tasks]
+            return self._combine_results(results)
+
+        except Exception as e:
+            # Log or re-raise the exception so it won't be "unhandled"
+            logger.error(f"Error in parallel chunk processing: {e}")
+            # Optionally do any cleanup or partial result handling here
+            raise
 
     @torch.compile(fullgraph=True, dynamic=False)
     def _process_chunk(self, chunk, keep_on_gpu):
