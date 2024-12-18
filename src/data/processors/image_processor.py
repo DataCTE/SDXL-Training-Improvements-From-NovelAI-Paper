@@ -56,6 +56,9 @@ class ImageProcessor:
         self.center_crop = transforms.CenterCrop(config.center_crop)
         self.random_crop = transforms.RandomCrop(config.resolution)
         
+        # Optional config attribute to retain everything on GPU
+        self.always_on_gpu = getattr(config, "always_on_gpu", False)
+        
         logger.info(
             f"Initialized ImageProcessor:\n"
             f"- Resolution: {config.resolution}\n"
@@ -116,9 +119,9 @@ class ImageProcessor:
             if self.vae_encoder is not None:
                 latents = await self.vae_encoder.encode_images(
                     image_tensor, 
-                    keep_on_gpu=keep_on_gpu
+                    keep_on_gpu=(keep_on_gpu or self.always_on_gpu)
                 )
-                if latents is not None and not keep_on_gpu:
+                if latents is not None and not (keep_on_gpu or self.always_on_gpu):
                     latents = latents.cpu()
                 result["latents"] = latents
 
@@ -230,10 +233,10 @@ class ImageProcessor:
                         try:
                             encoded = await self.vae_encoder.encode_images(
                                 batch_tensor,
-                                keep_on_gpu=keep_on_gpu
+                                keep_on_gpu=(keep_on_gpu or self.always_on_gpu)
                             )
                             if encoded is not None:
-                                if not keep_on_gpu:
+                                if not (keep_on_gpu or self.always_on_gpu):
                                     encoded = encoded.cpu()
                                 # Split back into single images
                                 if encoded.dim() == 3:
