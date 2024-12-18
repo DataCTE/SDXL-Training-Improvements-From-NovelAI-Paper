@@ -111,39 +111,72 @@ class TagWeighterConfig:
 
 @dataclass
 class DataConfig:
-    """Configuration for dataset and data loading."""
-    image_dirs: List[str] = field(default_factory=lambda: [])  # Initialize as empty list
+    image_dirs: List[str]
+    image_size: Tuple[int, int] = DEFAULT_IMAGE_SIZE
+    max_image_size: Tuple[int, int] = DEFAULT_MAX_IMAGE_SIZE
+    min_image_size: Union[Tuple[int, int], int] = DEFAULT_MIN_IMAGE_SIZE
+    max_dim: int = 4194304
+    bucket_step: int = 8
+    min_bucket_size: int = 16
+    batch_size: int = DEFAULT_BATCH_SIZE
+    min_bucket_resolution: Optional[int] = None
+    bucket_tolerance: float = 0.2
+    max_aspect_ratio: float = 2.0
+    cache_dir: str = DEFAULT_CACHE_DIR
+    text_cache_dir: str = "text_cache"
+    use_caching: bool = True
+    max_token_length: int = DEFAULT_MAX_TOKEN_LENGTH
+    vae_batch_size: int = DEFAULT_BATCH_SIZE
+    vae_image_size: Tuple[int, int] = (256, 256)
+    vae_validation_split: float = 0.1
     num_workers: int = DEFAULT_NUM_WORKERS
     pin_memory: bool = True
     persistent_workers: bool = True
     shuffle: bool = True
     proportion_empty_prompts: float = 0.0
-    
-    # Image size settings (will be overridden by global config)
-    image_size: Tuple[int, int] = DEFAULT_IMAGE_SIZE
-    max_image_size: Tuple[int, int] = DEFAULT_MAX_IMAGE_SIZE
-    min_image_size: Tuple[int, int] = DEFAULT_MIN_IMAGE_SIZE
-    max_dim: Optional[int] = None
-    bucket_step: int = 8
-    min_bucket_resolution: Optional[int] = None
-    max_aspect_ratio: float = 2.0
-    bucket_tolerance: float = 0.2
-    
+    use_tag_weighting: bool = True
+    tag_weighting: 'TagWeighterConfig' = field(default_factory=lambda: TagWeighterConfig())
+    tag_weight_ranges: Dict[str, Tuple[float, float]] = field(default_factory=lambda: {
+        'character': (0.8, 1.2),
+        'style': (0.7, 1.3),
+        'quality': (0.6, 1.4),
+        'artist': (0.5, 1.5)
+    })
+    tag_weights_path: Optional[str] = None
+
     def __post_init__(self):
-        """Validate the configuration after initialization."""
-        if not isinstance(self.image_dirs, list):
-            self.image_dirs = [self.image_dirs] if self.image_dirs else []
-        
+        """Convert and validate configuration."""
+        # Convert image sizes to tuples if needed
+        if isinstance(self.image_size, (list, tuple)):
+            self.image_size = tuple(self.image_size)
+        if isinstance(self.max_image_size, (list, tuple)):
+            self.max_image_size = tuple(self.max_image_size)
+        if isinstance(self.min_image_size, (list, tuple)):
+            self.min_image_size = tuple(self.min_image_size)
+        elif isinstance(self.min_image_size, int):
+            self.min_image_size = (self.min_image_size, self.min_image_size)
+            
+        # Set min_bucket_resolution if not specified
+        if self.min_bucket_resolution is None:
+            self.min_bucket_resolution = min(self.min_image_size)
+            
+        # Update max_dim to be the sum of max_image_size dimensions
+        self.max_dim = sum(self.max_image_size)
+
+        # Validate image directories
+        if not self.image_dirs:
+            raise ValueError("No image directories specified in config")
+            
         # Convert all paths to strings and validate they exist
         self.image_dirs = [str(Path(d).resolve()) for d in self.image_dirs if d]
-        
-        # Validate at least one directory exists
         valid_dirs = [d for d in self.image_dirs if Path(d).exists()]
+        
         if not valid_dirs:
-            logger.warning("No valid image directories found in config")
-        else:
-            logger.info(f"Found {len(valid_dirs)} valid image directories")
-            self.image_dirs = valid_dirs
+            raise ValueError("No valid image directories found in config")
+        
+        logger.info(f"Found {len(valid_dirs)} valid image directories")
+        self.image_dirs = valid_dirs
+
 
 @dataclass
 class ScoringConfig:
@@ -376,9 +409,8 @@ class GlobalConfig:
 
 @dataclass
 class Config:
-    """Main configuration class."""
     model: ModelConfig
-    training: TrainingConfig
+    training: 'TrainingConfig'
     data: DataConfig
     tag_weighting: 'TagWeighterConfig'
     scoring: 'ScoringConfig'
@@ -400,17 +432,13 @@ class Config:
 
             # Ensure data section exists
             if 'data' not in config_dict:
-                logger.error("Missing 'data' section in config file")
                 raise ValueError("Missing 'data' section in config file")
 
-            # Create DataConfig first to validate image directories
-            data_config = DataConfig(**config_dict['data'])
-            
-            # Create the full config
-            config = cls(
+            # Create an instance of Config using the loaded dictionary
+            return cls(
                 model=ModelConfig(**config_dict['model']),
                 training=TrainingConfig(**config_dict['training']),
-                data=data_config,
+                data=DataConfig(**config_dict['data']),
                 tag_weighting=TagWeighterConfig(**config_dict['tag_weighting']),
                 scoring=ScoringConfig(**config_dict['scoring']),
                 system=SystemConfig(**config_dict['system']),
@@ -422,8 +450,6 @@ class Config:
                 text_processor=TextProcessorConfig(**config_dict['text_processor']),
                 text_embedder=TextEmbedderConfig(**config_dict['text_embedder'])
             )
-
-            return config
 
         except Exception as e:
             logger.error(f"Error loading config from {path}: {str(e)}")
