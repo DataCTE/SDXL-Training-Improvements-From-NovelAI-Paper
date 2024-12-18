@@ -144,6 +144,8 @@ class TagWeighterConfig:
     min_weight: float = 0.1
     max_weight: float = 3.0
     smoothing_factor: float = 1e-4
+    use_cache: bool = True
+    device: torch.device = torch.device('cuda')
     dtype: torch.dtype = torch.float32
 
 @dataclass

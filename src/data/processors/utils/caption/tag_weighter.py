@@ -52,7 +52,7 @@ class TagWeighter:
             self.config = config
             self.tag_frequencies = defaultdict(lambda: defaultdict(int))
             self.class_totals = defaultdict(int)
-            self._weight_cache = WeakValueDictionary()
+            self._weight_cache = WeakValueDictionary() if config.use_cache else None
             
             # Log initialization
             logger.info(
@@ -155,23 +155,25 @@ class TagWeighter:
             for tag_class, tag_list in tags.items():
                 class_total = self.class_totals[tag_class]
                 for tag in tag_list:
-                    # Try cache first
-                    cache_key = f"{tag_class}:{tag}"
-                    cached_weight = self._weight_cache.get(cache_key)
-                    
-                    if cached_weight is not None:
-                        weights.append(cached_weight)
-                        weight_stats['cache_hits'] += 1
-                    else:
-                        # Calculate weight
-                        freq = self.tag_frequencies[tag_class][tag]
-                        weight = 1.0 / (freq + self.config.smoothing_factor)
-                        weights.append(weight)
+                    # Try cache first if enabled
+                    if self.config.use_cache and self._weight_cache is not None:
+                        cache_key = f"{tag_class}:{tag}"
+                        cached_weight = self._weight_cache.get(cache_key)
                         
-                        # Cache result
-                        if self.config.use_cache:
-                            self._weight_cache[cache_key] = weight
-                        weight_stats['cache_misses'] += 1
+                        if cached_weight is not None:
+                            weights.append(cached_weight)
+                            weight_stats['cache_hits'] += 1
+                            continue
+                    
+                    # Calculate weight
+                    freq = self.tag_frequencies[tag_class][tag]
+                    weight = 1.0 / (freq + self.config.smoothing_factor)
+                    weights.append(weight)
+                    
+                    # Cache result if enabled
+                    if self.config.use_cache and self._weight_cache is not None:
+                        self._weight_cache[cache_key] = weight
+                    weight_stats['cache_misses'] += 1
             
             weights = torch.tensor(weights, device=self.config.device)
             
