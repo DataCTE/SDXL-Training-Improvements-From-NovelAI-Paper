@@ -157,6 +157,7 @@ def train(config_path: str):
         
         # Create dataset config
         dataset_config = NovelAIDatasetConfig(
+            image_dirs=config.data.image_dirs,
             image_size=config.data.image_size,
             max_image_size=config.data.max_image_size,
             min_image_size=config.data.min_image_size,
@@ -166,18 +167,24 @@ def train(config_path: str):
             min_bucket_resolution=config.data.min_bucket_resolution,
             bucket_tolerance=config.data.bucket_tolerance,
             max_aspect_ratio=config.data.max_aspect_ratio,
-            cache_dir=config.data.cache_dir,
-            text_cache_dir=config.data.text_cache_dir,
-            use_caching=config.data.use_caching,
-            proportion_empty_prompts=config.data.proportion_empty_prompts,
-            max_consecutive_batch_samples=2,
-            model_name=config.model.pretrained_model_name,
-            tag_weighting=config.tag_weighting,
-            max_token_length=config.data.max_token_length,
+            batch_processor_config=config.batch_processor,
+            cache_config=config.global_config.cache,
             use_tag_weighting=config.data.use_tag_weighting,
             tag_weight_ranges=config.data.tag_weight_ranges,
-            tag_weights_path=os.path.join(config.paths.output_dir, "tag_weights.json")
+            tag_weights_path=config.paths.tag_weights_path,
+            batch_size=config.training.batch_size,
+            shuffle=config.data.shuffle,
+            drop_last=config.data.drop_last if hasattr(config.data, 'drop_last') else False,
+            debug_mode=config.data.debug_mode if hasattr(config.data, 'debug_mode') else False,
+            prefetch_factor=config.data.prefetch_factor if hasattr(config.data, 'prefetch_factor') else None
         )
+        
+        # Log dataset configuration
+        logger.info(f"Initializing dataset with config:")
+        logger.info(f"- Image directories: {dataset_config.image_dirs}")
+        logger.info(f"- Batch size: {dataset_config.batch_size}")
+        logger.info(f"- Image size: {dataset_config.image_size}")
+        logger.info(f"- Max image size: {dataset_config.max_image_size}")
         
         # Create async event loop for dataset operations
         loop = asyncio.new_event_loop()
@@ -198,7 +205,7 @@ def train(config_path: str):
             return await NovelAIDataset.create(
                 config=dataset_config,
                 vae=vae,
-                text_encoders=text_encoders,  # Make sure these are passed
+                text_encoders=text_encoders,
                 tokenizers=tokenizers,
                 tag_weighter=tag_weighter
             )

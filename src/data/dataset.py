@@ -44,6 +44,9 @@ class NovelAIDataset(Dataset):
     ):
         """Initialize dataset - use create() for async initialization."""
         self.config = config
+        if not self.config.image_dirs:
+            raise ValueError("No image directories specified in dataset config")
+            
         self.device = next(vae.parameters()).device  # Get device from VAE model
         self.vae = vae
         self.text_encoders = text_encoders
