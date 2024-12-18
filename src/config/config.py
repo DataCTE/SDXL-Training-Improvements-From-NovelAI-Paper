@@ -296,6 +296,9 @@ class TextProcessorConfig(DeviceConfig, CacheConfig):
     tag_frequency_threshold: int = 5
     tag_weight_smoothing: float = 0.1
 
+    # Add this attribute to allow passing 'prefetch_factor' from your YAML
+    prefetch_factor: int = DEFAULT_PREFETCH_FACTOR
+
 @dataclass
 class TextEmbedderConfig(DeviceConfig):
     max_length: int = DEFAULT_MAX_TOKEN_LENGTH
