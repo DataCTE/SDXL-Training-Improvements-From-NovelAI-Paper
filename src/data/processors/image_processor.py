@@ -203,81 +203,62 @@ class ImageProcessor:
         processed_tensors = []
         
         try:
-            # Calculate optimal batch size based on GPU memory
+            # Calculate optimal batch size
             available_memory = torch.cuda.get_device_properties(self.config.device).total_memory
-            memory_per_image = width * height * 4 * 4  # Rough estimate
+            memory_per_image = width * height * 4 * 4
             optimal_batch_size = min(
                 max(4, int(available_memory * 0.3 / memory_per_image)),
                 16,
                 batch_size
             )
             
-            # Create CUDA streams
-            compute_stream = torch.cuda.Stream()
-            transfer_stream = torch.cuda.Stream()
-            
             for i in range(0, batch_size, optimal_batch_size):
                 sub_batch = images[i:i + optimal_batch_size]
                 
-                # Parallel preprocessing
+                # Process images in parallel
                 preprocessing_tasks = [
                     asyncio.to_thread(self.preprocess, img, width, height)
                     for img in sub_batch
                 ]
                 
-                # Gather preprocessed tensors
                 sub_processed = await asyncio.gather(*preprocessing_tasks)
                 sub_processed = [t for t in sub_processed if t is not None]
                 
                 if sub_processed:
-                    with torch.cuda.stream(transfer_stream):
-                        # Stack tensors while they're on CPU and pin memory
-                        batch_tensor = torch.stack([t.cpu() for t in sub_processed])
-                        batch_tensor = batch_tensor.pin_memory().to(
-                            self.config.device,
-                            non_blocking=True
-                        )
-                        del sub_processed
+                    # Move tensors to GPU directly without pinning
+                    batch_tensor = torch.stack(sub_processed).to(
+                        self.config.device, 
+                        non_blocking=True
+                    )
+                    del sub_processed
                     
-                    with torch.cuda.stream(compute_stream):
-                        if self.vae_encoder is not None:
-                            try:
-                                # VAE encoding with mixed precision
-                                with torch.cuda.amp.autocast():
-                                    encoded = await self.vae_encoder.encode_batch(batch_tensor)
-                                
-                                # Transfer results back to CPU
-                                for tensor in encoded:
-                                    # Move to CPU first, then pin
-                                    cpu_tensor = tensor.cpu()
-                                    processed_tensors.append(cpu_tensor.pin_memory())
-                                del encoded
-                                
-                            except Exception as e:
-                                logger.error(f"VAE encoding error: {str(e)[:200]}...")
-                                for _ in range(len(batch_tensor)):
-                                    processed_tensors.append(
-                                        torch.zeros((4, height//8, width//8), 
-                                        dtype=self.config.dtype, 
-                                        device='cpu')
-                                    )
-                        else:
-                            # Handle non-VAE case
-                            for tensor in batch_tensor:
-                                cpu_tensor = tensor.cpu()
-                                processed_tensors.append(cpu_tensor.pin_memory())
-                        
-                        del batch_tensor
+                    if self.vae_encoder is not None:
+                        try:
+                            # Process through VAE
+                            encoded = await self.vae_encoder.encode_batch(batch_tensor)
+                            
+                            # Move results to CPU
+                            for tensor in encoded:
+                                processed_tensors.append(tensor.cpu())
+                            del encoded
+                            
+                        except Exception as e:
+                            logger.error(f"VAE encoding error: {str(e)[:200]}...")
+                            for _ in range(len(batch_tensor)):
+                                processed_tensors.append(
+                                    torch.zeros((4, height//8, width//8), 
+                                    dtype=self.config.dtype, 
+                                    device='cpu')
+                                )
+                    else:
+                        for tensor in batch_tensor:
+                            processed_tensors.append(tensor.cpu())
                     
-                    # Periodic cleanup
+                    del batch_tensor
+                    
+                    # Cleanup periodically
                     if i % (optimal_batch_size * 2) == 0:
-                        compute_stream.synchronize()
-                        if torch.cuda.memory_allocated() > available_memory * 0.8:
-                            torch.cuda.empty_cache()
-            
-            # Final synchronization
-            compute_stream.synchronize()
-            transfer_stream.synchronize()
+                        torch.cuda.empty_cache()
             
             return processed_tensors
             

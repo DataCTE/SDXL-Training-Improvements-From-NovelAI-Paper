@@ -72,58 +72,47 @@ class VAEEncoder:
         return tensor
 
     @torch.no_grad()
-    def encode_batch(self, pixel_values: torch.Tensor) -> torch.Tensor:
+    async def encode_batch(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """Encode images through VAE with optimized batch processing."""
         batch_size = pixel_values.shape[0]
         latents_list = []
         
         try:
-            # Optimal sub-batch size
             sub_batch_size = min(8, batch_size)
             
-            # Use stream for better GPU utilization
-            stream = torch.cuda.Stream()
-            with torch.cuda.stream(stream):
-                for i in range(0, batch_size, sub_batch_size):
-                    sub_batch = pixel_values[i:i+sub_batch_size]
+            # Define synchronous encoding function
+            def _encode_sub_batch(sub_batch):
+                if not sub_batch.is_cuda:
+                    sub_batch = sub_batch.to(self.config.device, non_blocking=True)
+                
+                with torch.cuda.amp.autocast(dtype=self.config.dtype):
+                    latents = self.vae.encode(sub_batch).latent_dist.sample()
+                    return latents * self.vae.config.scaling_factor
+
+            for i in range(0, batch_size, sub_batch_size):
+                sub_batch = pixel_values[i:i+sub_batch_size]
+                
+                try:
+                    # Run encoding in thread pool and await result
+                    latents = await asyncio.to_thread(_encode_sub_batch, sub_batch)
+                    latents_list.append(latents)
+                    del sub_batch
                     
-                    try:
-                        # Ensure sub_batch is on GPU
-                        if not sub_batch.is_cuda:
-                            sub_batch = sub_batch.to(
-                                self.config.device,
-                                non_blocking=True
-                            )
-                        
-                        # VAE encoding
-                        with torch.cuda.amp.autocast(dtype=self.config.dtype):
-                            latents = self.vae.encode(sub_batch).latent_dist.sample()
-                            latents = latents * self.vae.config.scaling_factor
-                        
-                        # Store result (keeping on GPU)
-                        latents_list.append(latents)
-                        
-                        del sub_batch
-                        
-                    except RuntimeError as e:
-                        logger.error(f"Error encoding sub-batch {i}: {str(e)[:200]}...")
-                        # Create zero tensor on correct device
-                        latents_list.append(torch.zeros(
-                            (len(sub_batch), 4, pixel_values.shape[2]//8, pixel_values.shape[3]//8),
-                            dtype=self.config.dtype,
-                            device=self.config.device
-                        ))
-                    
-                    # Periodic cleanup
-                    if i % (sub_batch_size * 4) == 0:
-                        torch.cuda.empty_cache()
+                except RuntimeError as e:
+                    logger.error(f"Error encoding sub-batch {i}: {str(e)[:200]}...")
+                    latents_list.append(torch.zeros(
+                        (len(sub_batch), 4, pixel_values.shape[2]//8, pixel_values.shape[3]//8),
+                        dtype=self.config.dtype,
+                        device=self.config.device
+                    ))
                 
-                # Combine results (all on GPU)
-                result = torch.cat(latents_list, dim=0)
-                del latents_list
-                
-                return result
-                
+                if i % (sub_batch_size * 4) == 0:
+                    torch.cuda.empty_cache()
+            
+            result = torch.cat(latents_list, dim=0)
+            del latents_list
+            return result
+            
         except Exception as e:
             logger.error(f"Error in batch encoding: {str(e)[:200]}...")
             if 'latents_list' in locals():
@@ -134,31 +123,26 @@ class VAEEncoder:
     async def encode_image(self, image_tensor: torch.Tensor) -> Optional[torch.Tensor]:
         """Encode a single image through VAE asynchronously."""
         try:
-            # Add batch dimension and ensure on CPU initially
-            image_tensor = image_tensor.unsqueeze(0).cpu()
+            # Add batch dimension if needed
+            if image_tensor.dim() == 3:
+                image_tensor = image_tensor.unsqueeze(0)
             
             # Encode through VAE
-            latents = await asyncio.to_thread(
-                self.encode_batch,
-                image_tensor
-            )
+            latents = await self.encode_batch(image_tensor)
             
-            # Remove batch dimension and cleanup input
+            # Remove batch dimension
             result = latents.squeeze(0)
             del image_tensor
             del latents
-            gc.collect()
             
             return result
             
         except Exception as e:
             logger.error(f"Error encoding through VAE: {str(e)[:200]}...")
-            # Cleanup on error
             if 'image_tensor' in locals():
                 del image_tensor
             if 'latents' in locals():
                 del latents
-            gc.collect()
             torch.cuda.empty_cache()
             return None
 
