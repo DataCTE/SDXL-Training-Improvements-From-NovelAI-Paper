@@ -345,7 +345,10 @@ class NovelAIDatasetConfig:
         model_name="stabilityai/stable-diffusion-xl-base-1.0",
         # Add other parameters as needed
     ))
-
+    text_processor_config: TextProcessorConfig = field(default_factory=lambda: TextProcessorConfig(
+        model_name="stabilityai/stable-diffusion-xl-base-1.0",
+        # Add other parameters as needed
+    ))
     def __post_init__(self):
         """Convert and validate configuration."""
         # Convert image sizes to tuples if needed
