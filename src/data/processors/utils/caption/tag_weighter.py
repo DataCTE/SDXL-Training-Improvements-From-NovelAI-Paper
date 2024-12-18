@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import torch
 import numpy as np
-
+from src.config.config import TagWeighterConfig
 logger = logging.getLogger(__name__)
 
 def parse_tags(text: str) -> Dict[str, List[str]]:
