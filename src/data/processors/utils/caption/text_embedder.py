@@ -149,8 +149,11 @@ class TextEmbedder:
                 truncation=True,
                 return_tensors="pt"
             )
-            # Move inputs to device
-            text_inputs_one = {k: v.to(target_device) for k, v in text_inputs_one.items()}
+            # Move inputs to device and ensure correct dtype
+            text_inputs_one = {
+                k: v.to(target_device, dtype=torch.long) if k == "input_ids" else v.to(target_device)
+                for k, v in text_inputs_one.items()
+            }
             
             text_inputs_two = self.tokenizer_two(
                 text,
@@ -159,8 +162,11 @@ class TextEmbedder:
                 truncation=True,
                 return_tensors="pt"
             )
-            # Move inputs to device
-            text_inputs_two = {k: v.to(target_device) for k, v in text_inputs_two.items()}
+            # Move inputs to device and ensure correct dtype
+            text_inputs_two = {
+                k: v.to(target_device, dtype=torch.long) if k == "input_ids" else v.to(target_device)
+                for k, v in text_inputs_two.items()
+            }
             
             # Get embeddings from both encoders
             with torch.no_grad():
