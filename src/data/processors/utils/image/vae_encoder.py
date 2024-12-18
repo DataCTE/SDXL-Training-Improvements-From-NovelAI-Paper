@@ -9,7 +9,7 @@ from src.utils.logging.metrics import log_error_with_context, log_metrics, log_s
 from src.data.processors.utils.batch_utils import get_gpu_memory_usage
 from diffusers import AutoencoderKL
 import asyncio
-from functools import lru_cache
+from collections import OrderedDict
 
 # Add this function
 def is_xformers_available():
@@ -22,10 +22,25 @@ def is_xformers_available():
 
 logger = logging.getLogger(__name__)
 
-class LRUCache(lru_cache):
+class LRUCache:
     """LRU cache with a max size."""
-    def __init__(self, maxsize=128, *args, **kwargs):
-        super().__init__(maxsize=maxsize, *args, **kwargs)
+    def __init__(self, maxsize=128):
+        self.cache = OrderedDict()
+        self.maxsize = maxsize
+
+    def get(self, key):
+        if key not in self.cache:
+            return None
+        # Move to end to show recently used
+        self.cache.move_to_end(key)
+        return self.cache[key]
+
+    def __setitem__(self, key, value):
+        if key in self.cache:
+            self.cache.move_to_end(key)
+        self.cache[key] = value
+        if len(self.cache) > self.maxsize:
+            self.cache.popitem(last=False)
 
 class VAEEncoder:
     """Handles VAE encoding with memory optimization and async support."""
