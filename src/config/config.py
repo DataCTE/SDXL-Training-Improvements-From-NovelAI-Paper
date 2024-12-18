@@ -211,6 +211,7 @@ class ImageProcessorConfig(DeviceConfig):
     normalize_mean: Tuple[float, ...] = (0.5, 0.5, 0.5)
     normalize_std: Tuple[float, ...] = (0.5, 0.5, 0.5)
     resolution: Tuple[int, int] = (1024, 1024)
+    center_crop: Tuple[int, int] = (512, 512)  # Default center crop size
     
 @dataclass
 class CacheConfig:
