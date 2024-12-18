@@ -97,7 +97,7 @@ class NovelAIDataset(Dataset):
             )
             
             # Initialize text processor
-            text_processor_config = TextProcessorConfig(**self.config.text_processor_config)  # Convert to dataclass
+            text_processor_config = TextProcessorConfig(**self.config.text_processor_config)
             self.text_processor = TextProcessor(
                 config=text_processor_config,
                 text_embedder=self.text_embedder,
@@ -105,7 +105,7 @@ class NovelAIDataset(Dataset):
             )
             
             # Initialize image processor
-            image_processor_config = ImageProcessorConfig(**self.config.image_processor_config)  # Convert to dataclass
+            image_processor_config = ImageProcessorConfig(**self.config.image_processor_config)
             self.image_processor = ImageProcessor(
                 config=image_processor_config,
                 bucket_manager=self.bucket_manager,
@@ -124,10 +124,16 @@ class NovelAIDataset(Dataset):
                 vae=self.vae
             )
             
-            # Process data
+            # Process data BEFORE initializing sampler
             await self._process_data(self.config.image_dirs)
             
-            # Initialize sampler
+            # Validate items were loaded
+            if len(self.items) == 0:
+                raise ValueError("No valid items were loaded from the specified image directories")
+            
+            logger.info(f"Loaded {len(self.items)} items from dataset")
+            
+            # Now initialize sampler after data is processed
             self.sampler = AspectBatchSampler(
                 dataset=self,
                 batch_size=self.config.batch_size,
