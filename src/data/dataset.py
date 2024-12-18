@@ -220,6 +220,13 @@ class NovelAIDataset(Dataset):
             f"{self.bucket_manager.get_stats()}"
         )
 
+        # After initializing self.bucket_manager, log how many buckets we got:
+        logger.info(f"BucketManager has {len(self.bucket_manager.buckets)} buckets after init")
+
+        # If none are created, consider adjusting min_bucket_resolution, aspect ratio, etc.
+        if not self.bucket_manager.buckets:
+            logger.warning("No buckets created! Check min_bucket_resolution and max_aspect_ratio settings.")
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """Get dataset item with cached data."""
         item = self.items[idx]
