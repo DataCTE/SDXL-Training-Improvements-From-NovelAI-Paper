@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List, Tuple, Optional, Literal, Union, Dict
+from typing import List, Tuple, Optional, Literal, Union, Dict, Any
 import yaml
 import torch
 from pathlib import Path
@@ -236,6 +236,7 @@ class NovelAIDatasetConfig:
         'artist': (0.5, 1.5)
     })
     tag_weights_path: Optional[str] = None
+    text_embedder_config: Dict[str, Any] = None
 
     def __post_init__(self):
         """Convert and validate configuration."""
