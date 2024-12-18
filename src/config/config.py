@@ -22,7 +22,27 @@ DEFAULT_LR = 4.0e-7
 DEFAULT_VAE_LR = 4.5e-5
 DEFAULT_DISC_LR = 4.5e-5
 
-
+# Updated constants
+TARGET_AREA = 1024 * 1024  # 1024 x 1024 target area
+DEFAULT_TARGET_RESOLUTIONS = [
+    # Square
+    (1024, 1024),  # 1:1
+    # Portrait
+    (832, 1152),   # 2:3
+    (896, 1152),   # 3:4
+    (832, 1280),   # 5:8
+    (768, 1344),   # 9:16
+    (704, 1472),   # 9:19
+    (704, 1536),   # 9:21
+    # Landscape
+    (1152, 832),   # 3:2
+    (1152, 896),   # 4:3
+    (1280, 832),   # 8:5
+    (1344, 768),   # 16:9
+    (1472, 704),   # 19:9
+    (1536, 704),   # 21:9
+]
+DEFAULT_MAX_AR_ERROR = 0.15
 
 @dataclass
 class DeviceConfig:
@@ -368,6 +388,10 @@ class NovelAIDatasetConfig:
     min_bucket_length: int = 1  # Default value
     debug_mode: bool = False  # Default value
     prefetch_factor: Optional[int] = DEFAULT_PREFETCH_FACTOR
+    target_resolutions: List[Tuple[int, int]] = field(
+        default_factory=lambda: DEFAULT_TARGET_RESOLUTIONS
+    )
+    max_ar_error: float = DEFAULT_MAX_AR_ERROR
 
     def __post_init__(self):
         # Convert image sizes to tuples if needed
