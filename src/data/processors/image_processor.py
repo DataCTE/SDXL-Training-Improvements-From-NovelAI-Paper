@@ -80,8 +80,8 @@ class ImageProcessor:
         """
         Load and validate an image using a utility function, in a separate thread if needed.
         """
-        # Use asyncio.to_thread since load_and_validate_image is synchronous
-        return await asyncio.to_thread(load_and_validate_image, path_or_str)
+        # Pass the config to load_and_validate_image
+        return await asyncio.to_thread(load_and_validate_image, path_or_str, config=self.config)
 
     async def process_image(
         self,
