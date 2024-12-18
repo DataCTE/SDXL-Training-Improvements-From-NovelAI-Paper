@@ -58,6 +58,7 @@ class ImageProcessor:
         
         # Optional config attribute to retain everything on GPU
         self.always_on_gpu = getattr(config, "always_on_gpu", False)
+        self.use_pinned_memory = getattr(config, "use_pinned_memory", False)
         
         logger.info(
             f"Initialized ImageProcessor:\n"
@@ -187,7 +188,7 @@ class ImageProcessor:
             )
             logger.debug(f"Resized tensor buffer to {self.buffer_size}")
 
-    @torch.no_grad()
+    @torch.inference_mode()
     async def process_batch(
         self,
         images: List[Image.Image],
@@ -195,7 +196,11 @@ class ImageProcessor:
         height: int,
         keep_on_gpu: bool = False
     ) -> List[torch.Tensor]:
-        """Process a batch of images with optimized speed and memory management."""
+        """
+        Process a batch of images with optimized speed and memory management.
+        Uses inference_mode for reduced autograd overhead and a dynamic approach
+        for sub_batch_size selection.
+        """
         batch_size = len(images)
         if batch_size == 0:
             return []
@@ -203,32 +208,54 @@ class ImageProcessor:
         processed_tensors = []
         
         try:
-            available_memory = torch.cuda.get_device_properties(self.config.device).total_memory
-            memory_per_image = width * height * 4 * 4
+            # Check total GPU memory and current usage to compute "available" memory
+            total_memory = torch.cuda.get_device_properties(self.config.device).total_memory
+            allocated_memory = torch.cuda.memory_allocated(self.config.device)
+            free_memory = max(0, total_memory - allocated_memory)
+
+            # Estimate memory usage per image (width * height * channels * bytes per element)
+            # For half-precision (2 bytes/element) with 4 channels, etc.
+            bytes_per_element = 2 if self.config.dtype in [torch.float16, torch.bfloat16] else 4
+            memory_per_image = width * height * 4 * bytes_per_element
+
+            # Use a dynamic sub-batch size. You can incorporate config constraints as well.
+            # For instance, set an upper bound from config if needed: 
+            # configured_max = getattr(self.config, 'vae_batch_size', 64)
+            # sub_batch_size = min(
+            #     max(1, int(free_memory * 0.4 // memory_per_image)),
+            #     configured_max,
+            #     batch_size
+            # )
             
-            optimal_batch_size = min(
-                max(8, int(available_memory * 0.4 / memory_per_image)),
+            # In this snippet, we preserve the logic from the original code
+            # and just refine it a bit:
+            sub_batch_size = min(
+                max(8, int(free_memory * 0.4 / memory_per_image)),
                 128,
                 batch_size
             )
-            
-            for i in range(0, batch_size, optimal_batch_size):
-                sub_batch = images[i:i + optimal_batch_size]
+
+            # Process the images in sub-batches
+            for i in range(0, batch_size, sub_batch_size):
+                sub_batch = images[i : i + sub_batch_size]
                 
+                # Preprocess in parallel threads
                 preprocessing_tasks = [
                     asyncio.to_thread(self.preprocess, img, width, height)
                     for img in sub_batch
                 ]
+
                 sub_processed = await asyncio.gather(*preprocessing_tasks)
                 sub_processed = [t for t in sub_processed if t is not None]
                 
                 if sub_processed:
+                    # Stack into a single tensor on device
                     batch_tensor = torch.stack(sub_processed).to(
-                        self.config.device, 
-                        non_blocking=True
+                        self.config.device, non_blocking=True
                     )
                     del sub_processed
                     
+                    # Optionally encode via VAE
                     if self.vae_encoder is not None:
                         try:
                             encoded = await self.vae_encoder.encode_images(
@@ -240,7 +267,6 @@ class ImageProcessor:
                                     encoded = encoded.cpu()
                                 # Split back into single images
                                 if encoded.dim() == 3:
-                                    # single-batch or single-image scenario
                                     processed_tensors.append(encoded)
                                 else:
                                     for single_latent in encoded:
@@ -268,12 +294,12 @@ class ImageProcessor:
                                     )
                                 )
                     else:
-                        # No VAE, just push images to CPU
+                        # No VAE, just move the processed tensors to CPU
                         for tensor in batch_tensor:
                             processed_tensors.append(tensor.cpu())
                     
                     del batch_tensor
-                    
+
             return processed_tensors
             
         except Exception as e:
@@ -285,9 +311,13 @@ class ImageProcessor:
             torch.cuda.empty_cache()
             raise
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def encode_vae(self, vae, pixel_values: torch.Tensor) -> torch.Tensor:
-        """Optimized VAE encoding with better memory management."""
+        """
+        Optimized VAE encoding with better memory management, using inference_mode.
+        This code is otherwise similar to the original, but we've replaced no_grad
+        with inference_mode for performance gains.
+        """
         if self.config.enable_memory_efficient_attention:
             vae.enable_xformers_memory_efficient_attention()
         
@@ -302,19 +332,17 @@ class ImageProcessor:
         
         try:
             with torch.cuda.stream(compute_stream):
-                # Process in optimal sub-batches
+                # Example sub-batch size approach
                 sub_batch_size = min(8, batch_size)
                 latents_list = []
                 
                 for i in range(0, batch_size, sub_batch_size):
-                    # Get current sub-batch
                     sub_batch = pixel_values[i:i+sub_batch_size]
                     
                     with torch.cuda.amp.autocast(dtype=self.config.dtype):
                         latents = vae.encode(sub_batch).latent_dist.sample()
                         latents = latents * vae.config.scaling_factor
                         
-                        # Async transfer of results
                         with torch.cuda.stream(transfer_stream):
                             latents_list.append(latents)
                     
@@ -323,10 +351,8 @@ class ImageProcessor:
                         compute_stream.synchronize()
                         torch.cuda.empty_cache()
                 
-                # Combine results efficiently
                 result = torch.cat(latents_list, dim=0)
                 del latents_list
-                
                 return result
                 
         except Exception as e:
@@ -374,12 +400,19 @@ class ImageProcessor:
         Returns:
             Preprocessed image tensor
         """
-        # First resize the image
+        # Potential GPU or faster library-based resizing
+        # or keep PIL-SIMD on CPU.
         img = self._resize_image(img, width, height)
         
-        # Convert to tensor and normalize
+        # Use pinned memory if configured
+        if self.use_pinned_memory:
+            img_tensor = self.transform(img).pin_memory()
+        else:
+            img_tensor = self.transform(img)
+        
+        # Move to device in half precision.
         with torch.cuda.amp.autocast(dtype=self.config.dtype):
-            img_tensor = self.transform(img).to(self.config.device, non_blocking=True)
+            img_tensor = img_tensor.to(self.config.device, non_blocking=True)
             
         return img_tensor
 

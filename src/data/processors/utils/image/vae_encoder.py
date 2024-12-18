@@ -103,7 +103,7 @@ class VAEEncoder:
     #         self._tensor_cache[key] = tensor
     #     return tensor
 
-    @torch.no_grad()
+    @torch.inference_mode()
     async def encode_images(self, images: "torch.Tensor", keep_on_gpu: bool = False) -> "torch.Tensor":
         """
         Unified chunk-based method to encode one or more images to latents.
@@ -116,34 +116,46 @@ class VAEEncoder:
             Latents as torch.Tensor on GPU or CPU, or None on failure.
         """
         try:
-            # Ensure images is 4D
             if images.dim() == 3:
                 images = images.unsqueeze(0)
 
-            images = images.to(memory_format=torch.contiguous_format).float()
-            latents = []
+            # Optional pinned memory for faster GPU transfers
+            if images.device.type == 'cpu':
+                images = images.pin_memory()
+
+            # Force contiguous for better memory access
+            images = images.contiguous(memory_format=torch.contiguous_format)
+
+            latents_list = []
             batch_size = images.shape[0]
 
-            for i in range(0, batch_size, self.config.vae_batch_size):
-                chunk = images[i : i + self.config.vae_batch_size]
-                chunk = chunk.to(self.vae.device, dtype=self.vae.dtype)
+            # Potential dynamic sub-batching idea (pseudo-code):
+            # sub_batch_size = min(self.config.vae_batch_size, self._available_gpu_capacity() // chunk_size_estimate)
+            sub_batch_size = self.config.vae_batch_size
 
-                latent_dist = self.vae.encode(chunk).latent_dist
-                chunk_latents = latent_dist.sample() * self.vae.config.scaling_factor
-
-                if keep_on_gpu:
-                    latents.append(chunk_latents)
-                else:
-                    latents.append(chunk_latents.cpu())
-
-            latents = torch.cat(latents, dim=0)
-
-            # If single image, remove batch dimension
+            with torch.cuda.amp.autocast(dtype=self.vae.dtype):
+                for i in range(0, batch_size, sub_batch_size):
+                    chunk = images[i : i + sub_batch_size]
+                    # Move chunk to GPU in half precision
+                    chunk = chunk.to(self.vae.device, non_blocking=True)
+                    
+                    # Encode
+                    latent_dist = self.vae.encode(chunk).latent_dist
+                    chunk_latents = latent_dist.sample() * self.vae.config.scaling_factor
+                    
+                    if keep_on_gpu:
+                        latents_list.append(chunk_latents)
+                    else:
+                        latents_list.append(chunk_latents.cpu(non_blocking=True))
+            
+            latents = torch.cat(latents_list, dim=0)
+            
+            # If we have a single image, squeeze batch dimension
             if latents.shape[0] == 1:
-                latents = latents.squeeze(0)
-
+                return latents.squeeze(0)
+            
             return latents
-
+        
         except Exception as e:
             logger.error(f"VAE encoding error: {str(e)[:200]}...")
             torch.cuda.empty_cache()
