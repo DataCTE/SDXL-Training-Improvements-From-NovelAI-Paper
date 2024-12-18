@@ -248,7 +248,7 @@ class CacheManager:
             cache_paths = self.get_cache_paths(image_path)
             
             # Save latent immediately if present
-            if 'processed_image' in item:
+            if 'processed_image' in item and item['processed_image'] is not None:
                 await self.save_latent_async(
                     cache_paths['latent'],
                     item['processed_image']
@@ -256,10 +256,10 @@ class CacheManager:
                 # Clear the tensor from the item dict after saving
                 del item['processed_image']
             
-            # Save text data immediately if present
-            if 'text_data' in item:
+            # Save text data immediately if present and not None
+            if 'text_data' in item and item['text_data'] is not None:
                 text_data = item['text_data'].copy()  # Make a copy to avoid modifying original
-                if 'tag_weights' in item:
+                if 'tag_weights' in item and item['tag_weights'] is not None:
                     text_data['tag_weights'] = item['tag_weights']
                 await self.save_text_data_async(
                     cache_paths['text'],
@@ -296,18 +296,18 @@ class CacheManager:
                 # Get cache paths
                 cache_paths = self.get_cache_paths(item['image_path'])
                 
-                # Save latent immediately if present
-                if 'processed_image' in item:
+                # Save latent immediately if present and not None
+                if 'processed_image' in item and item['processed_image'] is not None:
                     await self.save_latent_async(
                         cache_paths['latent'],
                         item['processed_image']
                     )
                     del item['processed_image']  # Clear after saving
                 
-                # Save text data immediately if present
-                if 'text_data' in item:
+                # Save text data immediately if present and not None
+                if 'text_data' in item and item['text_data'] is not None:
                     text_data = item['text_data'].copy()
-                    if 'tag_weights' in item:
+                    if 'tag_weights' in item and item['tag_weights'] is not None:
                         text_data['tag_weights'] = item['tag_weights']
                     await self.save_text_data_async(
                         cache_paths['text'],

@@ -219,16 +219,23 @@ class TextEmbedder:
                     len(prompts)
                 )
                 
+                # Ensure pooled embeddings have same dimensions before concatenating
+                pooled_1 = text_embeddings_1['pooled_prompt_embeds']
+                pooled_2 = text_embeddings_2['pooled_prompt_embeds']
+                
+                # Add batch dimension if needed
+                if pooled_1.dim() == 2:
+                    pooled_1 = pooled_1.unsqueeze(0)
+                if pooled_2.dim() == 2:
+                    pooled_2 = pooled_2.unsqueeze(0)
+                
                 # Combine embeddings
                 text_embeddings = torch.cat([
                     text_embeddings_1['prompt_embeds'],
                     text_embeddings_2['prompt_embeds']
                 ], dim=-1)
                 
-                pooled_embeddings = torch.cat([
-                    text_embeddings_1['pooled_prompt_embeds'],
-                    text_embeddings_2['pooled_prompt_embeds']
-                ], dim=-1)
+                pooled_embeddings = torch.cat([pooled_1, pooled_2], dim=-1)
             
             # Update stats
             batch_stats.update({
