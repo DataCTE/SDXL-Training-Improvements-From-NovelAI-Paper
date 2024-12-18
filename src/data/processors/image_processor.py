@@ -166,17 +166,35 @@ class ImageProcessor:
             img_obj = img_or_path
         return self.preprocess(img_obj)
 
-    async def process_image(self, image, skip_vae=False, keep_on_gpu=False):
+    async def process_image(self, image, original_size=None, skip_vae=False, keep_on_gpu=False):
         """
         Single-image version. Usually slower for big datasets.
         Batch calls are recommended for better throughput.
+
+        Returns a dictionary containing pixel_values (if skip_vae==True),
+        latents (if skip_vae==False), and original_size (always).
         """
+        import torch
         res = await self.process_batch([image], skip_vae=skip_vae, keep_on_gpu=keep_on_gpu)
         if res is None or res.shape[0] == 0:
             return {}
-        # Return the first
-        # If VAE encoded, shape is [1,4,H/8,W/8]. If raw, shape is [1,3,H,W].
-        return res[0].unsqueeze(0)
+
+        # The returned tensor is either:
+        #   - latents if skip_vae=False
+        #   - pixel data if skip_vae=True
+        tensor = res[0].unsqueeze(0)
+        if skip_vae:
+            return {
+                "pixel_values": tensor,
+                "latents": None,
+                "original_size": original_size
+            }
+        else:
+            return {
+                "pixel_values": None,
+                "latents": tensor,
+                "original_size": original_size
+            }
 
     async def cleanup(self):
         """
