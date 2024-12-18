@@ -89,6 +89,18 @@ class TrainingConfig:
     vae_validation_split: float = 0.1
 
 @dataclass
+class TagWeighterConfig:
+    """Configuration for tag weighting."""
+    default_weight: float = 1.0
+    min_weight: float = 0.1
+    max_weight: float = 3.0
+    smoothing_factor: float = 1e-4
+    use_cache: bool = True
+    device: torch.device = torch.device('cuda')
+    dtype: torch.dtype = torch.float32
+
+
+@dataclass
 class DataConfig:
     image_dirs: List[str]
     image_size: Tuple[int, int] = DEFAULT_IMAGE_SIZE
@@ -120,6 +132,17 @@ class DataConfig:
     persistent_workers: bool = True
     shuffle: bool = True
     proportion_empty_prompts: float = 0.0
+    
+    # Tag weighting settings
+    use_tag_weighting: bool = True
+    tag_weighting: TagWeighterConfig = field(default_factory=TagWeighterConfig)
+    tag_weight_ranges: Dict[str, Tuple[float, float]] = field(default_factory=lambda: {
+        'character': (0.8, 1.2),
+        'style': (0.7, 1.3),
+        'quality': (0.6, 1.4),
+        'artist': (0.5, 1.5)
+    })
+    tag_weights_path: Optional[str] = None
 
     def __post_init__(self):
         """Convert and validate configuration."""
@@ -140,16 +163,6 @@ class DataConfig:
         # Update max_dim to be the sum of max_image_size dimensions
         self.max_dim = sum(self.max_image_size)
 
-@dataclass
-class TagWeighterConfig:
-    """Configuration for tag weighting."""
-    default_weight: float = 1.0
-    min_weight: float = 0.1
-    max_weight: float = 3.0
-    smoothing_factor: float = 1e-4
-    use_cache: bool = True
-    device: torch.device = torch.device('cuda')
-    dtype: torch.dtype = torch.float32
 
 @dataclass
 class ScoringConfig:
