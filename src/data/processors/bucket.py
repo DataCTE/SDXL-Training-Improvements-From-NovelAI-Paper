@@ -135,6 +135,20 @@ class BucketManager:
         if skip_details:
             logger.debug("Skipped items:\n" + "\n".join(skip_details))
 
+        if len(self.buckets) == 0:
+            # Create a fallback bucket to avoid an empty bucket list
+            fallback_w, fallback_h = 512, 512
+            logger.warning(
+                f"No dynamic buckets created; adding fallback bucket "
+                f"[{fallback_w}x{fallback_h}] to prevent empty bucket list."
+            )
+            fallback_key = f"{fallback_w}x{fallback_h}"
+            self.buckets[fallback_key] = ImageBucket(width=fallback_w, height=fallback_h)
+
+        logger.info(
+            f"After fallback check, total {len(self.buckets)} bucket(s): {list(self.buckets.keys())}"
+        )
+
         logger.info(f"Created {len(self.buckets)} dynamic buckets from dataset.")
 
         # If zero buckets, raise an error with skip info
