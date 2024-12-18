@@ -69,6 +69,7 @@ class ImageProcessor:
         image: Union[str, Path, Image.Image],
         target_size: Optional[Tuple[int, int]] = None,
         original_size: Optional[Tuple[int, int]] = None,
+        keep_on_gpu: bool = False,
         **kwargs
     ) -> Dict[str, Any]:
         """Process a single image with SDXL-style augmentation."""
@@ -113,8 +114,13 @@ class ImageProcessor:
             }
 
             if self.vae_encoder is not None:
-                latents = await self.vae_encoder.encode_batch(image_tensor.unsqueeze(0))
-                result["latents"] = latents.cpu()
+                latents = await self.vae_encoder.encode_images(
+                    image_tensor, 
+                    keep_on_gpu=keep_on_gpu
+                )
+                if latents is not None and not keep_on_gpu:
+                    latents = latents.cpu()
+                result["latents"] = latents
 
             return result
 
@@ -183,7 +189,8 @@ class ImageProcessor:
         self,
         images: List[Image.Image],
         width: int,
-        height: int
+        height: int,
+        keep_on_gpu: bool = False
     ) -> List[torch.Tensor]:
         """Process a batch of images with optimized speed and memory management."""
         batch_size = len(images)
@@ -221,19 +228,44 @@ class ImageProcessor:
                     
                     if self.vae_encoder is not None:
                         try:
-                            encoded = await self.vae_encoder.encode_batch(batch_tensor)
-                            for tensor in encoded:
-                                processed_tensors.append(tensor.cpu())
+                            encoded = await self.vae_encoder.encode_images(
+                                batch_tensor,
+                                keep_on_gpu=keep_on_gpu
+                            )
+                            if encoded is not None:
+                                if not keep_on_gpu:
+                                    encoded = encoded.cpu()
+                                # Split back into single images
+                                if encoded.dim() == 3:
+                                    # single-batch or single-image scenario
+                                    processed_tensors.append(encoded)
+                                else:
+                                    for single_latent in encoded:
+                                        processed_tensors.append(single_latent)
+                            else:
+                                # Fallback: fill with zeros
+                                for _ in range(batch_tensor.shape[0]):
+                                    processed_tensors.append(
+                                        torch.zeros(
+                                            (4, height // 8, width // 8),
+                                            dtype=self.config.dtype,
+                                            device='cpu'
+                                        )
+                                    )
                             del encoded
                         except Exception as e:
                             logger.error(f"VAE encoding error: {str(e)[:200]}...")
-                            for _ in range(len(batch_tensor)):
+                            # On error, fill with zeros
+                            for _ in range(batch_tensor.shape[0]):
                                 processed_tensors.append(
-                                    torch.zeros((4, height//8, width//8),
-                                                dtype=self.config.dtype,
-                                                device='cpu')
+                                    torch.zeros(
+                                        (4, height // 8, width // 8),
+                                        dtype=self.config.dtype,
+                                        device='cpu'
+                                    )
                                 )
                     else:
+                        # No VAE, just push images to CPU
                         for tensor in batch_tensor:
                             processed_tensors.append(tensor.cpu())
                     
