@@ -197,6 +197,7 @@ class PathsConfig:
     output_dir: str = "outputs"
     vae_checkpoints_dir: str = "vae_checkpoints"
     vae_samples_dir: str = "vae_samples"
+    tag_weights_path: Optional[str] = "tag_weights.json"
 
 @dataclass
 class NovelAIDatasetConfig:

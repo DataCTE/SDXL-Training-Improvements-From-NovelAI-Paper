@@ -172,11 +172,11 @@ def train(config_path: str):
             proportion_empty_prompts=config.data.proportion_empty_prompts,
             max_consecutive_batch_samples=2,
             model_name=config.model.pretrained_model_name,
-            tag_weighting=config.tag_weighting,  # Pass tag weighting config
+            tag_weighting=config.tag_weighting,
             max_token_length=config.data.max_token_length,
             use_tag_weighting=config.data.use_tag_weighting,
             tag_weight_ranges=config.data.tag_weight_ranges,
-            tag_weights_path=config.paths.tag_weights_path,  # Add path for saving weights
+            tag_weights_path=os.path.join(config.paths.output_dir, "tag_weights.json")
         )
         
         # Create async event loop for dataset operations
