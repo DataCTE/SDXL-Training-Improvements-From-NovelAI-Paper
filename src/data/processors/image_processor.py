@@ -10,6 +10,8 @@ import torch.nn.functional as F
 import asyncio
 import gc
 import random
+from concurrent.futures import ThreadPoolExecutor
+import multiprocessing
 
 # Internal imports from utils
 from src.data.processors.utils.system_utils import get_gpu_memory_usage, get_optimal_workers, create_thread_pool, cleanup_processor
@@ -447,3 +449,25 @@ class ImageProcessor:
         """Process image using GPU acceleration."""
         with torch.cuda.amp.autocast(dtype=torch.bfloat16):
             return self.gpu_transform(image_data)
+
+    def _setup_parallel_processing(self):
+        """Setup parallel processing pools and queues."""
+        import multiprocessing
+        
+        # Determine optimal number of workers
+        num_workers = min(multiprocessing.cpu_count(), 8)  # Cap at 8 workers
+        
+        # Initialize thread pool for CPU operations
+        self.thread_pool = ThreadPoolExecutor(
+            max_workers=num_workers,
+            thread_name_prefix="img_proc_"
+        )
+        
+        # Initialize processing queue
+        self.processing_queue = asyncio.Queue(maxsize=32)
+        
+        # Initialize batch processing state
+        self.batch_size = getattr(self.config, 'batch_size', 1)
+        self.current_batch = []
+        
+        logger.info(f"Initialized parallel processing with {num_workers} workers")
