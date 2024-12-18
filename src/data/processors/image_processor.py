@@ -137,7 +137,7 @@ class ImageProcessor:
 
         # Combine all into one
         big_tensor = torch.cat(all_tensors, dim=0)
-        self.logger.info(f"Collected {big_tensor.size(0)} images in memory.")
+        self.logger.debug(f"Collected {big_tensor.size(0)} images in memory.")
 
         # Optional: VAE encode
         if not skip_vae and self.vae_encoder is not None:
