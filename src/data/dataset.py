@@ -153,11 +153,28 @@ class NovelAIDataset(Dataset):
     async def _process_data(self, image_dirs: List[str]):
         """Process all data with improved embedding handling."""
         try:
+            # Validate image directories
+            if not image_dirs:
+                raise ValueError("No image directories specified in config")
+            
+            # Check if directories exist
+            for dir_path in image_dirs:
+                if not Path(dir_path).exists():
+                    logger.error(f"Image directory does not exist: {dir_path}")
+                    raise ValueError(f"Image directory does not exist: {dir_path}")
+                logger.info(f"Processing directory: {dir_path}")
+
             # Find all image files with supported extensions
             image_files = await find_matching_files(
                 image_dirs,
                 extensions=['.png', '.jpg', '.jpeg', '.webp']
             )
+            
+            if not image_files:
+                logger.error("No image files found in specified directories")
+                raise ValueError("No image files found in specified directories")
+            
+            logger.info(f"Found {len(image_files)} image files")
             
             # Create progress tracker
             tracker = create_progress_tracker(
@@ -167,44 +184,79 @@ class NovelAIDataset(Dataset):
             )
             
             # Process images and text in batches
+            processed_count = 0
+            skipped_count = 0
+            error_count = 0
+            
             for batch in self._get_batches(image_files, self.config.batch_size):
                 # Get text embeddings
                 text_files = [Path(f).with_suffix('.txt') for f in batch]
-                texts = [await asyncio.to_thread(f.read_text) for f in text_files if f.exists()]
+                texts = []
+                for f, img_path in zip(text_files, batch):
+                    if f.exists():
+                        try:
+                            text = await asyncio.to_thread(f.read_text)
+                            texts.append(text)
+                        except Exception as e:
+                            logger.warning(f"Failed to read text file {f}: {e}")
+                            skipped_count += 1
+                    else:
+                        logger.warning(f"Missing text file for image: {img_path}")
+                        skipped_count += 1
                 
                 if texts:
                     # Process batch
                     batch_items = []
                     for img_path, text in zip(batch, texts):
-                        # Get original image size for SDXL conditioning
-                        with Image.open(img_path) as img:
-                            original_size = (img.height, img.width)
-                            
-                        batch_items.append({
-                            'image_path': img_path,
-                            'text': text,
-                            'original_size': original_size
-                        })
+                        try:
+                            # Get original image size for SDXL conditioning
+                            with Image.open(img_path) as img:
+                                original_size = (img.height, img.width)
+                                
+                            batch_items.append({
+                                'image_path': img_path,
+                                'text': text,
+                                'original_size': original_size
+                            })
+                        except Exception as e:
+                            logger.warning(f"Failed to process image {img_path}: {e}")
+                            error_count += 1
                     
-                    # Process batch
-                    processed_items, batch_stats = await self.batch_processor.process_batch(
-                        batch_items=batch_items,
-                        cache_manager=self.cache_manager
-                    )
-                    
-                    # Add successful items to dataset
-                    for item in processed_items:
-                        if item is not None:
-                            self.items.append(item)
+                    if batch_items:
+                        try:
+                            # Process batch
+                            processed_items, batch_stats = await self.batch_processor.process_batch(
+                                batch_items=batch_items,
+                                cache_manager=self.cache_manager
+                            )
                             
-                    # Update progress
-                    update_tracker(tracker, **batch_stats)
+                            # Add successful items to dataset
+                            for item in processed_items:
+                                if item is not None:
+                                    self.items.append(item)
+                                    processed_count += 1
+                                    
+                            # Update progress
+                            update_tracker(tracker, **batch_stats)
+                        except Exception as e:
+                            logger.error(f"Batch processing failed: {e}")
+                            error_count += len(batch_items)
                 
                 # Clear memory periodically
                 if len(self.items) % 1000 == 0:
                     gc.collect()
                     torch.cuda.empty_cache()
-                    
+            
+            # Log final statistics
+            logger.info(f"Dataset processing completed:")
+            logger.info(f"- Total files found: {len(image_files)}")
+            logger.info(f"- Successfully processed: {processed_count}")
+            logger.info(f"- Skipped (missing text): {skipped_count}")
+            logger.info(f"- Failed to process: {error_count}")
+            
+            if processed_count == 0:
+                raise ValueError("No valid items were processed from the image directories")
+            
         except Exception as e:
             logger.error(f"Error processing data: {e}")
             raise
