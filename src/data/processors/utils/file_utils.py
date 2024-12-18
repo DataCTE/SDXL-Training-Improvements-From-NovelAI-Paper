@@ -8,6 +8,7 @@ from contextlib import contextmanager
 import tempfile
 import time
 import asyncio
+from src.utils.logging.metrics import log_error_with_context, log_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -52,24 +53,67 @@ async def find_matching_files(
         logger.warning(f"Directory not found: {directory}")
         return
 
-    # Get text files if needed
-    text_files = set()
-    if require_text_pair:
-        text_files = {os.path.splitext(f)[0] for f in os.listdir(directory) if f.endswith('.txt')}
+    scan_stats = {
+        'total_scanned': 0,
+        'matched_files': 0,
+        'text_pairs': 0,
+        'errors': 0
+    }
 
-    # Process files
-    pattern = "**/*" if recursive else "*"
+    try:
+        # Get text files if needed
+        text_files = set()
+        if require_text_pair:
+            text_files = {os.path.splitext(f)[0] for f in os.listdir(directory) if f.endswith('.txt')}
+            scan_stats['text_pairs'] = len(text_files)
+            logger.info(f"Found {len(text_files)} text files in {directory}")
 
-    for ext in extensions:
-        try:
-            for file_path in directory.glob(f"{pattern}{ext}"):
-                if not require_text_pair or os.path.splitext(file_path.name)[0] in text_files:
-                    await asyncio.sleep(0)  # Yield control periodically
-                    yield str(file_path)
-        except Exception as e:
-            logger.error(f"Error processing extension {ext}: {e}")
+        # Process files
+        pattern = "**/*" if recursive else "*"
 
-    text_files.clear()
+        for ext in extensions:
+            try:
+                for file_path in directory.glob(f"{pattern}{ext}"):
+                    scan_stats['total_scanned'] += 1
+                    
+                    try:
+                        if not require_text_pair or os.path.splitext(file_path.name)[0] in text_files:
+                            scan_stats['matched_files'] += 1
+                            
+                            # Log progress periodically
+                            if scan_stats['matched_files'] % 1000 == 0:
+                                metrics = {
+                                    'total_scanned': scan_stats['total_scanned'],
+                                    'matched_files': scan_stats['matched_files'],
+                                    'text_pairs': scan_stats['text_pairs'],
+                                    'errors': scan_stats['errors']
+                                }
+                                log_metrics(metrics, scan_stats['matched_files'], step_type="scan")
+                                
+                            await asyncio.sleep(0)  # Yield control periodically
+                            yield str(file_path)
+                            
+                    except Exception as e:
+                        scan_stats['errors'] += 1
+                        log_error_with_context(e, f"Error processing file {file_path}")
+                        
+            except Exception as e:
+                log_error_with_context(e, f"Error processing extension {ext}")
+
+        # Log final stats
+        logger.info(
+            f"\nFile scan completed for {directory}:\n"
+            f"- Total files scanned: {scan_stats['total_scanned']}\n"
+            f"- Matched files: {scan_stats['matched_files']}\n"
+            f"- Text pairs found: {scan_stats['text_pairs']}\n"
+            f"- Errors encountered: {scan_stats['errors']}"
+        )
+
+    except Exception as e:
+        log_error_with_context(e, f"Error scanning directory {directory}")
+        raise
+    finally:
+        text_files.clear()
 
 def safe_file_write(path: str, data: bytes) -> bool:
     """Write file atomically using temporary file with proper cleanup."""
@@ -206,6 +250,5 @@ def validate_image_text_pair(
     except UnicodeDecodeError:
         return False, f"Text file not in {required_text_encoding} encoding"
     except Exception as e:
-        return False, f"Error reading text file: {str(e)}"
-        
+        return False, f"Error reading text file: {str(e)}"        
     return True, "Valid pair"

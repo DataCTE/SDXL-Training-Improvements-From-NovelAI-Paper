@@ -3,6 +3,8 @@ import logging
 from typing import Dict, Optional, Any, Callable
 from dataclasses import dataclass, field
 import torch
+from src.utils.logging.metrics import log_error_with_context, log_metrics
+from src.data.processors.utils.batch_utils import get_gpu_memory_usage
 
 logger = logging.getLogger(__name__)
 
@@ -127,29 +129,39 @@ def log_progress(
     stats: ProgressStats,
     prefix: str = "",
     extra_stats: Optional[Dict] = None,
-    callback: Optional[Callable[[Dict[str, Any]], None]] = None
+    log_interval: int = 10
 ) -> None:
-    """Log progress with optional extra statistics and callback."""
-    if stats.should_log(interval=10.0):
-        progress_msg = (
-            f"{prefix}Progress: {stats.processed_items}/{stats.total_items} "
-            f"({stats.progress*100:.1f}%)\n"
-            f"Performance:\n"
-            f"- Processing rate: {stats.rate:.1f} items/s\n"
-            f"- Memory usage: {stats.memory_usage_gb:.1f}GB\n"
-            f"- Failed items: {stats.failed_items}\n"
-            f"- Cache hits/misses: {stats.cache_hits}/{stats.cache_misses}\n"
-            f"- Elapsed: {format_time(stats.elapsed)}\n"
-            f"- ETA: {format_time(stats.eta_seconds)}"
-        )
-        
-        if extra_stats:
-            stats_msg = "\nExtra stats:\n" + "\n".join(
-                f"- {k}: {v}" for k, v in extra_stats.items()
-            )
-            progress_msg += stats_msg
+    """Log progress with improved metrics."""
+    if stats.should_log(interval=log_interval):
+        try:
+            # Prepare base metrics
+            metrics = {
+                'processed': stats.processed_items,
+                'total': stats.total_items,
+                'progress': f"{stats.progress*100:.1f}%",
+                'rate': f"{stats.rate:.1f} items/s",
+                'elapsed': format_time(stats.elapsed),
+                'eta': format_time(stats.eta_seconds),
+                'failed': stats.failed_items,
+                'cache_hits': stats.cache_hits,
+                'cache_misses': stats.cache_misses
+            }
             
-        logger.info(progress_msg)
-        
-        if callback:
-            callback(stats.get_stats())
+            # Add memory usage if device available
+            if stats.device and stats.device.type == 'cuda':
+                metrics['gpu_memory'] = f"{get_gpu_memory_usage(stats.device):.1%}"
+            
+            # Add extra stats
+            if extra_stats:
+                metrics.update(extra_stats)
+            
+            # Log using metrics logger
+            log_metrics(
+                metrics=metrics,
+                step=stats.processed_items,
+                is_main_process=True,
+                step_type="progress"
+            )
+            
+        except Exception as e:
+            log_error_with_context(e, "Error logging progress")

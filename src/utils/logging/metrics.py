@@ -5,50 +5,75 @@ import sys
 import platform
 import psutil
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 import traceback
 from src.config.config import Config
+import sys
+import time
+import torch.distributed as dist
 
 logger = logging.getLogger(__name__)
 
 def setup_logging(
     config: Config,
     logs_dir: str, 
-    is_main_process: bool = True
+    is_main_process: bool = True,
+    log_level: str = "INFO"
 ) -> None:
-    """Setup logging configuration.
-    
-    Args:
-        config: Training configuration
-        logs_dir: Directory to store log files
-        is_main_process: Whether this is the main process
-    """
+    """Setup logging configuration with more detailed formatting and handlers."""
     try:
         # Create logs directory if it doesn't exist
-        os.makedirs(logs_dir, exist_ok=True)
+        logs_dir = Path(logs_dir)
+        logs_dir.mkdir(parents=True, exist_ok=True)
         
-        # Setup logging format
-        log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        # Setup logging format with more detail
+        log_format = '%(asctime)s [%(levelname)s] %(name)s - %(message)s'
+        date_format = '%Y-%m-%d %H:%M:%S'
         
         # Configure root logger
-        logging.basicConfig(
-            level=logging.INFO if is_main_process else logging.WARNING,
-            format=log_format,
-            handlers=[
-                # Console handler
-                logging.StreamHandler(sys.stdout),
-                # File handler
-                logging.FileHandler(os.path.join(logs_dir, 'training.log'))
-            ] if is_main_process else []
-        )
-        
-        # Suppress unnecessary warnings
-        logging.getLogger("torch.distributed.distributed_c10d").setLevel(logging.WARNING)
-        logging.getLogger("transformers").setLevel(logging.WARNING)
-        logging.getLogger("diffusers").setLevel(logging.WARNING)
+        root_logger = logging.getLogger()
+        root_logger.setLevel(getattr(logging, log_level))
         
         if is_main_process:
+            # Console handler with color formatting
+            console_handler = logging.StreamHandler(sys.stdout)
+            console_handler.setFormatter(
+                logging.Formatter(log_format, datefmt=date_format)
+            )
+            root_logger.addHandler(console_handler)
+            
+            # File handlers
+            # Main log file
+            main_log = logs_dir / 'training.log'
+            file_handler = logging.FileHandler(main_log)
+            file_handler.setFormatter(
+                logging.Formatter(log_format, datefmt=date_format)
+            )
+            root_logger.addHandler(file_handler)
+            
+            # Debug log file
+            debug_log = logs_dir / 'debug.log'
+            debug_handler = logging.FileHandler(debug_log)
+            debug_handler.setLevel(logging.DEBUG)
+            debug_handler.setFormatter(
+                logging.Formatter(log_format, datefmt=date_format)
+            )
+            root_logger.addHandler(debug_handler)
+            
+            # Error log file
+            error_log = logs_dir / 'error.log'
+            error_handler = logging.FileHandler(error_log)
+            error_handler.setLevel(logging.ERROR)
+            error_handler.setFormatter(
+                logging.Formatter(log_format, datefmt=date_format)
+            )
+            root_logger.addHandler(error_handler)
+            
             logger.info(f"Logging setup complete. Logs will be saved to: {logs_dir}")
+            logger.info(f"Log files created:\n"
+                       f"- Main log: {main_log}\n"
+                       f"- Debug log: {debug_log}\n"
+                       f"- Error log: {error_log}")
             
             # Initialize wandb if enabled
             if config.training.use_wandb:
@@ -59,12 +84,18 @@ def setup_logging(
                             project=config.training.wandb_project,
                             name=config.training.wandb_run_name,
                             tags=config.training.wandb_tags,
-                            config=config
+                            config=config,
+                            settings=wandb.Settings(start_method="thread")
                         )
                     logger.info("Wandb initialized successfully")
                 except Exception as e:
                     logger.error(f"Error initializing wandb: {e}")
             
+        # Suppress unnecessary warnings
+        logging.getLogger("torch.distributed.distributed_c10d").setLevel(logging.WARNING)
+        logging.getLogger("transformers").setLevel(logging.WARNING)
+        logging.getLogger("diffusers").setLevel(logging.WARNING)
+        
     except Exception as e:
         print(f"Error setting up logging: {str(e)}", file=sys.stderr)
         raise
@@ -191,3 +222,99 @@ def cleanup_logging(is_main_process: bool = True) -> None:
                 wandb.finish()
         except Exception as e:
             logger.error(f"Error cleaning up wandb: {e}")
+
+def log_batch_metrics(
+    metrics: Dict[str, Any],
+    step: int,
+    phase: str = "train",
+    is_main_process: bool = True,
+    use_wandb: bool = False,
+    log_interval: int = 10
+) -> None:
+    """Log detailed batch metrics with better formatting."""
+    if not is_main_process or step % log_interval != 0:
+        return
+        
+    try:
+        # Format metrics string
+        metric_lines = [f"Step {step} ({phase}):"]
+        for k, v in metrics.items():
+            if isinstance(v, float):
+                metric_lines.append(f"  {k}: {v:.4f}")
+            else:
+                metric_lines.append(f"  {k}: {v}")
+                
+        # Log to console/file
+        logger.info("\n".join(metric_lines))
+        
+        # Log to wandb
+        if use_wandb:
+            import wandb
+            wandb.log({f"{phase}/{k}": v for k, v in metrics.items()}, step=step)
+            
+    except Exception as e:
+        logger.error(f"Error logging batch metrics: {e}")
+
+def log_system_metrics(
+    prefix: str = "",
+    include_gpu: bool = True,
+    include_memory: bool = True
+) -> Dict[str, Any]:
+    """Log detailed system metrics."""
+    metrics = {}
+    
+    try:
+        if include_memory:
+            import psutil
+            process = psutil.Process()
+            metrics.update({
+                "cpu_percent": process.cpu_percent(),
+                "memory_percent": process.memory_percent(),
+                "memory_rss_gb": process.memory_info().rss / (1024**3)
+            })
+            
+        if include_gpu and torch.cuda.is_available():
+            metrics.update({
+                "gpu_memory_allocated_gb": torch.cuda.memory_allocated() / (1024**3),
+                "gpu_memory_reserved_gb": torch.cuda.memory_reserved() / (1024**3),
+                "gpu_utilization": torch.cuda.utilization()
+            })
+            
+        # Log formatted metrics
+        if metrics:
+            logger.info(f"{prefix}System Metrics:")
+            for k, v in metrics.items():
+                if isinstance(v, float):
+                    logger.info(f"  {k}: {v:.2f}")
+                else:
+                    logger.info(f"  {k}: {v}")
+                    
+    except Exception as e:
+        logger.error(f"Error logging system metrics: {e}")
+        
+    return metrics
+
+def log_error_with_context(
+    error: Exception,
+    context: str,
+    include_traceback: bool = True
+) -> None:
+    """Log errors with additional context information."""
+    try:
+        import traceback
+        error_msg = [
+            f"Error in {context}:",
+            f"  Type: {type(error).__name__}",
+            f"  Message: {str(error)}"
+        ]
+        
+        if include_traceback:
+            error_msg.append("\nTraceback:")
+            error_msg.extend(
+                f"  {line}" for line in traceback.format_exc().split("\n")
+            )
+            
+        logger.error("\n".join(error_msg))
+        
+    except Exception as e:
+        logger.error(f"Error logging error: {e}")

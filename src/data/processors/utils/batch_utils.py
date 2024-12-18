@@ -13,6 +13,7 @@ from .progress_utils import (
 from src.config.config import BatchProcessorConfig
 import gc
 from weakref import WeakValueDictionary
+from src.utils.logging.metrics import log_error_with_context, log_metrics, log_system_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,16 @@ class BatchProcessor:
         self.stats = ProgressStats(total_items=0)
         self.last_memory_check = time.time()
         self._tensor_cache = WeakValueDictionary()
+        
+        # Log initialization
+        logger.info(
+            f"Initialized {name}:\n"
+            f"- Device: {config.device}\n"
+            f"- Batch size: {config.batch_size}\n"
+            f"- Workers: {executor._max_workers}\n"
+            f"- Memory target: {config.max_memory_usage:.1%}"
+        )
+        log_system_metrics(prefix=f"{name} initialization: ")
         
     def __del__(self):
         """Cleanup when processor is deleted."""
@@ -221,6 +232,58 @@ class BatchProcessor:
             self.cleanup()
             
         return results
+
+    async def process_batch(self, batch_items: List[Dict], **kwargs) -> Tuple[List[Dict], Dict]:
+        """Process a batch of items with detailed metrics."""
+        try:
+            batch_stats = {
+                'start_memory': get_gpu_memory_usage(self.config.device),
+                'start_time': time.time(),
+                'processed': 0,
+                'errors': 0,
+                'cache_hits': 0,
+                'cache_misses': 0
+            }
+
+            results = []
+            for item in batch_items:
+                try:
+                    processed = await self._process_item(item, **kwargs)
+                    if processed:
+                        results.append(processed)
+                        batch_stats['processed'] += 1
+                    else:
+                        batch_stats['errors'] += 1
+                except Exception as e:
+                    batch_stats['errors'] += 1
+                    log_error_with_context(e, f"Error processing item {item.get('image_path', 'unknown')}")
+
+            # Calculate final stats
+            batch_stats.update({
+                'end_memory': get_gpu_memory_usage(self.config.device),
+                'duration': time.time() - batch_stats['start_time'],
+                'memory_change': (
+                    get_gpu_memory_usage(self.config.device) - 
+                    batch_stats['start_memory']
+                )
+            })
+
+            # Log batch metrics
+            log_metrics({
+                'batch_size': len(batch_items),
+                'processed': batch_stats['processed'],
+                'errors': batch_stats['errors'],
+                'duration': f"{batch_stats['duration']:.2f}s",
+                'items_per_second': f"{batch_stats['processed']/batch_stats['duration']:.1f}",
+                'memory_usage': f"{batch_stats['end_memory']:.1%}",
+                'memory_change': f"{batch_stats['memory_change']:.1%}"
+            }, step=self.stats.total_items, step_type="batch")
+
+            return results, batch_stats
+
+        except Exception as e:
+            log_error_with_context(e, "Error in batch processing")
+            return [], {'errors': len(batch_items)}
 
 def create_tensor_buffer(
     batch_size: int,

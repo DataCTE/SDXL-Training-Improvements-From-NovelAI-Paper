@@ -9,6 +9,9 @@ import re
 import gc
 from src.config.config import TagWeighterConfig
 from weakref import WeakValueDictionary
+from src.utils.logging.metrics import log_error_with_context, log_metrics, log_system_metrics
+import time
+from src.data.processors.utils.batch_utils import get_gpu_memory_usage
 
 logger = logging.getLogger(__name__)
 
@@ -43,20 +46,28 @@ def parse_tags(caption: str) -> Dict[str, List[str]]:
         return {}
     
 class TagWeighter:
-    def __init__(self, config: Optional[TagWeighterConfig] = None):
+    def __init__(self, config: TagWeighterConfig):
         """Initialize tag weighter with configuration."""
-        self.config = config or TagWeighterConfig()
-        
-        # Track tag frequencies per class using defaultdict for automatic cleanup
-        self.tag_frequencies = defaultdict(lambda: defaultdict(int))
-        self.class_totals = defaultdict(int)
-        
-        # Cache for computed weights using weak references
-        self._weight_cache = WeakValueDictionary()
-        
-        # Tensor cache for reuse
-        self._tensor_cache = WeakValueDictionary()
-        
+        try:
+            self.config = config
+            self.tag_frequencies = defaultdict(lambda: defaultdict(int))
+            self.class_totals = defaultdict(int)
+            self._weight_cache = WeakValueDictionary()
+            
+            # Log initialization
+            logger.info(
+                f"Initialized TagWeighter:\n"
+                f"- Min weight: {config.min_weight}\n"
+                f"- Max weight: {config.max_weight}\n"
+                f"- Smoothing factor: {config.smoothing_factor}\n"
+                f"- Cache enabled: {config.use_cache}"
+            )
+            log_system_metrics(prefix="TagWeighter initialization: ")
+            
+        except Exception as e:
+            log_error_with_context(e, "Error initializing tag weighter")
+            raise
+
     def __del__(self):
         """Cleanup when weighter is deleted."""
         self.cleanup()
@@ -84,48 +95,130 @@ class TagWeighter:
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
         
-    def update_frequencies(self, tag_class: str, tag: str):
-        """Update frequency counters for a tag in its class."""
-        self.tag_frequencies[tag_class][tag] += 1
-        self.class_totals[tag_class] += 1
-        
-        # Clear cache when frequencies update
-        self._weight_cache.clear()
-        gc.collect()  # Help clean up old cached values
-        
-    def get_tag_weight(self, tag_class: str, tag: str) -> float:
-        """Calculate weight for a tag based on its frequency in its class."""
-        cache_key = (tag_class, tag)
-        
+    def update_frequencies(self, tags: Dict[str, List[str]]) -> None:
+        """Update tag frequency counters with metrics tracking."""
         try:
-            # Try to get from cache first
-            cached_weight = self._weight_cache.get(cache_key)
-            if cached_weight is not None:
-                return cached_weight
-                
-            class_total = self.class_totals[tag_class]
-            if class_total == 0:
-                return self.config.default_weight
-                
-            tag_freq = self.tag_frequencies[tag_class][tag]
-            if tag_freq == 0:
-                return self.config.max_weight
-                
-            # Calculate relative frequency with smoothing
-            smoothed_freq = (tag_freq + self.config.smoothing_factor) / (class_total + self.config.smoothing_factor)
+            update_stats = {
+                'total_tags': 0,
+                'unique_tags': 0,
+                'tag_classes': 0
+            }
             
-            # Inverse frequency weighting with bounds
-            weight = 1.0 / (smoothed_freq + self.config.smoothing_factor)
-            weight = max(self.config.min_weight, min(self.config.max_weight, weight))
+            # Track new tags
+            new_tags = set()
             
-            # Cache the computed weight
-            self._weight_cache[cache_key] = weight
-            return weight
+            for tag_class, tag_list in tags.items():
+                self.class_totals[tag_class] += len(tag_list)
+                update_stats['tag_classes'] += 1
+                
+                for tag in tag_list:
+                    self.tag_frequencies[tag_class][tag] += 1
+                    update_stats['total_tags'] += 1
+                    if tag not in new_tags:
+                        new_tags.add(tag)
+                        update_stats['unique_tags'] += 1
+            
+            # Log update metrics periodically
+            if hasattr(self, '_update_counter'):
+                self._update_counter += 1
+            else:
+                self._update_counter = 1
+                
+            if self._update_counter % 1000 == 0:  # Log every 1000 updates
+                update_stats.update({
+                    'total_unique_tags': len(self._weight_cache),
+                    'memory_usage_mb': get_gpu_memory_usage() * 1024
+                })
+                log_metrics(update_stats, step=self._update_counter, step_type="tag_update")
+                
+        except Exception as e:
+            log_error_with_context(e, "Error updating tag frequencies")
+
+    def calculate_weights(
+        self,
+        tags: Dict[str, List[str]],
+        embeddings: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Calculate tag weights with detailed metrics."""
+        try:
+            weight_stats = {
+                'start_time': time.time(),
+                'total_tags': sum(len(tags_list) for tags_list in tags.values()),
+                'tag_classes': len(tags),
+                'cache_hits': 0,
+                'cache_misses': 0
+            }
+            
+            # Calculate base weights
+            weights = []
+            for tag_class, tag_list in tags.items():
+                class_total = self.class_totals[tag_class]
+                for tag in tag_list:
+                    # Try cache first
+                    cache_key = f"{tag_class}:{tag}"
+                    cached_weight = self._weight_cache.get(cache_key)
+                    
+                    if cached_weight is not None:
+                        weights.append(cached_weight)
+                        weight_stats['cache_hits'] += 1
+                    else:
+                        # Calculate weight
+                        freq = self.tag_frequencies[tag_class][tag]
+                        weight = 1.0 / (freq + self.config.smoothing_factor)
+                        weights.append(weight)
+                        
+                        # Cache result
+                        if self.config.use_cache:
+                            self._weight_cache[cache_key] = weight
+                        weight_stats['cache_misses'] += 1
+            
+            weights = torch.tensor(weights, device=self.config.device)
+            
+            # Apply similarity factor if embeddings provided
+            if embeddings is not None:
+                with torch.cuda.amp.autocast(dtype=self.config.dtype):
+                    similarity_factors = self.calculate_similarity_factor(embeddings, attention_mask)
+                    weight_stats['similarity_min'] = similarity_factors.min().item()
+                    weight_stats['similarity_max'] = similarity_factors.max().item()
+                    weight_stats['similarity_mean'] = similarity_factors.mean().item()
+                    
+                    # Use mean similarity as a modulation factor
+                    similarity_weights = 1.0 / (similarity_factors.mean(dim=-1) + self.config.smoothing_factor)
+                    weights = weights * similarity_weights
+                    
+                    # Clean up similarity tensors
+                    del similarity_factors
+                    del similarity_weights
+                    
+            # Normalize weights
+            weights = weights / weights.mean()
+            weights = weights.clamp(self.config.min_weight, self.config.max_weight)
+            
+            # Log final stats
+            weight_stats.update({
+                'duration': time.time() - weight_stats['start_time'],
+                'min_weight': weights.min().item(),
+                'max_weight': weights.max().item(),
+                'mean_weight': weights.mean().item(),
+                'std_weight': weights.std().item()
+            })
+            
+            # Log metrics periodically
+            if hasattr(self, '_weight_counter'):
+                self._weight_counter += 1
+            else:
+                self._weight_counter = 1
+                
+            if self._weight_counter % 100 == 0:  # Log every 100 weight calculations
+                log_metrics(weight_stats, step=self._weight_counter, step_type="tag_weight")
+            
+            return weights
             
         except Exception as e:
-            logger.warning(f"Error calculating tag weight: {e}")
-            return self.config.default_weight
-            
+            log_error_with_context(e, "Error calculating tag weights")
+            return torch.ones(len(tags), device=self.config.device)
+
     def _get_cached_tensor(self, key: str, shape: tuple, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
         """Get or create tensor from cache."""
         tensor = self._tensor_cache.get(key)

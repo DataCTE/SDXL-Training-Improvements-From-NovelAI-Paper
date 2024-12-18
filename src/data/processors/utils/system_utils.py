@@ -9,6 +9,7 @@ from pathlib import Path
 from weakref import WeakValueDictionary
 import gc
 import time
+from src.utils.logging.metrics import log_system_metrics, log_error_with_context
 
 logger = logging.getLogger(__name__)
 
@@ -30,26 +31,30 @@ class SystemResources:
     gpu_memory_used: Optional[float] = None
 
 def get_system_resources() -> SystemResources:
-    """Get current system resource information."""
-    cpu_count = psutil.cpu_count(logical=True)
-    total_memory = psutil.virtual_memory().total / (1024 * 1024 * 1024)  # GB
-    available_memory = psutil.virtual_memory().available / (1024 * 1024 * 1024)  # GB
-    
-    # Get GPU memory info if available
-    gpu_total = None
-    gpu_used = None
-    if torch.cuda.is_available():
-        device = torch.cuda.current_device()
-        gpu_total = torch.cuda.get_device_properties(device).total_memory / (1024 * 1024 * 1024)  # GB
-        gpu_used = torch.cuda.memory_reserved() / (1024 * 1024 * 1024)  # GB
-    
-    return SystemResources(
-        cpu_count=cpu_count,
-        total_memory_gb=total_memory,
-        available_memory_gb=available_memory,
-        gpu_memory_total=gpu_total,
-        gpu_memory_used=gpu_used
-    )
+    """Get current system resource information with logging."""
+    try:
+        resources = SystemResources(
+            cpu_count=psutil.cpu_count(logical=True),
+            total_memory=psutil.virtual_memory().total / (1024**3),  # GB
+            available_memory=psutil.virtual_memory().available / (1024**3),  # GB
+            gpu_memory_total=None,
+            gpu_memory_used=None
+        )
+        
+        # Get GPU info if available
+        if torch.cuda.is_available():
+            device = torch.cuda.current_device()
+            resources.gpu_memory_total = torch.cuda.get_device_properties(device).total_memory / (1024**3)
+            resources.gpu_memory_used = torch.cuda.memory_reserved() / (1024**3)
+        
+        # Log system metrics
+        log_system_metrics(prefix="System Resources: ")
+        
+        return resources
+        
+    except Exception as e:
+        log_error_with_context(e, "Error getting system resources")
+        raise
 
 def get_optimal_workers(memory_per_worker_gb: float = 2.0) -> int:
     """Calculate optimal number of worker threads based on system resources."""
@@ -240,41 +245,45 @@ class MemoryCache:
         } 
 
 async def cleanup_processor(obj):
+    """Clean up processor resources with logging."""
     try:
+        logger.info(f"Starting cleanup for {obj.__class__.__name__}")
+        
+        cleanup_stats = {
+            'tensors_cleared': 0,
+            'cache_items_cleared': 0,
+            'gpu_memory_start': get_gpu_memory_usage(obj.device) if hasattr(obj, 'device') else 0
+        }
+
         # Thread pool
         if hasattr(obj, 'executor'):
             obj.executor.shutdown(wait=True)
+            logger.debug("Thread pool shutdown complete")
 
-        # VAE encoder memory
-        if hasattr(obj, 'vae_encoder'):
-            if hasattr(obj.vae_encoder, 'cleanup'):
-                await obj.vae_encoder.cleanup()
-
-        # Text embedder
-        if hasattr(obj, 'text_embedder'):
-            if hasattr(obj.text_embedder, 'cleanup'):
-                await obj.text_embedder.cleanup()
-
-        # Tag weighter
-        if hasattr(obj, 'tag_weighter'):
-            if hasattr(obj.tag_weighter, 'cleanup'):
-                await obj.tag_weighter.cleanup()
-        
-        # Transform / buffer cleanup
-        if hasattr(obj, 'transform'):
-            del obj.transform
-        if hasattr(obj, 'tensor_buffer'):
-            del obj.tensor_buffer
-
-        # Other references
-        for attr_name in dir(obj):
-            ref = getattr(obj, attr_name)
-            if isinstance(ref, torch.Tensor):
-                del ref
-        
         # Clear caches
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        if hasattr(obj, '_tensor_cache'):
+            cleanup_stats['tensors_cleared'] = len(obj._tensor_cache)
+            obj._tensor_cache.clear()
+            
+        if hasattr(obj, 'memory_cache'):
+            cleanup_stats['cache_items_cleared'] = len(obj.memory_cache)
+            obj.memory_cache.clear()
+
+        # Clear CUDA cache
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            cleanup_stats['gpu_memory_end'] = get_gpu_memory_usage(obj.device) if hasattr(obj, 'device') else 0
+            
+        # Force garbage collection
         gc.collect()
-    
+
+        # Log cleanup stats
+        logger.info(
+            f"Cleanup completed for {obj.__class__.__name__}:\n"
+            f"- Tensors cleared: {cleanup_stats['tensors_cleared']}\n"
+            f"- Cache items cleared: {cleanup_stats['cache_items_cleared']}\n"
+            f"- GPU memory freed: {cleanup_stats['gpu_memory_start'] - cleanup_stats['gpu_memory_end']:.1%}"
+        )
+        
     except Exception as e:
-        logger.error(f"Cleanup error: {str(e)}") 
+        log_error_with_context(e, f"Error during cleanup of {obj.__class__.__name__}") 
