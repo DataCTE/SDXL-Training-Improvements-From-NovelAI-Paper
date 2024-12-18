@@ -313,33 +313,24 @@ class ImageProcessor:
             torch.cuda.empty_cache()
             return None
 
-    async def process_image(self, image: Union[str, Path, "Image.Image"], **kwargs):
+    async def process_image(self, image: Union[str, Path, "Image.Image"], skip_vae: bool = False, **kwargs):
         """
         Overload process_image for additional GPU transforms and progress tracking.
+        Now also supports skipping the VAE encoding step if latents are already cached.
+        
+        Parameters:
+            image: The image path or PIL image to be processed.
+            skip_vae: If True, do not run the VAE encoder step.
         """
         try:
-            if not hasattr(self, 'progress'):
-                self.progress = create_progress_tracker(
-                    total_items=1,
-                    device=self.config.device,
-                    desc="Processing image",
-                    unit="img"
-                )
-
+            # 1) Load and preprocess the image into a tensor
             image_data = await self._parallel_load_and_preprocess(image)
 
+            # 2) Apply GPU transforms if available, else CPU transforms
             if self.use_gpu_transforms:
                 image_tensor = self._gpu_process_image(image_data)
             else:
                 image_tensor = self._cpu_process_image(image_data)
-
-            update_tracker(
-                self.progress,
-                processed=1,
-                memory_gb=get_gpu_memory_usage(self.config.device)
-                if torch.cuda.is_available() else None
-            )
-            log_progress(self.progress, prefix="Image Processing: ")
 
             if kwargs.get('keep_on_gpu', False):
                 image_tensor = image_tensor.to(
@@ -348,10 +339,26 @@ class ImageProcessor:
                     memory_format=torch.channels_last
                 )
 
-            return self._create_result_dict(image_tensor, **kwargs)
+            # 3) If skip_vae==False and a VAE is available, encode to latents.
+            latents = None
+            if not skip_vae and self.vae_encoder is not None:
+                encoded_list = await self.vae_encoder.encode_images(
+                    image_tensor.unsqueeze(0),  # [1, C, H, W]
+                    keep_on_gpu=kwargs.get('keep_on_gpu', False)
+                )
+                if encoded_list and len(encoded_list) > 0:
+                    latents = encoded_list[0]
+
+            # 4) Build the final dict. If skip_vae is True, latents remain None here.
+            return {
+                "pixel_values": image_tensor,
+                "latents": latents,
+                "width": image_tensor.shape[-1],
+                "height": image_tensor.shape[-2],
+                "original_size": kwargs.get("original_size", (image_tensor.shape[-2], image_tensor.shape[-1]))
+            }
 
         except Exception as e:
-            update_tracker(self.progress, failed=1, error_type=str(type(e).__name__))
             logger.error(f"Error processing image: {str(e)}")
             raise
 

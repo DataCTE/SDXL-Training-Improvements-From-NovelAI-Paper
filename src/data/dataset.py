@@ -223,12 +223,25 @@ class NovelAIDataset(Dataset):
                 # Use ImageProcessor instead of manually opening images
                 batch_items = []
                 for img_path, text in zip(batch, texts):
-                    # Let the processor handle loading and transformations
-                    # Optionally pass original_size=None for dynamic inference
+                    
+                    # 1) Check whether latents are already cached
+                    cached_item = await self.cache_manager.load_cached_item(img_path)
+                    skip_vae = (
+                        cached_item is not None
+                        and cached_item.get("latents") is not None
+                    )
+
+                    # 2) Let the processor handle loading, but skip VAE if already cached
                     processed_image = await self.image_processor.process_image(
                         image=img_path,
-                        original_size=None  # or manually pass if you have prior info
+                        original_size=None,   # or manually pass if you have prior info
+                        skip_vae=skip_vae
                     )
+                    
+                    # 3) If we did skip the VAE, fill the latents from cache
+                    if skip_vae and cached_item is not None:
+                        processed_image["latents"] = cached_item["latents"]
+                    
                     if processed_image is None:
                         logger.warning(f"Skipping corrupted or missing image: {img_path}")
                         continue
@@ -251,7 +264,8 @@ class NovelAIDataset(Dataset):
                         cache_manager=self.cache_manager
                     )
                     for item in processed_items:
-                        if item is not None:
+                        if item is not None and "latents" in item and item["latents"] is not None:
+                            await self.cache_manager.cache_item(item["image_path"], item)
                             self.items.append(item)
                             processed_count += 1
                     

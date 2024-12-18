@@ -52,7 +52,7 @@ class CacheManager:
         }
 
     async def cache_item(self, image_path: str, processed_item: Dict[str, Any]) -> None:
-        """Cache processed item data including tag weights."""
+        """Cache processed item data including tag weights and latents."""
         try:
             cache_paths = self.get_cache_paths(image_path)
             
@@ -71,16 +71,18 @@ class CacheManager:
                 'target_size': (processed_item.get('width'), processed_item.get('height'))
             }
             
-            # Save latents
+            # Save latents to disk so they're not lost
             if latents is not None:
+                logger.debug(f"Saving latents for {image_path} to {cache_paths['latent']}")
                 torch.save(
-                    latents.cpu(), 
+                    latents.cpu(),
                     cache_paths['latent'],
                     _use_new_zipfile_serialization=True
                 )
             
             # Save text embeddings
             if text_data is not None:
+                logger.debug(f"Saving text data for {image_path} to {cache_paths['text']}")
                 torch.save(
                     text_data,
                     cache_paths['text'],
@@ -90,6 +92,7 @@ class CacheManager:
             # Save metadata
             if any(metadata.values()):
                 import json
+                logger.debug(f"Saving metadata for {image_path} to {cache_paths['metadata']}")
                 with open(cache_paths['metadata'], 'w') as f:
                     json.dump(metadata, f)
             
