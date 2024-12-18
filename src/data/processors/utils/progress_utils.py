@@ -15,6 +15,7 @@ class ProgressStats:
     batch_size: Optional[int] = None
     device: Optional[torch.device] = None
     desc: Optional[str] = None
+    unit: Optional[str] = None
     processed_items: int = 0
     failed_items: int = 0
     cache_hits: int = 0
@@ -86,6 +87,7 @@ def create_progress_tracker(
     total_items: int,
     batch_size: Optional[int] = None,
     device: Optional[torch.device] = None,
+    desc: Optional[str] = None,
     unit: Optional[str] = None
 ) -> ProgressStats:
     """Create a new progress tracker with optional batch and device info."""
@@ -93,6 +95,7 @@ def create_progress_tracker(
         total_items=total_items,
         batch_size=batch_size,
         device=device,
+        desc=desc,
         unit=unit
     )
 
