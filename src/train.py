@@ -175,13 +175,12 @@ def train(config_path: str):
         
         # Initialize dataset with async context
         async def init_dataset():
-            dataset = NovelAIDataset(
+            return await NovelAIDataset.create(
                 image_dirs=config.data.image_dirs,
                 config=dataset_config,
                 vae=vae,
                 device=device
             )
-            return dataset
 
         try:
             # Run dataset initialization in the event loop
@@ -222,7 +221,6 @@ def train(config_path: str):
             logger.error(traceback.format_exc())
             raise
         finally:
-            # Cleanup dataset resources if it was initialized
             if dataset is not None:
                 loop.run_until_complete(dataset.cleanup())
             if loop is not None and not loop.is_closed():
