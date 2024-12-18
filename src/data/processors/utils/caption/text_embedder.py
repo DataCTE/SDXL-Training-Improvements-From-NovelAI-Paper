@@ -58,15 +58,15 @@ class TextEmbedder:
             # Load tokenizers from config
             self.tokenizer_one = AutoTokenizer.from_pretrained(
                 config.model_name,
-                subfolder="tokenizer",
-                use_fast=False,
-                revision=config.revision
+                subfolder=config.tokenizer_subfolder,
+                use_fast=config.use_fast_tokenizer,
+                low_cpu_mem_usage=config.low_cpu_mem_usage
             )
             self.tokenizer_two = AutoTokenizer.from_pretrained(
                 config.model_name,
-                subfolder="tokenizer_2",
-                use_fast=False,
-                revision=config.revision
+                subfolder=config.tokenizer_2_subfolder,
+                use_fast=config.use_fast_tokenizer,
+                low_cpu_mem_usage=config.low_cpu_mem_usage
             )
             logger.info("Initialized new tokenizers")
         
@@ -82,28 +82,24 @@ class TextEmbedder:
             # Load text encoders from config
             text_encoder_cls_one = import_model_class_from_model_name_or_path(
                 config.model_name, 
-                subfolder="text_encoder",
-                revision=config.revision
+                subfolder=config.text_encoder_subfolder
             )
             text_encoder_cls_two = import_model_class_from_model_name_or_path(
                 config.model_name,
-                subfolder="text_encoder_2",
-                revision=config.revision
+                subfolder=config.text_encoder_2_subfolder
             )
             
             self.text_encoder_one = text_encoder_cls_one.from_pretrained(
                 config.model_name,
-                subfolder="text_encoder",
-                torch_dtype=config.dtype,
-                revision=config.revision,
-                variant=config.variant
+                subfolder=config.text_encoder_subfolder,
+                torch_dtype=torch.float16,  # Use default dtype
+                low_cpu_mem_usage=config.low_cpu_mem_usage
             )
             self.text_encoder_two = text_encoder_cls_two.from_pretrained(
                 config.model_name,
-                subfolder="text_encoder_2",
-                torch_dtype=config.dtype,
-                revision=config.revision,
-                variant=config.variant
+                subfolder=config.text_encoder_2_subfolder,
+                torch_dtype=torch.float16,  # Use default dtype
+                low_cpu_mem_usage=config.low_cpu_mem_usage
             )
             logger.info("Initialized new text encoders")
         
@@ -115,9 +111,8 @@ class TextEmbedder:
             f"Initialized TextEmbedder:\n"
             f"- Model: {config.model_name}\n"
             f"- Device: {config.device}\n"
-            f"- Dtype: {config.dtype}\n"
-            f"- Revision: {config.revision}\n"
-            f"- Variant: {config.variant}"
+            f"- Fast tokenizer: {config.use_fast_tokenizer}\n"
+            f"- Low CPU memory: {config.low_cpu_mem_usage}"
         )
 
     @torch.no_grad()
