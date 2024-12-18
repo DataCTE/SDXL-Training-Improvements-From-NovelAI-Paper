@@ -202,7 +202,13 @@ class TextEmbedder:
             })
             
             # Log metrics
-            log_metrics(batch_stats, step=batch_stats['batch_size'], step_type="text_embed")
+            log_metrics(
+                metrics=batch_stats, 
+                step=batch_stats['batch_size'], 
+                step_type="text_embed",
+                is_main_process=True,
+                use_wandb=True  # Enable wandb logging for text embedding metrics
+            )
             
             return {
                 "prompt_embeds": text_embeddings,

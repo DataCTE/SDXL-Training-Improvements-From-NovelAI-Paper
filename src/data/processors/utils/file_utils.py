@@ -88,7 +88,13 @@ async def find_matching_files(
                                     'text_pairs': scan_stats['text_pairs'],
                                     'errors': scan_stats['errors']
                                 }
-                                log_metrics(metrics, scan_stats['matched_files'], step_type="scan")
+                                log_metrics(
+                                    metrics=metrics, 
+                                    step=scan_stats['matched_files'], 
+                                    step_type="scan",
+                                    is_main_process=True,
+                                    use_wandb=False
+                                )
                                 
                             await asyncio.sleep(0)  # Yield control periodically
                             yield str(file_path)

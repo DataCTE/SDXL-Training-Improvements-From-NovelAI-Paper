@@ -178,36 +178,38 @@ def compute_grad_norm(model: torch.nn.Module, grad_norm_buffer: torch.Tensor) ->
 
 def log_metrics(
     metrics: Dict[str, Any],
-    step: int,
-    is_main_process: bool,
-    use_wandb: bool,
-    step_type: str = "step"
+    step: Optional[int] = None,
+    step_type: str = "global",
+    is_main_process: bool = True,
+    use_wandb: bool = True
 ) -> None:
-    """Log metrics to console and wandb if enabled.
-    
-    Args:
-        metrics: Dictionary of metrics to log
-        step: Current training step
-        is_main_process: Whether this is the main process
-        use_wandb: Whether to use wandb
-        step_type: Type of step (e.g. "step", "epoch")
-    """
-    if not is_main_process:
-        return
-        
+    """Log metrics with proper error handling."""
     try:
+        if not is_main_process:
+            return
+
         # Log to console
-        metric_str = " - ".join([f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}" 
-                               for k, v in metrics.items()])
-        logger.info(f"{step_type.capitalize()} {step}: {metric_str}")
-        
-        # Log to wandb if enabled (assume already initialized)
-        if use_wandb:
-            import wandb
-            wandb.log(metrics, step=step)
+        if step is not None:
+            logger.info(f"Step {step} ({step_type}) metrics:")
+        else:
+            logger.info(f"Metrics ({step_type}):")
             
+        for key, value in metrics.items():
+            logger.info(f"- {key}: {value}")
+            
+        # Log to wandb if enabled
+        if use_wandb:
+            try:
+                import wandb
+                if wandb.run is not None:
+                    wandb.log(metrics, step=step)
+            except ImportError:
+                pass
+            except Exception as e:
+                logger.warning(f"Error logging to wandb: {e}")
+                
     except Exception as e:
-        logger.error(f"Error logging metrics: {str(e)}")
+        log_error_with_context(e, "Error logging metrics")
 
 def cleanup_logging(is_main_process: bool = True) -> None:
     """Cleanup logging resources.

@@ -212,8 +212,14 @@ class TagWeighter:
             else:
                 self._weight_counter = 1
                 
-            if self._weight_counter % 100 == 0:  # Log every 100 weight calculations
-                log_metrics(weight_stats, step=self._weight_counter, step_type="tag_weight")
+            if self._weight_counter % 100 == 0:
+                log_metrics(
+                    metrics=weight_stats, 
+                    step=self._weight_counter, 
+                    step_type="tag_weight",
+                    is_main_process=True,
+                    use_wandb=True
+                )
             
             return weights
             
