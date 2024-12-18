@@ -21,7 +21,7 @@ from src.data.processors.utils.progress_utils import (
 
 # Internal imports from processors
 from src.data.processors.utils.thread_config import get_optimal_cpu_threads
-from src.config.config import TextEmbedderConfig
+from src.config.config import TextEmbedderConfig, BatchProcessorConfig
 
 logger = logging.getLogger(__name__)
 
@@ -68,8 +68,18 @@ class TextEmbedder:
         """Initialize SDXL text embedder with consolidated config."""
         self.config = config
         
-        # Calculate optimal batch size
-        self.batch_size = calculate_optimal_batch_size(config.batch_size)
+        # Create a temporary BatchProcessorConfig to pass into calculate_optimal_batch_size
+        temp_config = BatchProcessorConfig(
+            device=config.device,
+            batch_size=config.batch_size,
+            min_batch_size=1,                # Minimal safe batch size
+            max_batch_size=config.batch_size,
+            memory_growth_factor=config.growth_factor,
+            max_memory_usage=config.max_memory_usage,
+            num_workers=16,                  # Or any reasonable default
+            prefetch_factor=2                # Or any reasonable default
+        )
+        self.batch_size = calculate_optimal_batch_size(temp_config)
         
         # Initialize tensor cache
         self._tensor_cache = WeakValueDictionary()
