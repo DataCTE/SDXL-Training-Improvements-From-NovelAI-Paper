@@ -383,9 +383,13 @@ class ImageProcessor:
     def _init_hardware_optimized_transforms(self):
         """Initialize hardware-optimized transforms."""
         if torch.cuda.is_available():
-            # Use CuPy for faster image processing
-            import cupy as cp
-            self.use_gpu_transforms = True
+            try:
+                import cupy as cp
+                self.use_gpu_transforms = True
+            except ImportError:
+                self.logger.info("CuPy not available, falling back to PyTorch transforms")
+                self.use_gpu_transforms = False
+            
             self.gpu_transform = self._create_gpu_transform_pipeline()
         else:
             self.use_gpu_transforms = False
