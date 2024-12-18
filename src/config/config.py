@@ -81,6 +81,9 @@ class TrainingConfig:
     wandb_project: str = "sdxl-training"
     wandb_run_name: Optional[str] = None
     wandb_tags: List[str] = field(default_factory=list)
+    
+    # VAE training settings
+    vae_validation_split: float = 0.1
 
 @dataclass
 class DataConfig:
