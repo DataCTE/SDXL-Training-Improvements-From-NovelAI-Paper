@@ -316,6 +316,7 @@ class NovelAIDatasetConfig:
     min_bucket_resolution: Optional[int] = None
     bucket_tolerance: float = 0.2
     max_aspect_ratio: float = 2.0
+    batch_processor_config: 'BatchProcessorConfig' = field(default_factory=lambda: BatchProcessorConfig())
     cache_config: CacheConfig = field(default_factory=CacheConfig)
     cache_dir: str = DEFAULT_CACHE_DIR
     text_cache_dir: str = "text_cache"
