@@ -34,7 +34,7 @@ from .processors.utils.progress_utils import (
 )
 
 # Config import
-from src.config.config import NovelAIDatasetConfig, ImageProcessorConfig, TextProcessorConfig, TextEmbedderConfig, BucketConfig
+from src.config.config import NovelAIDatasetConfig, ImageProcessorConfig, TextProcessorConfig, TextEmbedderConfig, BucketConfig, BatchProcessorConfig
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +89,7 @@ class NovelAIDataset(Dataset):
             self.text_processor = TextProcessor(
                 config=TextProcessorConfig(
                     device=device,
-                    batch_size=8,  # Or any suitable batch size
+                    batch_size=optimal_batch_size,
                     max_token_length=config.max_token_length,
                     use_caching=config.use_caching
                 ),
@@ -149,13 +149,17 @@ class NovelAIDataset(Dataset):
         
         # Initialize batch processor
         self.batch_processor = BatchProcessor(
+            config=BatchProcessorConfig(
+                device=device,
+                batch_size=optimal_batch_size,
+                prefetch_factor=thread_config.prefetch_factor,
+                max_memory_usage=0.8,
+                num_workers=num_workers
+            ),
             image_processor=self.image_processor,
             text_processor=self.text_processor,
             cache_manager=self.cache_manager,
-            vae=self.vae,
-            prefetch_factor=thread_config.prefetch_factor,
-            max_memory_usage=0.8,
-            num_workers=num_workers
+            vae=self.vae
         )
 
         # Create event loop if needed
