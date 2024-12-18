@@ -153,7 +153,6 @@ class NovelAIDataset(Dataset):
             text_processor=self.text_processor,
             cache_manager=self.cache_manager,
             vae=self.vae,
-            batch_size=optimal_batch_size,
             prefetch_factor=thread_config.prefetch_factor,
             max_memory_usage=0.8,
             num_workers=num_workers
