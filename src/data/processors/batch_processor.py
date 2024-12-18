@@ -286,11 +286,11 @@ class BatchProcessor(GenericBatchProcessor):
 
                     processed_item = {
                         'image_path': item['image_path'],
-                        'latents': img_result['latents'],
+                        'latents': img_result.get('latents'),
                         'prompt_embeds': prompt_embeds,
                         'pooled_prompt_embeds': pooled_prompt_embeds,
                         'original_size': item['original_size'],
-                        'crop_top_left': img_result['crop_top_left']
+                        'crop_top_left': img_result.get('crop_top_left', None)
                     }
 
                     # Optionally set tag_weights if present
