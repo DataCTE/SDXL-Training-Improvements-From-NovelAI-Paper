@@ -105,16 +105,25 @@ class NovelAIDataset(Dataset):
                 )
                 if self.config.tag_weights_path and Path(self.config.tag_weights_path).exists():
                     tag_weighter_loaded = TagWeighter.load(self.config.tag_weights_path)
-
+            """ 
+            max_image_size: Tuple[int, int] = DEFAULT_MAX_IMAGE_SIZE
+            min_image_size: Tuple[int, int] = DEFAULT_MIN_IMAGE_SIZE
+            bucket_step: int = 8
+            min_bucket_resolution: int = 65536
+            max_aspect_ratio: float = 2.0
+            bucket_tolerance: float = 0.2
+            target_resolutions: List[Tuple[int, int]] = field(
+                default_factory=lambda: DEFAULT_TARGET_RESOLUTIONS
+            )
+            max_ar_error: float = DEFAULT_MAX_AR_ERROR"""    
             # BucketManager - unpack the configuration
             self.bucket_manager = BucketManager(
-                image_size=self.config.image_size,
-                min_size=self.config.min_image_size,
-                max_size=self.config.max_image_size,
-                step=self.config.bucket_step,
-                min_resolution=self.config.min_bucket_resolution,
-                max_ar=self.config.max_aspect_ratio,
-                tolerance=self.config.bucket_tolerance,
+                max_image_size=self.config.max_image_size,
+                min_image_size=self.config.min_image_size,
+                bucket_step=self.config.bucket_step,
+                min_bucket_resolution=self.config.min_bucket_resolution,
+                max_aspect_ratio=self.config.max_aspect_ratio,
+                bucket_tolerance=self.config.bucket_tolerance,
                 target_resolutions=self.config.target_resolutions,
                 max_ar_error=self.config.max_ar_error
             )
@@ -126,6 +135,19 @@ class NovelAIDataset(Dataset):
                 cache_dir=self.config.cache_config.cache_dir,
                 cache_format=self.config.cache_config.cache_format
             )
+            """ 
+            num_workers: int = DEFAULT_NUM_WORKERS
+            batch_size: int = DEFAULT_BATCH_SIZE
+            max_token_length: int = DEFAULT_MAX_TOKEN_LENGTH
+            
+            # Tag weighting settings
+            enable_tag_weighting: bool = True
+            tag_frequency_threshold: int = 5
+            tag_weight_smoothing: float = 0.1
+
+            # Add this attribute to allow passing 'prefetch_factor' from your YAML
+            prefetch_factor: int = DEFAULT_PREFETCH_FACTOR
+            proportion_empty_prompts: float = 0.0"""
 
             # TextProcessor
             self.text_processor = TextProcessor(
