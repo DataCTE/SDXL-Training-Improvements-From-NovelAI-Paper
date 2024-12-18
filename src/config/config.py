@@ -341,11 +341,8 @@ class NovelAIDatasetConfig:
         'artist': (0.5, 1.5)
     })
     tag_weights_path: Optional[str] = "./latents/latent_weights.json"
+    text_processor_config: Dict[str, Any] = field(default_factory=dict)
     text_embedder_config: TextEmbedderConfig = field(default_factory=lambda: TextEmbedderConfig(
-        model_name="stabilityai/stable-diffusion-xl-base-1.0",
-        # Add other parameters as needed
-    ))
-    text_processor_config: TextProcessorConfig = field(default_factory=lambda: TextProcessorConfig(
         model_name="stabilityai/stable-diffusion-xl-base-1.0",
         # Add other parameters as needed
     ))
