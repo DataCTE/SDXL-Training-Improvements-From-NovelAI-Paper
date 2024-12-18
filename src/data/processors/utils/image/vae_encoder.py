@@ -175,32 +175,40 @@ class VAEEncoder:
     async def _process_chunks_parallel(self, chunks, keep_on_gpu):
         """
         Process chunks in parallel with advanced optimizations.
-
-        Wrapped in a try/except block to handle TaskGroup exceptions
-        and avoid "unhandled errors in a TaskGroup (1 sub-exception)."
         """
         try:
-            # gather results from each chunk in parallel
-            async with asyncio.TaskGroup() as group:
-                tasks = [
-                    group.create_task(self._process_chunk(chunk, keep_on_gpu))
-                    for chunk in chunks
-                ]
-            # If we reach here, all tasks have successfully completed
-            results = [t.result() for t in tasks]
+            results = []
+            # Process chunks sequentially but allow other async operations to run
+            for chunk in chunks:
+                # Wrap the synchronous processing in an executor to avoid blocking
+                result = await asyncio.get_event_loop().run_in_executor(
+                    None, self._process_chunk, chunk, keep_on_gpu
+                )
+                results.append(result)
             return self._combine_results(results)
 
         except Exception as e:
-            # Log or re-raise the exception so it won't be "unhandled"
             logger.error(f"Error in parallel chunk processing: {e}")
-            # Optionally do any cleanup or partial result handling here
             raise
+
+    def _combine_results(self, results):
+        """Combine processed chunks back into a single tensor."""
+        if not results:
+            return None
+        return torch.cat(results, dim=0)
 
     @torch.compile(fullgraph=True, dynamic=False)
     def _process_chunk(self, chunk, keep_on_gpu):
         """Optimized chunk processing with TorchDynamo."""
-        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-            return self.vae.encode(chunk).latent_dist.sample()
+        try:
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                latents = self.vae.encode(chunk).latent_dist.sample()
+                if not keep_on_gpu:
+                    latents = latents.cpu()
+                return latents
+        except Exception as e:
+            logger.error(f"Error processing chunk: {e}")
+            raise
 
     def _get_optimal_chunks(self, images):
         """Get optimal chunk sizes based on hardware and model."""
