@@ -34,7 +34,7 @@ from .processors.utils.progress_utils import (
 )
 
 # Config import
-from src.config.config import NovelAIDatasetConfig, ImageProcessorConfig, TextEmbedderConfig
+from src.config.config import NovelAIDatasetConfig, ImageProcessorConfig, TextProcessorConfig, TextEmbedderConfig
 
 logger = logging.getLogger(__name__)
 
@@ -87,8 +87,14 @@ class NovelAIDataset(Dataset):
             
             # Initialize processors
             self.text_processor = TextProcessor(
+                config=TextProcessorConfig(
+                    device=device,
+                    batch_size=8,  # Or any suitable batch size
+                    max_token_length=config.max_token_length,
+                    use_caching=config.use_caching
+                ),
                 text_embedder=self.text_embedder,
-                tag_weighter=self.tag_weighter,
+                tag_weighter=self.tag_weighter
             )
             
             # Initialize bucket manager
