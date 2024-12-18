@@ -8,7 +8,7 @@ from dataclasses import dataclass
 # Import all processors
 from .text_processor import TextProcessor
 from .batch_processor import BatchProcessor
-from .image_processor import ImageProcessor, ImageProcessorConfig
+from .image_processor import ImageProcessor
 from .cache_manager import CacheManager
 from .bucket import BucketManager, ImageBucket
 from .sampler import AspectBatchSampler
@@ -49,7 +49,6 @@ __all__ = [
     'TextProcessor',
     'BatchProcessor',
     'ImageProcessor',
-    'ImageProcessorConfig',
     'CacheManager',
     'BucketManager',
     'ImageBucket',
