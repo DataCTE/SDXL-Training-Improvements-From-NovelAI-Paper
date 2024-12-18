@@ -85,123 +85,96 @@ class BucketManager:
     
     def _validate_dimensions(self, width: int, height: int) -> Tuple[int, int]:
         """Validate and adjust dimensions to constraints."""
-        # Round to bucket step
+        # Optionally round them to multiples of bucket_step, etc.
         width = round(width / self.config.bucket_step) * self.config.bucket_step
         height = round(height / self.config.bucket_step) * self.config.bucket_step
         
-        # Enforce minimum dimensions
-        width = max(width, self.min_width)
-        height = max(height, self.min_height)
+        # Enforce min/max dimensions
+        width = max(min(width, self.max_width), self.min_width)
+        height = max(min(height, self.max_height), self.min_height)
         
-        # Enforce maximum dimensions
-        width = min(width, self.max_width)
-        height = min(height, self.max_height)
-            
         return width, height
     
     def _create_buckets(self) -> None:
-        """Generate bucket resolutions efficiently."""
+        """Generate bucket resolutions, but do not forcibly fail if none are created."""
         logger.debug(
-            f"Creating buckets with step={self.config.bucket_step}, "
-            f"min_res={self.config.min_bucket_resolution}, "
-            f"max_aspect_ratio={self.config.max_aspect_ratio}"
+            f"Creating buckets with:\n"
+            f"- step={self.config.bucket_step}\n"
+            f"- min_res={self.config.min_bucket_resolution}\n"
+            f"- max_aspect_ratio={self.config.max_aspect_ratio}"
         )
         seen_resolutions = set()
         
-        # Keep track of skip reasons for debugging
-        skip_reasons = {
-            "duplicates": 0,
-            "under_min_resolution": 0,
-            "wrong_aspect_ratio": 0
-        }
-        
+        # Keep track of every skip with detailed messages
+        skip_details: List[str] = []
+
         def add_bucket(width: int, height: int) -> None:
             """Helper to add bucket if valid."""
-            # Validate dimensions
+            original_w, original_h = width, height
             width, height = self._validate_dimensions(width, height)
             resolution = width * height
+            aspect = width / height if height else 0
             bucket_key = f"{width}x{height}"
-            
-            logger.debug(f"Attempting to add bucket: {bucket_key} (res: {resolution})")
-            
+
+            # Build a prefix for logs that includes original & final
+            dimension_info = (
+                f"[orig={original_w}x{original_h}, final={width}x{height}, "
+                f"res={resolution}, aspect={aspect:.3f}]"
+            )
+
             if bucket_key in seen_resolutions:
-                logger.debug(f"=> Skipping duplicate bucket: {bucket_key}")
-                skip_reasons["duplicates"] += 1
-                return
-            
-            # If min_bucket_resolution is very large, try lowering it slightly
-            # so that 256x256 or 320x256, etc., don’t get skipped.
-            if resolution < self.config.min_bucket_resolution * 0.95:
-                logger.debug(
-                    f"=> Skipping: Resolution {resolution} < "
-                    f"{int(self.config.min_bucket_resolution * 0.95)}"
+                skip_details.append(
+                    f"Duplicate: {bucket_key} {dimension_info}"
                 )
-                skip_reasons["under_min_resolution"] += 1
                 return
             
-            aspect = width / height
-            # If max_aspect_ratio is smaller than actual ratio, skip
+            # If resolution is below min requirement
+            if resolution < self.config.min_bucket_resolution:
+                skip_details.append(
+                    f"Under min resolution: {resolution} < {self.config.min_bucket_resolution} {dimension_info}"
+                )
+                return
+
+            # Check aspect ratio
             if aspect > self.config.max_aspect_ratio or aspect < (1.0 / self.config.max_aspect_ratio):
-                logger.debug(
-                    f"=> Skipping: aspect {aspect:.2f} not in "
-                    f"[{1/self.config.max_aspect_ratio:.2f}, {self.config.max_aspect_ratio:.2f}]"
+                skip_details.append(
+                    f"Wrong aspect ratio: {aspect:.3f} not in "
+                    f"[{1/self.config.max_aspect_ratio:.3f}, {self.config.max_aspect_ratio:.3f}] {dimension_info}"
                 )
-                skip_reasons["wrong_aspect_ratio"] += 1
                 return
-            
+
             # Bucket is valid, so add it
             self.buckets[bucket_key] = ImageBucket(width=width, height=height)
             seen_resolutions.add(bucket_key)
-            logger.debug(f"Added bucket: {bucket_key}")
-        
-        # Generate buckets more efficiently for large ranges
+            logger.debug(f"Added bucket: {bucket_key} {dimension_info}")
+
+        # Example loop generating potential widths/heights
         current_width = self.min_width
         while current_width <= self.max_width:
             current_height = self.min_height
             while current_height <= self.max_height:
-                # Skip if resolution would be too large
-                if current_width * current_height > (2048 * 2048):
-                    break
-                    
                 add_bucket(current_width, current_height)
-                
-                # Use larger steps for higher resolutions to avoid too many buckets
-                if current_height >= 2048:
-                    current_height += self.config.bucket_step * 4
-                elif current_height >= 1024:
-                    current_height += self.config.bucket_step * 2
-                else:
-                    current_height += self.config.bucket_step
-                    
-            if current_width >= 2048:
-                current_width += self.config.bucket_step * 4
-            elif current_width >= 1024:
-                current_width += self.config.bucket_step * 2
-            else:
-                current_width += self.config.bucket_step
-        
-        # Clear temporary set
+
+                current_height += self.config.bucket_step
+            current_width += self.config.bucket_step
+
+        # Clear intermediate data
         seen_resolutions.clear()
         gc.collect()
             
         num_buckets = len(self.buckets)
         logger.info(f"Created {num_buckets} buckets")
 
-        # Force a failure if no buckets were created
         if num_buckets == 0:
-            # Log skip reasons in detail
-            skip_details = "\n".join(
-                f"- {reason}: {count}"
-                for reason, count in skip_reasons.items()
-            )
-            logger.error(
-                "No buckets created. Detailed skip reasons:\n" + skip_details
-            )
-            raise ValueError(
-                "Failed to create any buckets. Buckets are required. "
-                "Please adjust min_bucket_resolution, max_aspect_ratio, "
-                "or other constraints."
-            )
+            # We do NOT raise an error, but we do log a detailed summary
+            if skip_details:
+                logger.error(
+                    "No buckets created. Detailed skip reasons:\n"
+                    + "\n".join(skip_details)
+                )
+            else:
+                logger.error("No buckets created, but no skip details were recorded.")
+            # No forced fail, just letting code proceed so you get a full log
     
     def find_bucket(self, width: int, height: int) -> Optional[ImageBucket]:
         """Find best bucket for given dimensions."""
