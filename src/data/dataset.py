@@ -105,18 +105,8 @@ class NovelAIDataset(Dataset):
                 )
                 if self.config.tag_weights_path and Path(self.config.tag_weights_path).exists():
                     tag_weighter_loaded = TagWeighter.load(self.config.tag_weights_path)
-            """ 
-            max_image_size: Tuple[int, int] = DEFAULT_MAX_IMAGE_SIZE
-            min_image_size: Tuple[int, int] = DEFAULT_MIN_IMAGE_SIZE
-            bucket_step: int = 8
-            min_bucket_resolution: int = 65536
-            max_aspect_ratio: float = 2.0
-            bucket_tolerance: float = 0.2
-            target_resolutions: List[Tuple[int, int]] = field(
-                default_factory=lambda: DEFAULT_TARGET_RESOLUTIONS
-            )
-            max_ar_error: float = DEFAULT_MAX_AR_ERROR"""    
-            # BucketManager - unpack the configuration
+
+            # BucketManager
             self.bucket_manager = BucketManager(
                 config=BucketConfig(
                     image_size=self.config.image_size,
@@ -125,11 +115,9 @@ class NovelAIDataset(Dataset):
                     step=self.config.bucket_step,
                     min_resolution=self.config.min_bucket_resolution,
                     max_ar=self.config.max_aspect_ratio,
-                    tolerance=self.config.bucket_tolerance,
-                    target_resolutions=self.config.target_resolutions,
-                    max_ar_error=self.config.max_ar_error
+                    tolerance=self.config.bucket_tolerance
                 )
-)
+            )
 
             # CacheManager
             self.cache_manager = CacheManager(
@@ -138,64 +126,35 @@ class NovelAIDataset(Dataset):
                 cache_dir=self.config.cache_config.cache_dir,
                 cache_format=self.config.cache_config.cache_format
             )
-            """ 
-            num_workers: int = DEFAULT_NUM_WORKERS
-            batch_size: int = DEFAULT_BATCH_SIZE
-            max_token_length: int = DEFAULT_MAX_TOKEN_LENGTH
-            
-            # Tag weighting settings
-            enable_tag_weighting: bool = True
-            tag_frequency_threshold: int = 5
-            tag_weight_smoothing: float = 0.1
 
-    # Add this attribute to allow passing 'prefetch_factor' from your YAML
-    prefetch_factor: int = DEFAULT_PREFETCH_FACTOR
-    proportion_empty_prompts: float = 0.0"""
-
-            # TextProcessor
+            # TextProcessor with updated config
             self.text_processor = TextProcessor(
-                num_workers=self.config.text_processor_config.get('num_workers', DEFAULT_NUM_WORKERS),
-                batch_size=self.config.text_processor_config.get('batch_size', DEFAULT_BATCH_SIZE),
-                max_token_length=self.config.max_token_length,
-                enable_tag_weighting=self.config.use_tag_weighting,
-                tag_frequency_threshold=self.config.text_processor_config.get('tag_frequency_threshold', 5),
-                tag_weight_smoothing=self.config.text_processor_config.get('tag_weight_smoothing', 0.1),
-                prefetch_factor=self.config.prefetch_factor,
-                proportion_empty_prompts=self.config.proportion_empty_prompts
+                config=TextProcessorConfig(
+                    num_workers=self.config.batch_processor_config.num_workers,
+                    batch_size=self.config.batch_size,
+                    max_token_length=self.config.max_token_length,
+                    enable_tag_weighting=self.config.use_tag_weighting,
+                    prefetch_factor=self.config.prefetch_factor
+                )
             )
 
-            # ImageProcessor
+            # ImageProcessor with updated config
             self.image_processor = ImageProcessor(
                 config=ImageProcessorConfig(
                     device=str(self.device),
                     max_image_size=self.config.max_image_size,
                     min_image_size=self.config.min_image_size,
-                    enable_vae_slicing=self.config.image_processor_config.get('enable_vae_slicing', True),
                     vae_batch_size=self.config.batch_size,
-                    num_workers=self.config.image_processor_config.get('num_workers', DEFAULT_NUM_WORKERS),
+                    num_workers=self.config.batch_processor_config.num_workers,
                     prefetch_factor=self.config.prefetch_factor
                 ),
                 bucket_manager=self.bucket_manager,
                 vae=self.vae
             )
 
-            # BatchProcessor
+            # BatchProcessor with updated config
             self.batch_processor = BatchProcessor(
-                config=BatchProcessorConfig(
-                    device=str(self.device),
-                    batch_size=self.config.batch_size,
-                    prefetch_factor=self.config.prefetch_factor,
-                    num_workers=self.config.batch_processor_config.num_workers,
-                    max_memory_usage=self.config.batch_processor_config.max_memory_usage,
-                    memory_check_interval=self.config.batch_processor_config.memory_check_interval,
-                    memory_growth_factor=self.config.batch_processor_config.memory_growth_factor,
-                    high_memory_threshold=self.config.batch_processor_config.high_memory_threshold,
-                    cleanup_interval=self.config.batch_processor_config.cleanup_interval,
-                    retry_count=self.config.batch_processor_config.retry_count,
-                    backoff_factor=self.config.batch_processor_config.backoff_factor,
-                    min_batch_size=self.config.batch_processor_config.min_batch_size,
-                    max_batch_size=self.config.batch_processor_config.max_batch_size
-                ),
+                config=self.config.batch_processor_config,
                 image_processor=self.image_processor,
                 text_processor=self.text_processor,
                 cache_manager=self.cache_manager,
