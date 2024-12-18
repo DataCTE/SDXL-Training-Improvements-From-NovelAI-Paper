@@ -152,8 +152,11 @@ class VAEEncoder:
             logger.warning("xformers not available, using standard attention")
 
     @torch.inference_mode()
-    async def encode_images(self, images: torch.Tensor, keep_on_gpu: bool = False) -> torch.Tensor:
-        """Encode images to latent space."""
+    async def encode_images(self, images: torch.Tensor, keep_on_gpu: bool = False) -> Optional[torch.Tensor]:
+        """
+        Encode images to latent space.
+        Returns a single tensor containing all encoded latents, or None if encoding fails.
+        """
         try:
             # Check cache
             cache_key = self._get_cache_key(images)
@@ -164,8 +167,10 @@ class VAEEncoder:
             chunks = self._get_optimal_chunks(images)
             latents = await self._process_chunks_parallel(chunks, keep_on_gpu)
 
-            # Cache results
-            self.latent_cache[cache_key] = latents
+            if latents is not None:
+                # Cache results
+                self.latent_cache[cache_key] = latents
+                
             return latents
 
         except Exception as e:

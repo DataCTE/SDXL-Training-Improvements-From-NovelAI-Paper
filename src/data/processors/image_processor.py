@@ -314,14 +314,7 @@ class ImageProcessor:
             return None
 
     async def process_image(self, image: Union[str, Path, "Image.Image"], skip_vae: bool = False, **kwargs):
-        """
-        Overload process_image for additional GPU transforms and progress tracking.
-        Now also supports skipping the VAE encoding step if latents are already cached.
-        
-        Parameters:
-            image: The image path or PIL image to be processed.
-            skip_vae: If True, do not run the VAE encoder step.
-        """
+        """Process a single image with optional VAE encoding."""
         try:
             # 1) Load and preprocess the image into a tensor
             image_data = await self._parallel_load_and_preprocess(image)
@@ -339,17 +332,23 @@ class ImageProcessor:
                     memory_format=torch.channels_last
                 )
 
-            # 3) If skip_vae==False and a VAE is available, encode to latents.
+            # 3) If skip_vae==False and a VAE is available, encode to latents
             latents = None
             if not skip_vae and self.vae_encoder is not None:
-                encoded_list = await self.vae_encoder.encode_images(
-                    image_tensor.unsqueeze(0),  # [1, C, H, W]
+                # Add batch dimension if needed
+                if image_tensor.dim() == 3:
+                    image_tensor = image_tensor.unsqueeze(0)
+                
+                latents = await self.vae_encoder.encode_images(
+                    image_tensor,
                     keep_on_gpu=kwargs.get('keep_on_gpu', False)
                 )
-                if encoded_list and len(encoded_list) > 0:
-                    latents = encoded_list[0]
+                
+                # Remove batch dimension if it was added
+                if latents is not None and latents.dim() == 4 and latents.size(0) == 1:
+                    latents = latents.squeeze(0)
 
-            # 4) Build the final dict. If skip_vae is True, latents remain None here.
+            # 4) Build the final dict
             return {
                 "pixel_values": image_tensor,
                 "latents": latents,
