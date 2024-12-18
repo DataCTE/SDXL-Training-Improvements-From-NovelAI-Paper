@@ -15,7 +15,7 @@ from src.data.processors.utils.caption.tag_weighter import TagWeighter, parse_ta
 import gc
 import traceback
 from src.config.arg_parser import parse_args
-
+from src.config.config import DEFAULT_TARGET_RESOLUTIONS, DEFAULT_MAX_AR_ERROR
 logger = logging.getLogger(__name__)
 
 
@@ -159,24 +159,20 @@ def train(config_path: str):
         dataset_config = NovelAIDatasetConfig(
             image_dirs=config.data.image_dirs,
             image_size=config.data.image_size,
-            max_image_size=config.data.max_image_size,
-            min_image_size=config.data.min_image_size,
+            max_size=config.data.max_image_size,
+            min_size=config.data.min_image_size,
             max_dim=config.data.max_dim,
-            bucket_step=config.data.bucket_step,
-            min_bucket_size=config.data.min_bucket_size,
-            min_bucket_resolution=config.data.min_bucket_resolution,
-            bucket_tolerance=config.data.bucket_tolerance,
-            max_aspect_ratio=config.data.max_aspect_ratio,
-            batch_processor_config=config.batch_processor,
-            cache_config=config.global_config.cache,
-            use_tag_weighting=config.data.use_tag_weighting,
-            tag_weight_ranges=config.data.tag_weight_ranges,
-            tag_weights_path=config.paths.tag_weights_path,
+            step=config.data.bucket_step,
+            min_resolution=config.data.min_bucket_resolution,
+            max_ar=config.data.max_aspect_ratio,
+            tolerance=config.data.bucket_tolerance,
             batch_size=config.training.batch_size,
             shuffle=config.data.shuffle,
             drop_last=config.data.drop_last if hasattr(config.data, 'drop_last') else False,
             debug_mode=config.data.debug_mode if hasattr(config.data, 'debug_mode') else False,
-            prefetch_factor=config.data.prefetch_factor if hasattr(config.data, 'prefetch_factor') else None
+            prefetch_factor=config.data.prefetch_factor if hasattr(config.data, 'prefetch_factor') else None,
+            target_resolutions=DEFAULT_TARGET_RESOLUTIONS,
+            max_ar_error=DEFAULT_MAX_AR_ERROR
         )
         
         # Log dataset configuration
