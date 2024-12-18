@@ -253,10 +253,10 @@ class ImageSizeConfig:
 @dataclass
 class BatchProcessorConfig:
     """Configuration for batch processing."""
-    device: torch.device
     batch_size: int
     prefetch_factor: int
     num_workers: int
+    device: Optional[torch.device] = None
     max_memory_usage: float = 0.8
     memory_check_interval: float = 30.0
     memory_growth_factor: float = 0.7
@@ -393,16 +393,12 @@ class Config:
             with open(path, 'r') as f:
                 config_dict = yaml.safe_load(f)
             
-            # Validate required sections
-            required_sections = ['model', 'training', 'data', 'tag_weighting', 
-                               'scoring', 'system', 'paths']
-            missing_sections = [s for s in required_sections if s not in config_dict]
-            if missing_sections:
-                raise ValueError(f"Missing required config sections: {missing_sections}")
+            # Set device from global config
+            device = torch.device(config_dict['global_config']['device']['device'])
             
-            # Handle VAE config if present
-            if 'vae' in config_dict.get('model', {}):
-                config_dict['model']['vae'] = VAEModelConfig(**config_dict['model']['vae'])
+            # Update batch processor config with device
+            if 'batch_processor' in config_dict:
+                config_dict['batch_processor']['device'] = device
             
             # Create config instance with proper type conversion
             return cls(
