@@ -5,9 +5,6 @@ from torch.utils.data import Dataset
 import logging
 import asyncio
 import gc
-from PIL import Image
-from tqdm import tqdm
-import time
 from pathlib import Path
 
 # Internal imports from processors
@@ -19,12 +16,10 @@ from .processors.bucket import BucketManager
 from .processors.sampler import AspectBatchSampler
 
 # Import utilities
-from .processors.utils.caption.text_embedder import TextEmbedder
 from .processors.utils.caption.tag_weighter import TagWeighter
-from .processors.utils.thread_config import get_optimal_thread_config
 from .processors.utils.batch_utils import find_matching_files
 from .processors.utils.progress_utils import create_progress_tracker, update_tracker, log_progress
-from .processors.utils.system_utils import get_gpu_memory_usage, cleanup_processor
+
 
 # Config import
 from src.config.config import NovelAIDatasetConfig, BucketConfig, TextProcessorConfig, ImageProcessorConfig, BatchProcessorConfig
