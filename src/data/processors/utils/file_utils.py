@@ -1,12 +1,13 @@
 from pathlib import Path
 import os
 import shutil
-from typing import List, Set, Dict, Optional, Tuple, Generator
+from typing import List, Set, Dict, Optional, Tuple, Generator, AsyncGenerator
 import logging
 import gc
 from contextlib import contextmanager
 import tempfile
 import time
+import asyncio
 
 logger = logging.getLogger(__name__)
 
@@ -38,54 +39,36 @@ def get_file_size(path: str) -> int:
     except Exception:
         return 0
 
-def find_matching_files(
+async def find_matching_files(
     directory: str,
     extensions: Set[str],
     recursive: bool = True,
     require_text_pair: bool = False,
     batch_size: int = 1000
-) -> Generator[str, None, None]:
-    """Find files with given extensions, optionally requiring text pairs.
-    Returns a generator to avoid loading all paths into memory at once."""
+) -> AsyncGenerator[str, None]:
+    """Find files with given extensions asynchronously."""
     directory = Path(directory)
     if not directory.exists():
         logger.warning(f"Directory not found: {directory}")
         return
-        
-    # Get all text files first if needed
+
+    # Get text files if needed
     text_files = set()
     if require_text_pair:
-        try:
-            text_files = {
-                os.path.splitext(f)[0]
-                for f in os.listdir(directory)
-                if f.endswith('.txt')
-            }
-        except Exception as e:
-            logger.error(f"Error reading text files: {e}")
-            return
-    
-    # Find matching files in batches
+        text_files = {os.path.splitext(f)[0] for f in os.listdir(directory) if f.endswith('.txt')}
+
+    # Process files
     pattern = "**/*" if recursive else "*"
-    batch = []
-    
+
     for ext in extensions:
         try:
             for file_path in directory.glob(f"{pattern}{ext}"):
                 if not require_text_pair or os.path.splitext(file_path.name)[0] in text_files:
-                    batch.append(str(file_path))
-                    if len(batch) >= batch_size * 5:
-                        gc.collect()
-                        
-            # Yield remaining files
-            if batch:
-                yield from batch
-                batch.clear()
-                
+                    await asyncio.sleep(0)  # Yield control periodically
+                    yield str(file_path)
         except Exception as e:
             logger.error(f"Error processing extension {ext}: {e}")
-            
-    # Clear text files set
+
     text_files.clear()
 
 def safe_file_write(path: str, data: bytes) -> bool:

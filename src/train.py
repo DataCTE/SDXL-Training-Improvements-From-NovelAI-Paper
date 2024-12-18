@@ -1,6 +1,9 @@
 import os
 import logging
 import torch
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 
 from src.data import NovelAIDataset, NovelAIDatasetConfig
 from src.training.trainer import NovelAIDiffusionV3Trainer
@@ -164,44 +167,61 @@ def train(config_path: str):
             max_token_length=config.data.max_token_length
         )
         
-        # Create dataset
-        dataset = NovelAIDataset(
-            image_dirs=config.data.image_dirs,
-            config=dataset_config,
-            vae=vae,
-            device=device
-        )
+        # Create async event loop for dataset operations
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         
-        if len(dataset) == 0:
-            raise ValueError("Dataset contains no valid samples after initialization")
+        # Initialize dataset with async context
+        async def init_dataset():
+            dataset = NovelAIDataset(
+                image_dirs=config.data.image_dirs,
+                config=dataset_config,
+                vae=vae,
+                device=device
+            )
+            return dataset
+
+        try:
+            # Run dataset initialization in the event loop
+            dataset = loop.run_until_complete(init_dataset())
             
-        logger.info(f"Dataset initialized with {len(dataset)} samples")
-        
-        # Create trainer
-        trainer = NovelAIDiffusionV3Trainer(
-            config=config,
-            model=unet,
-            dataset=dataset,
-            device=device
-        )
-        
-        # Train
-        logger.info("Starting training...")
-        for epoch in range(config.training.num_epochs):
-            try:
-                trainer.train_epoch(epoch)
+            if len(dataset) == 0:
+                raise ValueError("Dataset contains no valid samples after initialization")
                 
-                # Save checkpoint
-                if is_main_process:
-                    trainer.save_checkpoint(config.paths.checkpoints_dir, epoch)
+            logger.info(f"Dataset initialized with {len(dataset)} samples")
+            
+            # Create trainer with async-aware dataset
+            trainer = NovelAIDiffusionV3Trainer(
+                config=config,
+                model=unet,
+                dataset=dataset,
+                device=device
+            )
+            
+            # Training loop with proper async cleanup
+            for epoch in range(config.training.num_epochs):
+                try:
+                    trainer.train_epoch(epoch)
                     
-            except Exception as e:
-                logger.error(f"Error during epoch {epoch}: {str(e)}")
-                logger.error(traceback.format_exc())
-                raise
-        
-        logger.info("Training complete!")
-        
+                    # Save checkpoint
+                    if is_main_process:
+                        trainer.save_checkpoint(config.paths.checkpoints_dir, epoch)
+                        
+                except Exception as e:
+                    logger.error(f"Error during epoch {epoch}: {str(e)}")
+                    logger.error(traceback.format_exc())
+                    raise
+                finally:
+                    # Ensure batch processor cleanup after each epoch
+                    loop.run_until_complete(dataset.batch_processor.cleanup())
+                    
+        except Exception as e:
+            raise e
+        finally:
+            # Cleanup dataset resources
+            loop.run_until_complete(dataset.cleanup())
+            loop.close()
+            
     except Exception as e:
         logger.error(f"Training failed: {str(e)}")
         logger.error(traceback.format_exc())

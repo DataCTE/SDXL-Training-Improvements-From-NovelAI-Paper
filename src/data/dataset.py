@@ -299,30 +299,36 @@ class NovelAIDataset(Dataset):
             raise
 
     async def _process_data(self, image_dirs: List[str]) -> None:
-        """Process all data files with improved async handling."""
+        """Process all data files asynchronously with progress tracking."""
         try:
-            # Find all image files
+            # Find all image files asynchronously
             image_files = []
             for image_dir in image_dirs:
-                found_files = find_matching_files(image_dir, ['.jpg', '.jpeg', '.png'])
-                image_files.extend(found_files)
+                async for found_file in find_matching_files(
+                    image_dir, 
+                    ['.jpg', '.jpeg', '.png'],
+                    batch_size=self.config.batch_size
+                ):
+                    image_files.append(found_file)
+                    
+                    # Yield control periodically
+                    if len(image_files) % (self.config.batch_size * 2) == 0:
+                        await asyncio.sleep(0)
                 
             if not image_files:
                 raise ValueError(f"No valid image files found in {image_dirs}")
                 
-            # Create tracker
+            # Create tracker with total files
             tracker = create_progress_tracker(
                 total_items=len(image_files),
                 batch_size=self.config.batch_size,
                 device=self.device
             )
-            
-            # Process in optimized batch sizes
-            batch_size = min(32, self.config.batch_size)
+
+            # Process files in batches
             processed_items = []
-            
-            for i in range(0, len(image_files), batch_size):
-                batch_files = image_files[i:i + batch_size]
+            for i in range(0, len(image_files), self.config.batch_size):
+                batch_files = image_files[i:i + self.config.batch_size]
                 batch_items = [{'image_path': f} for f in batch_files]
                 
                 # Process batch
@@ -347,17 +353,15 @@ class NovelAIDataset(Dataset):
                     extra_stats = {
                         'processed': len(processed_items),
                         'memory': f"{get_gpu_memory_usage(self.device):.1%}",
-                        'batch_size': batch_size
+                        'batch_size': self.config.batch_size
                     }
                     log_progress(tracker, prefix="Processing dataset: ", extra_stats=extra_stats)
+
+                # Allow other tasks to run
+                await asyncio.sleep(0)
                 
-                # Periodic cleanup
-                if i % (batch_size * 4) == 0:
-                    self.cache_manager.clear_memory_cache()
-                    torch.cuda.empty_cache()
-            
             self.items = processed_items
-            
+
         except Exception as e:
             logger.error(f"Error processing dataset: {e}")
             raise
