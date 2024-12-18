@@ -476,12 +476,14 @@ class ImageProcessor:
     def _init_memory_pools(self):
         """Initialize memory pools for efficient tensor allocation."""
         if torch.cuda.is_available():
-            # Initialize pinned memory pool
-            self.pinned_memory_pool = torch.cuda.get_allocator()
+            # Clear any existing cached memory
             torch.cuda.empty_cache()
             
             # Set up tensor cache for frequently reused sizes
             self.tensor_cache = WeakValueDictionary()
+            
+            # Enable memory pinning for faster transfers
+            self.use_pinned_memory = True
             
             # Configure memory allocator
             if hasattr(torch.cuda, 'memory_stats'):
@@ -491,8 +493,8 @@ class ImageProcessor:
             # Set memory allocation strategy
             torch.cuda.set_per_process_memory_fraction(0.95)  # Use up to 95% of available memory
             
-            logger.info("Initialized CUDA memory pools and caching")
+            logger.info("Initialized CUDA memory optimizations and caching")
         else:
-            self.pinned_memory_pool = None
+            self.use_pinned_memory = False
             self.tensor_cache = WeakValueDictionary()
-            logger.info("Running in CPU mode, memory pools disabled")
+            logger.info("Running in CPU mode, memory optimizations disabled")
