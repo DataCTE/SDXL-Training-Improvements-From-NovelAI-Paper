@@ -33,471 +33,167 @@ logger = logging.getLogger(__name__)
 
 class ImageProcessor:
     """
-    Main ImageProcessor class that handles loading, preprocessing,
-    and optional VAE encoding of images. Incorporates techniques
-    for performance optimization and memory efficiency, including
-    pinned memory, inference_mode, and dynamic sub-batching.
+    Main ImageProcessor class for loading, preprocessing,
+    and optionally VAE-encoding images.
+
+    Changes made to:
+      - Remove excessive concurrency overhead
+      - Combine steps where possible
+      - Limit usage of torch.compile
+      - Increase default load_batch_size for speed
+      - Use fewer dynamic calls
     """
 
-    def __init__(
-        self,
-        config: ImageProcessorConfig,
-        bucket_manager: Optional[BucketManager] = None,
-        vae=None
-    ):
-        """Initialize image processor with VAE and bucket manager."""
+    def __init__(self, config, bucket_manager=None, vae=None):
+        import torch
+        import logging
+        from torchvision import transforms
+        from src.data.processors.utils.image.vae_encoder import VAEEncoder
+        from src.data.processors.utils.system_utils import get_optimal_workers, create_thread_pool
+
+        self.logger = logging.getLogger(__name__)
         self.config = config
         self.bucket_manager = bucket_manager
-        self.logger = logging.getLogger(__name__)
 
-        # Apply shared Torch optimizations from VAEEncoder
+        # Some basic Torch optimizations
         VAEEncoder.enable_torch_backend_optimizations(self.config)
 
-        self.vae_encoder = None
+        # Optional VAE wrapper
         if vae is not None:
-            self.vae_encoder = VAEEncoder(vae=vae, config=config)
-
-        # Build transform pipeline
-        if hasattr(torch, 'compile'):
-            self.transform = torch.compile(
-                transforms.Compose([
-                    transforms.ToTensor(),
-                    transforms.Normalize(
-                        mean=config.normalize_mean,
-                        std=config.normalize_std
-                    )
-                ])
-            )
+            self.vae_encoder = VAEEncoder(vae, config)
         else:
-            self.transform = transforms.Compose([
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=config.normalize_mean,
-                    std=config.normalize_std
-                )
-            ])
+            self.vae_encoder = None
 
-        # Initialize resize transforms
-        self.resize = transforms.Resize(
+        # Basic transforms
+        self.transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=config.normalize_mean,
+                std=config.normalize_std
+            )
+        ])
+
+        # Simple resize
+        self.resize_op = transforms.Resize(
             config.resolution,
             interpolation=transforms.InterpolationMode.BILINEAR,
             antialias=True
         )
-        self.center_crop = transforms.CenterCrop(config.center_crop)
-        self.random_crop = transforms.RandomCrop(config.resolution)
 
-        # Whether to keep data on GPU
-        self.always_on_gpu = getattr(config, "always_on_gpu", False)
+        # Some config flags
         self.use_pinned_memory = getattr(config, "use_pinned_memory", False)
+        self.device = self.config.device
+        self.batch_size = getattr(self.config, "batch_size", 64)  # Larger default
+        self.load_batch_size = getattr(self.config, "load_batch_size", 256)  # Larger for speed
 
-        # Add processing pools and queues
-        self.num_workers = get_optimal_workers()
-        self.thread_pool = create_thread_pool(self.num_workers)
-        self.preprocessing_queue = asyncio.Queue(maxsize=32)
+        # Thread pool for CPU I/O
+        cpu_workers = min(get_optimal_workers(), 8)
+        self.thread_pool = create_thread_pool(cpu_workers)
+        self.logger.info(f"ImageProcessor using {cpu_workers} CPU workers.")
 
-        # Compile the resize transform if possible
-        if isinstance(self.resize, transforms.Resize) and hasattr(torch, 'compile'):
-            self.resize = torch.compile(self.resize)
-
-        # Setup fast transforms
-        self._setup_fast_transforms()
-
-        # Initialize hardware-optimized transforms
-        self._init_hardware_optimized_transforms()
-
-        # Setup parallel processing
-        self._setup_parallel_processing()
-
-        # Initialize memory pools
-        self._init_memory_pools()
-
-        # Increase batch size if your GPU can handle it
-        self.batch_size = getattr(self.config, 'batch_size', 16)
-
-        # Potential new attribute to define how many images to load at once in a load batch
-        self.load_batch_size = getattr(self.config, "load_batch_size", 64)
-
-        self.logger.info(
-            f"Initialized ImageProcessor:\n"
-            f"- Resolution: {config.resolution}\n"
-            f"- Center crop: {config.center_crop}\n"
-            f"- Random flip: {config.random_flip}\n"
-            f"- VAE: {'Yes' if self.vae_encoder else 'No'}"
-        )
-
-    def _setup_fast_transforms(self):
-        """Setup optimized transform pipeline."""
-        def fast_transform(img):
-            # Convert to tensor efficiently
-            if not isinstance(img, torch.Tensor):
-                img = transforms.functional.to_tensor(img)
-
-            # Apply direct normalization using tensor ops
-            if (
-                hasattr(self.config, 'normalize_mean') and
-                hasattr(self.config, 'normalize_std')
-            ):
-                mean = torch.tensor(self.config.normalize_mean, device=img.device)[None, :, None, None]
-                std = torch.tensor(self.config.normalize_std, device=img.device)[None, :, None, None]
-                img = (img - mean) / std
-
-            return img
-
-        self.fast_transform = fast_transform
-
-    def _setup_parallel_processing(self):
-        """Setup parallel processing pools and queues."""
-        num_workers = min(multiprocessing.cpu_count(), 8)
-        self.thread_pool = ThreadPoolExecutor(
-            max_workers=num_workers,
-            thread_name_prefix="img_proc_"
-        )
-        self.processing_queue = asyncio.Queue(maxsize=32)
-        self.batch_size = getattr(self.config, 'batch_size', 1)
-
-        logger.info(f"Initialized parallel processing with {num_workers} workers")
-
-    def _init_memory_pools(self):
-        """Initialize memory pools for efficient tensor allocation."""
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            self.tensor_cache = WeakValueDictionary()
-            if hasattr(torch.cuda, 'memory_stats'):
-                torch.cuda.memory_stats(device=self.config.device)
-                torch.cuda.reset_peak_memory_stats()
-            try:
-                torch.cuda.set_per_process_memory_fraction(0.95)
-            except Exception as e:
-                self.logger.warning(f"Unable to set per_process_memory_fraction: {e}")
-        else:
-            self.tensor_cache = WeakValueDictionary()
-
-    def _init_hardware_optimized_transforms(self):
-        """Initialize hardware-optimized transforms."""
-        if torch.cuda.is_available():
-            try:
-                import cupy as cp
-                self.use_gpu_transforms = True
-            except ImportError:
-                self.logger.info("CuPy not available, falling back to PyTorch transforms")
-                self.use_gpu_transforms = False
-
-            self.gpu_transform = self._create_gpu_transform_pipeline()
-        else:
-            self.use_gpu_transforms = False
-
-    def _create_gpu_transform_pipeline(self):
-        """Create GPU-accelerated transform pipeline."""
-        @torch.compile
-        def gpu_transform(x: torch.Tensor):
-            x = self._gpu_normalize(x)
-            x = self._gpu_resize(x)  # <--- We now call a properly defined method below
-            return x
-
-        return gpu_transform
-
-    @torch.compile(fullgraph=True)
-    def _gpu_normalize(self, x: torch.Tensor) -> torch.Tensor:
+    def preprocess(self, img):
         """
-        Hardware-optimized normalization (optional).
-        Adjust or extend logic if you want actual GPU-based mean/std normalization.
-        For now, this is a placeholder or no-op.
+        Synchronously preprocess: convert to tensor & normalize,
+        then move to GPU if needed.
         """
-        return x
+        import torch
+        # Resize on CPU first
+        img = self.resize_op(img)
 
-    @torch.compile(fullgraph=True)
-    def _gpu_resize(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Dedicated GPU-based resizing using PyTorch F.interpolate.
-        Resizes to self.config.resolution.
-        If x is [C, H, W], we add a batch dimension (N=1) before interpolation 
-        and then remove it afterwards, so that F.interpolate can operate on 4D input.
-        """
-        # If x is 3D: (C, H, W), add an extra batch dimension -> (1, C, H, W)
-        added_batch_dim = False
-        if x.dim() == 3:
-            x = x.unsqueeze(0)
-            added_batch_dim = True
+        # To tensor & normalize
+        tensor = self.transform(img)
 
-        # Interpolate now that x is guaranteed to be [N, C, H, W].
-        x = F.interpolate(
-            x,
-            size=(self.config.resolution[0], self.config.resolution[1]),
-            mode='bilinear',
-            align_corners=False
-        )
-        
-        # If we added a batch dimension, remove it again.
-        if added_batch_dim:
-            x = x.squeeze(0)
-
-        return x
-
-    async def load_image(self, path_or_str) -> "Image.Image":
-        """
-        Load and validate an image using a utility function, in a separate thread if needed.
-        """
-        return await asyncio.to_thread(load_and_validate_image, path_or_str, config=self.config)
-
-    def _resize_image(self, img: "Image.Image", width: int, height: int) -> "Image.Image":
-        """
-        Basic wrapper for resizing logic. Could be replaced with fast GPU-based ops.
-        """
-        import torchvision.transforms.functional as TF
-        img = TF.resize(
-            img,
-            (height, width),
-            interpolation=self.resize.interpolation,
-            antialias=self.resize.antialias
-        )
-        return img
-
-    def preprocess(self, img: "Image.Image", width: int, height: int) -> torch.Tensor:
-        """
-        Preprocess a single image with resizing and normalization.
-        """
-        img = self._resize_image(img, width, height)
-
+        # Optionally pin
         if self.use_pinned_memory:
-            img_tensor = self.transform(img).pin_memory()
-        else:
-            img_tensor = self.transform(img)
+            tensor = tensor.pin_memory()
 
-        # Move to device in half precision if desired
-        with torch.cuda.amp.autocast(enabled=torch.cuda.is_available(), dtype=self.config.dtype):
-            img_tensor = img_tensor.to(self.config.device, non_blocking=True)
+        # Move to GPU in half precision
+        if torch.cuda.is_available():
+            with torch.cuda.amp.autocast(dtype=self.config.dtype):
+                tensor = tensor.to(self.device, non_blocking=True)
+        return tensor
 
-        return img_tensor
-
-    @torch.inference_mode()
-    async def process_batch(
-        self,
-        images: List["Image.Image"],
-        width: int,
-        height: int,
-        keep_on_gpu: bool = False
-    ) -> List[torch.Tensor]:
+    async def process_batch(self, images, skip_vae=False, keep_on_gpu=False):
         """
-        Optimized batch processing with parallel preprocessing and optional VAE encoding.
+        Load & preprocess images in bigger sub-batches for speed.
+        Optionally encode with VAE if skip_vae=False.
+        Returns stacked or encoded latents.
         """
-        try:
-            # If dealing with a lot of images, we can chunk them
-            results = []
-            for start in range(0, len(images), self.load_batch_size):
-                chunk = images[start : start + self.load_batch_size]
+        import asyncio
+        import torch
 
-                # Process images in parallel using thread pool
-                preprocessing_tasks = [
-                    self.thread_pool.submit(self.preprocess, img, width, height)
-                    for img in chunk
-                ]
+        all_tensors = []
+        for start in range(0, len(images), self.load_batch_size):
+            chunk = images[start : start + self.load_batch_size]
+            # Preprocess in parallel
+            futures = [self.thread_pool.submit(self._load_and_preprocess, img) for img in chunk]
+            results = await asyncio.get_event_loop().run_in_executor(None, lambda: [f.result() for f in futures])
+            # Stack
+            batch_tensor = torch.stack(results, dim=0)
+            all_tensors.append(batch_tensor)
 
-                # Gather results maintaining order
-                processed = []
-                for future in preprocessing_tasks:
-                    try:
-                        tensor = await asyncio.wrap_future(future)
-                        if tensor is not None:
-                            processed.append(tensor)
-                    except Exception as e:
-                        self.logger.error(f"Preprocessing error: {e}")
-
-                if not processed:
-                    continue
-
-                # Stack sub-batch
-                batch_tensor = torch.stack(processed, dim=0)
-                del processed
-
-                # VAE encoding if available
-                encoded_subbatch = None
-                if self.vae_encoder is not None:
-                    try:
-                        encoded_subbatch = await self.vae_encoder.encode_images(
-                            batch_tensor,
-                            keep_on_gpu=keep_on_gpu
-                        )
-                        del batch_tensor
-                    except Exception as e:
-                        self.logger.error(f"VAE encoding error: {e}")
-
-                results.append(encoded_subbatch if encoded_subbatch is not None else batch_tensor)
-
-            # Concat all sub-batches if you want a single result
-            if results:
-                final = []
-                for item in results:
-                    if item is not None:
-                        final.append(item)
-                # Keep memory usage in mind for large merges
-                return torch.cat(final, dim=0) if len(final) > 1 else final[0]
-
-            return []
-
-        except Exception as e:
-            self.logger.error(f"Batch processing error: {e}")
-            torch.cuda.empty_cache()
+        if not all_tensors:
             return None
 
-    async def process_image(self, image: Union[str, Path, "Image.Image"], skip_vae: bool = False, **kwargs):
-        """Process a single image with optional VAE encoding."""
-        try:
-            # 1) Load and preprocess the image into a tensor
-            image_data = await self._parallel_load_and_preprocess(image)
+        # Combine all into one
+        big_tensor = torch.cat(all_tensors, dim=0)
+        self.logger.info(f"Collected {big_tensor.size(0)} images in memory.")
 
-            # 2) Apply GPU transforms if available, else CPU transforms
-            if self.use_gpu_transforms:
-                image_tensor = self._gpu_process_image(image_data)
-            else:
-                image_tensor = self._cpu_process_image(image_data)
+        # Optional: VAE encode
+        if not skip_vae and self.vae_encoder is not None:
+            latents = await self.vae_encoder.encode_images(big_tensor, keep_on_gpu=keep_on_gpu)
+            return latents
 
-            if kwargs.get('keep_on_gpu', False):
-                image_tensor = image_tensor.to(
-                    self.config.device,
-                    non_blocking=True,
-                    memory_format=torch.channels_last
-                )
+        # If not encoding, optionally move to CPU
+        if not keep_on_gpu:
+            big_tensor = big_tensor.cpu()
+        return big_tensor
 
-            # 3) If skip_vae==False and a VAE is available, encode to latents
-            latents = None
-            if not skip_vae and self.vae_encoder is not None:
-                # Add batch dimension if needed
-                if image_tensor.dim() == 3:
-                    image_tensor = image_tensor.unsqueeze(0)
-                
-                latents = await self.vae_encoder.encode_images(
-                    image_tensor,
-                    keep_on_gpu=kwargs.get('keep_on_gpu', False)
-                )
-                
-                # Remove batch dimension if it was added
-                if latents is not None and latents.dim() == 4 and latents.size(0) == 1:
-                    latents = latents.squeeze(0)
-
-            # 4) Build the final dict
-            return {
-                "pixel_values": image_tensor,
-                "latents": latents,
-                "width": image_tensor.shape[-1],
-                "height": image_tensor.shape[-2],
-                "original_size": kwargs.get("original_size", (image_tensor.shape[-2], image_tensor.shape[-1]))
-            }
-
-        except Exception as e:
-            logger.error(f"Error processing image: {str(e)}")
-            raise
-
-    async def _parallel_load_and_preprocess(self, image):
-        async with asyncio.TaskGroup() as group:
-            load_task = group.create_task(self._async_load(image))
-            prep_task = group.create_task(self._async_preprocess(await load_task))
-        return await prep_task
-
-    @torch.compile
-    def _gpu_process_image(self, image_data: torch.Tensor):
+    def _load_and_preprocess(self, img_or_path):
         """
-        Example GPU transform pipeline (normalization + resizing in this example).
+        Inline utility that loads from disk if path, then calls self.preprocess.
         """
-        with torch.cuda.amp.autocast(enabled=torch.cuda.is_available(), dtype=torch.bfloat16):
-            return self.gpu_transform(image_data)
+        from PIL import Image
+        import torch
+        if isinstance(img_or_path, str) or isinstance(img_or_path, Path):
+            try:
+                img_obj = Image.open(img_or_path).convert('RGB')
+            except Exception as e:
+                self.logger.error(f"Failed to load image {img_or_path}: {e}")
+                return torch.zeros(3, *self.config.resolution)
+        else:
+            # Assume it's already a PIL Image
+            img_obj = img_or_path
+        return self.preprocess(img_obj)
 
-    def _cpu_process_image(self, image_data: torch.Tensor):
+    async def process_image(self, img_or_path, skip_vae=False, keep_on_gpu=False):
         """
-        Basic CPU-based transform pipeline placeholder.
-        If GPU transforms are disabled, we land here.
+        Single-image version. Usually slower for big datasets.
+        Batch calls are recommended for better throughput.
         """
-        return image_data
-
-    async def _async_load(self, image_path):
-        """Asynchronously load an image."""
-        try:
-            if isinstance(image_path, (str, Path)):
-                return Image.open(image_path).convert('RGB')
-            return image_path
-        except Exception as e:
-            self.logger.error(f"Error loading image: {str(e)}")
-            raise
-
-    async def _async_preprocess(self, image):
-        """Asynchronously preprocess an image."""
-        try:
-            loop = asyncio.get_event_loop()
-            if self.thread_pool:
-                return await loop.run_in_executor(
-                    self.thread_pool,
-                    self.preprocess,
-                    image,
-                    self.config.resolution[0],
-                    self.config.resolution[1]
-                )
-            return self.preprocess(
-                image,
-                self.config.resolution[0],
-                self.config.resolution[1]
-            )
-        except Exception as e:
-            self.logger.error(f"Error preprocessing image: {str(e)}")
-            raise
-
-    async def process_batch(self, images: List["Image.Image"], **kwargs):
-        """
-        Process a batch of images with progress tracking and hardware optimizations.
-        """
-        try:
-            batch_progress = create_progress_tracker(
-                total_items=len(images),
-                batch_size=self.batch_size,
-                device=self.config.device,
-                desc="Processing batch",
-                unit="batch"
-            )
-
-            results = []
-            for i, img in enumerate(images):
-                result = await self.process_image(img, **kwargs)
-                if result is not None:
-                    results.append(result)
-
-                update_tracker(
-                    batch_progress,
-                    processed=1,
-                    failed=0 if result is not None else 1,
-                    memory_gb=get_gpu_memory_usage(self.config.device)
-                    if torch.cuda.is_available() else None
-                )
-                log_progress(batch_progress, prefix="Batch Processing: ")
-
-            return results
-
-        except Exception as e:
-            logger.error(f"Batch processing error: {e}")
-            if batch_progress:
-                update_tracker(batch_progress, failed=1, error_type=str(type(e).__name__))
-            raise
-
-    def _create_result_dict(self, image_tensor, **kwargs):
-        """
-        Create the final output dictionary. Example usage for structuring results.
-        """
-        return {
-            "pixel_values": image_tensor,
-            "width": image_tensor.shape[-1],
-            "height": image_tensor.shape[-2],
-            **kwargs
-        }
+        res = await self.process_batch([img_or_path], skip_vae=skip_vae, keep_on_gpu=keep_on_gpu)
+        if res is None or res.shape[0] == 0:
+            return {}
+        # Return the first
+        # If VAE encoded, shape is [1,4,H/8,W/8]. If raw, shape is [1,3,H,W].
+        return res[0].unsqueeze(0)
 
     async def cleanup(self):
         """
-        Perform resource cleanup. Reliant on shared Torch cleanup in VAEEncoder
-        plus any processor-specific logic.
+        Cleanup any resources. For large dataset usage, you can keep this minimal.
         """
-        try:
-            VAEEncoder.perform_basic_cleanup()  # GPU cleanup
-            await cleanup_processor(self)
-        except Exception as e:
-            self.logger.error(f"Error during image processor cleanup: {e}")
+        import torch
+        import gc
+        self.logger.info("Cleaning up ImageProcessor.")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+        if self.vae_encoder is not None:
+            await self.vae_encoder.cleanup()
 
     def __del__(self):
+        import asyncio, logging
+        logger = logging.getLogger(__name__)
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
@@ -505,71 +201,4 @@ class ImageProcessor:
             else:
                 loop.run_until_complete(self.cleanup())
         except Exception as e:
-            self.logger.error(f"Error during image processor deletion: {e}")
-
-    def recalc_buffer_size(self) -> None:
-        """
-        Recalculate buffer dimensions based on newly available buckets,
-        then re-allocate the tensor buffer.
-        """
-        self.buffer_size = self._calculate_initial_buffer_size()
-        self.tensor_buffer = self._allocate_tensor_buffer()
-        self.logger.info(f"Recalculated buffer size: {self.buffer_size}")
-
-    def _calculate_initial_buffer_size(self) -> int:
-        """Calculate optimal buffer size based on available memory and bucket sizes."""
-        try:
-            if self.bucket_manager and self.bucket_manager.buckets:
-                max_dims = max(
-                    (bucket.width * bucket.height)
-                    for bucket in self.bucket_manager.buckets.values()
-                )
-            else:
-                max_dims = self.config.resolution[0] * self.config.resolution[1]
-
-            # Calculate memory per image (3 channels, float32)
-            bytes_per_image = max_dims * 3 * 4
-
-            if torch.cuda.is_available():
-                free_memory = torch.cuda.get_device_properties(self.config.device).total_memory
-                free_memory = int(free_memory * 0.7)  # Leave 30% headroom
-            else:
-                import psutil
-                free_memory = psutil.virtual_memory().available
-                free_memory = int(free_memory * 0.7)
-
-            buffer_size = max(1, free_memory // bytes_per_image)
-            return min(buffer_size, 2048)
-
-        except Exception as e:
-            self.logger.warning(f"Error calculating buffer size: {e}, using default")
-            return 512
-
-    def _allocate_tensor_buffer(self) -> Optional[torch.Tensor]:
-        """Allocate tensor buffer for batch processing with error handling."""
-        try:
-            if not self.buffer_size:
-                return None
-
-            if self.bucket_manager and self.bucket_manager.buckets:
-                max_h = max(b.height for b in self.bucket_manager.buckets.values())
-                max_w = max(b.width for b in self.bucket_manager.buckets.values())
-            else:
-                max_h, max_w = self.config.resolution
-
-            buffer = torch.empty(
-                (self.buffer_size, 3, max_h, max_w),
-                dtype=self.config.dtype,
-                device="cpu",
-                pin_memory=self.use_pinned_memory
-            )
-
-            self.logger.info(
-                f"Allocated tensor buffer: {buffer.shape}, "
-                f"Memory: {buffer.element_size() * buffer.nelement() / 1024**2:.1f}MB"
-            )
-            return buffer
-
-        except Exception as e:
-            self.logger.error(f"Failed to allocate tensor buffer: {e}")
-            return None
+            logger.error(f"ImageProcessor del error: {e}")

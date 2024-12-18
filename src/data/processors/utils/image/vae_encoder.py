@@ -45,16 +45,18 @@ class VAEEncoder:
     """
     Handles VAE encoding with memory optimization and async support.
     Includes staticmethods to unify Torch backend and cleanup logic.
+
+    Modified to reduce overhead from repeated torch.compile calls
+    and small-chunk processing. Large sub-batches usually
+    yield much faster throughput for big datasets.
     """
 
     @staticmethod
-    def enable_torch_backend_optimizations(config: VAEEncoderConfig):
+    def enable_torch_backend_optimizations(config):
         """
-        Centralized Torch backend optimizations.
-        This replaces duplication in other modules.
+        Enable TF32 on Ampere GPUs and set cudnn options.
         """
         if torch.cuda.is_available():
-            # Enable TF32 on Ampere GPUs and set cudnn options
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
             torch.backends.cudnn.benchmark = True
@@ -62,9 +64,7 @@ class VAEEncoder:
 
     @staticmethod
     def perform_basic_cleanup():
-        """
-        Centralized GPU memory cleanup (empty cache, garbage collect).
-        """
+        """ Centralized GPU memory cleanup (empty cache, garbage collect). """
         try:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -72,86 +72,101 @@ class VAEEncoder:
         except Exception as e:
             logger.warning(f"Cleanup warning: {e}")
 
-    def __init__(self, vae: AutoencoderKL, config: VAEEncoderConfig):
-        """Initialize VAE encoder with configuration."""
+    def __init__(self, vae, config):
+        """
+        Initialize VAE encoder with configuration, enabling large
+        sub-batches to reduce iteration overhead for big datasets.
+        """
+        self.logger = logging.getLogger(__name__)
         self.vae = vae
         self.config = config
 
-        # Apply shared Torch backend optimizations
-        VAEEncoder.enable_torch_backend_optimizations(config)
+        # Use shared Torch optimizations
+        self.enable_torch_backend_optimizations(config)
 
-        # Freeze VAE and move to device
+        # Freeze and relocate VAE
         self._setup_vae()
 
-        # Enable VAE-related optimizations (slicing, xformers, etc.)
+        # VAE-specific optimizations
         self._enable_vae_specific_optimizations()
 
-        # Setup optional flash attention and tensor parallel
+        # Try flash attention
         self._setup_flash_attention()
+
+        # Setup multi-GPU if needed
         self._setup_tensor_parallel()
 
-        # Increase sub-batch size for large images/datasets if memory allows
-        self.inference_chunk_size = getattr(config, "inference_chunk_size", 8)
+        # Larger chunk size for big datasets
+        # Increase this if your GPU has enough memory; e.g., 128 or 256
+        self.inference_chunk_size = getattr(config, "inference_chunk_size", 64)
 
-        # Initialize caching
-        self.latent_cache = LRUCache(maxsize=1024)
-        self._static_shapes = set()
+        # Simple LRU cache
+        self.latent_cache = {}
+        self.max_cache_size = 64  # Keep it small to avoid overhead
 
-        # Optional: Warm-up the VAE once for faster subsequent calls
+        # Optional warm-up to compile CUDA kernels:
         self._warmup_vae()
 
     def _warmup_vae(self):
-        """
-        Optional warm-up by running a dummy forward pass 
-        so that PyTorch compiles/caches CUDA kernels.
-        """
+        """Optional warm-up pass for the VAE."""
         if torch.cuda.is_available():
-            dummy_input = torch.zeros(
-                (1, 3, 128, 128),
-                device=self.config.device
-            )
-            with torch.no_grad(), torch.cuda.amp.autocast(
-                enabled=True, dtype=torch.bfloat16
-            ):
+            dummy_size = getattr(self.config, "test_warmup_size", 128)
+            dummy_input = torch.zeros((1, 3, dummy_size, dummy_size), device=self.config.device)
+            with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.half):
                 _ = self.vae.encode(dummy_input).latent_dist.sample()
             torch.cuda.synchronize()
-            logger.info("VAE warm-up completed for faster subsequent inference.")
+            self.logger.info("Warm-up pass complete.")
 
     def _setup_vae(self):
-        """Setup VAE model with proper configuration."""
+        """Freeze and move VAE to proper device & dtype."""
         self.vae.requires_grad_(False)
         self.vae.eval()
-        dtype = getattr(torch, self.config.forced_dtype, torch.float32)
+        forced_dtype = getattr(self.config, "forced_dtype", "float32")
+        dtype = getattr(torch, forced_dtype, torch.float32)
         self.vae.to(device=self.config.device, dtype=dtype)
 
     def _enable_vae_specific_optimizations(self):
-        """Enable VAE-specific optimizations for faster processing."""
+        """Enable VAE slicing, xformers, etc. for memory or speed gains."""
         if torch.cuda.is_available():
-            # Always enable VAE slicing for memory efficiency
             self.vae.enable_slicing()
 
-        # Enable xformers if configured and available
-        if self.config.enable_xformers_attention and is_xformers_available():
-            self.vae.enable_xformers_memory_efficient_attention()
+        if getattr(self.config, "enable_xformers_attention", False):
+            try:
+                import xformers
+                self.vae.enable_xformers_memory_efficient_attention()
+            except ImportError:
+                pass
+
+    def _setup_flash_attention(self):
+        """Try enabling flash attention at model level if possible."""
+        try:
+            from flash_attn import flash_attn_func
+            self.use_flash_attention = True
+            for module in self.vae.modules():
+                if isinstance(module, torch.nn.MultiheadAttention):
+                    module._flash_attention_func = flash_attn_func
+        except ImportError:
+            self.use_flash_attention = False
+
+    def _setup_tensor_parallel(self):
+        """Wrap the VAE in DDP if multiple GPUs are available."""
+        if torch.cuda.device_count() > 1:
+            self.vae = torch.nn.parallel.DistributedDataParallel(
+                self.vae,
+                device_ids=[self.config.device],
+                output_device=self.config.device,
+                find_unused_parameters=True
+            )
 
     async def cleanup(self):
-        """Clean up resources."""
+        """Clean up VAE resources."""
         try:
-            # Clear CUDA cache if using GPU
             if self.config.device.type == 'cuda':
-                VAEEncoder.perform_basic_cleanup()
-
-            # Clear references to the VAE
+                self.perform_basic_cleanup()
             del self.vae
-
-            logger.info("Successfully cleaned up VAE encoder resources.")
-
+            self.logger.info("VAE encoder cleanup done.")
         except Exception as e:
-            logger.error(f"Error during VAE encoder cleanup: {str(e)}")
-            try:
-                VAEEncoder.perform_basic_cleanup()
-            except:
-                pass
+            self.logger.error(f"VAE cleanup error: {str(e)}")
 
     def __del__(self):
         """Cleanup when encoder is deleted."""
@@ -165,182 +180,48 @@ class VAEEncoder:
         except Exception as e:
             logger.error(f"Error during VAE encoder destructor: {e}")
 
-    def _enable_memory_efficient_attention(self) -> None:
-        """Enable memory efficient attention if possible."""
-        try:
-            import xformers
-            self.vae.enable_xformers_memory_efficient_attention()
-            logger.info("Enabled xformers memory efficient attention for VAE")
-        except ImportError:
-            logger.warning("xformers not available, using standard attention")
+    @staticmethod
+    def _make_cache_key(images):
+        # Something simple: shape + device + small data hash
+        device_str = str(images.device)
+        shape_str = "x".join(str(s) for s in images.shape)
+        # Very cheap partial hash:
+        data_hash = hash(images[0, 0, 0, 0].item()) if images.numel() > 0 else 0
+        return f"{shape_str}_{device_str}_{data_hash}"
 
     @torch.inference_mode()
-    async def encode_images(self, images: torch.Tensor, keep_on_gpu: bool = False) -> Optional[torch.Tensor]:
+    async def encode_images(self, images, keep_on_gpu=False):
         """
-        Encode images to latent space.
-        Returns a single tensor containing all encoded latents, or None if encoding fails.
+        Encode images into latents. Uses bigger chunking to reduce overhead.
         """
-        try:
-            # Check cache
-            cache_key = self._get_cache_key(images)
-            cached_latents = self.latent_cache.get(cache_key)
-            if cached_latents is not None:
-                # Ensure cached latents are on the correct device
-                if keep_on_gpu:
-                    return cached_latents.to(self.config.device)
-                return cached_latents.cpu()
+        # Attempt to retrieve from cache
+        key = self._make_cache_key(images)
+        if key in self.latent_cache:
+            latents_cached = self.latent_cache[key]
+            return latents_cached.to(self.config.device) if keep_on_gpu else latents_cached.cpu()
 
-            # Process in optimal chunks
-            chunks = self._get_optimal_chunks(images)
-            latents = await self._process_chunks_parallel(chunks, keep_on_gpu)
+        # Process in chunks:
+        latents_list = []
+        for start in range(0, images.shape[0], self.inference_chunk_size):
+            end = start + self.inference_chunk_size
+            chunk = images[start:end]
 
-            if latents is not None:
-                # Cache CPU version of latents
-                self.latent_cache[cache_key] = latents.cpu()
-                # Return on requested device
-                if keep_on_gpu:
-                    return latents.to(self.config.device)
-                return latents.cpu()
+            # Move chunk to device if not there
+            if chunk.device != self.config.device:
+                chunk = chunk.to(self.config.device, non_blocking=True)
 
-            return None
+            with torch.cuda.amp.autocast(enabled=torch.cuda.is_available(), dtype=torch.half):
+                latent_dist = self.vae.encode(chunk).latent_dist
+                latents_chunk = latent_dist.sample()
+            # Possibly move off GPU if we won't keep it
+            if not keep_on_gpu:
+                latents_chunk = latents_chunk.cpu()
 
-        except Exception as e:
-            logger.error(f"VAE encoding error: {str(e)}")
-            return None
+            latents_list.append(latents_chunk)
 
-    async def _process_chunks_parallel(self, chunks, keep_on_gpu):
-        """
-        Process chunks in parallel with advanced optimizations.
-        """
-        try:
-            results = []
-            # Process chunks sequentially but allow other async operations to run
-            for chunk in chunks:
-                # Wrap the synchronous processing in an executor to avoid blocking
-                result = await asyncio.get_event_loop().run_in_executor(
-                    None, self._process_chunk, chunk, keep_on_gpu
-                )
-                if result is not None:
-                    results.append(result)
-            
-            # Only combine if we have results
-            if results:
-                return self._combine_results(results)
-            return None
-
-        except Exception as e:
-            logger.error(f"Error in parallel chunk processing: {e}")
-            return None
-
-    def _combine_results(self, results):
-        """Combine processed chunks back into a single tensor."""
-        if not results:
-            return None
-        try:
-            combined = torch.cat(results, dim=0)
-            return combined
-        except Exception as e:
-            logger.error(f"Error combining results: {e}")
-            return None
-
-    @torch.compile(fullgraph=True, dynamic=False)
-    def _process_chunk(self, chunk, keep_on_gpu):
-        """Optimized chunk processing with TorchDynamo."""
-        try:
-            # Ensure chunk is on the correct device
-            chunk = chunk.to(self.config.device)
-            
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                latents = self.vae.encode(chunk).latent_dist.sample()
-                
-                # Handle device placement
-                if not keep_on_gpu:
-                    latents = latents.cpu()
-                    
-                return latents
-                
-        except Exception as e:
-            logger.error(f"Error processing chunk: {e}")
-            return None  # Changed from raise to return None for consistency
-
-    def _get_optimal_chunks(self, images):
-        """Get optimal chunk sizes based on hardware and model."""
-        if torch.cuda.is_available():
-            sm_count = torch.cuda.get_device_properties(0).multi_processor_count
-            return self._split_for_hardware(images, sm_count)
-        return [images]
-
-    def _split_for_hardware(self, images, sm_count):
-        """Split batch optimally for hardware."""
-        chunk_size = max(1, (sm_count * 128) // images.shape[-1])
-        return torch.chunk(images, chunk_size)
-
-    def _setup_flash_attention(self):
-        """Enable flash attention for faster processing."""
-        try:
-            from flash_attn import flash_attn_func
-            self.use_flash_attention = True
-            # Patch VAE attention layers to use flash attention
-            for module in self.vae.modules():
-                if isinstance(module, torch.nn.MultiheadAttention):
-                    module._flash_attention_func = flash_attn_func
-        except ImportError:
-            self.use_flash_attention = False
-
-    def _setup_tensor_parallel(self):
-        """Setup tensor parallelism for multi-GPU processing."""
-        if torch.cuda.device_count() > 1:
-            self.vae = torch.nn.parallel.DistributedDataParallel(
-                self.vae,
-                device_ids=[self.config.device],
-                output_device=self.config.device,
-                find_unused_parameters=True
-            )
-
-    def _get_optimal_batch_size(self, images: torch.Tensor) -> int:
-        """Determine optimal batch size based on available memory and image size."""
-        try:
-            if not torch.cuda.is_available():
-                return self.config.vae_batch_size
-
-            total_memory = torch.cuda.get_device_properties(self.vae.device).total_memory
-            used_memory = torch.cuda.memory_allocated(self.vae.device)
-            # Calculate actual available memory
-            available_memory = total_memory - used_memory
-            safe_memory = int(available_memory * 0.8)  # Leave 20% buffer
-
-            # Calculate memory per image
-            sample_latent = self.vae.encode(images[0:1]).latent_dist.sample()
-            bytes_per_image = sample_latent.element_size() * sample_latent.nelement()
-
-            optimal_size = max(1, safe_memory // bytes_per_image)
-            return min(optimal_size, self.config.vae_batch_size)
-
-        except Exception as e:
-            logger.warning(f"Error calculating optimal batch size: {e}")
-            return self.config.vae_batch_size
-
-    def _get_cached_tensor(self, key: str, shape: tuple, dtype: torch.dtype) -> torch.Tensor:
-        """Get or create tensor from cache."""
-        tensor = self._tensor_cache.get(key)
-        if tensor is None or tensor.shape != shape or tensor.dtype != dtype:
-            tensor = torch.empty(shape, dtype=dtype, device=self.vae.device)
-            self._tensor_cache[key] = tensor
-        return tensor
-
-    def _get_latent_shape(self, images: torch.Tensor) -> tuple:
-        """Calculate latent shape without encoding."""
-        b, c, h, w = images.shape
-        return (b, 4, h // 8, w // 8)
-
-    def _get_cache_key(self, images: torch.Tensor) -> str:
-        """
-        Generate a cache key based on tensor properties.
-        Now returns a string instead of potentially returning a tensor.
-        """
-        shape_str = "_".join(str(dim) for dim in images.shape)
-        dtype_str = str(images.dtype)
-        device_str = str(images.device)
-        # Add a hash of the first few values to help distinguish different images
-        data_hash = hash(str(images[:, :, 0, 0].cpu().numpy().tobytes()[:1024]))
-        return f"{shape_str}_{dtype_str}_{device_str}_{data_hash}"
+        latents = torch.cat(latents_list, dim=0)
+        # Simple cache, remove oldest if over capacity
+        if len(self.latent_cache) >= self.max_cache_size:
+            self.latent_cache.pop(next(iter(self.latent_cache)))
+        self.latent_cache[key] = latents
+        return latents if keep_on_gpu else latents.cpu()
