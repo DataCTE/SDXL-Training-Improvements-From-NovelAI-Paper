@@ -228,6 +228,7 @@ class ImageProcessorConfig(DeviceConfig):
     resolution: Tuple[int, int] = (1024, 1024)
     center_crop: Tuple[int, int] = (512, 512)  # Default center crop size
     random_flip: bool = True  # or
+    forced_dtype: str = "float32"
 
     
 @dataclass
