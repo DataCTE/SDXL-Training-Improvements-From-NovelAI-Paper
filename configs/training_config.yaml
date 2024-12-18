@@ -171,3 +171,23 @@ text_processor:
   enable_tag_weighting: true
   tag_frequency_threshold: 5
   tag_weight_smoothing: 0.1
+
+# Text embedder configuration section
+text_embedder:
+  max_length: 77
+  batch_size: 32
+  model_name: "stabilityai/stable-diffusion-xl-base-1.0"
+  
+  # Model settings
+  use_fast_tokenizer: true
+  low_cpu_mem_usage: true
+  
+  # Performance settings
+  growth_factor: 0.3
+  proportion_empty_prompts: 0.0
+  
+  # Subfolder settings
+  tokenizer_subfolder: "tokenizer"
+  tokenizer_2_subfolder: "tokenizer_2"
+  text_encoder_subfolder: "text_encoder"
+  text_encoder_2_subfolder: "text_encoder_2"

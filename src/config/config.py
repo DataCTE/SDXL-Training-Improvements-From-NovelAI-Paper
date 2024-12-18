@@ -289,6 +289,27 @@ class TextProcessorConfig(DeviceConfig, CacheConfig):
     tag_weight_smoothing: float = 0.1
 
 @dataclass
+class TextEmbedderConfig(DeviceConfig):
+    """Configuration for text embedding."""
+    max_length: int = 77  # Default CLIP token length
+    batch_size: int = 32
+    model_name: str = "stabilityai/stable-diffusion-xl-base-1.0"
+    
+    # Model settings
+    use_fast_tokenizer: bool = True
+    low_cpu_mem_usage: bool = True
+    
+    # Performance settings
+    growth_factor: float = 0.3  # Conservative growth for text embedding
+    proportion_empty_prompts: float = 0.0
+    
+    # Subfolder settings
+    tokenizer_subfolder: str = "tokenizer"
+    tokenizer_2_subfolder: str = "tokenizer_2"
+    text_encoder_subfolder: str = "text_encoder"
+    text_encoder_2_subfolder: str = "text_encoder_2"
+
+@dataclass
 class GlobalConfig:
     """Global configuration settings shared across all components."""
     image_sizes: ImageSizeConfig = field(default_factory=ImageSizeConfig)
@@ -304,16 +325,18 @@ class Config:
     scoring: ScoringConfig
     system: SystemConfig
     paths: PathsConfig
-    global_config: GlobalConfig  # Add global config
+    global_config: GlobalConfig
     vae_encoder: VAEEncoderConfig
     batch_processor: BatchProcessorConfig
     bucket: BucketConfig
     text_processor: TextProcessorConfig
+    text_embedder: TextEmbedderConfig
 
     def __post_init__(self):
         """Apply global settings to components."""
         # Apply device settings
-        for component in [self.vae_encoder, self.batch_processor, self.text_processor]:
+        for component in [self.vae_encoder, self.batch_processor, 
+                         self.text_processor, self.text_embedder]:
             component.device = self.global_config.device.device
             component.dtype = self.global_config.device.dtype
             component.max_memory_usage = self.global_config.device.max_memory_usage
@@ -356,7 +379,8 @@ class Config:
                 vae_encoder=VAEEncoderConfig(**config_dict['vae_encoder']),
                 batch_processor=BatchProcessorConfig(**config_dict['batch_processor']),
                 bucket=BucketConfig(**config_dict['bucket']),
-                text_processor=TextProcessorConfig(**config_dict['text_processor'])
+                text_processor=TextProcessorConfig(**config_dict['text_processor']),
+                text_embedder=TextEmbedderConfig(**config_dict['text_embedder'])
             )
         except Exception as e:
             raise ValueError(f"Error loading config from {path}: {str(e)}") from e

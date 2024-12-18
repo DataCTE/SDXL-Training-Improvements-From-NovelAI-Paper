@@ -21,6 +21,7 @@ from src.data.processors.utils.progress_utils import (
 
 # Internal imports from processors
 from src.data.processors.utils.thread_config import get_optimal_cpu_threads
+from src.config.config import TextEmbedderConfig
 
 logger = logging.getLogger(__name__)
 
@@ -62,27 +63,18 @@ def setup_memory_efficient_attention(model: torch.nn.Module) -> bool:
 class TextEmbedder:
     def __init__(
         self,
-        pretrained_model_name_or_path: str,
-        device: torch.device,
-        max_length: int = 77,
-        dtype: torch.dtype = torch.float16,
-        batch_size: int = 32,
-        enable_memory_efficient_attention: bool = True,
-        max_memory_usage: float = 0.9
+        config: TextEmbedderConfig
     ):
-        """Initialize SDXL text embedder."""
-        self.device = device
-        self.max_length = max_length
-        self.dtype = dtype
-        self.max_memory_usage = max_memory_usage
+        """Initialize SDXL text embedder with consolidated config."""
+        self.config = config
         
         # Calculate optimal batch size
         self.batch_size = calculate_optimal_batch_size(
-            device=device,
+            config=config,
             min_batch_size=1,
-            max_batch_size=batch_size,
-            target_memory_usage=max_memory_usage,
-            growth_factor=0.3  # Conservative growth for text embedding
+            max_batch_size=config.batch_size,
+            target_memory_usage=config.max_memory_usage,
+            growth_factor=config.growth_factor
         )
         
         # Initialize tensor cache
@@ -91,44 +83,45 @@ class TextEmbedder:
         try:
             # Load tokenizers with caching
             self.tokenizer_one = AutoTokenizer.from_pretrained(
-                pretrained_model_name_or_path,
-                subfolder="tokenizer",
-                use_fast=True,
-                model_max_length=max_length
+                config.model_name,
+                subfolder=config.tokenizer_subfolder,
+                use_fast=config.use_fast_tokenizer,
+                model_max_length=config.max_length
             )
             self.tokenizer_two = AutoTokenizer.from_pretrained(
-                pretrained_model_name_or_path,
-                subfolder="tokenizer_2",
-                use_fast=True,
-                model_max_length=max_length
+                config.model_name,
+                subfolder=config.tokenizer_2_subfolder,
+                use_fast=config.use_fast_tokenizer,
+                model_max_length=config.max_length
             )
 
             # Load text encoders
             text_encoder_cls_one = import_model_class_from_model_name_or_path(
-                pretrained_model_name_or_path
+                config.model_name,
+                subfolder=config.text_encoder_subfolder
             )
             text_encoder_cls_two = import_model_class_from_model_name_or_path(
-                pretrained_model_name_or_path,
-                subfolder="text_encoder_2"
+                config.model_name,
+                subfolder=config.text_encoder_2_subfolder
             )
             
             # Load and optimize encoders
             self.text_encoder_one = text_encoder_cls_one.from_pretrained(
-                pretrained_model_name_or_path,
-                subfolder="text_encoder",
-                torch_dtype=dtype,
-                low_cpu_mem_usage=True
-            ).to(device)
+                config.model_name,
+                subfolder=config.text_encoder_subfolder,
+                torch_dtype=config.dtype,
+                low_cpu_mem_usage=config.low_cpu_mem_usage
+            ).to(config.device)
             
             self.text_encoder_two = text_encoder_cls_two.from_pretrained(
-                pretrained_model_name_or_path,
-                subfolder="text_encoder_2",
-                torch_dtype=dtype,
-                low_cpu_mem_usage=True
-            ).to(device)
+                config.model_name,
+                subfolder=config.text_encoder_2_subfolder,
+                torch_dtype=config.dtype,
+                low_cpu_mem_usage=config.low_cpu_mem_usage
+            ).to(config.device)
 
             # Enable memory efficient attention if available
-            if enable_memory_efficient_attention:
+            if config.enable_memory_efficient_attention:
                 setup_memory_efficient_attention(self.text_encoder_one)
                 setup_memory_efficient_attention(self.text_encoder_two)
 
@@ -145,11 +138,11 @@ class TextEmbedder:
             
             logger.info(
                 f"Initialized TextEmbedder:\n"
-                f"- Device: {device}\n"
-                f"- Dtype: {dtype}\n"
+                f"- Device: {config.device}\n"
+                f"- Dtype: {config.dtype}\n"
                 f"- Batch size: {self.batch_size}\n"
-                f"- Max length: {max_length}\n"
-                f"- Memory usage target: {max_memory_usage:.1%}"
+                f"- Max length: {config.max_length}\n"
+                f"- Memory usage target: {config.max_memory_usage:.1%}"
             )
             
         except Exception as e:
@@ -165,7 +158,7 @@ class TextEmbedder:
         """Get or create tensor from cache."""
         tensor = self._tensor_cache.get(key)
         if tensor is None or tensor.shape != shape or tensor.dtype != dtype:
-            tensor = torch.empty(shape, dtype=dtype, device=self.device)
+            tensor = torch.empty(shape, dtype=dtype, device=self.config.device)
             self._tensor_cache[key] = tensor
         return tensor
 
@@ -184,17 +177,17 @@ class TextEmbedder:
             text_inputs = tokenizer(
                 prompts,
                 padding="max_length",
-                max_length=self.max_length,
+                max_length=self.config.max_length,
                 truncation=True,
                 return_tensors="pt",
             )
             
             # Move to device efficiently
-            text_input_ids = text_inputs.input_ids.to(self.device, non_blocking=True)
-            attention_mask = text_inputs.attention_mask.to(self.device, non_blocking=True)
+            text_input_ids = text_inputs.input_ids.to(self.config.device, non_blocking=True)
+            attention_mask = text_inputs.attention_mask.to(self.config.device, non_blocking=True)
             
             # Use new autocast syntax
-            with torch.cuda.amp.autocast(dtype=self.dtype):
+            with torch.cuda.amp.autocast(dtype=self.config.dtype):
                 prompt_embeds = text_encoder(
                     text_input_ids,
                     attention_mask=attention_mask,
@@ -311,8 +304,8 @@ class TextEmbedder:
 
             try:
                 # Combine all batches
-                prompt_embeds = torch.cat(all_prompt_embeds, dim=0).to(self.device)
-                pooled_prompt_embeds = torch.cat(all_pooled_embeds, dim=0).to(self.device)
+                prompt_embeds = torch.cat(all_prompt_embeds, dim=0).to(self.config.device)
+                pooled_prompt_embeds = torch.cat(all_pooled_embeds, dim=0).to(self.config.device)
                 
                 # Clean up intermediate lists
                 del all_prompt_embeds
@@ -327,15 +320,15 @@ class TextEmbedder:
             except Exception as e:
                 logger.error(f"Error combining batches: {str(e)}")
                 return {
-                    "prompt_embeds": torch.empty(0, device=self.device),
-                    "pooled_prompt_embeds": torch.empty(0, device=self.device)
+                    "prompt_embeds": torch.empty(0, device=self.config.device),
+                    "pooled_prompt_embeds": torch.empty(0, device=self.config.device)
                 }
                 
         except Exception as e:
             logger.error(f"Error in text embedding: {str(e)}")
             return {
-                "prompt_embeds": torch.empty(0, device=self.device),
-                "pooled_prompt_embeds": torch.empty(0, device=self.device)
+                "prompt_embeds": torch.empty(0, device=self.config.device),
+                "pooled_prompt_embeds": torch.empty(0, device=self.config.device)
             }
             
         finally:
@@ -351,7 +344,7 @@ class TextEmbedder:
                 self._tensor_cache.clear()
             
             # Clear CUDA cache if using GPU
-            if self.device.type == 'cuda':
+            if self.config.device.type == 'cuda':
                 torch.cuda.empty_cache()
             
             # Clear model references
