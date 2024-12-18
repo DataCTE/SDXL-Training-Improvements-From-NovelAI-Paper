@@ -27,7 +27,7 @@ from .processors.utils.progress_utils import create_progress_tracker, update_tra
 from .processors.utils.system_utils import get_gpu_memory_usage, cleanup_processor
 
 # Config import
-from src.config.config import NovelAIDatasetConfig, BucketConfig, TextProcessorConfig
+from src.config.config import NovelAIDatasetConfig, BucketConfig, TextProcessorConfig, ImageProcessorConfig
 
 logger = logging.getLogger(__name__)
 
@@ -106,8 +106,9 @@ class NovelAIDataset(Dataset):
             )
             
             # Initialize image processor
+            image_processor_config = ImageProcessorConfig(**self.config.image_processor_config)  # Convert to dataclass
             self.image_processor = ImageProcessor(
-                config=self.config.image_processor_config,
+                config=image_processor_config,
                 bucket_manager=self.bucket_manager,
                 vae=self.vae
             )

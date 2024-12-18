@@ -341,11 +341,19 @@ class NovelAIDatasetConfig:
         'artist': (0.5, 1.5)
     })
     tag_weights_path: Optional[str] = "./latents/latent_weights.json"
+    
+    # Add this line to include image processor configuration
+    image_processor_config: Dict[str, Any] = field(default_factory=dict)
+    
+    # Add text processor configuration
     text_processor_config: Dict[str, Any] = field(default_factory=dict)
+    
+    # Add text embedder configuration
     text_embedder_config: TextEmbedderConfig = field(default_factory=lambda: TextEmbedderConfig(
         model_name="stabilityai/stable-diffusion-xl-base-1.0",
         # Add other parameters as needed
     ))
+
     def __post_init__(self):
         """Convert and validate configuration."""
         # Convert image sizes to tuples if needed
