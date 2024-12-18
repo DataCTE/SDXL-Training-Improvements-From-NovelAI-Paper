@@ -329,9 +329,9 @@ class ImageProcessor:
             image_data = await self._parallel_load_and_preprocess(image)
 
             if self.use_gpu_transforms:
-                image_tensor = await self._gpu_process_image(image_data)
+                image_tensor = self._gpu_process_image(image_data)
             else:
-                image_tensor = await self._cpu_process_image(image_data)
+                image_tensor = self._cpu_process_image(image_data)
 
             update_tracker(
                 self.progress,
